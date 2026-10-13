@@ -477,6 +477,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     private func setError(_ msg: String) {
         // 调用方保证在 bleQueue 上
+        stopErrorShown = false // 修 L2：红字换成别的了，标记不能残留
         queueState = .failed
         DispatchQueue.main.async { [weak self] in
             self?.lastError = msg
@@ -486,7 +487,15 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 清掉界面上的旧红字（修 N8）；调用方保证在 bleQueue 上
     private func clearError() {
+        stopErrorShown = false // 修 L2
         DispatchQueue.main.async { [weak self] in self?.lastError = nil }
+    }
+
+    /// 显示非停止帧类的红字（看门狗/30 分钟/写失败等），并重置 stopErrorShown（修 L2），
+    /// 避免之后停止帧确认成功时把这条提示误删；调用方保证在 bleQueue 上
+    private func showError(_ msg: String) {
+        stopErrorShown = false
+        DispatchQueue.main.async { [weak self] in self?.lastError = msg }
     }
 
     // MARK: - 看门狗（心跳版）
@@ -506,9 +515,7 @@ final class BLEManager: NSObject, ObservableObject {
                 enqueueFrame(Protocol.stopFrame)
                 outputLocked = true
                 notifyForceZero()
-                DispatchQueue.main.async { [weak self] in
-                    self?.lastError = "单次连续输出超过 30 分钟，已自动停止"
-                }
+                showError("单次连续输出超过 30 分钟，已自动停止")
             } else if let hb = lastHeartbeat,
                       now.timeIntervalSince(hb) > Self.watchdogInterval,
                       peripheral != nil, writeChar != nil {
@@ -516,9 +523,7 @@ final class BLEManager: NSObject, ObservableObject {
                 enqueueFrame(Protocol.stopFrame)
                 outputLocked = true // 修 高1：看门狗停机也要锁闸
                 notifyForceZero()   // 修 高1：通知 VM 把界面输出归零
-                DispatchQueue.main.async { [weak self] in
-                    self?.lastError = "看门狗：界面心跳丢失，已自动停止"
-                }
+                showError("看门狗：界面心跳丢失，已自动停止")
             }
         }
         bleQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
@@ -554,6 +559,7 @@ extension BLEManager: CBCentralManagerDelegate {
             let msg = central.state == .unauthorized
                 ? "蓝牙权限未授权，请去系统设置里打开"
                 : "蓝牙已关闭"
+            stopErrorShown = false // 修 L2
             DispatchQueue.main.async { [weak self] in
                 self?.lastError = msg
                 self?.showDeviceConfirm = false
@@ -684,16 +690,16 @@ extension BLEManager: CBPeripheralDelegate {
                 // 之后已有更新的帧入队则丢弃重试，以更新的帧为准（修 M2）
                 if shouldRetryStop(w) { enqueueRetry(w) }
             } else {
-                w.onAck?()
+                // 修 L1：先置标记、再调 onAck（与 writeTimedOut 一致），
+                // 否则断开流程走完后标记又被置回 true，带进下一次连接
                 if w.isStop {
                     // 修 F：停止帧最终失败，按"设备可能还在输出"处理
                     stopWriteFailed = true
                     showStopError("停止帧写入失败，设备可能仍在输出，请直接关闭设备电源")
                 } else {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.lastError = "写入失败：\(error.localizedDescription)"
-                    }
+                    showError("写入失败：\(error.localizedDescription)")
                 }
+                w.onAck?()
             }
             return
         }
