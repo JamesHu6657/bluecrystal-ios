@@ -21,7 +21,7 @@ final class VideoSyncPlayer: ObservableObject {
     private var lastActive = ActiveChannels.zero
     private weak var ble: BLEManager?
     /// 状态订阅（attach 可安全重建）；播放器订阅（duration/timeControlStatus）单独管理，
-    /// 只在换播放器时清理 —— attach 挂在 Section.onAppear 上，滚动重触发时不会
+    /// 只在换播放器时清理 —— attach 每次 onAppear 都会重跑（修 CC r3 L4：已移到 Form 上），重触发时不会
     /// 把还没回来的 duration 订阅一起清掉（修 N4）
     private var stateCancellables = Set<AnyCancellable>()
     private var playerCancellables = Set<AnyCancellable>()
@@ -30,6 +30,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// seek 代次：拖进度条会连发多个 seek，只有最新的回调有效（修 #5 的小尾巴）
     private var seekGen = 0
     private var seekInFlight = 0
+    /// 修 CC r3 L3：seek 期间 KVO 看到的外部暂停（此时被 seekInFlight 跳过），重播回调据此不再 play
+    private var pausedDuringSeek = false
 
     /// 重连后强制重发首帧（修 N6：避免被"没有变化"吞掉）
     private var needsResync = false
@@ -71,6 +73,9 @@ final class VideoSyncPlayer: ObservableObject {
                 // 外部把播放器停了，但 vm 还以为在播：同步停机
                 if status == .paused, self.isPlaying, self.seekInFlight == 0 {
                     self.handleExternalPause()
+                } else if status == .paused, self.isPlaying {
+                    // 修 CC r3 L3：seek 期间先记下，由 seek 回调处理
+                    self.pausedDuringSeek = true
                 }
             }
             .store(in: &playerCancellables)
@@ -152,10 +157,12 @@ final class VideoSyncPlayer: ObservableObject {
                 seekGen += 1
                 let gen = seekGen
                 seekInFlight += 1
+                pausedDuringSeek = false // 修 CC r3 L3
                 p.seek(to: .zero) { [weak self] _ in
                     // 修 CC L4：AVPlayer 不保证回调线程，回到主线程再改状态
                     DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
+                    // 修 CC r3 L2：换过视频后旧播放器的回调不许碰新播放器的计数和状态
+                    guard let self = self, p === self.player else { return }
                     self.seekInFlight = max(0, self.seekInFlight - 1)
                     // 修 B：seek 完成前用户点了暂停/停止/切 Tab，或设备断开，
                     // 不许把播放复活 —— 否则界面显示已停，设备却继续跟视频走，
@@ -163,6 +170,12 @@ final class VideoSyncPlayer: ObservableObject {
                     guard gen == self.seekGen, self.isPlaying else { return }
                     self.lastActive = .zero
                     self.currentSeconds = 0
+                    // 修 CC r3 L3：seek 期间被外部暂停过，不复活播放，按外部暂停停机
+                    if self.pausedDuringSeek {
+                        self.pausedDuringSeek = false
+                        self.handleExternalPause()
+                        return
+                    }
                     p.play()
                     self.startTimer()
                     }
@@ -183,7 +196,8 @@ final class VideoSyncPlayer: ObservableObject {
         let wasPlaying = isPlaying
         p.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) { [weak self] _ in
             DispatchQueue.main.async { [weak self] in // 修 CC L4
-            guard let self = self else { return }
+            // 修 CC r3 L2：换过视频后旧播放器的回调不许碰新播放器的计数和状态
+            guard let self = self, p === self.player else { return }
             self.seekInFlight = max(0, self.seekInFlight - 1)
             // 被更新的 seek 抢先了，这个回调作废
             guard gen == self.seekGen else { return }
@@ -256,6 +270,12 @@ final class VideoSyncPlayer: ObservableObject {
         // 修 CC L6：拖进度条期间界面是活的，心跳照发，避免长时间拖动误触看门狗
         ble.heartbeat()
         guard seekInFlight == 0 else { return }
+        // 修 CC r3 L3：心跳只证明 Timer 活着；播放器已停而 vm 仍以为在播时立即停机，
+        // 不让心跳替一个不动的画面续命
+        if isPlaying, p.timeControlStatus == .paused {
+            handleExternalPause()
+            return
+        }
         let t = p.currentTime().seconds
         guard t.isFinite else { return }
 
@@ -334,7 +354,6 @@ struct VideoSyncView: View {
                     Text(err).font(.caption).foregroundColor(.red)
                 }
             }
-            .onAppear { vm.attach(ble: ble) }
 
             Section("素材") {
                 HStack {
@@ -385,6 +404,8 @@ struct VideoSyncView: View {
             }
         }
         .navigationTitle("视频联动")
+        // 修 CC r3 L4：attach 挂在整个 Form 上，与 onDisappear 对称（同 ManualControlView）
+        .onAppear { vm.attach(ble: ble) }
         .sheet(isPresented: $showVideoPicker) {
             DocumentPicker(contentTypes: [UTType.movie, UTType.video]) { url in
                 vm.loadVideo(url: url)

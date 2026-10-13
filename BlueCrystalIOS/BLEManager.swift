@@ -326,11 +326,16 @@ final class BLEManager: NSObject, ObservableObject {
             // 修 Factory M2：不管停止帧发不发得出去，都先锁闸并让界面归零
             self.outputLocked = true
             self.notifyForceZero()
+            // 修 CC r3 L1：onAck 里要拿本链 id 和 lastNonStopId 比较；回执一定晚于入队，届时已赋值
+            var ackChainId = -1
             let stopId: Int
             if self.peripheral != nil, self.writeChar != nil, self.queueState == .ready {
                 stopId = self.enqueueFrame(BCProtocol.stopFrame, onAck: { [weak self] in
                     ackRan = true
                     guard let self = self else { finish(); return }
+                    // 修 CC r3 L1：回前台后用户已发出更新的非零帧，以新帧为准，
+                    // 不误报"关电源"、不置失败标记（否则看门狗和 30 分钟上限失明）
+                    guard self.lastNonStopId < ackChainId else { finish(); return }
                     // 修 Factory L4：停止帧之后还有更晚的非零帧，不能当成已停
                     if self.isActive, !self.stopWriteFailed {
                         self.reportStopUnconfirmed()
@@ -341,6 +346,7 @@ final class BLEManager: NSObject, ObservableObject {
             } else {
                 stopId = -1
             }
+            ackChainId = stopId
             guard stopId >= 0 else {
                 // 发不出去：设备上还有输出就明确提示（修 Factory M2）
                 if self.isActive {
@@ -355,8 +361,13 @@ final class BLEManager: NSObject, ObservableObject {
             self.bleQueue.asyncAfter(deadline: .now() + Self.disconnectFallback) { [weak self] in
                 guard let self = self else { finish(); return }
                 if self.cancelChainCallbacks(chain: stopId) {
-                    self.reportStopUnconfirmed()
-                    self.postStopFailureNotification(then: finish)
+                    // 修 CC r3 L1：已被更新的非零帧取代时以新帧为准，只结束后台任务
+                    if self.lastNonStopId < stopId {
+                        self.reportStopUnconfirmed()
+                        self.postStopFailureNotification(then: finish)
+                    } else {
+                        finish()
+                    }
                 } else if ackRan {
                     // 修 CC r2 L2：回执路径已经接管（可能还在登记通知），由它结束后台任务
                     return
