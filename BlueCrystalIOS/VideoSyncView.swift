@@ -145,6 +145,8 @@ final class VideoSyncPlayer: ObservableObject {
                 let gen = seekGen
                 seekInFlight += 1
                 p.seek(to: .zero) { [weak self] _ in
+                    // 修 CC L4：AVPlayer 不保证回调线程，回到主线程再改状态
+                    DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
                     self.seekInFlight = max(0, self.seekInFlight - 1)
                     // 修 B：seek 完成前用户点了暂停/停止/切 Tab，或设备断开，
@@ -155,6 +157,7 @@ final class VideoSyncPlayer: ObservableObject {
                     self.currentSeconds = 0
                     p.play()
                     self.startTimer()
+                    }
                 }
             } else {
                 p.play()
@@ -171,6 +174,7 @@ final class VideoSyncPlayer: ObservableObject {
         seekInFlight += 1
         let wasPlaying = isPlaying
         p.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in // 修 CC L4
             guard let self = self else { return }
             self.seekInFlight = max(0, self.seekInFlight - 1)
             // 被更新的 seek 抢先了，这个回调作废
@@ -186,6 +190,7 @@ final class VideoSyncPlayer: ObservableObject {
             }
             // seek 后强制算一次，避免设备停在旧强度
             self.tick(force: true)
+            }
         }
     }
 
@@ -235,8 +240,10 @@ final class VideoSyncPlayer: ObservableObject {
 
     /// 每 100ms 按当前播放时间计算激活通道，变化时才发帧
     private func tick(force: Bool = false) {
-        guard let p = player, let s = script, let ble = ble,
-              seekInFlight == 0 else { return }
+        guard let p = player, let s = script, let ble = ble else { return }
+        // 修 CC L6：拖进度条期间界面是活的，心跳照发，避免长时间拖动误触看门狗
+        ble.heartbeat()
+        guard seekInFlight == 0 else { return }
         let t = p.currentTime().seconds
         guard t.isFinite else { return }
 
@@ -249,8 +256,6 @@ final class VideoSyncPlayer: ObservableObject {
             return
         }
 
-        // 界面心跳：看门狗靠这个判断 UI 线程是否还活着
-        ble.heartbeat()
 
         currentSeconds = t
 
