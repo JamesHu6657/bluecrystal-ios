@@ -144,8 +144,13 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 持久化"设备可能仍在输出"；属性 didSet 调用（bleQueue 上），UserDefaults 线程安全
     private func persistMayBeActive() {
-        UserDefaults.standard.set(isActive || stopWriteFailed || deviceMayBeActive, forKey: Self.mayBeActiveKey)
+        // 修 CC r2 L5：值变了才写，避免每帧写两次 UserDefaults
+        let v = isActive || stopWriteFailed || deviceMayBeActive
+        guard v != lastPersistedMayBeActive else { return }
+        lastPersistedMayBeActive = v
+        UserDefaults.standard.set(v, forKey: Self.mayBeActiveKey)
     }
+    private var lastPersistedMayBeActive: Bool?
 
     /// 进程即将退出：同步等最多 1 秒，让停止帧尽量拿到回执（修 CC M2）
     @objc private func appWillTerminate() {
@@ -352,7 +357,10 @@ final class BLEManager: NSObject, ObservableObject {
                 if self.cancelChainCallbacks(chain: stopId) {
                     self.reportStopUnconfirmed()
                     self.postStopFailureNotification(then: finish)
-                } else if !ackRan, self.deviceMayBeActive || self.stopWriteFailed {
+                } else if ackRan {
+                    // 修 CC r2 L2：回执路径已经接管（可能还在登记通知），由它结束后台任务
+                    return
+                } else if self.deviceMayBeActive || self.stopWriteFailed {
                     // 修 CC M1：链路在停止帧出结果前断开，pendingWrites 被清空、onAck 没机会跑
                     self.postStopFailureNotification(then: finish)
                 } else {
@@ -366,8 +374,10 @@ final class BLEManager: NSObject, ObservableObject {
     func resumeFromBackground() {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
+            // 修 CC r2 L1：只有真的从后台回来才补发；下拉控制中心等 inactive→active 不发
+            let wasBackground = self.appInBackground
             self.appInBackground = false
-            guard self.queueState == .ready,
+            guard wasBackground, self.queueState == .ready,
                   self.isActive || self.stopWriteFailed || self.deviceMayBeActive else { return }
             self.sendConfirmingStop()
         }
@@ -479,9 +489,13 @@ final class BLEManager: NSObject, ObservableObject {
                 enqueueRetry(w)
             }
         } else {
-            // 停止帧两次都没结果：按"设备可能还在输出"处理（修 F）
-            stopWriteFailed = true
-            showStopError("停止帧写入超时，设备可能仍在输出，请直接关闭设备电源")
+            // 停止帧两次都没结果：按"设备可能还在输出"处理（修 F）。
+            // 修 CC r2 M1：之后已经发出更新的非零帧时，以那一帧为准，不置失败标记，
+            // 否则看门狗和 30 分钟上限会对正在运行的新帧失明
+            if w.id > lastNonStopId {
+                stopWriteFailed = true
+                showStopError("停止帧写入超时，设备可能仍在输出，请直接关闭设备电源")
+            }
             // 最终结果出来了：把 onAck 交还调用方（断开流程据此立刻断开，不用干等兜底）
             pendingWrites[idx].onAck = nil
             w.onAck?()
@@ -648,7 +662,10 @@ final class BLEManager: NSObject, ObservableObject {
         content.body = "停止帧未得到设备确认，设备可能仍在输出，请关闭设备电源"
         content.sound = .default
         let req = UNNotificationRequest(identifier: "bluecrystal.stopFailed", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req) { _ in done() }
+        // 修 CC r2 L2：回到 bleQueue 再回调，emergencyStop 的 finished 标记只在 bleQueue 上读写
+        UNUserNotificationCenter.current().add(req) { [weak self] _ in
+            if let q = self?.bleQueue { q.async(execute: done) } else { done() }
+        }
     }
 
     /// 连接建立后服务/特征值发现失败：断开并清空外设，否则 peripheral 残留会让之后的扫描被拒（修 Factory H2 配套）
@@ -679,7 +696,9 @@ final class BLEManager: NSObject, ObservableObject {
     /// 避免之后停止帧确认成功时把这条提示误删；调用方保证在 bleQueue 上
     private func showError(_ msg: String) {
         stopErrorShown = false
-        DispatchQueue.main.async { [weak self] in self?.lastError = msg }
+        // 修 CC r2 L6：设备可能还在输出时保留警告
+        let text = deviceMayBeActive ? "\(msg)\n\(Self.mayBeActiveMsg)" : msg
+        DispatchQueue.main.async { [weak self] in self?.lastError = text }
     }
 
     // MARK: - 看门狗（心跳版）
@@ -916,9 +935,12 @@ extension BLEManager: CBPeripheralDelegate {
                 // 修 L1：先置标记、再调 onAck（与 writeTimedOut 一致），
                 // 否则断开流程走完后标记又被置回 true，带进下一次连接
                 if w.isStop {
-                    // 修 F：停止帧最终失败，按"设备可能还在输出"处理
-                    stopWriteFailed = true
-                    showStopError("停止帧写入失败，设备可能仍在输出，请直接关闭设备电源")
+                    // 修 F：停止帧最终失败，按"设备可能还在输出"处理；
+                    // 修 CC r2 M1：已被更新的非零帧取代时不置标记，以新帧为准
+                    if w.id > lastNonStopId {
+                        stopWriteFailed = true
+                        showStopError("停止帧写入失败，设备可能仍在输出，请直接关闭设备电源")
+                    }
                 } else {
                     showError("写入失败：\(error.localizedDescription)")
                 }

@@ -127,7 +127,6 @@ struct ManualControlView: View {
                     Text(err).font(.caption).foregroundColor(.red)
                 }
             }
-            .onAppear { vm.attach(ble: ble) }
 
             Section("四通道强度") {
                 ForEach(BCProtocol.Channel.allCases, id: \.rawValue) { ch in
@@ -172,6 +171,8 @@ struct ManualControlView: View {
             }
         }
         .navigationTitle("手动控制")
+        // 修 CC r2 L7：attach 挂在整个 Form 上，与 detach 对称；设备区块滚出屏幕也能重新挂上
+        .onAppear { vm.attach(ble: ble) }
         // 切走 Tab 时停机：避免滑杆显示 50、设备实际跟视频走的不一致（修 #6 的小尾巴）
         .onDisappear {
             vm.stopAll()

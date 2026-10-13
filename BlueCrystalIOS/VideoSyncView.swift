@@ -70,20 +70,25 @@ final class VideoSyncPlayer: ObservableObject {
                 guard let self = self else { return }
                 // 外部把播放器停了，但 vm 还以为在播：同步停机
                 if status == .paused, self.isPlaying, self.seekInFlight == 0 {
-                    // 修 M4：最后 0.5 秒内停下（自然播完，或来电/耳机暂停）同样必须停机，
-                    // 只是提示文案不同；直接 return 会让设备停在最后一帧强度上
-                    if self.durationSeconds > 0,
-                       self.currentSeconds >= self.durationSeconds - 0.5 {
-                        self.stopAll()
-                        self.statusLine = "播放结束，设备已停止"
-                        return
-                    }
-                    self.isPlaying = false
-                    self.stopTimer(sendZero: true)
-                    self.statusLine = "外部暂停，设备已停止"
+                    self.handleExternalPause()
                 }
             }
             .store(in: &playerCancellables)
+    }
+
+    /// 外部暂停/播完的停机处理；seek 完成时也会补查一次（修 CC r2 L4）
+    private func handleExternalPause() {
+        // 修 M4：最后 0.5 秒内停下（自然播完，或来电/耳机暂停）同样必须停机，
+        // 只是提示文案不同；直接 return 会让设备停在最后一帧强度上
+        if self.durationSeconds > 0,
+           self.currentSeconds >= self.durationSeconds - 0.5 {
+            self.stopAll()
+            self.statusLine = "播放结束，设备已停止"
+            return
+        }
+        self.isPlaying = false
+        self.stopTimer(sendZero: true)
+        self.statusLine = "外部暂停，设备已停止"
     }
 
     func loadVideo(url: URL) {
@@ -91,6 +96,9 @@ final class VideoSyncPlayer: ObservableObject {
         stopAll()
         // 修 N4：旧播放器的订阅在这里释放，KVO 不再持有旧 player
         playerCancellables.removeAll()
+        // 修 CC r2 L4：旧播放器未完成的 seek 回调作废
+        seekGen += 1
+        seekInFlight = 0
         videoName = url.lastPathComponent
         let p = AVPlayer(url: url)
         player = p
@@ -187,6 +195,10 @@ final class VideoSyncPlayer: ObservableObject {
             if self.timer == nil {
                 p.play()
                 self.startTimer()
+            } else if p.timeControlStatus == .paused {
+                // 修 CC r2 L4：seek 期间的外部暂停被跳过了，这里补上
+                self.handleExternalPause()
+                return
             }
             // seek 后强制算一次，避免设备停在旧强度
             self.tick(force: true)
@@ -293,7 +305,10 @@ struct NoControlsPlayerView: UIViewControllerRepresentable {
         return vc
     }
 
-    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
+        // 修 CC r2 L3：换视频后预览也要换成新播放器
+        if uiViewController.player !== player { uiViewController.player = player }
+    }
 }
 
 /// 视频联动：播本地视频，按时间轴脚本自动发 0x06 帧
