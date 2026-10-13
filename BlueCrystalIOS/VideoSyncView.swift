@@ -60,10 +60,7 @@ final class VideoSyncPlayer: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.passiveStop() }
             .store(in: &stateCancellables)
-        // 监听播放器自身状态：来电/耳机按键/控制中心等外部暂停（修 #2 的小尾巴）
-        if let p = player {
-            observeTimeControlStatus(p)
-        }
+        // 修 M5：timeControlStatus 订阅只在 loadVideo 里挂一次，attach 不再重复添加
     }
 
     private func observeTimeControlStatus(_ p: AVPlayer) {
@@ -73,9 +70,12 @@ final class VideoSyncPlayer: ObservableObject {
                 guard let self = self else { return }
                 // 外部把播放器停了，但 vm 还以为在播：同步停机
                 if status == .paused, self.isPlaying, self.seekInFlight == 0 {
-                    // 修 高2 小尾巴：视频自然播完也会进 .paused，这不算外部暂停
+                    // 修 M4：最后 0.5 秒内停下（自然播完，或来电/耳机暂停）同样必须停机，
+                    // 只是提示文案不同；直接 return 会让设备停在最后一帧强度上
                     if self.durationSeconds > 0,
                        self.currentSeconds >= self.durationSeconds - 0.5 {
+                        self.stopAll()
+                        self.statusLine = "播放结束，设备已停止"
                         return
                     }
                     self.isPlaying = false
@@ -116,7 +116,9 @@ final class VideoSyncPlayer: ObservableObject {
             script = try JSONDecoder().decode(TimelineScript.self, from: data)
             scriptName = url.lastPathComponent
             if let s = script {
-                statusLine = "脚本就绪：\(s.commands.count) 条命令，\(s.scaleDescription)刻度"
+                // 高6 建议：刻度声明写错回退自动判断时明确提示
+                let warn = s.scaleFallback ? "（intensityScale 无法识别，已自动判断）" : ""
+                statusLine = "脚本就绪：\(s.commands.count) 条命令，\(s.scaleDescription)刻度\(warn)"
             }
         } catch {
             scriptName = "解析失败：\(error.localizedDescription)"
@@ -174,8 +176,16 @@ final class VideoSyncPlayer: ObservableObject {
             // 被更新的 seek 抢先了，这个回调作废
             guard gen == self.seekGen else { return }
             self.currentSeconds = seconds
+            // 以回调时的状态为准：seek 期间用户点了暂停/停止，不再发帧
+            guard wasPlaying, self.isPlaying else { return }
+            // 修 M3：重播的 seek 被这次拖动抢掉时，重播回调不会 play/启动 Timer，
+            // 这里补上，避免"按钮显示在播、视频不动、设备卡在一帧上"
+            if self.timer == nil {
+                p.play()
+                self.startTimer()
+            }
             // seek 后强制算一次，避免设备停在旧强度
-            if wasPlaying { self.tick(force: true) }
+            self.tick(force: true)
         }
     }
 

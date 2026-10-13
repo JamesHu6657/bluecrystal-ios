@@ -1,1 +1,69 @@
-aW1wb3J0IEZvdW5kYXRpb24KCi8vLyDphonmuIXpo44gYWEg5Y2P6K6uIDB4MDYg5qih5byP5ZG95Luk77yIbWl6enplZV8wMDMyIOWunuaKk+mqjOivge+8iQovLy8KLy8vIOW4p+agvOW8j++8mkFBIDA2IDA1IDxjaDA+IDxjaDE+IDxjaDI+IDxjaDM+IDxmbGFnPTAwPiA8Y2hlY2tzdW0+Ci8vLyDlhbEgOSDlrZfoioLvvIxjaGVja3N1bSA9IOWJjSA4IOWtl+iKguebuOWKoOWPluS9jiA4IOS9jQovLy8g5YaZ54m55b6B5YC8IEZGQTHvvIzpnIAgV3JpdGUgV2l0aCBSZXNwb25zZQplbnVtIFByb3RvY29sIHsKCiAgICBzdGF0aWMgbGV0IGhlYWRlcjogVUludDggPSAweEFBCiAgICBzdGF0aWMgbGV0IGNtZDogVUludDggPSAweDA2CiAgICBzdGF0aWMgbGV0IGxlbjogVUludDggPSAweDA1CgogICAgLy8vIOWbm+mAmumBk+e0ouW8lQogICAgZW51bSBDaGFubmVsOiBJbnQsIENhc2VJdGVyYWJsZSB7CiAgICAgICAgY2FzZSB0aHJ1c3QgPSAwICAgIC8vIOS8uOe8qQogICAgICAgIGNhc2UgdmlicmF0aW9uID0gMSAvLyDpnIfliqgKICAgICAgICBjYXNlIHN1Y3Rpb24gPSAyICAgLy8g5ZCu5ZC4CiAgICAgICAgY2FzZSByb3RhdGlvbiA9IDMgIC8vIOaXi+i9rAoKICAgICAgICB2YXIgZGlzcGxheU5hbWU6IFN0cmluZyB7CiAgICAgICAgICAgIHN3aXRjaCBzZWxmIHsKICAgICAgICAgICAgY2FzZSAudGhydXN0OiByZXR1cm4gIuS8uOe8qSIKICAgICAgICAgICAgY2FzZSAudmlicmF0aW9uOiByZXR1cm4gIumch+WKqCIKICAgICAgICAgICAgY2FzZSAuc3VjdGlvbjogcmV0dXJuICLlkK7lkLgiCiAgICAgICAgICAgIGNhc2UgLnJvdGF0aW9uOiByZXR1cm4gIuaXi+i9rCIKICAgICAgICAgICAgfQogICAgICAgIH0KCiAgICAgICAgLy8vIOaXtumXtOi9tOiEmuacrOmHjOeahCBjb21tYW5kVHlwZSDmmKDlsIQKICAgICAgICBzdGF0aWMgZnVuYyBmcm9tKGNvbW1hbmRUeXBlOiBTdHJpbmcpIC0+IENoYW5uZWw/IHsKICAgICAgICAgICAgc3dpdGNoIGNvbW1hbmRUeXBlLmxvd2VyY2FzZWQoKSB7CiAgICAgICAgICAgIGNhc2UgInRocnVzdCIsICJzdHJldGNoIjogcmV0dXJuIC50aHJ1c3QKICAgICAgICAgICAgY2FzZSAidmlicmF0aW9uIjogcmV0dXJuIC52aWJyYXRpb24KICAgICAgICAgICAgY2FzZSAic3VjdGlvbiIsICJzdWNraW5nIjogcmV0dXJuIC5zdWN0aW9uCiAgICAgICAgICAgIGNhc2UgInJvdGF0aW9uIiwgInJvdGF0ZSI6IHJldHVybiAucm90YXRpb24KICAgICAgICAgICAgZGVmYXVsdDogcmV0dXJuIG5pbAogICAgICAgICAgICB9CiAgICAgICAgfQogICAgfQoKICAgIC8vLyDmnoTpgKAgMHgwNiDmjqfliLbluKfvvIzlvLrluqYgMH45OQogICAgc3RhdGljIGZ1bmMgZnJhbWUoY2hhbm5lbHM6IFtJbnRdKSAtPiBEYXRhIHsKICAgICAgICB2YXIgYnl0ZXM6IFtVSW50OF0gPSBbaGVhZGVyLCBjbWQsIGxlbl0KICAgICAgICBmb3IgaSBpbiAwLi48NCB7CiAgICAgICAgICAgIGxldCB2ID0gaSA8IGNoYW5uZWxzLmNvdW50ID8gY2hhbm5lbHNbaV0gOiAwCiAgICAgICAgICAgIGJ5dGVzLmFwcGVuZChVSW50OChtYXgoMCwgbWluKDk5LCB2KSkpKQogICAgICAgIH0KICAgICAgICBieXRlcy5hcHBlbmQoMHgwMCkgLy8gZmxhZ++8jOaBkiAwCiAgICAgICAgbGV0IGNoZWNrc3VtID0gYnl0ZXMucmVkdWNlKDApIHsgKCQwICsgSW50KCQxKSkgJiAweEZGIH0KICAgICAgICBieXRlcy5hcHBlbmQoVUludDgoY2hlY2tzdW0pKQogICAgICAgIHJldHVybiBEYXRhKGJ5dGVzKQogICAgfQoKICAgIC8vLyDlgZzmraLluKfvvJpBQSAwNiAwNSAwMCAwMCAwMCAwMCAwMCBCNe+8iOWunuaKk+mqjOivge+8iQogICAgc3RhdGljIHZhciBzdG9wRnJhbWU6IERhdGEgewogICAgICAgIGZyYW1lKGNoYW5uZWxzOiBbMCwgMCwgMCwgMF0pCiAgICB9CgogICAgLy8vIOWumOaWuSBVSSDlkK/liqjluKfvvJpBQSAwNiAwNSAwNCAwNiAwNSAwMCAwMCBDNO+8iOWunuaKk+mqjOivge+8iQogICAgc3RhdGljIHZhciBvZmZpY2lhbFN0YXJ0RnJhbWU6IERhdGEgewogICAgICAgIERhdGEoWzB4QUEsIDB4MDYsIDB4MDUsIDB4MDQsIDB4MDYsIDB4MDUsIDB4MDAsIDB4MDAsIDB4QzRdKQogICAgfQoKICAgIC8vLyDosIPor5XnlKjvvJpEYXRhIOi9rCBIRVgg5a2X56ym5LiyCiAgICBzdGF0aWMgZnVuYyBoZXgoXyBkYXRhOiBEYXRhKSAtPiBTdHJpbmcgewogICAgICAgIGRhdGEubWFwIHsgU3RyaW5nKGZvcm1hdDogIiUwMlgiLCAkMCkgfS5qb2luZWQoKQogICAgfQp9Cg==
+import Foundation
+
+/// 醉清风 aa 协议 0x06 模式命令（mizzzee_0032 实抓验证）
+///
+/// 帧格式：AA 06 05 <ch0> <ch1> <ch2> <ch3> <flag=00> <checksum>
+/// 共 9 字节，checksum = 前 8 字节相加取低 8 位
+/// 写特征值 FFA1，需 Write With Response
+enum Protocol {
+
+    static let header: UInt8 = 0xAA
+    static let cmd: UInt8 = 0x06
+    static let len: UInt8 = 0x05
+
+    /// 四通道索引
+    enum Channel: Int, CaseIterable {
+        case thrust = 0    // 伸缩
+        case vibration = 1 // 震动
+        case suction = 2   // 吮吸
+        case rotation = 3  // 旋转
+
+        var displayName: String {
+            switch self {
+            case .thrust: return "伸缩"
+            case .vibration: return "震动"
+            case .suction: return "吮吸"
+            case .rotation: return "旋转"
+            }
+        }
+
+        /// 时间轴脚本里的 commandType 映射
+        static func from(commandType: String) -> Channel? {
+            switch commandType.lowercased() {
+            case "thrust", "stretch": return .thrust
+            case "vibration": return .vibration
+            case "suction", "sucking": return .suction
+            case "rotation", "rotate": return .rotation
+            default: return nil
+            }
+        }
+    }
+
+    /// 构造 0x06 控制帧，强度 0~99
+    static func frame(channels: [Int]) -> Data {
+        var bytes: [UInt8] = [header, cmd, len]
+        for i in 0..<4 {
+            let v = i < channels.count ? channels[i] : 0
+            bytes.append(UInt8(max(0, min(99, v))))
+        }
+        bytes.append(0x00) // flag，恒 0
+        let checksum = bytes.reduce(0) { ($0 + Int($1)) & 0xFF }
+        bytes.append(UInt8(checksum))
+        return Data(bytes)
+    }
+
+    /// 停止帧：AA 06 05 00 00 00 00 00 B5（实抓验证）
+    static var stopFrame: Data {
+        frame(channels: [0, 0, 0, 0])
+    }
+
+    /// 官方 UI 启动帧：AA 06 05 04 06 05 00 00 C4（实抓验证）
+    static var officialStartFrame: Data {
+        Data([0xAA, 0x06, 0x05, 0x04, 0x06, 0x05, 0x00, 0x00, 0xC4])
+    }
+
+    /// 调试用：Data 转 HEX 字符串
+    static func hex(_ data: Data) -> String {
+        data.map { String(format: "%02X", $0) }.joined()
+    }
+}

@@ -27,6 +27,8 @@ struct TimelineScript: Decodable {
 
     /// 缓存的刻度判断结果，避免每 tick O(n)（修 N10）
     let useTenScale: Bool
+    /// intensityScale 写了但不是 "ten"/"percent"，已回退自动判断（用于界面提示）
+    let scaleFallback: Bool
 
     enum CodingKeys: String, CodingKey {
         case commands
@@ -42,12 +44,16 @@ struct TimelineScript: Decodable {
         if let s = intensityScale?.lowercased() {
             if s == "ten" {
                 useTenScale = true
+                scaleFallback = false
             } else if s == "percent" {
                 useTenScale = false
+                scaleFallback = false
             } else {
                 useTenScale = commands.allSatisfy { $0.intensityLevel <= 10 }
+                scaleFallback = true
             }
         } else {
+            scaleFallback = false
             // 自动判断：整个脚本统一用一种刻度，避免 10→99、10.5→11 这种断层
             useTenScale = commands.allSatisfy { $0.intensityLevel <= 10 }
         }

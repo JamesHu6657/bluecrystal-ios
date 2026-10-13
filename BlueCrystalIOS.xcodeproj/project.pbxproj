@@ -1,1 +1,252 @@
-Ly8gISQqVVRGOCokIQp7CglhcmNoaXZlVmVyc2lvbiA9IDE7CgljbGFzc2VzID0gewoJfTsKCW9iamVjdFZlcnNpb24gPSA1NjsKCW9iamVjdHMgPSB7CgovKiBCZWdpbiBQQlhCdWlsZEZpbGUgc2VjdGlvbiAqLwoJCUExMDEwMDAxIC8qIEJsdWVDcnlzdGFsSU9TQXBwLnN3aWZ0IGluIFNvdXJjZXMgKi8gPSB7aXNhID0gUEJYQnVpbGRGaWxlOyBmaWxlUmVmID0gQTEwMjAwMDEgLyogQmx1ZUNyeXN0YWxJT1NBcHAuc3dpZnQgKi87IH07CgkJQTEwMTAwMDIgLyogQ29udGVudFZpZXcuc3dpZnQgaW4gU291cmNlcyAqLyA9IHtpc2EgPSBQQlhCdWlsZEZpbGU7IGZpbGVSZWYgPSBBMTAyMDAwMiAvKiBDb250ZW50Vmlldy5zd2lmdCAqLzsgfTsKCQlBMTAxMDAwMyAvKiBCTEVNYW5hZ2VyLnN3aWZ0IGluIFNvdXJjZXMgKi8gPSB7aXNhID0gUEJYQnVpbGRGaWxlOyBmaWxlUmVmID0gQTEwMjAwMDMgLyogQkxFTWFuYWdlci5zd2lmdCAqLzsgfTsKCQlBMTAxMDAwNCAvKiBQcm90b2NvbC5zd2lmdCBpbiBTb3VyY2VzICovID0ge2lzYSA9IFBCWEJ1aWxkRmlsZTsgZmlsZVJlZiA9IEExMDIwMDA0IC8qIFByb3RvY29sLnN3aWZ0ICovOyB9OwoJCUExMDEwMDA1IC8qIE1vZGVscy5zd2lmdCBpbiBTb3VyY2VzICovID0ge2lzYSA9IFBCWEJ1aWxkRmlsZTsgZmlsZVJlZiA9IEExMDIwMDA1IC8qIE1vZGVscy5zd2lmdCAqLzsgfTsKCQlBMTAxMDAwNiAvKiBNYW51YWxDb250cm9sVmlldy5zd2lmdCBpbiBTb3VyY2VzICovID0ge2lzYSA9IFBCWEJ1aWxkRmlsZTsgZmlsZVJlZiA9IEExMDIwMDA2IC8qIE1hbnVhbENvbnRyb2xWaWV3LnN3aWZ0ICovOyB9OwoJCUExMDEwMDA3IC8qIFZpZGVvU3luY1ZpZXcuc3dpZnQgaW4gU291cmNlcyAqLyA9IHtpc2EgPSBQQlhCdWlsZEZpbGU7IGZpbGVSZWYgPSBBMTAyMDAwNyAvKiBWaWRlb1N5bmNWaWV3LnN3aWZ0ICovOyB9OwovKiBFbmQgUEJYQnVpbGRGaWxlIHNlY3Rpb24gKi8KCi8qIEJlZ2luIFBCWEZpbGVSZWZlcmVuY2Ugc2VjdGlvbiAqLwoJCUExMDIwMDAxIC8qIEJsdWVDcnlzdGFsSU9TQXBwLnN3aWZ0ICovID0ge2lzYSA9IFBCWEZpbGVSZWZlcmVuY2U7IGxhc3RLbm93bkZpbGVUeXBlID0gc291cmNlY29kZS5zd2lmdDsgcGF0aCA9IEJsdWVDcnlzdGFsSU9TQXBwLnN3aWZ0OyBzb3VyY2VUcmVlID0gIjxncm91cD4iOyB9OwoJCUExMDIwMDAyIC8qIENvbnRlbnRWaWV3LnN3aWZ0ICovID0ge2lzYSA9IFBCWEZpbGVSZWZlcmVuY2U7IGxhc3RLbm93bkZpbGVUeXBlID0gc291cmNlY29kZS5zd2lmdDsgcGF0aCA9IENvbnRlbnRWaWV3LnN3aWZ0OyBzb3VyY2VUcmVlID0gIjxncm91cD4iOyB9OwoJCUExMDIwMDAzIC8qIEJMRU1hbmFnZXIuc3dpZnQgKi8gPSB7aXNhID0gUEJYRmlsZVJlZmVyZW5jZTsgbGFzdEtub3duRmlsZVR5cGUgPSBzb3VyY2Vjb2RlLnN3aWZ0OyBwYXRoID0gQkxFTWFuYWdlci5zd2lmdDsgc291cmNlVHJlZSA9ICI8Z3JvdXA+IjsgfTsKCQlBMTAyMDAwNCAvKiBQcm90b2NvbC5zd2lmdCAqLyA9IHtpc2EgPSBQQlhGaWxlUmVmZXJlbmNlOyBsYXN0S25vd25GaWxlVHlwZSA9IHNvdXJjZWNvZGUuc3dpZnQ7IHBhdGggPSBQcm90b2NvbC5zd2lmdDsgc291cmNlVHJlZSA9ICI8Z3JvdXA+IjsgfTsKCQlBMTAyMDAwNSAvKiBNb2RlbHMuc3dpZnQgKi8gPSB7aXNhID0gUEJYRmlsZVJlZmVyZW5jZTsgbGFzdEtub3duRmlsZVR5cGUgPSBzb3VyY2Vjb2RlLnN3aWZ0OyBwYXRoID0gTW9kZWxzLnN3aWZ0OyBzb3VyY2VUcmVlID0gIjxncm91cD4iOyB9OwoJCUExMDIwMDA2IC8qIE1hbnVhbENvbnRyb2xWaWV3LnN3aWZ0ICovID0ge2lzYSA9IFBCWEZpbGVSZWZlcmVuY2U7IGxhc3RLbm93bkZpbGVUeXBlID0gc291cmNlY29kZS5zd2lmdDsgcGF0aCA9IE1hbnVhbENvbnRyb2xWaWV3LnN3aWZ0OyBzb3VyY2VUcmVlID0gIjxncm91cD4iOyB9OwoJCUExMDIwMDA3IC8qIFZpZGVvU3luY1ZpZXcuc3dpZnQgKi8gPSB7aXNhID0gUEJYRmlsZVJlZmVyZW5jZTsgbGFzdEtub3duRmlsZVR5cGUgPSBzb3VyY2Vjb2RlLnN3aWZ0OyBwYXRoID0gVmlkZW9TeW5jVmlldy5zd2lmdDsgc291cmNlVHJlZSA9ICI8Z3JvdXA+IjsgfTsKCQlBMTAyMDAwOCAvKiBJbmZvLnBsaXN0ICovID0ge2lzYSA9IFBCWEZpbGVSZWZlcmVuY2U7IGxhc3RLbm93bkZpbGVUeXBlID0gdGV4dC5wbGlzdC54bWw7IHBhdGggPSBJbmZvLnBsaXN0OyBzb3VyY2VUcmVlID0gIjxncm91cD4iOyB9OwoJCUExMDIwMDA5IC8qIEJsdWVDcnlzdGFsSU9TLmFwcCAqLyA9IHtpc2EgPSBQQlhGaWxlUmVmZXJlbmNlOyBleHBsaWNpdEZpbGVUeXBlID0gd3JhcHBlci5hcHBsaWNhdGlvbjsgaW5jbHVkZUluSW5kZXggPSAwOyBwYXRoID0gQmx1ZUNyeXN0YWxJT1MuYXBwOyBzb3VyY2VUcmVlID0gQlVJTFRfUFJPRFVDVFNfRElSOyB9OwovKiBFbmQgUEJYRmlsZVJlZmVyZW5jZSBzZWN0aW9uICovCgovKiBCZWdpbiBQQlhGcmFtZXdvcmtzQnVpbGRQaGFzZSBzZWN0aW9uICovCgkJQTEwMzAwMDEgLyogRnJhbWV3b3JrcyAqLyA9IHsKCQkJaXNhID0gUEJYRnJhbWV3b3Jrc0J1aWxkUGhhc2U7CgkJCWJ1aWxkQWN0aW9uTWFzayA9IDIxNDc0ODM2NDc7CgkJCWZpbGVzID0gKAoJCQkpOwoJCQlydW5Pbmx5Rm9yRGVwbG95bWVudFBvc3Rwcm9jZXNzaW5nID0gMDsKCQl9OwovKiBFbmQgUEJYRnJhbWV3b3Jrc0J1aWxkUGhhc2Ugc2VjdGlvbiAqLwoKLyogQmVnaW4gUEJYR3JvdXAgc2VjdGlvbiAqLwoJCUExMDQwMDAxID0gewoJCQlpc2EgPSBQQlhHcm91cDsKCQkJY2hpbGRyZW4gPSAoCgkJCQlBMTA0MDAwMiAvKiBCbHVlQ3J5c3RhbElPUyAqLywKCQkJCUExMDQwMDAzIC8qIFByb2R1Y3RzICovLAoJCQkpOwoJCQlzb3VyY2VUcmVlID0gIjxncm91cD4iOwoJCX07CgkJQTEwNDAwMDIgLyogQmx1ZUNyeXN0YWxJT1MgKi8gPSB7CgkJCWlzYSA9IFBCWEdyb3VwOwoJCQljaGlsZHJlbiA9ICgKCQkJCUExMDIwMDAxIC8qIEJsdWVDcnlzdGFsSU9TQXBwLnN3aWZ0ICovLAoJCQkJQTEwMjAwMDIgLyogQ29udGVudFZpZXcuc3dpZnQgKi8sCgkJCQlBMTAyMDAwMyAvKiBCTEVNYW5hZ2VyLnN3aWZ0ICovLAoJCQkJQTEwMjAwMDQgLyogUHJvdG9jb2wuc3dpZnQgKi8sCgkJCQlBMTAyMDAwNSAvKiBNb2RlbHMuc3dpZnQgKi8sCgkJCQlBMTAyMDAwNiAvKiBNYW51YWxDb250cm9sVmlldy5zd2lmdCAqLywKCQkJCUExMDIwMDA3IC8qIFZpZGVvU3luY1ZpZXcuc3dpZnQgKi8sCgkJCQlBMTAyMDAwOCAvKiBJbmZvLnBsaXN0ICovLAoJCQkpOwoJCQlwYXRoID0gQmx1ZUNyeXN0YWxJT1M7CgkJCXNvdXJjZVRyZWUgPSAiPGdyb3VwPiI7CgkJfTsKCQlBMTA0MDAwMyAvKiBQcm9kdWN0cyAqLyA9IHsKCQkJaXNhID0gUEJYR3JvdXA7CgkJCWNoaWxkcmVuID0gKAoJCQkJQTEwMjAwMDkgLyogQmx1ZUNyeXN0YWxJT1MuYXBwICovLAoJCQkpOwoJCQluYW1lID0gUHJvZHVjdHM7CgkJCXNvdXJjZVRyZWUgPSAiPGdyb3VwPiI7CgkJfTsKLyogRW5kIFBCWEdyb3VwIHNlY3Rpb24gKi8KCi8qIEJlZ2luIFBCWE5hdGl2ZVRhcmdldCBzZWN0aW9uICovCgkJQTEwNTAwMDEgLyogQmx1ZUNyeXN0YWxJT1MgKi8gPSB7CgkJCWlzYSA9IFBCWE5hdGl2ZVRhcmdldDsKCQkJYnVpbGRDb25maWd1cmF0aW9uTGlzdCA9IEExMDgwMDAyIC8qIEJ1aWxkIGNvbmZpZ3VyYXRpb24gbGlzdCBmb3IgUEJYTmF0aXZlVGFyZ2V0ICJCbHVlQ3J5c3RhbElPUyIgKi87CgkJCWJ1aWxkUGhhc2VzID0gKAoJCQkJQTEwMzAwMDEgLyogRnJhbWV3b3JrcyAqLywKCQkJCUExMDYwMDAxIC8qIFJlc291cmNlcyAqLywKCQkJCUExMDcwMDAxIC8qIFNvdXJjZXMgKi8sCgkJCSk7CgkJCWJ1aWxkUnVsZXMgPSAoCgkJCSk7CgkJCWRlcGVuZGVuY2llcyA9ICgKCQkJKTsKCQkJbmFtZSA9IEJsdWVDcnlzdGFsSU9TOwoJCQlwcm9kdWN0TmFtZSA9IEJsdWVDcnlzdGFsSU9TOwoJCQlwcm9kdWN0UmVmZXJlbmNlID0gQTEwMjAwMDkgLyogQmx1ZUNyeXN0YWxJT1MuYXBwICovOwoJCQlwcm9kdWN0VHlwZSA9ICJjb20uYXBwbGUucHJvZHVjdC10eXBlLmFwcGxpY2F0aW9uIjsKCQl9OwovKiBFbmQgUEJYTmF0aXZlVGFyZ2V0IHNlY3Rpb24gKi8KCi8qIEJlZ2luIFBCWFByb2plY3Qgc2VjdGlvbiAqLwoJCUExMDkwMDAxIC8qIFByb2plY3Qgb2JqZWN0ICovID0gewoJCQlpc2EgPSBQQlhQcm9qZWN0OwoJCQlhdHRyaWJ1dGVzID0gewoJCQkJQnVpbGRJbmRlcGVuZGVudFRhcmdldHNJblBhcmFsbGVsID0gMTsKCQkJCUxhc3RVcGdyYWRlQ2hlY2sgPSAxNTAwOwoJCQkJVGFyZ2V0QXR0cmlidXRlcyA9IHsKCQkJCQlBMTA1MDAwMSA9IHsKCQkJCQkJQ3JlYXRlZE9uVG9vbHNWZXJzaW9uID0gMTUuMDsKCQkJCQl9OwoJCQkJfTsKCQkJfTsKCQkJYnVpbGRDb25maWd1cmF0aW9uTGlzdCA9IEExMDgwMDAxIC8qIEJ1aWxkIGNvbmZpZ3VyYXRpb24gbGlzdCBmb3IgUEJYUHJvamVjdCAiQmx1ZUNyeXN0YWxJT1MiICovOwoJCQljb21wYXRpYmlsaXR5VmVyc2lvbiA9ICJYY29kZSAxNC4wIjsKCQkJZGV2ZWxvcG1lbnRSZWdpb24gPSB6aF9DTjsKCQkJaGFzU2Nhbm5lZEZvckVuY29kaW5ncyA9IDA7CgkJCWtub3duUmVnaW9ucyA9ICgKCQkJCXpoX0NOLAoJCQkJQmFzZSwKCQkJKTsKCQkJbWFpbkdyb3VwID0gQTEwNDAwMDE7CgkJCXByb2R1Y3RSZWZHcm91cCA9IEExMDQwMDAzIC8qIFByb2R1Y3RzICovOwoJCQlwcm9qZWN0RGlyUGF0aCA9ICIiOwoJCQlwcm9qZWN0Um9vdCA9ICIiOwoJCQl0YXJnZXRzID0gKAoJCQkJQTEwNTAwMDEgLyogQmx1ZUNyeXN0YWxJT1MgKi8sCgkJCSk7CgkJfTsKLyogRW5kIFBCWFByb2plY3Qgc2VjdGlvbiAqLwoKLyogQmVnaW4gUEJYUmVzb3VyY2VzQnVpbGRQaGFzZSBzZWN0aW9uICovCgkJQTEwNjAwMDEgLyogUmVzb3VyY2VzICovID0gewoJCQlpc2EgPSBQQlhSZXNvdXJjZXNCdWlsZFBoYXNlOwoJCQlidWlsZEFjdGlvbk1hc2sgPSAyMTQ3NDgzNjQ3OwoJCQlmaWxlcyA9ICgKCQkJKTsKCQkJcnVuT25seUZvckRlcGxveW1lbnRQb3N0cHJvY2Vzc2luZyA9IDA7CgkJfTsKLyogRW5kIFBCWFJlc291cmNlc0J1aWxkUGhhc2Ugc2VjdGlvbiAqLwoKLyogQmVnaW4gUEJYU291cmNlc0J1aWxkUGhhc2Ugc2VjdGlvbiAqLwoJCUExMDcwMDAxIC8qIFNvdXJjZXMgKi8gPSB7CgkJCWlzYSA9IFBCWFNvdXJjZXNCdWlsZFBoYXNlOwoJCQlidWlsZEFjdGlvbk1hc2sgPSAyMTQ3NDgzNjQ3OwoJCQlmaWxlcyA9ICgKCQkJCUExMDEwMDAxIC8qIEJsdWVDcnlzdGFsSU9TQXBwLnN3aWZ0IGluIFNvdXJjZXMgKi8sCgkJCQlBMTAxMDAwMiAvKiBDb250ZW50Vmlldy5zd2lmdCBpbiBTb3VyY2VzICovLAoJCQkJQTEwMTAwMDMgLyogQkxFTWFuYWdlci5zd2lmdCBpbiBTb3VyY2VzICovLAoJCQkJQTEwMTAwMDQgLyogUHJvdG9jb2wuc3dpZnQgaW4gU291cmNlcyAqLywKCQkJCUExMDEwMDA1IC8qIE1vZGVscy5zd2lmdCBpbiBTb3VyY2VzICovLAoJCQkJQTEwMTAwMDYgLyogTWFudWFsQ29udHJvbFZpZXcuc3dpZnQgaW4gU291cmNlcyAqLywKCQkJCUExMDEwMDA3IC8qIFZpZGVvU3luY1ZpZXcuc3dpZnQgaW4gU291cmNlcyAqLywKCQkJKTsKCQkJcnVuT25seUZvckRlcGxveW1lbnRQb3N0cHJvY2Vzc2luZyA9IDA7CgkJfTsKLyogRW5kIFBCWFNvdXJjZXNCdWlsZFBoYXNlIHNlY3Rpb24gKi8KCi8qIEJlZ2luIFhDQnVpbGRDb25maWd1cmF0aW9uIHNlY3Rpb24gKi8KCQlBMTEwMDAwMSAvKiBEZWJ1ZyAqLyA9IHsKCQkJaXNhID0gWENCdWlsZENvbmZpZ3VyYXRpb247CgkJCWJ1aWxkU2V0dGluZ3MgPSB7CgkJCQlBTFdBWVNfU0VBUkNIX1VTRVJfUEFUSFMgPSBOTzsKCQkJCUNMQU5HX0FOQUxZWkVSX05PTk5VTEwgPSBZRVM7CgkJCQlDTEFOR19DWFhfTEFOR1VBR0VfU1RBTkRBUkQgPSAiZ251KysyMCI7CgkJCQlDTEFOR19FTkFCTEVfT0JKQ19XRUFLID0gWUVTOwoJCQkJREVCVUdfSU5GT1JNQVRJT05fRk9STUFUID0gZHdhcmY7CgkJCQlHQ0NfQ19MQU5HVUFHRV9TVEFOREFSRCA9IGdudTE3OwoJCQkJTVRMX0VOQUJMRV9ERUJVR19JTkZPID0gSU5DTFVERV9TT1VSQ0U7CgkJCQlNVExfRkFTVF9NQVRIID0gWUVTOwoJCQkJT05MWV9BQ1RJVkVfQVJDSCA9IFlFUzsKCQkJCVNES1JPT1QgPSBpcGhvbmVvczsKCQkJCVNXSUZUX0FDVElWRV9DT01QSUxBVElPTl9DT05ESVRJT05TID0gREVCVUc7CgkJCQlTV0lGVF9PUFRJTUlaQVRJT05fTEVWRUwgPSAiLU9ub25lIjsKCQkJfTsKCQkJbmFtZSA9IERlYnVnOwoJCX07CgkJQTExMDAwMDIgLyogUmVsZWFzZSAqLyA9IHsKCQkJaXNhID0gWENCdWlsZENvbmZpZ3VyYXRpb247CgkJCWJ1aWxkU2V0dGluZ3MgPSB7CgkJCQlBTFdBWVNfU0VBUkNIX1VTRVJfUEFUSFMgPSBOTzsKCQkJCUNMQU5HX0FOQUxZWkVSX05PTk5VTEwgPSBZRVM7CgkJCQlDTEFOR19DWFhfTEFOR1VBR0VfU1RBTkRBUkQgPSAiZ251KysyMCI7CgkJCQlDTEFOR19FTkFCTEVfT0JKQ19XRUFLID0gWUVTOwoJCQkJREVCVUdfSU5GT1JNQVRJT05fRk9STUFUID0gImR3YXJmLXdpdGgtZHN5bSI7CgkJCQlHQ0NfQ19MQU5HVUFHRV9TVEFOREFSRCA9IGdudTE3OwoJCQkJTVRMX0ZBU1RfTUFUSCA9IFlFUzsKCQkJCVNES1JPT1QgPSBpcGhvbmVvczsKCQkJCVNXSUZUX0NPTVBJTEFUSU9OX01PREUgPSB3aG9sZW1vZHVsZTsKCQkJCVNXSUZUX09QVElNSVpBVElPTl9MRVZFTCA9ICItTyI7CgkJCX07CgkJCW5hbWUgPSBSZWxlYXNlOwoJCX07CgkJQTExMDAwMDMgLyogRGVidWcgKi8gPSB7CgkJCWlzYSA9IFhDQnVpbGRDb25maWd1cmF0aW9uOwoJCQlidWlsZFNldHRpbmdzID0gewoJCQkJQ09ERV9TSUdOX1NUWUxFID0gTWFudWFsOwoJCQkJQ1VSUkVOVF9QUk9KRUNUX1ZFUlNJT04gPSAxOwoJCQkJSU5GT1BMSVNUX0ZJTEUgPSBCbHVlQ3J5c3RhbElPUy9JbmZvLnBsaXN0OwoJCQkJSVBIT05FT1NfREVQTE9ZTUVOVF9UQVJHRVQgPSAxNi4wOwoJCQkJTERfUlVOUEFUSF9TRUFSQ0hfUEFUSFMgPSAoCgkJCQkJIiQoaW5oZXJpdGVkKSIsCgkJCQkJIkBleGVjdXRhYmxlX3BhdGgvRnJhbWV3b3JrcyIsCgkJCQkpOwoJCQkJTUFSS0VUSU5HX1ZFUlNJT04gPSAxLjA7CgkJCQlQUk9EVUNUX0JVTkRMRV9JREVOVElGSUVSID0gY29tLmJsdWVjcnlzdGFsLmlvczsKCQkJCVBST0RVQ1RfTkFNRSA9ICIkKFRBUkdFVF9OQU1FKSI7CgkJCQlTV0lGVF9FTUlUX0xPQ19TVFJJTkdTID0gWUVTOwoJCQkJU1dJRlRfVkVSU0lPTiA9IDUuMDsKCQkJCVRBUkdFVEVEX0RFVklDRV9GQU1JTFkgPSAxOwoJCQl9OwoJCQluYW1lID0gRGVidWc7CgkJfTsKCQlBMTEwMDAwNCAvKiBSZWxlYXNlICovID0gewoJCQlpc2EgPSBYQ0J1aWxkQ29uZmlndXJhdGlvbjsKCQkJYnVpbGRTZXR0aW5ncyA9IHsKCQkJCUNPREVfU0lHTl9TVFlMRSA9IE1hbnVhbDsKCQkJCUNPREVfU0lHTklOR19BTExPV0VEID0gTk87CgkJCQlDVVJSRU5UX1BST0pFQ1RfVkVSU0lPTiA9IDE7CgkJCQlJTkZPUExJU1RfRklMRSA9IEJsdWVDcnlzdGFsSU9TL0luZm8ucGxpc3Q7CgkJCQlJUEhPTkVPU19ERVBMT1lNRU5UX1RBUkdFVCA9IDE2LjA7CgkJCQlMRF9SVU5QQVRIX1NFQVJDSF9QQVRIUyA9ICgKCQkJCQkiJChpbmhlcml0ZWQpIiwKCQkJCQkiQGV4ZWN1dGFibGVfcGF0aC9GcmFtZXdvcmtzIiwKCQkJCSk7CgkJCQlNQVJLRVRJTkdfVkVSU0lPTiA9IDEuMDsKCQkJCVBST0RVQ1RfQlVORExFX0lERU5USUZJRVIgPSBjb20uYmx1ZWNyeXN0YWwuaW9zOwoJCQkJUFJPRFVDVF9OQU1FID0gIiQoVEFSR0VUX05BTUUpIjsKCQkJCVNXSUZUX0VNSVRfTE9DX1NUUklOR1MgPSBZRVM7CgkJCQlTV0lGVF9WRVJTSU9OID0gNS4wOwoJCQkJVEFSR0VURURfREVWSUNFX0ZBTUlMWSA9IDE7CgkJCX07CgkJCW5hbWUgPSBSZWxlYXNlOwoJCX07Ci8qIEVuZCBYQ0J1aWxkQ29uZmlndXJhdGlvbiBzZWN0aW9uICovCgovKiBCZWdpbiBYQ0NvbmZpZ3VyYXRpb25MaXN0IHNlY3Rpb24gKi8KCQlBMTA4MDAwMSAvKiBCdWlsZCBjb25maWd1cmF0aW9uIGxpc3QgZm9yIFBCWFByb2plY3QgIkJsdWVDcnlzdGFsSU9TIiAqLyA9IHsKCQkJaXNhID0gWENDb25maWd1cmF0aW9uTGlzdDsKCQkJYnVpbGRDb25maWd1cmF0aW9ucyA9ICgKCQkJCUExMTAwMDAxIC8qIERlYnVnICovLAoJCQkJQTExMDAwMDIgLyogUmVsZWFzZSAqLywKCQkJKTsKCQkJZGVmYXVsdENvbmZpZ3VyYXRpb25Jc1Zpc2libGUgPSAwOwoJCQlkZWZhdWx0Q29uZmlndXJhdGlvbk5hbWUgPSBSZWxlYXNlOwoJCX07CgkJQTEwODAwMDIgLyogQnVpbGQgY29uZmlndXJhdGlvbiBsaXN0IGZvciBQQlhOYXRpdmVUYXJnZXQgIkJsdWVDcnlzdGFsSU9TIiAqLyA9IHsKCQkJaXNhID0gWENDb25maWd1cmF0aW9uTGlzdDsKCQkJYnVpbGRDb25maWd1cmF0aW9ucyA9ICgKCQkJCUExMTAwMDAzIC8qIERlYnVnICovLAoJCQkJQTExMDAwMDQgLyogUmVsZWFzZSAqLywKCQkJKTsKCQkJZGVmYXVsdENvbmZpZ3VyYXRpb25Jc1Zpc2libGUgPSAwOwoJCQlkZWZhdWx0Q29uZmlndXJhdGlvbk5hbWUgPSBSZWxlYXNlOwoJCX07Ci8qIEVuZCBYQ0NvbmZpZ3VyYXRpb25MaXN0IHNlY3Rpb24gKi8KCX07Cglyb290T2JqZWN0ID0gQTEwOTAwMDEgLyogUHJvamVjdCBvYmplY3QgKi87Cn0K
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1010001 /* BlueCrystalIOSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020001 /* BlueCrystalIOSApp.swift */; };
+		A1010002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020002 /* ContentView.swift */; };
+		A1010003 /* BLEManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020003 /* BLEManager.swift */; };
+		A1010004 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020004 /* Protocol.swift */; };
+		A1010005 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020005 /* Models.swift */; };
+		A1010006 /* ManualControlView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020006 /* ManualControlView.swift */; };
+		A1010007 /* VideoSyncView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020007 /* VideoSyncView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A1020001 /* BlueCrystalIOSApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BlueCrystalIOSApp.swift; sourceTree = "<group>"; };
+		A1020002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A1020003 /* BLEManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEManager.swift; sourceTree = "<group>"; };
+		A1020004 /* Protocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Protocol.swift; sourceTree = "<group>"; };
+		A1020005 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
+		A1020006 /* ManualControlView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualControlView.swift; sourceTree = "<group>"; };
+		A1020007 /* VideoSyncView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoSyncView.swift; sourceTree = "<group>"; };
+		A1020008 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A1020009 /* BlueCrystalIOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BlueCrystalIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A1030001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A1040001 = {
+			isa = PBXGroup;
+			children = (
+				A1040002 /* BlueCrystalIOS */,
+				A1040003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A1040002 /* BlueCrystalIOS */ = {
+			isa = PBXGroup;
+			children = (
+				A1020001 /* BlueCrystalIOSApp.swift */,
+				A1020002 /* ContentView.swift */,
+				A1020003 /* BLEManager.swift */,
+				A1020004 /* Protocol.swift */,
+				A1020005 /* Models.swift */,
+				A1020006 /* ManualControlView.swift */,
+				A1020007 /* VideoSyncView.swift */,
+				A1020008 /* Info.plist */,
+			);
+			path = BlueCrystalIOS;
+			sourceTree = "<group>";
+		};
+		A1040003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A1020009 /* BlueCrystalIOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A1050001 /* BlueCrystalIOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A1080002 /* Build configuration list for PBXNativeTarget "BlueCrystalIOS" */;
+			buildPhases = (
+				A1030001 /* Frameworks */,
+				A1060001 /* Resources */,
+				A1070001 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = BlueCrystalIOS;
+			productName = BlueCrystalIOS;
+			productReference = A1020009 /* BlueCrystalIOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A1090001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					A1050001 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = A1080001 /* Build configuration list for PBXProject "BlueCrystalIOS" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = zh_CN;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				zh_CN,
+				Base,
+			);
+			mainGroup = A1040001;
+			productRefGroup = A1040003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A1050001 /* BlueCrystalIOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A1060001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A1070001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1010001 /* BlueCrystalIOSApp.swift in Sources */,
+				A1010002 /* ContentView.swift in Sources */,
+				A1010003 /* BLEManager.swift in Sources */,
+				A1010004 /* Protocol.swift in Sources */,
+				A1010005 /* Models.swift in Sources */,
+				A1010006 /* ManualControlView.swift in Sources */,
+				A1010007 /* VideoSyncView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A1100001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A1100002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		A1100003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = BlueCrystalIOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bluecrystal.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		A1100004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGNING_ALLOWED = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = BlueCrystalIOS/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bluecrystal.ios;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A1080001 /* Build configuration list for PBXProject "BlueCrystalIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1100001 /* Debug */,
+				A1100002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A1080002 /* Build configuration list for PBXNativeTarget "BlueCrystalIOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1100003 /* Debug */,
+				A1100004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A1090001 /* Project object */;
+}

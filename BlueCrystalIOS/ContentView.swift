@@ -1,1 +1,32 @@
-aW1wb3J0IFN3aWZ0VUkKCnN0cnVjdCBDb250ZW50VmlldzogVmlldyB7CiAgICBARW52aXJvbm1lbnRPYmplY3QgdmFyIGJsZTogQkxFTWFuYWdlcgoKICAgIHZhciBib2R5OiBzb21lIFZpZXcgewogICAgICAgIFRhYlZpZXcgewogICAgICAgICAgICBOYXZpZ2F0aW9uVmlldyB7CiAgICAgICAgICAgICAgICBNYW51YWxDb250cm9sVmlldygpCiAgICAgICAgICAgIH0KICAgICAgICAgICAgLnRhYkl0ZW0gewogICAgICAgICAgICAgICAgTGFiZWwoIuaJi+WKqOaOp+WItiIsIHN5c3RlbUltYWdlOiAic2xpZGVycy5ob3Jpem9udGFsLjMiKQogICAgICAgICAgICB9CgogICAgICAgICAgICBOYXZpZ2F0aW9uVmlldyB7CiAgICAgICAgICAgICAgICBWaWRlb1N5bmNWaWV3KCkKICAgICAgICAgICAgfQogICAgICAgICAgICAudGFiSXRlbSB7CiAgICAgICAgICAgICAgICBMYWJlbCgi6KeG6aKR6IGU5YqoIiwgc3lzdGVtSW1hZ2U6ICJwbGF5LnJlY3RhbmdsZSIpCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICAgICAgLy8g5Y+R546w5pyq57uR5a6a6L+H55qE6K6+5aSH5pe25by556Gu6K6k5qGG77yI6Ziy6L+e5Yiw5Yir5Lq655qE6K6+5aSH77yJ44CCCiAgICAgICAgLy8g55u05o6l55SoIHNob3dEZXZpY2VDb25maXJtIOWBmiBiaW5kaW5n77ya54K5Iui/nuaOpSLlkozngrki5Y+W5raIIui1sOWQhOiHqueahOaWueazle+8jAogICAgICAgIC8vIOS4jeS8muWDj+S5i+WJjemCo+agt+WcqCBzZXQoZmFsc2UpIOmHjOivr+iwgyBjYW5jZWwg5oqKIGNvbmZpcm0g55qE6K6+5aSH5oqi5o6J77yI5L+uIE4377yJ44CCCiAgICAgICAgLmFsZXJ0KCLlj5HnjrDorr7lpIciLCBpc1ByZXNlbnRlZDogJGJsZS5zaG93RGV2aWNlQ29uZmlybSkgewogICAgICAgICAgICBCdXR0b24oIui/nuaOpSIpIHsgYmxlLmNvbmZpcm1QZW5kaW5nRGV2aWNlKCkgfQogICAgICAgICAgICBCdXR0b24oIuWPlua2iCIsIHJvbGU6IC5jYW5jZWwpIHsgYmxlLmNhbmNlbFBlbmRpbmdEZXZpY2UoKSB9CiAgICAgICAgfSBtZXNzYWdlOiB7CiAgICAgICAgICAgIFRleHQoIuWPkeeOsCBcKGJsZS5wZW5kaW5nRGV2aWNlTmFtZSA/PyAiIilcblwoYmxlLnBlbmRpbmdEZXZpY2VVVUlEID8/ICIiKVxuXG7ov5nlj7Dorr7lpIfmsqHmnInnu5Hlrprov4fvvIznoa7orqTmmK/kvaDnmoTorr7lpIflho3ov57mjqXjgIIiKQogICAgICAgIH0KICAgIH0KfQo=
+import SwiftUI
+
+struct ContentView: View {
+    @EnvironmentObject var ble: BLEManager
+
+    var body: some View {
+        TabView {
+            NavigationView {
+                ManualControlView()
+            }
+            .tabItem {
+                Label("手动控制", systemImage: "sliders.horizontal.3")
+            }
+
+            NavigationView {
+                VideoSyncView()
+            }
+            .tabItem {
+                Label("视频联动", systemImage: "play.rectangle")
+            }
+        }
+        // 发现未绑定过的设备时弹确认框（防连到别人的设备）。
+        // 直接用 showDeviceConfirm 做 binding：点"连接"和点"取消"走各自的方法，
+        // 不会像之前那样在 set(false) 里误调 cancel 把 confirm 的设备抢掉（修 N7）。
+        .alert("发现设备", isPresented: $ble.showDeviceConfirm) {
+            Button("连接") { ble.confirmPendingDevice() }
+            Button("取消", role: .cancel) { ble.cancelPendingDevice() }
+        } message: {
+            Text("发现 \(ble.pendingDeviceName ?? "")\n\(ble.pendingDeviceUUID ?? "")\n\n这台设备没有绑定过，确认是你的设备再连接。")
+        }
+    }
+}

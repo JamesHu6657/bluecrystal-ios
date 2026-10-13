@@ -76,6 +76,11 @@ final class BLEManager: NSObject, ObservableObject {
     /// 发出未回执的写入，按发出顺序排队；回执按 FIFO 配对
     private var pendingWrites: [PendingWrite] = []
     private var writeSeq = 0
+    /// 最后一次入队的非停止帧的写入 id（修 H1）：
+    /// 停止帧回执成功时，只有它的 id 比这个大（物理上排在最后一个非零帧之后）才算真的停了
+    private var lastNonStopId = 0
+    /// 断开/退后台兜底：必须晚于"首发 + 一次重试"两轮写超时，停止帧才有机会重试（修 M1）
+    static let disconnectFallback: TimeInterval = writeTimeout * 2 + 0.5
 
     // MARK: - 看门狗（心跳版，修 N1）
     /// 界面心跳：视频页 tick（100ms）、手动页心跳定时器（1s）调用
@@ -139,7 +144,12 @@ final class BLEManager: NSObject, ObservableObject {
                   self.scanGen == gen,
                   self.queueState == .scanning else { return }
             self.central.stopScan()
-            self.setError("未找到 mizzzee_0032，请确认设备开机且未被官方 App 占用")
+            // 修 E 小尾巴：附近只有被拒绝过的设备时，文案不能说"没找到"
+            if self.rejectedUUIDs.isEmpty {
+                self.setError("未找到 mizzzee_0032，请确认设备开机且未被官方 App 占用")
+            } else {
+                self.setError("没有找到其他 mizzzee_0032（已跳过你取消的设备），需要连它请重新点\"连接\"")
+            }
         }
     }
 
@@ -183,7 +193,7 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// 断开：先发停止帧，等它自己的最终结果（或 1.5s 超时）再真正断开；随后锁死输出闸门
+    /// 断开：先发停止帧，等它自己的最终结果（含一次重试，或 4.5s 兜底）再真正断开；随后锁死输出闸门
     func disconnect() {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
@@ -200,9 +210,10 @@ final class BLEManager: NSObject, ObservableObject {
                 self.finishDisconnect()
                 return
             }
-            // 超时兜底：1.5s 还没出最终结果就直接断开。
+            // 超时兜底：晚于两轮写超时（修 M1），停止帧的重试有机会跑完。
+            // 兜底触发时停止帧仍未确认：按"设备可能还在输出"处理，先提示关电源再断开。
             // 只把 onAck 作废，不从队列中间删条目（修 D）；finishDisconnect 会整体清空。
-            self.bleQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self.bleQueue.asyncAfter(deadline: .now() + Self.disconnectFallback) { [weak self] in
                 guard let self = self else { return }
                 let stillPending = self.pendingWrites.contains {
                     $0.isStop && !$0.timedOut && $0.onAck != nil
@@ -211,6 +222,7 @@ final class BLEManager: NSObject, ObservableObject {
                     for i in self.pendingWrites.indices where self.pendingWrites[i].isStop {
                         self.pendingWrites[i].onAck = nil
                     }
+                    self.reportStopUnconfirmed()
                     self.finishDisconnect()
                 }
                 // 已出最终结果：onAck 自己调过 finishDisconnect，这里什么都不做
@@ -241,6 +253,9 @@ final class BLEManager: NSObject, ObservableObject {
                     for i in self.pendingWrites.indices where self.pendingWrites[i].isStop {
                         self.pendingWrites[i].onAck = nil
                     }
+                    // 修 M1：后台时间只有约 2 秒，等不到重试；停止帧没确认就明确提示关电源，
+                    // 不能把结果不确定的停止帧当成已停
+                    self.reportStopUnconfirmed()
                     done.signal()
                 }
                 // 已出最终结果：onAck 已经 signal 过了，这里不再补
@@ -287,10 +302,11 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// 停止帧不受闸门限制，也不再打开闸门（修 C 备注）：
+    /// 它会被外部暂停/播完等自动路径调用，"只有用户操作才能开闸"必须严格成立
     func sendStop() {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
-            self.outputLocked = false
             self.enqueueFrame(Protocol.stopFrame)
         }
     }
@@ -328,6 +344,7 @@ final class BLEManager: NSObject, ObservableObject {
             // 发出时不清，否则写失败会被当成"已停止"
             isActive = true
             stopWriteFailed = false
+            lastNonStopId = id // 修 H1
             if activeSince == nil { activeSince = Date() }
         }
         // 每笔写入单独 2s 超时（修 D）
@@ -347,13 +364,36 @@ final class BLEManager: NSObject, ObservableObject {
         pendingWrites[idx] = w
         guard w.isStop else { return }
         if w.retryCount < 1 {
-            enqueueRetry(w)
+            if shouldRetryStop(w) {
+                pendingWrites[idx].onAck = nil // onAck 转交给重试帧
+                enqueueRetry(w)
+            }
         } else {
             // 停止帧两次都没结果：按"设备可能还在输出"处理（修 F）
             stopWriteFailed = true
+            // 最终结果出来了：把 onAck 交还调用方（断开流程据此立刻断开，不用干等兜底）
+            pendingWrites[idx].onAck = nil
+            w.onAck?()
             DispatchQueue.main.async { [weak self] in
                 self?.lastError = "停止帧写入超时，设备可能仍在输出，请直接关闭设备电源"
             }
+        }
+    }
+
+    /// 修 M2：停止帧失败/超时后是否重试。
+    /// S 之后已经有更新的帧入队（用户新操作或新的停止帧），重试 S' 会排到它后面、把它覆盖掉，
+    /// 结果"设备停了，滑杆还显示原值"，这时丢弃重试，以更新的帧为准。
+    /// 断开/退后台流程（带 onAck）例外：那里停止帧必须是最后一帧，必须重试。
+    private func shouldRetryStop(_ w: PendingWrite) -> Bool {
+        if w.onAck != nil { return true }
+        return writeSeq == w.id
+    }
+
+    /// 兜底时停止帧仍未确认：标记失败并提示关电源（修 M1）；调用方保证在 bleQueue 上
+    private func reportStopUnconfirmed() {
+        stopWriteFailed = true
+        DispatchQueue.main.async { [weak self] in
+            self?.lastError = "停止帧未得到设备确认，设备可能仍在输出，请直接关闭设备电源"
         }
     }
 
@@ -535,6 +575,10 @@ extension BLEManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
+        // 修 G 小尾巴：只处理当前外设；失败后置空，避免残留引用
+        if let cur = self.peripheral, cur.identifier != peripheral.identifier { return }
+        self.peripheral = nil
+        self.writeChar = nil
         setError("连接失败：\(error?.localizedDescription ?? "未知")")
     }
 
@@ -606,8 +650,9 @@ extension BLEManager: CBPeripheralDelegate {
         }
         if let error = error {
             if w.isStop, w.retryCount < 1 {
-                // 停止帧写失败立刻重试一次，追加到队尾（修 #3、D）
-                enqueueRetry(w)
+                // 停止帧写失败立刻重试一次，追加到队尾（修 #3、D）；
+                // 之后已有更新的帧入队则丢弃重试，以更新的帧为准（修 M2）
+                if shouldRetryStop(w) { enqueueRetry(w) }
             } else {
                 w.onAck?()
                 if w.isStop {
@@ -626,10 +671,14 @@ extension BLEManager: CBPeripheralDelegate {
         }
         // 成功：这个回执对应的那一帧才是"最后一帧"
         if w.isStop {
-            // 修 F：只有回执成功才算真的停了
-            isActive = false
-            activeSince = nil
+            // 修 F：只有回执成功才算真的停了。
+            // 修 H1：而且这个停止帧必须排在最后一个非零帧之后 ——
+            // "S 发出 → N 发出 → S 回执"时设备实际在跑 N，不能清零，否则看门狗和 30 分钟上限失明
             stopWriteFailed = false
+            if w.id > lastNonStopId {
+                isActive = false
+                activeSince = nil
+            }
         }
         let hex = w.hex
         DispatchQueue.main.async { [weak self] in

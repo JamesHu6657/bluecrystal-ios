@@ -1,1 +1,4 @@
-YnVpbGQvCioueGN1c2VyZGF0YS8KRGVyaXZlZERhdGEvCi5EU19TdG9yZQo=
+build/
+*.xcuserdata/
+DerivedData/
+.DS_Store

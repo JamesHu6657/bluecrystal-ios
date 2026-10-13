@@ -1,1 +1,29 @@
-aW1wb3J0IFN3aWZ0VUkKaW1wb3J0IFVJS2l0CgpAbWFpbgpzdHJ1Y3QgQmx1ZUNyeXN0YWxJT1NBcHA6IEFwcCB7CiAgICBAU3RhdGVPYmplY3QgcHJpdmF0ZSB2YXIgYmxlID0gQkxFTWFuYWdlcigpCiAgICBARW52aXJvbm1lbnQoXC5zY2VuZVBoYXNlKSBwcml2YXRlIHZhciBzY2VuZVBoYXNlCgogICAgdmFyIGJvZHk6IHNvbWUgU2NlbmUgewogICAgICAgIFdpbmRvd0dyb3VwIHsKICAgICAgICAgICAgQ29udGVudFZpZXcoKQogICAgICAgICAgICAgICAgLmVudmlyb25tZW50T2JqZWN0KGJsZSkKICAgICAgICB9CiAgICAgICAgLm9uQ2hhbmdlKG9mOiBzY2VuZVBoYXNlKSB7IHBoYXNlIGluCiAgICAgICAgICAgIGlmIHBoYXNlID09IC5iYWNrZ3JvdW5kIHsKICAgICAgICAgICAgICAgIC8vIOmAgOWQjuWPsC/plIHlsY/vvJrnlLPor7fkuIDngrnlkI7lj7Dml7bpl7TvvIzlsL3lipvmiorlgZzmraLluKflj5Hlh7rljrsKICAgICAgICAgICAgICAgIC8vIOiuvuWkh+S4jeiDveWBnOWcqOafkOS4quW8uuW6puS4iuetieS6uuWbnuadpQogICAgICAgICAgICAgICAgdmFyIGJnVGFzazogVUlCYWNrZ3JvdW5kVGFza0lkZW50aWZpZXIgPSAuaW52YWxpZAogICAgICAgICAgICAgICAgYmdUYXNrID0gVUlBcHBsaWNhdGlvbi5zaGFyZWQuYmVnaW5CYWNrZ3JvdW5kVGFzayB7CiAgICAgICAgICAgICAgICAgICAgVUlBcHBsaWNhdGlvbi5zaGFyZWQuZW5kQmFja2dyb3VuZFRhc2soYmdUYXNrKQogICAgICAgICAgICAgICAgICAgIGJnVGFzayA9IC5pbnZhbGlkCiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICBibGUuZW1lcmdlbmN5U3RvcCgpCiAgICAgICAgICAgICAgICBVSUFwcGxpY2F0aW9uLnNoYXJlZC5lbmRCYWNrZ3JvdW5kVGFzayhiZ1Rhc2spCiAgICAgICAgICAgICAgICBiZ1Rhc2sgPSAuaW52YWxpZAogICAgICAgICAgICB9CiAgICAgICAgfQogICAgfQp9Cg==
+import SwiftUI
+import UIKit
+
+@main
+struct BlueCrystalIOSApp: App {
+    @StateObject private var ble = BLEManager()
+    @Environment(\.scenePhase) private var scenePhase
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(ble)
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .background {
+                // 退后台/锁屏：申请一点后台时间，尽力把停止帧发出去
+                // 设备不能停在某个强度上等人回来
+                var bgTask: UIBackgroundTaskIdentifier = .invalid
+                bgTask = UIApplication.shared.beginBackgroundTask {
+                    UIApplication.shared.endBackgroundTask(bgTask)
+                    bgTask = .invalid
+                }
+                ble.emergencyStop()
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+    }
+}
