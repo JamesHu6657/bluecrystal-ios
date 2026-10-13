@@ -1,0 +1,33 @@
+# 手动把某次 Build Unsigned IPA 的产物推到 ipa 分支（只保留最新一份），便于用 git 直接取包。
+name: IPA to Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build Unsigned IPA 的运行 ID"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n BlueCrystalIOS-unsigned -D /tmp/out
+          git config user.name ci && git config user.email ci@users.noreply.github.com
+          git checkout --orphan ipa
+          git rm -rf --cached . >/dev/null
+          cp /tmp/out/* .
+          git add -f BlueCrystalIOS-unsigned.ipa BlueCrystalIOS-unsigned.ipa.sha256
+          git commit -m "IPA from run ${{ inputs.run_id }}"
+          git push -f origin ipa
