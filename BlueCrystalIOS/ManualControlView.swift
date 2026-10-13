@@ -120,7 +120,7 @@ struct ManualControlView: View {
                         Button("断开") { ble.disconnect() }
                     } else {
                         Button("连接 mizzzee_0032") { ble.startScan() }
-                            .disabled(ble.state == .scanning || ble.state == .connecting)
+                            .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .disconnecting)
                     }
                 }
                 if let err = ble.lastError {

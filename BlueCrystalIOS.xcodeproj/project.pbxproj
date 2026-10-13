@@ -188,6 +188,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Manual;
+				CODE_SIGNING_ALLOWED = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = BlueCrystalIOS/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
