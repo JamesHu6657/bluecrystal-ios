@@ -1,1 +1,181 @@
-aW1wb3J0IFN3aWZ0VUkKaW1wb3J0IENvbWJpbmUKCi8vLyDmiYvliqjmjqfliLbnmoQgVmlld01vZGVs77ya5bim5ZCO57yY6IqC5rWB55qE5by65bqm5Y+R6YCBCmZpbmFsIGNsYXNzIE1hbnVhbENvbnRyb2xWTTogT2JzZXJ2YWJsZU9iamVjdCB7CiAgICBAUHVibGlzaGVkIHZhciBjaGFubmVsczogW0RvdWJsZV0gPSBbMCwgMCwgMCwgMF0KCiAgICBwcml2YXRlIHdlYWsgdmFyIGJsZTogQkxFTWFuYWdlcj8KICAgIHByaXZhdGUgdmFyIGxhc3RTZW5kID0gRGF0ZS5kaXN0YW50UGFzdAogICAgcHJpdmF0ZSB2YXIgcGVuZGluZ1dvcms6IERpc3BhdGNoV29ya0l0ZW0/CiAgICBwcml2YXRlIHZhciBjYW5jZWxsYWJsZXMgPSBTZXQ8QW55Q2FuY2VsbGFibGU+KCkKCiAgICBzdGF0aWMgbGV0IHRocm90dGxlSW50ZXJ2YWw6IFRpbWVJbnRlcnZhbCA9IDAuMTIKCiAgICBmdW5jIGF0dGFjaChibGU6IEJMRU1hbmFnZXIpIHsKICAgICAgICAvLyBONO+8muWIhyBUYWIg5Zue5p2l5Lya6YeN5aSNIGF0dGFjaO+8jOWFiOa4heaOieaXp+eahOiuoumYhQogICAgICAgIGNhbmNlbGxhYmxlcy5yZW1vdmVBbGwoKQogICAgICAgIHNlbGYuYmxlID0gYmxlCiAgICAgICAgLy8g5pat5byA5ZCO5ruR5p2G5b2S6Zu277yM6YG/5YWNIFVJIOaYvuekuuWSjOiuvuWkh+WunumZheeKtuaAgeS4jeS4gOiHtAogICAgICAgIGJsZS4kc3RhdGUKICAgICAgICAgICAgLnJlY2VpdmUob246IERpc3BhdGNoUXVldWUubWFpbikKICAgICAgICAgICAgLnNpbmsgeyBbd2VhayBzZWxmXSBzIGluCiAgICAgICAgICAgICAgICBpZiBzICE9IC5yZWFkeSB7IHNlbGY/LnJlc2V0KCkgfQogICAgICAgICAgICB9CiAgICAgICAgICAgIC5zdG9yZShpbjogJmNhbmNlbGxhYmxlcykKICAgIH0KCiAgICBmdW5jIHNldENoYW5uZWwoXyBpbmRleDogSW50LCBfIHZhbHVlOiBEb3VibGUpIHsKICAgICAgICBjaGFubmVsc1tpbmRleF0gPSB2YWx1ZQogICAgICAgIHNjaGVkdWxlU2VuZCgpCiAgICB9CgogICAgZnVuYyBzdG9wQWxsKCkgewogICAgICAgIHBlbmRpbmdXb3JrPy5jYW5jZWwoKQogICAgICAgIHBlbmRpbmdXb3JrID0gbmlsCiAgICAgICAgY2hhbm5lbHMgPSBbMCwgMCwgMCwgMF0KICAgICAgICBibGU/LnNlbmRTdG9wKCkKICAgIH0KCiAgICBmdW5jIHJlc2V0KCkgewogICAgICAgIHBlbmRpbmdXb3JrPy5jYW5jZWwoKQogICAgICAgIHBlbmRpbmdXb3JrID0gbmlsCiAgICAgICAgY2hhbm5lbHMgPSBbMCwgMCwgMCwgMF0KICAgICAgICBsYXN0U2VuZCA9IC5kaXN0YW50UGFzdAogICAgfQoKICAgIC8vLyDlkI7nvJjoioLmtYHvvJoxMjBtcyDlhoXlj6rlj5HkuIDluKfvvIzkvYbmnIDlkI7kuIDmrKHnmoTlgLzkuIDlrprooaXlj5HvvIjpmY3lvLrluqbkuI3og73kuKLvvIkKICAgIHByaXZhdGUgZnVuYyBzY2hlZHVsZVNlbmQoKSB7CiAgICAgICAgbGV0IG5vdyA9IERhdGUoKQogICAgICAgIGxldCBlbGFwc2VkID0gbm93LnRpbWVJbnRlcnZhbFNpbmNlKGxhc3RTZW5kKQogICAgICAgIGlmIGVsYXBzZWQgPj0gU2VsZi50aHJvdHRsZUludGVydmFsIHsKICAgICAgICAgICAgbGFzdFNlbmQgPSBub3cKICAgICAgICAgICAgcGVuZGluZ1dvcms/LmNhbmNlbCgpCiAgICAgICAgICAgIHBlbmRpbmdXb3JrID0gbmlsCiAgICAgICAgICAgIHNlbmROb3coKQogICAgICAgIH0gZWxzZSB7CiAgICAgICAgICAgIHBlbmRpbmdXb3JrPy5jYW5jZWwoKQogICAgICAgICAgICBsZXQgc25hcHNob3QgPSBjaGFubmVscwogICAgICAgICAgICBsZXQgd29yayA9IERpc3BhdGNoV29ya0l0ZW0geyBbd2VhayBzZWxmXSBpbgogICAgICAgICAgICAgICAgZ3VhcmQgbGV0IHNlbGYgPSBzZWxmIGVsc2UgeyByZXR1cm4gfQogICAgICAgICAgICAgICAgc2VsZi5sYXN0U2VuZCA9IERhdGUoKQogICAgICAgICAgICAgICAgLy8g5bu26L+f5bin6LWwIHNlbmRUaHJvdHRsZWTvvJrkuI3mlq3lvIDovpPlh7rpl7jpl6jjgIIKICAgICAgICAgICAgICAgIC8vIOWBnOacui/mlq3lvIDlkI7ov5nluKfkvJrooqvkuKLmjonvvIzpgb/lhY0i5YGc5q2i5bin5LmL5ZCO5Y+I5p2l5LiA5bin6Z2e6Zu2Iu+8iOS/riBOMu+8iQogICAgICAgICAgICAgICAgc2VsZi5ibGU/LnNlbmRUaHJvdHRsZWQoY2hhbm5lbHM6IHNuYXBzaG90Lm1hcCB7IEludCgkMCkgfSkKICAgICAgICAgICAgICAgIHNlbGYuYmxlPy5oZWFydGJlYXQoKQogICAgICAgICAgICB9CiAgICAgICAgICAgIHBlbmRpbmdXb3JrID0gd29yawogICAgICAgICAgICBEaXNwYXRjaFF1ZXVlLm1haW4uYXN5bmNBZnRlcigKICAgICAgICAgICAgICAgIGRlYWRsaW5lOiAubm93KCkgKyAoU2VsZi50aHJvdHRsZUludGVydmFsIC0gZWxhcHNlZCksCiAgICAgICAgICAgICAgICBleGVjdXRlOiB3b3JrCiAgICAgICAgICAgICkKICAgICAgICB9CiAgICB9CgogICAgcHJpdmF0ZSBmdW5jIHNlbmROb3coKSB7CiAgICAgICAgYmxlPy5zZW5kKGNoYW5uZWxzOiBjaGFubmVscy5tYXAgeyBJbnQoJDApIH0pCiAgICAgICAgYmxlPy5oZWFydGJlYXQoKQogICAgfQp9CgovLy8g5omL5Yqo5o6n5Yi277ya5Zub6YCa6YGT5by65bqm5ruR5p2GICsg5ZCv5YqoL+WBnOatogpzdHJ1Y3QgTWFudWFsQ29udHJvbFZpZXc6IFZpZXcgewogICAgQEVudmlyb25tZW50T2JqZWN0IHZhciBibGU6IEJMRU1hbmFnZXIKICAgIEBTdGF0ZU9iamVjdCBwcml2YXRlIHZhciB2bSA9IE1hbnVhbENvbnRyb2xWTSgpCgogICAgdmFyIGJvZHk6IHNvbWUgVmlldyB7CiAgICAgICAgRm9ybSB7CiAgICAgICAgICAgIFNlY3Rpb24oIuiuvuWkhyIpIHsKICAgICAgICAgICAgICAgIEhTdGFjayB7CiAgICAgICAgICAgICAgICAgICAgVGV4dChibGUuc3RhdGUucmF3VmFsdWUpCiAgICAgICAgICAgICAgICAgICAgICAgIC5mb3JlZ3JvdW5kQ29sb3IoYmxlLnN0YXRlID09IC5yZWFkeSA/IC5ncmVlbiA6IC5zZWNvbmRhcnkpCiAgICAgICAgICAgICAgICAgICAgU3BhY2VyKCkKICAgICAgICAgICAgICAgICAgICBpZiBibGUuc3RhdGUgPT0gLnJlYWR5IHsKICAgICAgICAgICAgICAgICAgICAgICAgQnV0dG9uKCLmlq3lvIAiKSB7IGJsZS5kaXNjb25uZWN0KCkgfQogICAgICAgICAgICAgICAgICAgIH0gZWxzZSB7CiAgICAgICAgICAgICAgICAgICAgICAgIEJ1dHRvbigi6L+e5o6lIG1penp6ZWVfMDAzMiIpIHsgYmxlLnN0YXJ0U2NhbigpIH0KICAgICAgICAgICAgICAgICAgICAgICAgICAgIC5kaXNhYmxlZChibGUuc3RhdGUgPT0gLnNjYW5uaW5nIHx8IGJsZS5zdGF0ZSA9PSAuY29ubmVjdGluZykKICAgICAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICBpZiBsZXQgZXJyID0gYmxlLmxhc3RFcnJvciB7CiAgICAgICAgICAgICAgICAgICAgVGV4dChlcnIpLmZvbnQoLmNhcHRpb24pLmZvcmVncm91bmRDb2xvcigucmVkKQogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9CiAgICAgICAgICAgIC5vbkFwcGVhciB7IHZtLmF0dGFjaChibGU6IGJsZSkgfQoKICAgICAgICAgICAgU2VjdGlvbigi5Zub6YCa6YGT5by65bqmIikgewogICAgICAgICAgICAgICAgRm9yRWFjaChQcm90b2NvbC5DaGFubmVsLmFsbENhc2VzLCBpZDogXC5yYXdWYWx1ZSkgeyBjaCBpbgogICAgICAgICAgICAgICAgICAgIFZTdGFjayhhbGlnbm1lbnQ6IC5sZWFkaW5nKSB7CiAgICAgICAgICAgICAgICAgICAgICAgIEhTdGFjayB7CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBUZXh0KGNoLmRpc3BsYXlOYW1lKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgU3BhY2VyKCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgIFRleHQoIlwoSW50KHZtLmNoYW5uZWxzW2NoLnJhd1ZhbHVlXSkpIikKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAubW9ub3NwYWNlZERpZ2l0KCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAuZm9yZWdyb3VuZENvbG9yKC5zZWNvbmRhcnkpCiAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAgICAgU2xpZGVyKAogICAgICAgICAgICAgICAgICAgICAgICAgICAgdmFsdWU6IEJpbmRpbmcoCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZ2V0OiB7IHZtLmNoYW5uZWxzW2NoLnJhd1ZhbHVlXSB9LAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHNldDogeyB2bS5zZXRDaGFubmVsKGNoLnJhd1ZhbHVlLCAkMCkgfQogICAgICAgICAgICAgICAgICAgICAgICAgICAgKSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGluOiAwLi4uOTksIHN0ZXA6IDEKICAgICAgICAgICAgICAgICAgICAgICAgKQogICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAuZGlzYWJsZWQoYmxlLnN0YXRlICE9IC5yZWFkeSkKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfQoKICAgICAgICAgICAgU2VjdGlvbigi5b+r5o23IikgewogICAgICAgICAgICAgICAgSFN0YWNrIHsKICAgICAgICAgICAgICAgICAgICBCdXR0b24oIuWumOaWueWQr+WKqOW4pyIpIHsKICAgICAgICAgICAgICAgICAgICAgICAgYmxlLnNlbmRPZmZpY2lhbFN0YXJ0KCkKICAgICAgICAgICAgICAgICAgICAgICAgYmxlLmhlYXJ0YmVhdCgpCiAgICAgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgICAgIFNwYWNlcigpCiAgICAgICAgICAgICAgICAgICAgQnV0dG9uKCLlgZzmraIiLCByb2xlOiAuZGVzdHJ1Y3RpdmUpIHsgdm0uc3RvcEFsbCgpIH0KICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIC5kaXNhYmxlZChibGUuc3RhdGUgIT0gLnJlYWR5KQogICAgICAgICAgICB9CgogICAgICAgICAgICBTZWN0aW9uKCLmnIDlkI7kuIDluKciKSB7CiAgICAgICAgICAgICAgICBUZXh0KGJsZS5sYXN0U2VudEhleCkKICAgICAgICAgICAgICAgICAgICAuZm9udCguc3lzdGVtKC5jYXB0aW9uLCBkZXNpZ246IC5tb25vc3BhY2VkKSkKICAgICAgICAgICAgICAgICAgICAuZm9yZWdyb3VuZENvbG9yKC5zZWNvbmRhcnkpCiAgICAgICAgICAgICAgICBUZXh0KCLku4XlnKjorr7lpIfnoa7orqTmlLbliLDlkI7mm7TmlrAiKQogICAgICAgICAgICAgICAgICAgIC5mb250KC5jYXB0aW9uMikuZm9yZWdyb3VuZENvbG9yKC5zZWNvbmRhcnkpCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICAgICAgLm5hdmlnYXRpb25UaXRsZSgi5omL5Yqo5o6n5Yi2IikKICAgICAgICAvLyDliIfotbAgVGFiIOaXtuWBnOacuu+8mumBv+WFjea7keadhuaYvuekuiA1MOOAgeiuvuWkh+WunumZhei3n+inhumikei1sOeahOS4jeS4gOiHtO+8iOS/riAjNiDnmoTlsI/lsL7lt7TvvIkKICAgICAgICAub25EaXNhcHBlYXIgeyB2bS5zdG9wQWxsKCkgfQogICAgfQp9Cg==
+import SwiftUI
+import Combine
+
+/// 手动控制的 ViewModel：带后缘节流的强度发送
+final class ManualControlVM: ObservableObject {
+    @Published var channels: [Double] = [0, 0, 0, 0]
+
+    private weak var ble: BLEManager?
+    private var lastSend = Date.distantPast
+    private var pendingWork: DispatchWorkItem?
+    private var cancellables = Set<AnyCancellable>()
+
+    /// 手动页心跳定时器：滑杆停住不动时也要告诉看门狗"我还活着"，
+    /// 否则 5 秒就被误杀（修 N1）
+    private var heartbeatTimer: Timer?
+
+    static let throttleInterval: TimeInterval = 0.12
+
+    func attach(ble: BLEManager) {
+        // N4：切 Tab 回来会重复 attach，先清掉旧的订阅
+        cancellables.removeAll()
+        self.ble = ble
+        // 断开后滑杆归零，避免 UI 显示和设备实际状态不一致
+        ble.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] s in
+                if s != .ready { self?.reset() }
+            }
+            .store(in: &cancellables)
+        // 被动停机（看门狗/退后台）：滑杆归零（修 高1）
+        ble.forceZeroOutputs
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.reset() }
+            .store(in: &cancellables)
+        startHeartbeatTimer()
+    }
+
+    /// 离开手动页时调用：停心跳、清订阅（stopAll 另行调用）
+    func detach() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+        cancellables.removeAll()
+    }
+
+    private func startHeartbeatTimer() {
+        heartbeatTimer?.invalidate()
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.ble?.heartbeat()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        heartbeatTimer = t
+    }
+
+    func setChannel(_ index: Int, _ value: Double) {
+        channels[index] = value
+        scheduleSend()
+    }
+
+    func stopAll() {
+        pendingWork?.cancel()
+        pendingWork = nil
+        channels = [0, 0, 0, 0]
+        ble?.sendStop()
+    }
+
+    func reset() {
+        pendingWork?.cancel()
+        pendingWork = nil
+        channels = [0, 0, 0, 0]
+        lastSend = .distantPast
+    }
+
+    /// 后缘节流：120ms 内只发一帧，但最后一次的值一定补发（降强度不能丢）
+    private func scheduleSend() {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastSend)
+        if elapsed >= Self.throttleInterval {
+            lastSend = now
+            pendingWork?.cancel()
+            pendingWork = nil
+            sendNow()
+        } else {
+            pendingWork?.cancel()
+            let snapshot = channels
+            let work = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.lastSend = Date()
+                // 延迟帧走 sendThrottled：不断开输出闸门。
+                // 停机/断开后这帧会被丢掉，避免"停止帧之后又来一帧非零"（修 N2）
+                self.ble?.sendThrottled(channels: snapshot.map { Int($0) })
+                self.ble?.heartbeat()
+            }
+            pendingWork = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + (Self.throttleInterval - elapsed),
+                execute: work
+            )
+        }
+    }
+
+    private func sendNow() {
+        ble?.send(channels: channels.map { Int($0) })
+        ble?.heartbeat()
+    }
+}
+
+/// 手动控制：四通道强度滑杆 + 启动/停止
+struct ManualControlView: View {
+    @EnvironmentObject var ble: BLEManager
+    @StateObject private var vm = ManualControlVM()
+
+    var body: some View {
+        Form {
+            Section("设备") {
+                HStack {
+                    Text(ble.state.rawValue)
+                        .foregroundColor(ble.state == .ready ? .green : .secondary)
+                    Spacer()
+                    if ble.state == .ready {
+                        Button("断开") { ble.disconnect() }
+                    } else {
+                        Button("连接 mizzzee_0032") { ble.startScan() }
+                            .disabled(ble.state == .scanning || ble.state == .connecting)
+                    }
+                }
+                if let err = ble.lastError {
+                    Text(err).font(.caption).foregroundColor(.red)
+                }
+            }
+            .onAppear { vm.attach(ble: ble) }
+
+            Section("四通道强度") {
+                ForEach(Protocol.Channel.allCases, id: \.rawValue) { ch in
+                    VStack(alignment: .leading) {
+                        HStack {
+                            Text(ch.displayName)
+                            Spacer()
+                            Text("\(Int(vm.channels[ch.rawValue]))")
+                                .monospacedDigit()
+                                .foregroundColor(.secondary)
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { vm.channels[ch.rawValue] },
+                                set: { vm.setChannel(ch.rawValue, $0) }
+                            ),
+                            in: 0...99, step: 1
+                        )
+                    }
+                    .disabled(ble.state != .ready)
+                }
+            }
+
+            Section("快捷") {
+                HStack {
+                    Button("官方启动帧") {
+                        ble.sendOfficialStart()
+                        ble.heartbeat()
+                    }
+                    Spacer()
+                    Button("停止", role: .destructive) { vm.stopAll() }
+                }
+                .disabled(ble.state != .ready)
+            }
+
+            Section("最后一帧") {
+                Text(ble.lastSentHex)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.secondary)
+                Text("仅在设备确认收到后更新")
+                    .font(.caption2).foregroundColor(.secondary)
+            }
+        }
+        .navigationTitle("手动控制")
+        // 切走 Tab 时停机：避免滑杆显示 50、设备实际跟视频走的不一致（修 #6 的小尾巴）
+        .onDisappear {
+            vm.stopAll()
+            vm.detach()
+        }
+    }
+}

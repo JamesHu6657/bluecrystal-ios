@@ -1,1 +1,402 @@
-aW1wb3J0IFN3aWZ0VUkKaW1wb3J0IEFWS2l0CmltcG9ydCBVbmlmb3JtVHlwZUlkZW50aWZpZXJzCmltcG9ydCBDb21iaW5lCgovLy8g6KeG6aKR6IGU5Yqo5pKt5pS+5Zmo77yIVmlld01vZGVs77yJCmZpbmFsIGNsYXNzIFZpZGVvU3luY1BsYXllcjogT2JzZXJ2YWJsZU9iamVjdCB7CiAgICBAUHVibGlzaGVkIHZhciBwbGF5ZXI6IEFWUGxheWVyPwogICAgQFB1Ymxpc2hlZCB2YXIgc2NyaXB0OiBUaW1lbGluZVNjcmlwdD8KICAgIEBQdWJsaXNoZWQgdmFyIHNjcmlwdE5hbWU6IFN0cmluZyA9ICLmnKrovb3lhaXohJrmnKwiCiAgICBAUHVibGlzaGVkIHZhciB2aWRlb05hbWU6IFN0cmluZyA9ICLmnKrpgInmi6nop4bpopEiCiAgICBAUHVibGlzaGVkIHZhciBpc1BsYXlpbmcgPSBmYWxzZQogICAgQFB1Ymxpc2hlZCB2YXIgc3RhdHVzTGluZTogU3RyaW5nID0gIuKAlCIKICAgIEBQdWJsaXNoZWQgdmFyIGN1cnJlbnRTZWNvbmRzOiBEb3VibGUgPSAwCiAgICBAUHVibGlzaGVkIHZhciBkdXJhdGlvblNlY29uZHM6IERvdWJsZSA9IDAKCiAgICAvLy8g5Y2V5qyh6IGU5Yqo5pyA6ZW/IDMwIOWIhumSn++8jOi2heaXtuiHquWKqOWBnAogICAgc3RhdGljIGxldCBtYXhTZXNzaW9uU2Vjb25kczogVGltZUludGVydmFsID0gMzAgKiA2MAoKICAgIHByaXZhdGUgdmFyIHRpbWVyOiBUaW1lcj8KICAgIHByaXZhdGUgdmFyIGxhc3RBY3RpdmUgPSBBY3RpdmVDaGFubmVscy56ZXJvCiAgICBwcml2YXRlIHdlYWsgdmFyIGJsZTogQkxFTWFuYWdlcj8KICAgIHByaXZhdGUgdmFyIGNhbmNlbGxhYmxlcyA9IFNldDxBbnlDYW5jZWxsYWJsZT4oKQogICAgcHJpdmF0ZSB2YXIgc2Vzc2lvblN0YXJ0OiBEYXRlPwoKICAgIC8vLyBzZWVrIOS7o+asoe+8muaLlui/m+W6puadoeS8mui/nuWPkeWkmuS4qiBzZWVr77yM5Y+q5pyJ5pyA5paw55qE5Zue6LCD5pyJ5pWI77yI5L+uICM1IOeahOWwj+WwvuW3tO+8iQogICAgcHJpdmF0ZSB2YXIgc2Vla0dlbiA9IDAKICAgIHByaXZhdGUgdmFyIHNlZWtJbkZsaWdodCA9IDAKCiAgICAvLy8g6YeN6L+e5ZCO5by65Yi26YeN5Y+R6aaW5bin77yI5L+uIE4277ya6YG/5YWN6KKrIuayoeacieWPmOWMliLlkJ7mjonvvIkKICAgIHByaXZhdGUgdmFyIG5lZWRzUmVzeW5jID0gZmFsc2UKCiAgICBmdW5jIGF0dGFjaChibGU6IEJMRU1hbmFnZXIpIHsKICAgICAgICAvLyBONO+8muWIhyBUYWIg5Zue5p2l5Lya6YeN5aSNIGF0dGFjaO+8jOWFiOa4heaOieaXp+eahOiuoumYhQogICAgICAgIGNhbmNlbGxhYmxlcy5yZW1vdmVBbGwoKQogICAgICAgIHNlbGYuYmxlID0gYmxlCiAgICAgICAgLy8g5oSP5aSW5pat5byA77ya5YGc5o6JIFRpbWVy77yM55WM6Z2i5LiN5YaN5pi+56S6IuaSreaUvuS4rSIKICAgICAgICBibGUuJHN0YXRlCiAgICAgICAgICAgIC5yZWNlaXZlKG9uOiBEaXNwYXRjaFF1ZXVlLm1haW4pCiAgICAgICAgICAgIC5zaW5rIHsgW3dlYWsgc2VsZl0gcyBpbgogICAgICAgICAgICAgICAgZ3VhcmQgbGV0IHNlbGYgPSBzZWxmIGVsc2UgeyByZXR1cm4gfQogICAgICAgICAgICAgICAgaWYgcyA9PSAucmVhZHkgewogICAgICAgICAgICAgICAgICAgIHNlbGYubmVlZHNSZXN5bmMgPSB0cnVlCiAgICAgICAgICAgICAgICB9IGVsc2UgaWYgc2VsZi5pc1BsYXlpbmcgewogICAgICAgICAgICAgICAgICAgIHNlbGYucGxheWVyPy5wYXVzZSgpCiAgICAgICAgICAgICAgICAgICAgc2VsZi5pc1BsYXlpbmcgPSBmYWxzZQogICAgICAgICAgICAgICAgICAgIC8vIOaWreW8gOS6hu+8jOWPkeS5n+WPkeS4jeWHuuWOu++8jOebtOaOpeWBnCBUaW1lciDkuI3ooaXlj5EKICAgICAgICAgICAgICAgICAgICBzZWxmLnN0b3BUaW1lcihzZW5kWmVybzogZmFsc2UpCiAgICAgICAgICAgICAgICAgICAgc2VsZi5zdGF0dXNMaW5lID0gIuiuvuWkh+W3suaWreW8gO+8jOiBlOWKqOW3suWBnOatoiIKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfQogICAgICAgICAgICAuc3RvcmUoaW46ICZjYW5jZWxsYWJsZXMpCiAgICAgICAgLy8g55uR5ZCs5pKt5pS+5Zmo6Ieq6Lqr54q25oCB77ya5p2l55S1L+iAs+acuuaMiemUri/mjqfliLbkuK3lv4PnrYnlpJbpg6jmmoLlgZzvvIjkv64gIzIg55qE5bCP5bC+5be077yJCiAgICAgICAgaWYgbGV0IHAgPSBwbGF5ZXIgewogICAgICAgICAgICBvYnNlcnZlVGltZUNvbnRyb2xTdGF0dXMocCkKICAgICAgICB9CiAgICB9CgogICAgcHJpdmF0ZSBmdW5jIG9ic2VydmVUaW1lQ29udHJvbFN0YXR1cyhfIHA6IEFWUGxheWVyKSB7CiAgICAgICAgcC5wdWJsaXNoZXIoZm9yOiBcLnRpbWVDb250cm9sU3RhdHVzKQogICAgICAgICAgICAucmVjZWl2ZShvbjogRGlzcGF0Y2hRdWV1ZS5tYWluKQogICAgICAgICAgICAuc2luayB7IFt3ZWFrIHNlbGZdIHN0YXR1cyBpbgogICAgICAgICAgICAgICAgZ3VhcmQgbGV0IHNlbGYgPSBzZWxmIGVsc2UgeyByZXR1cm4gfQogICAgICAgICAgICAgICAgLy8g5aSW6YOo5oqK5pKt5pS+5Zmo5YGc5LqG77yM5L2GIHZtIOi/mOS7peS4uuWcqOaSre+8muWQjOatpeWBnOacugogICAgICAgICAgICAgICAgaWYgc3RhdHVzID09IC5wYXVzZWQsIHNlbGYuaXNQbGF5aW5nLCBzZWxmLnNlZWtJbkZsaWdodCA9PSAwIHsKICAgICAgICAgICAgICAgICAgICBzZWxmLmlzUGxheWluZyA9IGZhbHNlCiAgICAgICAgICAgICAgICAgICAgc2VsZi5zdG9wVGltZXIoc2VuZFplcm86IHRydWUpCiAgICAgICAgICAgICAgICAgICAgc2VsZi5zdGF0dXNMaW5lID0gIuWklumDqOaaguWBnO+8jOiuvuWkh+W3suWBnOatoiIKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfQogICAgICAgICAgICAuc3RvcmUoaW46ICZjYW5jZWxsYWJsZXMpCiAgICB9CgogICAgZnVuYyBsb2FkVmlkZW8odXJsOiBVUkwpIHsKICAgICAgICAvLyBOM++8muaNouinhumikeWJjeWFiOWBnOaOieaXp+eahO+8jOmBv+WFjeaXpyBUaW1lciDor7vmlrAgcGxheWVyIOeahCB0PTAg6K+v6amx5Yqo6K6+5aSHCiAgICAgICAgc3RvcEFsbCgpCiAgICAgICAgdmlkZW9OYW1lID0gdXJsLmxhc3RQYXRoQ29tcG9uZW50CiAgICAgICAgbGV0IHAgPSBBVlBsYXllcih1cmw6IHVybCkKICAgICAgICBwbGF5ZXIgPSBwCiAgICAgICAgb2JzZXJ2ZVRpbWVDb250cm9sU3RhdHVzKHApCiAgICAgICAgaWYgbGV0IGR1ciA9IHAuY3VycmVudEl0ZW0/LmR1cmF0aW9uLnNlY29uZHMsIGR1ci5pc0Zpbml0ZSB7CiAgICAgICAgICAgIGR1cmF0aW9uU2Vjb25kcyA9IGR1cgogICAgICAgIH0gZWxzZSB7CiAgICAgICAgICAgIHAuY3VycmVudEl0ZW0/LnB1Ymxpc2hlcihmb3I6IFwuZHVyYXRpb24pCiAgICAgICAgICAgICAgICAucmVjZWl2ZShvbjogRGlzcGF0Y2hRdWV1ZS5tYWluKQogICAgICAgICAgICAgICAgLnNpbmsgeyBbd2VhayBzZWxmXSBkIGluCiAgICAgICAgICAgICAgICAgICAgaWYgZC5zZWNvbmRzLmlzRmluaXRlIHsgc2VsZj8uZHVyYXRpb25TZWNvbmRzID0gZC5zZWNvbmRzIH0KICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIC5zdG9yZShpbjogJmNhbmNlbGxhYmxlcykKICAgICAgICB9CiAgICAgICAgY3VycmVudFNlY29uZHMgPSAwCiAgICB9CgogICAgZnVuYyBsb2FkU2NyaXB0KHVybDogVVJMKSB7CiAgICAgICAgLy8gTjPvvJrmjaLohJrmnKzliY3lhYjlgZwKICAgICAgICBzdG9wQWxsKCkKICAgICAgICBkbyB7CiAgICAgICAgICAgIGxldCBkYXRhID0gdHJ5IERhdGEoY29udGVudHNPZjogdXJsKQogICAgICAgICAgICBzY3JpcHQgPSB0cnkgSlNPTkRlY29kZXIoKS5kZWNvZGUoVGltZWxpbmVTY3JpcHQuc2VsZiwgZnJvbTogZGF0YSkKICAgICAgICAgICAgc2NyaXB0TmFtZSA9IHVybC5sYXN0UGF0aENvbXBvbmVudAogICAgICAgICAgICBpZiBsZXQgcyA9IHNjcmlwdCB7CiAgICAgICAgICAgICAgICBzdGF0dXNMaW5lID0gIuiEmuacrOWwsee7qu+8mlwocy5jb21tYW5kcy5jb3VudCkg5p2h5ZG95Luk77yMXChzLnNjYWxlRGVzY3JpcHRpb24p5Yi75bqmIgogICAgICAgICAgICB9CiAgICAgICAgfSBjYXRjaCB7CiAgICAgICAgICAgIHNjcmlwdE5hbWUgPSAi6Kej5p6Q5aSx6LSl77yaXChlcnJvci5sb2NhbGl6ZWREZXNjcmlwdGlvbikiCiAgICAgICAgfQogICAgfQoKICAgIGZ1bmMgdG9nZ2xlUGxheSgpIHsKICAgICAgICBndWFyZCBsZXQgcCA9IHBsYXllciwgc2NyaXB0ICE9IG5pbCwgYmxlPy5zdGF0ZSA9PSAucmVhZHkgZWxzZSB7IHJldHVybiB9CiAgICAgICAgaWYgaXNQbGF5aW5nIHsKICAgICAgICAgICAgcC5wYXVzZSgpCiAgICAgICAgICAgIGlzUGxheWluZyA9IGZhbHNlCiAgICAgICAgICAgIHN0b3BUaW1lcihzZW5kWmVybzogdHJ1ZSkKICAgICAgICAgICAgc3RhdHVzTGluZSA9ICLlt7LmmoLlgZwiCiAgICAgICAgfSBlbHNlIHsKICAgICAgICAgICAgbGV0IHQgPSBwLmN1cnJlbnRUaW1lKCkuc2Vjb25kcwogICAgICAgICAgICBsZXQgbmVlZHNSZXN0YXJ0ID0gZHVyYXRpb25TZWNvbmRzID4gMCAmJiB0LmlzRmluaXRlICYmIHQgPj0gZHVyYXRpb25TZWNvbmRzIC0gMC41CiAgICAgICAgICAgIHNlc3Npb25TdGFydCA9IERhdGUoKQogICAgICAgICAgICBpc1BsYXlpbmcgPSB0cnVlCiAgICAgICAgICAgIGlmIG5lZWRzUmVzdGFydCB7CiAgICAgICAgICAgICAgICAvLyDmkq3lrozkuobku47lpLTmnaXvvJrnrYkgc2VlayDlrozmiJDlho3lvIDmkq3vvIjkv64gIzUg55qE5bCP5bC+5be077yJCiAgICAgICAgICAgICAgICBzZWVrR2VuICs9IDEKICAgICAgICAgICAgICAgIHNlZWtJbkZsaWdodCArPSAxCiAgICAgICAgICAgICAgICBwLnNlZWsodG86IC56ZXJvKSB7IFt3ZWFrIHNlbGZdIF8gaW4KICAgICAgICAgICAgICAgICAgICBndWFyZCBsZXQgc2VsZiA9IHNlbGYgZWxzZSB7IHJldHVybiB9CiAgICAgICAgICAgICAgICAgICAgc2VsZi5zZWVrSW5GbGlnaHQgPSBtYXgoMCwgc2VsZi5zZWVrSW5GbGlnaHQgLSAxKQogICAgICAgICAgICAgICAgICAgIHNlbGYubGFzdEFjdGl2ZSA9IC56ZXJvCiAgICAgICAgICAgICAgICAgICAgc2VsZi5jdXJyZW50U2Vjb25kcyA9IDAKICAgICAgICAgICAgICAgICAgICBwLnBsYXkoKQogICAgICAgICAgICAgICAgICAgIHNlbGYuc3RhcnRUaW1lcigpCiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH0gZWxzZSB7CiAgICAgICAgICAgICAgICBwLnBsYXkoKQogICAgICAgICAgICAgICAgc3RhcnRUaW1lcigpCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICB9CgogICAgLy8vIOeUqOaIt+aLlui/m+W6puadoe+8mui1sCB2be+8jHNlZWsg5a6M5oiQ5ZCO56uL5Y2z5ZCM5q2l5LiA5qyh6K6+5aSH54q25oCBCiAgICBmdW5jIHNlZWsodG8gc2Vjb25kczogRG91YmxlKSB7CiAgICAgICAgZ3VhcmQgbGV0IHAgPSBwbGF5ZXIgZWxzZSB7IHJldHVybiB9CiAgICAgICAgc2Vla0dlbiArPSAxCiAgICAgICAgbGV0IGdlbiA9IHNlZWtHZW4KICAgICAgICBzZWVrSW5GbGlnaHQgKz0gMQogICAgICAgIGxldCB3YXNQbGF5aW5nID0gaXNQbGF5aW5nCiAgICAgICAgcC5zZWVrKHRvOiBDTVRpbWUoc2Vjb25kczogc2Vjb25kcywgcHJlZmVycmVkVGltZXNjYWxlOiA2MDApKSB7IFt3ZWFrIHNlbGZdIF8gaW4KICAgICAgICAgICAgZ3VhcmQgbGV0IHNlbGYgPSBzZWxmIGVsc2UgeyByZXR1cm4gfQogICAgICAgICAgICBzZWxmLnNlZWtJbkZsaWdodCA9IG1heCgwLCBzZWxmLnNlZWtJbkZsaWdodCAtIDEpCiAgICAgICAgICAgIC8vIOiiq+abtOaWsOeahCBzZWVrIOaKouWFiOS6hu+8jOi/meS4quWbnuiwg+S9nOW6nwogICAgICAgICAgICBndWFyZCBnZW4gPT0gc2VsZi5zZWVrR2VuIGVsc2UgeyByZXR1cm4gfQogICAgICAgICAgICBzZWxmLmN1cnJlbnRTZWNvbmRzID0gc2Vjb25kcwogICAgICAgICAgICAvLyBzZWVrIOWQjuW8uuWItueul+S4gOasoe+8jOmBv+WFjeiuvuWkh+WBnOWcqOaXp+W8uuW6pgogICAgICAgICAgICBpZiB3YXNQbGF5aW5nIHsgc2VsZi50aWNrKGZvcmNlOiB0cnVlKSB9CiAgICAgICAgfQogICAgfQoKICAgIGZ1bmMgc3RvcEFsbCgpIHsKICAgICAgICBwbGF5ZXI/LnBhdXNlKCkKICAgICAgICBpc1BsYXlpbmcgPSBmYWxzZQogICAgICAgIHN0b3BUaW1lcihzZW5kWmVybzogdHJ1ZSkKICAgICAgICBzZXNzaW9uU3RhcnQgPSBuaWwKICAgICAgICBzdGF0dXNMaW5lID0gIuKAlCIKICAgIH0KCiAgICB2YXIgY2FuUGxheTogQm9vbCB7CiAgICAgICAgcGxheWVyICE9IG5pbCAmJiBzY3JpcHQgIT0gbmlsICYmIGJsZT8uc3RhdGUgPT0gLnJlYWR5CiAgICB9CgogICAgLy8gTUFSSzogLSDlhoXpg6gKCiAgICBwcml2YXRlIGZ1bmMgc3RhcnRUaW1lcigpIHsKICAgICAgICBzdG9wVGltZXIoc2VuZFplcm86IGZhbHNlKQogICAgICAgIC8vIE4177ya55SoIGNvbW1vbiBtb2Rlc++8jOa7muWKqCBGb3JtIOaXtiB0aWNrIOS4jeaaguWBnAogICAgICAgIGxldCB0ID0gVGltZXIodGltZUludGVydmFsOiAwLjEsIHJlcGVhdHM6IHRydWUpIHsgW3dlYWsgc2VsZl0gXyBpbgogICAgICAgICAgICBzZWxmPy50aWNrKCkKICAgICAgICB9CiAgICAgICAgUnVuTG9vcC5tYWluLmFkZCh0LCBmb3JNb2RlOiAuY29tbW9uKQogICAgICAgIHRpbWVyID0gdAogICAgfQoKICAgIHByaXZhdGUgZnVuYyBzdG9wVGltZXIoc2VuZFplcm86IEJvb2wpIHsKICAgICAgICB0aW1lcj8uaW52YWxpZGF0ZSgpCiAgICAgICAgdGltZXIgPSBuaWwKICAgICAgICBpZiBzZW5kWmVybyB7CiAgICAgICAgICAgIGJsZT8uc2VuZFN0b3AoKQogICAgICAgICAgICBsYXN0QWN0aXZlID0gLnplcm8KICAgICAgICB9CiAgICB9CgogICAgLy8vIOavjyAxMDBtcyDmjInlvZPliY3mkq3mlL7ml7bpl7TorqHnrpfmv4DmtLvpgJrpgZPvvIzlj5jljJbml7bmiY3lj5HluKcKICAgIHByaXZhdGUgZnVuYyB0aWNrKGZvcmNlOiBCb29sID0gZmFsc2UpIHsKICAgICAgICBndWFyZCBsZXQgcCA9IHBsYXllciwgbGV0IHMgPSBzY3JpcHQsIGxldCBibGUgPSBibGUsCiAgICAgICAgICAgICAgc2Vla0luRmxpZ2h0ID09IDAgZWxzZSB7IHJldHVybiB9CiAgICAgICAgbGV0IHQgPSBwLmN1cnJlbnRUaW1lKCkuc2Vjb25kcwogICAgICAgIGd1YXJkIHQuaXNGaW5pdGUgZWxzZSB7IHJldHVybiB9CgogICAgICAgIC8vIOS8muivnei2heaXtuS/neaKpO+8muWFiOWBnO+8jOWGjeWGmeaPkOekuu+8iOS/riBOMTHvvJrmj5DnpLrkuI3ooqsgc3RvcEFsbCDopobnm5bvvIkKICAgICAgICBpZiBsZXQgc3RhcnQgPSBzZXNzaW9uU3RhcnQsCiAgICAgICAgICAgRGF0ZSgpLnRpbWVJbnRlcnZhbFNpbmNlKHN0YXJ0KSA+IFNlbGYubWF4U2Vzc2lvblNlY29uZHMgewogICAgICAgICAgICBzZXNzaW9uU3RhcnQgPSBuaWwKICAgICAgICAgICAgc3RvcEFsbCgpCiAgICAgICAgICAgIHN0YXR1c0xpbmUgPSAi5Y2V5qyh6IGU5Yqo6LaF6L+HIDMwIOWIhumSn++8jOW3suiHquWKqOWBnOatoiIKICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgfQoKICAgICAgICAvLyDnlYzpnaLlv4Pot7PvvJrnnIvpl6jni5fpnaDov5nkuKrliKTmlq0gVUkg57q/56iL5piv5ZCm6L+Y5rS7552ACiAgICAgICAgYmxlLmhlYXJ0YmVhdCgpCgogICAgICAgIGN1cnJlbnRTZWNvbmRzID0gdAoKICAgICAgICB2YXIgdmFscyA9IFswLCAwLCAwLCAwXQogICAgICAgIGZvciBjbWQgaW4gcy5jb21tYW5kcyB7CiAgICAgICAgICAgIGd1YXJkIHQgPj0gY21kLnN0YXJ0VGltZVNlY29uZHMsIHQgPCBjbWQuZW5kVGltZSwKICAgICAgICAgICAgICAgICAgbGV0IGNoID0gY21kLmNoYW5uZWwgZWxzZSB7IGNvbnRpbnVlIH0KICAgICAgICAgICAgdmFsc1tjaC5yYXdWYWx1ZV0gPSBtYXgodmFsc1tjaC5yYXdWYWx1ZV0sIHMuaW50ZW5zaXR5OTkoZm9yOiBjbWQpKQogICAgICAgIH0KICAgICAgICBsZXQgYWN0aXZlID0gQWN0aXZlQ2hhbm5lbHModmFsdWVzOiB2YWxzKQogICAgICAgIGlmIGZvcmNlIHx8IG5lZWRzUmVzeW5jIHx8IGFjdGl2ZSAhPSBsYXN0QWN0aXZlIHsKICAgICAgICAgICAgbmVlZHNSZXN5bmMgPSBmYWxzZQogICAgICAgICAgICBsYXN0QWN0aXZlID0gYWN0aXZlCiAgICAgICAgICAgIGJsZS5zZW5kKGNoYW5uZWxzOiB2YWxzKQogICAgICAgICAgICBsZXQgbmFtZXMgPSBbIuS8uOe8qSIsICLpnIfliqgiLCAi5ZCu5ZC4IiwgIuaXi+i9rCJdCiAgICAgICAgICAgIGxldCBkZXNjID0gdmFscy5lbnVtZXJhdGVkKCkubWFwIHsgIlwobmFtZXNbJDAub2Zmc2V0XSk6XCgkMC5lbGVtZW50KSIgfS5qb2luZWQoc2VwYXJhdG9yOiAiICIpCiAgICAgICAgICAgIHN0YXR1c0xpbmUgPSBTdHJpbmcoZm9ybWF0OiAidD0lLjFmcyAlQCIsIHQsIGRlc2MpCiAgICAgICAgfQogICAgICAgIGlmIGR1cmF0aW9uU2Vjb25kcyA+IDAsIHQgPj0gZHVyYXRpb25TZWNvbmRzIHsKICAgICAgICAgICAgc3RvcEFsbCgpCiAgICAgICAgfQogICAgfQp9CgovLy8g5peg57O757uf5o6n5Lu255qE6KeG6aKR6aKE6KeI77yI57O757uf6Ieq5bim5pKt5pS+L+aaguWBnC/mi5bliqjkvJrnu5Xov4cgdm3vvIzlv4XpobvnpoHnlKjvvIkKc3RydWN0IE5vQ29udHJvbHNQbGF5ZXJWaWV3OiBVSVZpZXdDb250cm9sbGVyUmVwcmVzZW50YWJsZSB7CiAgICBsZXQgcGxheWVyOiBBVlBsYXllcgoKICAgIGZ1bmMgbWFrZVVJVmlld0NvbnRyb2xsZXIoY29udGV4dDogQ29udGV4dCkgLT4gQVZQbGF5ZXJWaWV3Q29udHJvbGxlciB7CiAgICAgICAgbGV0IHZjID0gQVZQbGF5ZXJWaWV3Q29udHJvbGxlcigpCiAgICAgICAgdmMucGxheWVyID0gcGxheWVyCiAgICAgICAgdmMuc2hvd3NQbGF5YmFja0NvbnRyb2xzID0gZmFsc2UKICAgICAgICB2Yy52aWRlb0dyYXZpdHkgPSAucmVzaXplQXNwZWN0CiAgICAgICAgcmV0dXJuIHZjCiAgICB9CgogICAgZnVuYyB1cGRhdGVVSVZpZXdDb250cm9sbGVyKF8gdWlWaWV3Q29udHJvbGxlcjogQVZQbGF5ZXJWaWV3Q29udHJvbGxlciwgY29udGV4dDogQ29udGV4dCkge30KfQoKLy8vIOinhumikeiBlOWKqO+8muaSreacrOWcsOinhumike+8jOaMieaXtumXtOi9tOiEmuacrOiHquWKqOWPkSAweDA2IOW4pwpzdHJ1Y3QgVmlkZW9TeW5jVmlldzogVmlldyB7CiAgICBARW52aXJvbm1lbnRPYmplY3QgdmFyIGJsZTogQkxFTWFuYWdlcgogICAgQFN0YXRlT2JqZWN0IHByaXZhdGUgdmFyIHZtID0gVmlkZW9TeW5jUGxheWVyKCkKICAgIEBTdGF0ZSBwcml2YXRlIHZhciBzaG93VmlkZW9QaWNrZXIgPSBmYWxzZQogICAgQFN0YXRlIHByaXZhdGUgdmFyIHNob3dTY3JpcHRQaWNrZXIgPSBmYWxzZQoKICAgIHZhciBib2R5OiBzb21lIFZpZXcgewogICAgICAgIEZvcm0gewogICAgICAgICAgICBTZWN0aW9uKCLorr7lpIciKSB7CiAgICAgICAgICAgICAgICBIU3RhY2sgewogICAgICAgICAgICAgICAgICAgIFRleHQoYmxlLnN0YXRlLnJhd1ZhbHVlKQogICAgICAgICAgICAgICAgICAgICAgICAuZm9yZWdyb3VuZENvbG9yKGJsZS5zdGF0ZSA9PSAucmVhZHkgPyAuZ3JlZW4gOiAuc2Vjb25kYXJ5KQogICAgICAgICAgICAgICAgICAgIFNwYWNlcigpCiAgICAgICAgICAgICAgICAgICAgaWYgYmxlLnN0YXRlICE9IC5yZWFkeSB7CiAgICAgICAgICAgICAgICAgICAgICAgIEJ1dHRvbigi6L+e5o6lIikgeyBibGUuc3RhcnRTY2FuKCkgfQogICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIGlmIGxldCBlcnIgPSBibGUubGFzdEVycm9yIHsKICAgICAgICAgICAgICAgICAgICBUZXh0KGVycikuZm9udCguY2FwdGlvbikuZm9yZWdyb3VuZENvbG9yKC5yZWQpCiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgIH0KICAgICAgICAgICAgLm9uQXBwZWFyIHsgdm0uYXR0YWNoKGJsZTogYmxlKSB9CgogICAgICAgICAgICBTZWN0aW9uKCLntKDmnZAiKSB7CiAgICAgICAgICAgICAgICBIU3RhY2sgewogICAgICAgICAgICAgICAgICAgIFRleHQoIuinhumikSIpOyBTcGFjZXIoKQogICAgICAgICAgICAgICAgICAgIFRleHQodm0udmlkZW9OYW1lKS5mb3JlZ3JvdW5kQ29sb3IoLnNlY29uZGFyeSkubGluZUxpbWl0KDEpCiAgICAgICAgICAgICAgICAgICAgQnV0dG9uKCLpgInmi6kiKSB7IHNob3dWaWRlb1BpY2tlciA9IHRydWUgfQogICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgSFN0YWNrIHsKICAgICAgICAgICAgICAgICAgICBUZXh0KCLohJrmnKwiKTsgU3BhY2VyKCkKICAgICAgICAgICAgICAgICAgICBUZXh0KHZtLnNjcmlwdE5hbWUpLmZvcmVncm91bmRDb2xvciguc2Vjb25kYXJ5KS5saW5lTGltaXQoMSkKICAgICAgICAgICAgICAgICAgICBCdXR0b24oIui9veWFpSIpIHsgc2hvd1NjcmlwdFBpY2tlciA9IHRydWUgfQogICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgICAgaWYgbGV0IHMgPSB2bS5zY3JpcHQgewogICAgICAgICAgICAgICAgICAgIFRleHQoIlwocy5jb21tYW5kcy5jb3VudCkg5p2h5ZG95LukIikKICAgICAgICAgICAgICAgICAgICAgICAgLmZvbnQoLmNhcHRpb24pLmZvcmVncm91bmRDb2xvciguc2Vjb25kYXJ5KQogICAgICAgICAgICAgICAgfQogICAgICAgICAgICB9CgogICAgICAgICAgICBTZWN0aW9uKCLmkq3mlL7mjqfliLYiKSB7CiAgICAgICAgICAgICAgICBIU3RhY2sgewogICAgICAgICAgICAgICAgICAgIEJ1dHRvbih2bS5pc1BsYXlpbmcgPyAi5pqC5YGcIiA6ICLmkq3mlL4iKSB7IHZtLnRvZ2dsZVBsYXkoKSB9CiAgICAgICAgICAgICAgICAgICAgICAgIC5kaXNhYmxlZCghdm0uY2FuUGxheSkKICAgICAgICAgICAgICAgICAgICBTcGFjZXIoKQogICAgICAgICAgICAgICAgICAgIEJ1dHRvbigi5YGc5q2iIiwgcm9sZTogLmRlc3RydWN0aXZlKSB7IHZtLnN0b3BBbGwoKSB9CiAgICAgICAgICAgICAgICB9CiAgICAgICAgICAgICAgICAvLyDoh6rlu7rov5vluqbmnaHvvJrmi5bliqjotbAgdm0uc2Vla++8jOiuvuWkh+eKtuaAgeWQjOatpei3n+S4igogICAgICAgICAgICAgICAgaWYgdm0uZHVyYXRpb25TZWNvbmRzID4gMCB7CiAgICAgICAgICAgICAgICAgICAgU2xpZGVyKAogICAgICAgICAgICAgICAgICAgICAgICB2YWx1ZTogQmluZGluZygKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGdldDogeyB2bS5jdXJyZW50U2Vjb25kcyB9LAogICAgICAgICAgICAgICAgICAgICAgICAgICAgc2V0OiB7IHZtLnNlZWsodG86ICQwKSB9CiAgICAgICAgICAgICAgICAgICAgICAgICksCiAgICAgICAgICAgICAgICAgICAgICAgIGluOiAwLi4udm0uZHVyYXRpb25TZWNvbmRzCiAgICAgICAgICAgICAgICAgICAgKQogICAgICAgICAgICAgICAgICAgIC5kaXNhYmxlZCghdm0uY2FuUGxheSkKICAgICAgICAgICAgICAgICAgICBUZXh0KCJcKGZvcm1hdFRpbWUodm0uY3VycmVudFNlY29uZHMpKSAvIFwoZm9ybWF0VGltZSh2bS5kdXJhdGlvblNlY29uZHMpKSIpCiAgICAgICAgICAgICAgICAgICAgICAgIC5mb250KC5jYXB0aW9uKS5mb3JlZ3JvdW5kQ29sb3IoLnNlY29uZGFyeSkKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgIFRleHQodm0uc3RhdHVzTGluZSkKICAgICAgICAgICAgICAgICAgICAuZm9udCguY2FwdGlvbikuZm9yZWdyb3VuZENvbG9yKC5zZWNvbmRhcnkpCiAgICAgICAgICAgIH0KCiAgICAgICAgICAgIGlmIGxldCBwID0gdm0ucGxheWVyIHsKICAgICAgICAgICAgICAgIFNlY3Rpb24oIumihOiniCIpIHsKICAgICAgICAgICAgICAgICAgICBOb0NvbnRyb2xzUGxheWVyVmlldyhwbGF5ZXI6IHApCiAgICAgICAgICAgICAgICAgICAgICAgIC5mcmFtZShoZWlnaHQ6IDIyMCkKICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgfQogICAgICAgIH0KICAgICAgICAubmF2aWdhdGlvblRpdGxlKCLop4bpopHogZTliqgiKQogICAgICAgIC5zaGVldChpc1ByZXNlbnRlZDogJHNob3dWaWRlb1BpY2tlcikgewogICAgICAgICAgICBEb2N1bWVudFBpY2tlcihjb250ZW50VHlwZXM6IFtVVFR5cGUubW92aWUsIFVUVHlwZS52aWRlb10pIHsgdXJsIGluCiAgICAgICAgICAgICAgICB2bS5sb2FkVmlkZW8odXJsOiB1cmwpCiAgICAgICAgICAgIH0KICAgICAgICB9CiAgICAgICAgLnNoZWV0KGlzUHJlc2VudGVkOiAkc2hvd1NjcmlwdFBpY2tlcikgewogICAgICAgICAgICBEb2N1bWVudFBpY2tlcihjb250ZW50VHlwZXM6IFtVVFR5cGUuanNvbl0pIHsgdXJsIGluCiAgICAgICAgICAgICAgICB2bS5sb2FkU2NyaXB0KHVybDogdXJsKQogICAgICAgICAgICB9CiAgICAgICAgfQogICAgICAgIC5vbkRpc2FwcGVhciB7IHZtLnN0b3BBbGwoKSB9CiAgICB9CgogICAgcHJpdmF0ZSBmdW5jIGZvcm1hdFRpbWUoXyBzOiBEb3VibGUpIC0+IFN0cmluZyB7CiAgICAgICAgZ3VhcmQgcy5pc0Zpbml0ZSBlbHNlIHsgcmV0dXJuICItLTotLSIgfQogICAgICAgIGxldCBtID0gSW50KHMpIC8gNjAsIHNlYyA9IEludChzKSAlIDYwCiAgICAgICAgcmV0dXJuIFN0cmluZyhmb3JtYXQ6ICIlZDolMDJkIiwgbSwgc2VjKQogICAgfQp9CgovLy8g57O757uf5paH5Lu26YCJ5oup5Zmo77yIYXNDb3B5OiB0cnVl77yM5paH5Lu25ou36L+b5rKZ55uS77yM5LiN546pIHNlY3VyaXR5LXNjb3BlZCDmnYLmioDvvIkKc3RydWN0IERvY3VtZW50UGlja2VyOiBVSVZpZXdDb250cm9sbGVyUmVwcmVzZW50YWJsZSB7CiAgICBsZXQgY29udGVudFR5cGVzOiBbVVRUeXBlXQogICAgbGV0IG9uUGljazogKFVSTCkgLT4gVm9pZAoKICAgIGZ1bmMgbWFrZVVJVmlld0NvbnRyb2xsZXIoY29udGV4dDogQ29udGV4dCkgLT4gVUlEb2N1bWVudFBpY2tlclZpZXdDb250cm9sbGVyIHsKICAgICAgICBsZXQgdmMgPSBVSURvY3VtZW50UGlja2VyVmlld0NvbnRyb2xsZXIoZm9yT3BlbmluZ0NvbnRlbnRUeXBlczogY29udGVudFR5cGVzLCBhc0NvcHk6IHRydWUpCiAgICAgICAgdmMuZGVsZWdhdGUgPSBjb250ZXh0LmNvb3JkaW5hdG9yCiAgICAgICAgdmMuYWxsb3dzTXVsdGlwbGVTZWxlY3Rpb24gPSBmYWxzZQogICAgICAgIHJldHVybiB2YwogICAgfQoKICAgIGZ1bmMgdXBkYXRlVUlWaWV3Q29udHJvbGxlcihfIHVpVmlld0NvbnRyb2xsZXI6IFVJRG9jdW1lbnRQaWNrZXJWaWV3Q29udHJvbGxlciwgY29udGV4dDogQ29udGV4dCkge30KCiAgICBmdW5jIG1ha2VDb29yZGluYXRvcigpIC0+IENvb3JkaW5hdG9yIHsgQ29vcmRpbmF0b3Iob25QaWNrOiBvblBpY2spIH0KCiAgICBmaW5hbCBjbGFzcyBDb29yZGluYXRvcjogTlNPYmplY3QsIFVJRG9jdW1lbnRQaWNrZXJEZWxlZ2F0ZSB7CiAgICAgICAgbGV0IG9uUGljazogKFVSTCkgLT4gVm9pZAogICAgICAgIGluaXQob25QaWNrOiBAZXNjYXBpbmcgKFVSTCkgLT4gVm9pZCkgeyBzZWxmLm9uUGljayA9IG9uUGljayB9CgogICAgICAgIGZ1bmMgZG9jdW1lbnRQaWNrZXIoXyBjb250cm9sbGVyOiBVSURvY3VtZW50UGlja2VyVmlld0NvbnRyb2xsZXIsIGRpZFBpY2tEb2N1bWVudHNBdCB1cmxzOiBbVVJMXSkgewogICAgICAgICAgICBndWFyZCBsZXQgdXJsID0gdXJscy5maXJzdCBlbHNlIHsgcmV0dXJuIH0KICAgICAgICAgICAgb25QaWNrKHVybCkKICAgICAgICB9CiAgICB9Cn0K
+import SwiftUI
+import AVKit
+import UniformTypeIdentifiers
+import Combine
+
+/// 视频联动播放器（ViewModel）
+final class VideoSyncPlayer: ObservableObject {
+    @Published var player: AVPlayer?
+    @Published var script: TimelineScript?
+    @Published var scriptName: String = "未载入脚本"
+    @Published var videoName: String = "未选择视频"
+    @Published var isPlaying = false
+    @Published var statusLine: String = "—"
+    @Published var currentSeconds: Double = 0
+    @Published var durationSeconds: Double = 0
+
+    /// 单次联动最长 30 分钟，超时自动停
+    static let maxSessionSeconds: TimeInterval = 30 * 60
+
+    private var timer: Timer?
+    private var lastActive = ActiveChannels.zero
+    private weak var ble: BLEManager?
+    /// 状态订阅（attach 可安全重建）；播放器订阅（duration/timeControlStatus）单独管理，
+    /// 只在换播放器时清理 —— attach 挂在 Section.onAppear 上，滚动重触发时不会
+    /// 把还没回来的 duration 订阅一起清掉（修 N4）
+    private var stateCancellables = Set<AnyCancellable>()
+    private var playerCancellables = Set<AnyCancellable>()
+    private var sessionStart: Date?
+
+    /// seek 代次：拖进度条会连发多个 seek，只有最新的回调有效（修 #5 的小尾巴）
+    private var seekGen = 0
+    private var seekInFlight = 0
+
+    /// 重连后强制重发首帧（修 N6：避免被"没有变化"吞掉）
+    private var needsResync = false
+
+    func attach(ble: BLEManager) {
+        // N4：切 Tab 回来会重复 attach，只清状态订阅；
+        // 播放器订阅在 playerCancellables 里，不受影响
+        stateCancellables.removeAll()
+        self.ble = ble
+        // 意外断开：停掉 Timer，界面不再显示"播放中"
+        ble.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] s in
+                guard let self = self else { return }
+                if s == .ready {
+                    self.needsResync = true
+                } else if self.isPlaying {
+                    self.player?.pause()
+                    self.isPlaying = false
+                    // 断开了，发也发不出去，直接停 Timer 不补发
+                    self.stopTimer(sendZero: false)
+                    self.statusLine = "设备已断开，联动已停止"
+                }
+            }
+            .store(in: &stateCancellables)
+        // 被动停机（看门狗/退后台/30 分钟上限）：只归零 UI，不补发停止帧
+        ble.forceZeroOutputs
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.passiveStop() }
+            .store(in: &stateCancellables)
+        // 监听播放器自身状态：来电/耳机按键/控制中心等外部暂停（修 #2 的小尾巴）
+        if let p = player {
+            observeTimeControlStatus(p)
+        }
+    }
+
+    private func observeTimeControlStatus(_ p: AVPlayer) {
+        p.publisher(for: \.timeControlStatus)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                guard let self = self else { return }
+                // 外部把播放器停了，但 vm 还以为在播：同步停机
+                if status == .paused, self.isPlaying, self.seekInFlight == 0 {
+                    // 修 高2 小尾巴：视频自然播完也会进 .paused，这不算外部暂停
+                    if self.durationSeconds > 0,
+                       self.currentSeconds >= self.durationSeconds - 0.5 {
+                        return
+                    }
+                    self.isPlaying = false
+                    self.stopTimer(sendZero: true)
+                    self.statusLine = "外部暂停，设备已停止"
+                }
+            }
+            .store(in: &playerCancellables)
+    }
+
+    func loadVideo(url: URL) {
+        // N3：换视频前先停掉旧的，避免旧 Timer 读新 player 的 t=0 误驱动设备
+        stopAll()
+        // 修 N4：旧播放器的订阅在这里释放，KVO 不再持有旧 player
+        playerCancellables.removeAll()
+        videoName = url.lastPathComponent
+        let p = AVPlayer(url: url)
+        player = p
+        observeTimeControlStatus(p)
+        if let dur = p.currentItem?.duration.seconds, dur.isFinite {
+            durationSeconds = dur
+        } else {
+            p.currentItem?.publisher(for: \.duration)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] d in
+                    if d.seconds.isFinite { self?.durationSeconds = d.seconds }
+                }
+                .store(in: &playerCancellables)
+        }
+        currentSeconds = 0
+    }
+
+    func loadScript(url: URL) {
+        // N3：换脚本前先停
+        stopAll()
+        do {
+            let data = try Data(contentsOf: url)
+            script = try JSONDecoder().decode(TimelineScript.self, from: data)
+            scriptName = url.lastPathComponent
+            if let s = script {
+                statusLine = "脚本就绪：\(s.commands.count) 条命令，\(s.scaleDescription)刻度"
+            }
+        } catch {
+            scriptName = "解析失败：\(error.localizedDescription)"
+        }
+    }
+
+    func togglePlay() {
+        guard let p = player, script != nil, ble?.state == .ready else { return }
+        if isPlaying {
+            p.pause()
+            isPlaying = false
+            stopTimer(sendZero: true)
+            statusLine = "已暂停"
+        } else {
+            let t = p.currentTime().seconds
+            let needsRestart = durationSeconds > 0 && t.isFinite && t >= durationSeconds - 0.5
+            sessionStart = Date()
+            isPlaying = true
+            // 修 C：用户点"播放"才显式开闸；tick 自己不会开闸
+            ble?.userResumeOutput()
+            if needsRestart {
+                // 播完了从头来：等 seek 完成再开播（修 #5 的小尾巴）
+                seekGen += 1
+                let gen = seekGen
+                seekInFlight += 1
+                p.seek(to: .zero) { [weak self] _ in
+                    guard let self = self else { return }
+                    self.seekInFlight = max(0, self.seekInFlight - 1)
+                    // 修 B：seek 完成前用户点了暂停/停止/切 Tab，或设备断开，
+                    // 不许把播放复活 —— 否则界面显示已停，设备却继续跟视频走，
+                    // 且 sessionStart 已是 nil，30 分钟上限和看门狗都管不到
+                    guard gen == self.seekGen, self.isPlaying else { return }
+                    self.lastActive = .zero
+                    self.currentSeconds = 0
+                    p.play()
+                    self.startTimer()
+                }
+            } else {
+                p.play()
+                startTimer()
+            }
+        }
+    }
+
+    /// 用户拖进度条：走 vm，seek 完成后立即同步一次设备状态
+    func seek(to seconds: Double) {
+        guard let p = player else { return }
+        seekGen += 1
+        let gen = seekGen
+        seekInFlight += 1
+        let wasPlaying = isPlaying
+        p.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) { [weak self] _ in
+            guard let self = self else { return }
+            self.seekInFlight = max(0, self.seekInFlight - 1)
+            // 被更新的 seek 抢先了，这个回调作废
+            guard gen == self.seekGen else { return }
+            self.currentSeconds = seconds
+            // seek 后强制算一次，避免设备停在旧强度
+            if wasPlaying { self.tick(force: true) }
+        }
+    }
+
+    func stopAll() {
+        player?.pause()
+        isPlaying = false
+        stopTimer(sendZero: true)
+        sessionStart = nil
+        statusLine = "—"
+    }
+
+    /// 被动停机（看门狗/退后台/30 分钟上限）：只归零 UI，不补发停止帧
+    /// （停止帧已经发出去了，再发一次反而可能把闸重新打开）
+    private func passiveStop() {
+        player?.pause()
+        isPlaying = false
+        stopTimer(sendZero: false)
+        lastActive = .zero
+        sessionStart = nil
+        statusLine = "已自动停止"
+    }
+
+    var canPlay: Bool {
+        player != nil && script != nil && ble?.state == .ready
+    }
+
+    // MARK: - 内部
+
+    private func startTimer() {
+        stopTimer(sendZero: false)
+        // N5：用 common modes，滚动 Form 时 tick 不暂停
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    private func stopTimer(sendZero: Bool) {
+        timer?.invalidate()
+        timer = nil
+        if sendZero {
+            ble?.sendStop()
+            lastActive = .zero
+        }
+    }
+
+    /// 每 100ms 按当前播放时间计算激活通道，变化时才发帧
+    private func tick(force: Bool = false) {
+        guard let p = player, let s = script, let ble = ble,
+              seekInFlight == 0 else { return }
+        let t = p.currentTime().seconds
+        guard t.isFinite else { return }
+
+        // 会话超时保护：先停，再写提示（修 N11：提示不被 stopAll 覆盖）
+        if let start = sessionStart,
+           Date().timeIntervalSince(start) > Self.maxSessionSeconds {
+            sessionStart = nil
+            stopAll()
+            statusLine = "单次联动超过 30 分钟，已自动停止"
+            return
+        }
+
+        // 界面心跳：看门狗靠这个判断 UI 线程是否还活着
+        ble.heartbeat()
+
+        currentSeconds = t
+
+        var vals = [0, 0, 0, 0]
+        for cmd in s.commands {
+            guard t >= cmd.startTimeSeconds, t < cmd.endTime,
+                  let ch = cmd.channel else { continue }
+            vals[ch.rawValue] = max(vals[ch.rawValue], s.intensity99(for: cmd))
+        }
+        let active = ActiveChannels(values: vals)
+        if force || needsResync || active != lastActive {
+            needsResync = false
+            lastActive = active
+            // 修 C：tick 走不开闸的发送路径，看门狗锁住的闸不会被自动帧打开
+            ble.sendTick(channels: vals)
+            let names = ["伸缩", "震动", "吮吸", "旋转"]
+            let desc = vals.enumerated().map { "\(names[$0.offset]):\($0.element)" }.joined(separator: " ")
+            statusLine = String(format: "t=%.1fs %@", t, desc)
+        }
+        if durationSeconds > 0, t >= durationSeconds {
+            stopAll()
+        }
+    }
+}
+
+/// 无系统控件的视频预览（系统自带播放/暂停/拖动会绕过 vm，必须禁用）
+struct NoControlsPlayerView: UIViewControllerRepresentable {
+    let player: AVPlayer
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController()
+        vc.player = player
+        vc.showsPlaybackControls = false
+        vc.videoGravity = .resizeAspect
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
+}
+
+/// 视频联动：播本地视频，按时间轴脚本自动发 0x06 帧
+struct VideoSyncView: View {
+    @EnvironmentObject var ble: BLEManager
+    @StateObject private var vm = VideoSyncPlayer()
+    @State private var showVideoPicker = false
+    @State private var showScriptPicker = false
+
+    var body: some View {
+        Form {
+            Section("设备") {
+                HStack {
+                    Text(ble.state.rawValue)
+                        .foregroundColor(ble.state == .ready ? .green : .secondary)
+                    Spacer()
+                    if ble.state != .ready {
+                        Button("连接") { ble.startScan() }
+                    }
+                }
+                if let err = ble.lastError {
+                    Text(err).font(.caption).foregroundColor(.red)
+                }
+            }
+            .onAppear { vm.attach(ble: ble) }
+
+            Section("素材") {
+                HStack {
+                    Text("视频"); Spacer()
+                    Text(vm.videoName).foregroundColor(.secondary).lineLimit(1)
+                    Button("选择") { showVideoPicker = true }
+                }
+                HStack {
+                    Text("脚本"); Spacer()
+                    Text(vm.scriptName).foregroundColor(.secondary).lineLimit(1)
+                    Button("载入") { showScriptPicker = true }
+                }
+                if let s = vm.script {
+                    Text("\(s.commands.count) 条命令")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+
+            Section("播放控制") {
+                HStack {
+                    Button(vm.isPlaying ? "暂停" : "播放") { vm.togglePlay() }
+                        .disabled(!vm.canPlay)
+                    Spacer()
+                    Button("停止", role: .destructive) { vm.stopAll() }
+                }
+                // 自建进度条：拖动走 vm.seek，设备状态同步跟上
+                if vm.durationSeconds > 0 {
+                    Slider(
+                        value: Binding(
+                            get: { vm.currentSeconds },
+                            set: { vm.seek(to: $0) }
+                        ),
+                        in: 0...vm.durationSeconds
+                    )
+                    .disabled(!vm.canPlay)
+                    Text("\(formatTime(vm.currentSeconds)) / \(formatTime(vm.durationSeconds))")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+                Text(vm.statusLine)
+                    .font(.caption).foregroundColor(.secondary)
+            }
+
+            if let p = vm.player {
+                Section("预览") {
+                    NoControlsPlayerView(player: p)
+                        .frame(height: 220)
+                }
+            }
+        }
+        .navigationTitle("视频联动")
+        .sheet(isPresented: $showVideoPicker) {
+            DocumentPicker(contentTypes: [UTType.movie, UTType.video]) { url in
+                vm.loadVideo(url: url)
+            }
+        }
+        .sheet(isPresented: $showScriptPicker) {
+            DocumentPicker(contentTypes: [UTType.json]) { url in
+                vm.loadScript(url: url)
+            }
+        }
+        .onDisappear { vm.stopAll() }
+    }
+
+    private func formatTime(_ s: Double) -> String {
+        guard s.isFinite else { return "--:--" }
+        let m = Int(s) / 60, sec = Int(s) % 60
+        return String(format: "%d:%02d", m, sec)
+    }
+}
+
+/// 系统文件选择器（asCopy: true，文件拷进沙盒，不玩 security-scoped 杂技）
+struct DocumentPicker: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
+    let onPick: (URL) -> Void
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let vc = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
+        vc.delegate = context.coordinator
+        vc.allowsMultipleSelection = false
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: (URL) -> Void
+        init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard let url = urls.first else { return }
+            onPick(url)
+        }
+    }
+}

@@ -1,1 +1,79 @@
-aW1wb3J0IEZvdW5kYXRpb24KCi8vLyDml7bpl7TovbTohJrmnKzph4znmoTkuIDmnaHlkb3ku6TvvIjlhbzlrrnlrpjmlrnmnI3liqHnq6/moLzlvI/vvIkKc3RydWN0IFRpbWVsaW5lQ29tbWFuZDogRGVjb2RhYmxlIHsKICAgIC8vLyBUaHJ1c3QgLyBWaWJyYXRpb24gLyBTdWN0aW9uIC8gUm90YXRpb27vvIjlpKflsI/lhpnkuI3mlY/mhJ/vvIkKICAgIGxldCBjb21tYW5kVHlwZTogU3RyaW5nCiAgICBsZXQgc3RhcnRUaW1lU2Vjb25kczogRG91YmxlCiAgICBsZXQgZHVyYXRpb25TZWNvbmRzOiBEb3VibGUKICAgIC8vLyDljp/lp4vlvLrluqbvvJrlrpjmlrnmoLzlvI/mmK8gMH4xMCDljYHmoaPvvIzkuZ/lj6/og73mmK8gMH4xMDAg55m+5YiG5Yi2CiAgICBsZXQgaW50ZW5zaXR5TGV2ZWw6IERvdWJsZQoKICAgIHZhciBjaGFubmVsOiBQcm90b2NvbC5DaGFubmVsPyB7CiAgICAgICAgUHJvdG9jb2wuQ2hhbm5lbC5mcm9tKGNvbW1hbmRUeXBlOiBjb21tYW5kVHlwZSkKICAgIH0KCiAgICB2YXIgZW5kVGltZTogRG91YmxlIHsgc3RhcnRUaW1lU2Vjb25kcyArIGR1cmF0aW9uU2Vjb25kcyB9Cn0KCi8vLyDml7bpl7TovbTohJrmnKzmlofku7YKc3RydWN0IFRpbWVsaW5lU2NyaXB0OiBEZWNvZGFibGUgewogICAgbGV0IGNvbW1hbmRzOiBbVGltZWxpbmVDb21tYW5kXQogICAgLy8vIOWPr+mAie+8muW8uuW6puWIu+W6puWjsOaYju+8jCJ0ZW4i77yIMH4xMO+8ieaIliAicGVyY2VudCLvvIgwfjEwMO+8ieOAggogICAgLy8vIOS4jeWhq+WImeiHquWKqOWIpOaWre+8muS7u+S4gOWRveS7pCA+MTAg4oaSIOeZvuWIhuWItu+8m+WQpuWImeaMieWumOaWueWNgeaho+WkhOeQhuOAggogICAgLy8vIOazqOaEj++8muS4gOS7veWFqOaYr+Wwj+WAvOeahOeZvuWIhuWItuiEmuacrO+8iOWmgiAzLzUvOO+8ieS8muiiq+ivr+WIpOaIkOWNgeaho++8jAogICAgLy8vIOi/meenjeiEmuacrOivt+aYvuW8j+WGmSAiaW50ZW5zaXR5U2NhbGUiOiAicGVyY2VudCLjgIIKICAgIGxldCBpbnRlbnNpdHlTY2FsZTogU3RyaW5nPwoKICAgIC8vLyDnvJPlrZjnmoTliLvluqbliKTmlq3nu5PmnpzvvIzpgb/lhY3mr48gdGljayBPKG4p77yI5L+uIE4xMO+8iQogICAgbGV0IHVzZVRlblNjYWxlOiBCb29sCgogICAgZW51bSBDb2RpbmdLZXlzOiBTdHJpbmcsIENvZGluZ0tleSB7CiAgICAgICAgY2FzZSBjb21tYW5kcwogICAgICAgIGNhc2UgaW50ZW5zaXR5U2NhbGUKICAgIH0KCiAgICBpbml0KGZyb20gZGVjb2RlcjogRGVjb2RlcikgdGhyb3dzIHsKICAgICAgICBsZXQgYyA9IHRyeSBkZWNvZGVyLmNvbnRhaW5lcihrZXllZEJ5OiBDb2RpbmdLZXlzLnNlbGYpCiAgICAgICAgY29tbWFuZHMgPSB0cnkgYy5kZWNvZGUoW1RpbWVsaW5lQ29tbWFuZF0uc2VsZiwgZm9yS2V5OiAuY29tbWFuZHMpCiAgICAgICAgaW50ZW5zaXR5U2NhbGUgPSB0cnkgYy5kZWNvZGVJZlByZXNlbnQoU3RyaW5nLnNlbGYsIGZvcktleTogLmludGVuc2l0eVNjYWxlKQogICAgICAgIGlmIGxldCBzID0gaW50ZW5zaXR5U2NhbGU/Lmxvd2VyY2FzZWQoKSB7CiAgICAgICAgICAgIHVzZVRlblNjYWxlID0gKHMgPT0gInRlbiIpCiAgICAgICAgfSBlbHNlIHsKICAgICAgICAgICAgLy8g6Ieq5Yqo5Yik5pat77ya5pW05Liq6ISa5pys57uf5LiA55So5LiA56eN5Yi75bqm77yM6YG/5YWNIDEw4oaSOTnjgIExMC414oaSMTEg6L+Z56eN5pat5bGCCiAgICAgICAgICAgIHVzZVRlblNjYWxlID0gY29tbWFuZHMuYWxsU2F0aXNmeSB7ICQwLmludGVuc2l0eUxldmVsIDw9IDEwIH0KICAgICAgICB9CiAgICB9CgogICAgLy8vIOWRveS7pOW8uuW6puW9kuS4gOWMluWIsCAwfjk5CiAgICBmdW5jIGludGVuc2l0eTk5KGZvciBjbWQ6IFRpbWVsaW5lQ29tbWFuZCkgLT4gSW50IHsKICAgICAgICBsZXQgdiA9IHVzZVRlblNjYWxlID8gY21kLmludGVuc2l0eUxldmVsICogMTAgOiBjbWQuaW50ZW5zaXR5TGV2ZWwKICAgICAgICByZXR1cm4gbWF4KDAsIG1pbig5OSwgSW50KHYucm91bmRlZCgpKSkpCiAgICB9CgogICAgdmFyIHNjYWxlRGVzY3JpcHRpb246IFN0cmluZyB7CiAgICAgICAgdXNlVGVuU2NhbGUgPyAi5Y2B5qGj77yIMH4xMO+8iSIgOiAi55m+5YiG77yIMH4xMDDvvIkiCiAgICB9Cn0KCi8vLyDmkq3mlL7kuK3nmoTmv4DmtLvlkb3ku6Tpm4blkIjvvIjnlKjkuo7liKTmlq3mmK/lkKbpnIDopoHph43lj5HvvIkKc3RydWN0IEFjdGl2ZUNoYW5uZWxzOiBFcXVhdGFibGUgewogICAgdmFyIHZhbHVlczogW0ludF0gLy8gW2NoMCwgY2gxLCBjaDIsIGNoM13vvIwwfjk5CgogICAgc3RhdGljIHZhciB6ZXJvOiBBY3RpdmVDaGFubmVscyB7IEFjdGl2ZUNoYW5uZWxzKHZhbHVlczogWzAsIDAsIDAsIDBdKSB9CgogICAgc3RhdGljIGZ1bmMgPT0gKGxoczogQWN0aXZlQ2hhbm5lbHMsIHJoczogQWN0aXZlQ2hhbm5lbHMpIC0+IEJvb2wgewogICAgICAgIGxocy52YWx1ZXMgPT0gcmhzLnZhbHVlcwogICAgfQp9Cg==
+import Foundation
+
+/// 时间轴脚本里的一条命令（兼容官方服务端格式）
+struct TimelineCommand: Decodable {
+    /// Thrust / Vibration / Suction / Rotation（大小写不敏感）
+    let commandType: String
+    let startTimeSeconds: Double
+    let durationSeconds: Double
+    /// 原始强度：官方格式是 0~10 十档，也可能是 0~100 百分制
+    let intensityLevel: Double
+
+    var channel: Protocol.Channel? {
+        Protocol.Channel.from(commandType: commandType)
+    }
+
+    var endTime: Double { startTimeSeconds + durationSeconds }
+}
+
+/// 时间轴脚本文件
+struct TimelineScript: Decodable {
+    let commands: [TimelineCommand]
+    /// 可选：强度刻度声明，"ten"（0~10）或 "percent"（0~100）。
+    /// 不填则自动判断：任一命令 >10 → 百分制；否则按官方十档处理。
+    /// 注意：一份全是小值的百分制脚本（如 3/5/8）会被误判成十档，
+    /// 这种脚本请显式写 "intensityScale": "percent"。
+    let intensityScale: String?
+
+    /// 缓存的刻度判断结果，避免每 tick O(n)（修 N10）
+    let useTenScale: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case commands
+        case intensityScale
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        commands = try c.decode([TimelineCommand].self, forKey: .commands)
+        intensityScale = try c.decodeIfPresent(String.self, forKey: .intensityScale)
+        // 修 高6：只有 "ten"/"percent" 是合法声明；写成其他值时回退到自动判断，
+        // 不再静默当成百分制
+        if let s = intensityScale?.lowercased() {
+            if s == "ten" {
+                useTenScale = true
+            } else if s == "percent" {
+                useTenScale = false
+            } else {
+                useTenScale = commands.allSatisfy { $0.intensityLevel <= 10 }
+            }
+        } else {
+            // 自动判断：整个脚本统一用一种刻度，避免 10→99、10.5→11 这种断层
+            useTenScale = commands.allSatisfy { $0.intensityLevel <= 10 }
+        }
+    }
+
+    /// 命令强度归一化到 0~99
+    func intensity99(for cmd: TimelineCommand) -> Int {
+        let v = useTenScale ? cmd.intensityLevel * 10 : cmd.intensityLevel
+        // 修 高6：先在 Double 域夹紧再转 Int，1e20 这种值不会溢出崩溃
+        // （播放中崩溃 = 设备停在非零强度上没人管）
+        let clamped = min(max(v, 0), 99)
+        return Int(clamped.rounded())
+    }
+
+    var scaleDescription: String {
+        useTenScale ? "十档（0~10）" : "百分（0~100）"
+    }
+}
+
+/// 播放中的激活命令集合（用于判断是否需要重发）
+struct ActiveChannels: Equatable {
+    var values: [Int] // [ch0, ch1, ch2, ch3]，0~99
+
+    static var zero: ActiveChannels { ActiveChannels(values: [0, 0, 0, 0]) }
+
+    static func == (lhs: ActiveChannels, rhs: ActiveChannels) -> Bool {
+        lhs.values == rhs.values
+    }
+}
