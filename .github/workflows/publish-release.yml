@@ -1,0 +1,49 @@
+# 手动把某次 Build Unsigned IPA 运行的产物发布成 GitHub Release（tag 不存在时在指定提交上创建）。
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build Unsigned IPA 的运行 ID"
+        required: true
+      tag:
+        description: "Release 的 tag（如 v1.6.2）"
+        required: true
+      target:
+        description: "tag 指向的提交 SHA"
+        required: true
+      notes:
+        description: "Release 说明"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n BlueCrystalIOS-unsigned -D out
+          ls -l out
+          cat out/BlueCrystalIOS-unsigned.ipa.sha256
+      - name: Create release and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${{ inputs.tag }}" -R "${{ github.repository }}" \
+              --target "${{ inputs.target }}" --title "${{ inputs.tag }}" --notes "$NOTES"
+          fi
+          gh release upload "${{ inputs.tag }}" out/BlueCrystalIOS-unsigned.ipa out/BlueCrystalIOS-unsigned.ipa.sha256 \
+            -R "${{ github.repository }}" --clobber
