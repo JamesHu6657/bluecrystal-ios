@@ -120,7 +120,7 @@ struct ManualControlView: View {
                         Button("断开") { ble.disconnect() }
                     } else {
                         Button("连接 mizzzee_0032") { ble.startScan() }
-                            .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .disconnecting)
+                            .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .discovering || ble.state == .disconnecting)
                     }
                 }
                 if let err = ble.lastError {
@@ -130,7 +130,7 @@ struct ManualControlView: View {
             .onAppear { vm.attach(ble: ble) }
 
             Section("四通道强度") {
-                ForEach(Protocol.Channel.allCases, id: \.rawValue) { ch in
+                ForEach(BCProtocol.Channel.allCases, id: \.rawValue) { ch in
                     VStack(alignment: .leading) {
                         HStack {
                             Text(ch.displayName)

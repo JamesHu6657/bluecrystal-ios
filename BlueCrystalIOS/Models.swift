@@ -9,8 +9,8 @@ struct TimelineCommand: Decodable {
     /// 原始强度：官方格式是 0~10 十档，也可能是 0~100 百分制
     let intensityLevel: Double
 
-    var channel: Protocol.Channel? {
-        Protocol.Channel.from(commandType: commandType)
+    var channel: BCProtocol.Channel? {
+        BCProtocol.Channel.from(commandType: commandType)
     }
 
     var endTime: Double { startTimeSeconds + durationSeconds }

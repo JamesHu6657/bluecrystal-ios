@@ -307,7 +307,7 @@ struct VideoSyncView: View {
                     Spacer()
                     if ble.state != .ready {
                         Button("连接") { ble.startScan() }
-                            .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .disconnecting)
+                            .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .discovering || ble.state == .disconnecting)
                     }
                 }
                 if let err = ble.lastError {

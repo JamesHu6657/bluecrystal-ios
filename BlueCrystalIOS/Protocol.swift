@@ -5,7 +5,7 @@ import Foundation
 /// 帧格式：AA 06 05 <ch0> <ch1> <ch2> <ch3> <flag=00> <checksum>
 /// 共 9 字节，checksum = 前 8 字节相加取低 8 位
 /// 写特征值 FFA1，需 Write With Response
-enum Protocol {
+enum BCProtocol {
 
     static let header: UInt8 = 0xAA
     static let cmd: UInt8 = 0x06

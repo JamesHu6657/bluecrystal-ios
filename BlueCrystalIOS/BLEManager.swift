@@ -1,6 +1,7 @@
 import Foundation
 import CoreBluetooth
 import Combine
+import UserNotifications
 
 /// mizzzee_0032 的 BLE 连接管理
 ///
@@ -62,7 +63,8 @@ final class BLEManager: NSObject, ObservableObject {
     /// 停机（disconnect/emergencyStop/看门狗）后锁死：排队中的延迟帧不许再出去。
     /// 只有用户主动操作（send/sendStop/sendOfficialStart/视频页点"播放"）才能重新打开。
     /// 视频 tick 走 sendTick，不开闸（修 C）。
-    private var outputLocked = false
+    /// 修 Factory L1：冷启动时闸门是关的，必须等用户第一次主动操作才开
+    private var outputLocked = true
     /// 断开流程进行中：除停止帧外一律拒发，避免断开期间被重新开闸（修 N1）
     private var disconnecting = false
 
@@ -100,6 +102,14 @@ final class BLEManager: NSObject, ObservableObject {
     private var stopWriteFailed = false
     /// 当前红字是不是停止帧失败/未确认的提示：之后停止帧真正确认成功时自动清掉（v1.4 低危）
     private var stopErrorShown = false
+    /// 修 Factory H1：上次连接结束时设备可能还在输出（断链/蓝牙关闭/停止帧未确认）。
+    /// 跨连接保留；期间红字不会被普通的 clearError 清掉，重新连上后发一帧停止帧并确认成功才清除
+    private var deviceMayBeActive = false
+    static let mayBeActiveMsg = "连接已断开，设备可能仍在输出，请关闭设备电源"
+    /// 连接代次：连接超时只对本次连接有效（修 Factory L6）
+    private var connectGen = 0
+    static let connectTimeout: TimeInterval = 10
+    private var notificationAuthRequested = false
 
     /// 扫描代次：防止旧扫描的超时把新扫描提前停掉（修 N9）
     private var scanGen = 0
@@ -125,7 +135,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     func startScan() {
         bleQueue.async { [weak self] in
-            guard let self = self, !self.disconnecting else { return }
+            guard let self = self else { return }
             self.beginScan(clearRejected: true)
         }
     }
@@ -133,6 +143,10 @@ final class BLEManager: NSObject, ObservableObject {
     /// 实际开始扫描；clearRejected=false 时保留本轮拒绝过的设备（修 E）
     /// 调用方保证在 bleQueue 上
     private func beginScan(clearRejected: Bool) {
+        // 修 Factory H2：只有空闲/失败且没有外设时才允许扫描。
+        // 已连接、发现服务中、断开中点"连接"都不能把状态机打回扫描/空闲
+        guard queueState == .idle || queueState == .failed,
+              peripheral == nil, !disconnecting else { return }
         guard central.state == .poweredOn else {
             setError("蓝牙未就绪")
             return
@@ -167,6 +181,15 @@ final class BLEManager: NSObject, ObservableObject {
         bleQueue.async { [weak self] in
             guard let self = self, let p = self.pendingPeripheral else { return }
             self.pendingPeripheral = nil
+            // 修 Factory H2：已有外设时不许覆盖它的引用
+            guard self.peripheral == nil else {
+                DispatchQueue.main.async {
+                    self.pendingDeviceName = nil
+                    self.pendingDeviceUUID = nil
+                    self.showDeviceConfirm = false
+                }
+                return
+            }
             // 记住这次连的设备，下次自动连
             UserDefaults.standard.set(p.identifier.uuidString, forKey: Self.bondedDeviceKey)
             DispatchQueue.main.async {
@@ -179,6 +202,7 @@ final class BLEManager: NSObject, ObservableObject {
             self.clearError()
             self.updateState(.connecting)
             self.central.connect(p, options: nil)
+            self.scheduleConnectTimeout(for: p)
         }
     }
 
@@ -212,7 +236,7 @@ final class BLEManager: NSObject, ObservableObject {
             }
             guard !self.disconnecting else { return } // 已在断开中，不重复发起
             self.outputLocked = true
-            let stopId = self.enqueueFrame(Protocol.stopFrame, onAck: { [weak self] in
+            let stopId = self.enqueueFrame(BCProtocol.stopFrame, onAck: { [weak self] in
                 guard let self = self else { return }
                 // 修 N1 兜底：停止帧确认了，但设备上仍有更晚的非零帧（isActive 未被清零），
                 // 不能当成已停，提示关电源后再断开
@@ -244,36 +268,62 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// App 退后台/锁屏时的紧急停止：同步尽力把停止帧发出去（最多等 2 秒），随后锁死输出闸门
-    func emergencyStop() {
-        let done = DispatchSemaphore(value: 0)
+    /// App 退后台/锁屏时的紧急停止（修 Factory M1：改为异步）。
+    /// 立刻锁闸并通知界面归零；停止帧整条链（含一次重试）出最终结果或 4.5s 兜底后才回调 completion，
+    /// 调用方据此结束后台任务。最终未确认时发本地通知提示关电源。completion 在主线程回调，只回调一次。
+    func emergencyStop(completion: @escaping () -> Void) {
         bleQueue.async { [weak self] in
-            // 修 A：weak self 必须先解包，否则下面全是编译错误
-            guard let self = self else { done.signal(); return }
-            guard self.peripheral != nil,
-                  self.writeChar != nil,
-                  self.queueState == .ready else {
-                done.signal()
+            var finished = false
+            let finish = {
+                guard !finished else { return }
+                finished = true
+                DispatchQueue.main.async(execute: completion)
+            }
+            guard let self = self else { finish(); return }
+            // 修 Factory M2：不管停止帧发不发得出去，都先锁闸并让界面归零
+            self.outputLocked = true
+            self.notifyForceZero()
+            let stopId: Int
+            if self.peripheral != nil, self.writeChar != nil, self.queueState == .ready {
+                stopId = self.enqueueFrame(BCProtocol.stopFrame, onAck: { [weak self] in
+                    guard let self = self else { finish(); return }
+                    // 修 Factory L4：停止帧之后还有更晚的非零帧，不能当成已停
+                    if self.isActive, !self.stopWriteFailed {
+                        self.reportStopUnconfirmed()
+                    }
+                    if self.stopWriteFailed { self.postStopFailureNotification() }
+                    finish()
+                })
+            } else {
+                stopId = -1
+            }
+            guard stopId >= 0 else {
+                // 发不出去：设备上还有输出就明确提示（修 Factory M2）
+                if self.isActive {
+                    self.reportStopUnconfirmed()
+                    self.postStopFailureNotification()
+                }
+                finish()
                 return
             }
-            self.outputLocked = true
-            let stopId = self.enqueueFrame(Protocol.stopFrame, onAck: { done.signal() })
-            guard stopId >= 0 else { done.signal(); return }
-            self.bleQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-                guard let self = self else { done.signal(); return }
-                // 修 N2：只作废自己这条链的回调，断开流程那帧的 onAck 保持不动
-                if self.cancelChainCallbacks(chain: stopId) {
-                    // 修 M1：后台时间只有约 2 秒，等不到重试；停止帧没确认就明确提示关电源，
-                    // 不能把结果不确定的停止帧当成已停
+            // 兜底：晚于两轮写超时，只处理自己这条链（修 N2）
+            self.bleQueue.asyncAfter(deadline: .now() + Self.disconnectFallback) { [weak self] in
+                if let self = self, self.cancelChainCallbacks(chain: stopId) {
                     self.reportStopUnconfirmed()
-                    done.signal()
+                    self.postStopFailureNotification()
                 }
-                // 已出最终结果：onAck 已经 signal 过了，这里不再补
+                finish()
             }
-            // 被动停机：通知 VM 把界面输出归零（修 高1）
-            self.notifyForceZero()
         }
-        _ = done.wait(timeout: .now() + 2.0)
+    }
+
+    /// 回到前台（修 Factory M1）：设备可能还在输出时再补发一帧带确认的停止帧
+    func resumeFromBackground() {
+        bleQueue.async { [weak self] in
+            guard let self = self, self.queueState == .ready,
+                  self.isActive || self.stopWriteFailed || self.deviceMayBeActive else { return }
+            self.sendConfirmingStop()
+        }
     }
 
     // MARK: - 用户主动发送（会重新打开输出闸门）
@@ -283,7 +333,7 @@ final class BLEManager: NSObject, ObservableObject {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
             self.outputLocked = false
-            self.enqueueFrame(Protocol.frame(channels: channels))
+            self.enqueueFrame(BCProtocol.frame(channels: channels))
         }
     }
 
@@ -291,7 +341,7 @@ final class BLEManager: NSObject, ObservableObject {
     func sendThrottled(channels: [Int]) {
         bleQueue.async { [weak self] in
             guard let self = self, !self.outputLocked else { return }
-            self.enqueueFrame(Protocol.frame(channels: channels))
+            self.enqueueFrame(BCProtocol.frame(channels: channels))
         }
     }
 
@@ -301,7 +351,7 @@ final class BLEManager: NSObject, ObservableObject {
     func sendTick(channels: [Int]) {
         bleQueue.async { [weak self] in
             guard let self = self, !self.outputLocked else { return }
-            self.enqueueFrame(Protocol.frame(channels: channels))
+            self.enqueueFrame(BCProtocol.frame(channels: channels))
         }
     }
 
@@ -317,7 +367,7 @@ final class BLEManager: NSObject, ObservableObject {
     func sendStop() {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
-            self.enqueueFrame(Protocol.stopFrame)
+            self.enqueueFrame(BCProtocol.stopFrame)
         }
     }
 
@@ -325,7 +375,7 @@ final class BLEManager: NSObject, ObservableObject {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
             self.outputLocked = false
-            self.enqueueFrame(Protocol.officialStartFrame)
+            self.enqueueFrame(BCProtocol.officialStartFrame)
         }
     }
 
@@ -338,21 +388,21 @@ final class BLEManager: NSObject, ObservableObject {
               let c = writeChar,
               queueState == .ready else { return -1 }
         // 修 N1：断开流程中只放行停止帧
-        if disconnecting, data != Protocol.stopFrame { return -1 }
+        if disconnecting, data != BCProtocol.stopFrame { return -1 }
         writeSeq += 1
         let id = writeSeq
         pendingWrites.append(PendingWrite(
             id: id,
-            hex: Protocol.hex(data),
+            hex: BCProtocol.hex(data),
             data: data,
-            isStop: data == Protocol.stopFrame,
+            isStop: data == BCProtocol.stopFrame,
             retryCount: 0,
             onAck: onAck,
             timedOut: false,
             chain: id
         ))
         p.writeValue(data, for: c, type: .withResponse)
-        if data != Protocol.stopFrame {
+        if data != BCProtocol.stopFrame {
             // 修 F：isActive 只在停止帧回执成功后才清零；
             // 发出时不清，否则写失败会被当成"已停止"
             isActive = true
@@ -451,6 +501,8 @@ final class BLEManager: NSObject, ObservableObject {
         if let p = peripheral {
             central.cancelPeripheralConnection(p)
         }
+        // 修 Factory H1/M2：断开时设备可能还在输出（停止帧没确认、或根本没发出去）
+        let mayBeActive = isActive || stopWriteFailed
         peripheral = nil
         writeChar = nil
         pendingPeripheral = nil
@@ -462,6 +514,7 @@ final class BLEManager: NSObject, ObservableObject {
         outputLocked = true
         disconnecting = false
         updateState(.idle)
+        if mayBeActive { markDeviceMayBeActive(prefix: nil) }
         DispatchQueue.main.async { [weak self] in
             self?.pendingDeviceName = nil
             self?.pendingDeviceUUID = nil
@@ -479,8 +532,10 @@ final class BLEManager: NSObject, ObservableObject {
         // 调用方保证在 bleQueue 上
         stopErrorShown = false // 修 L2：红字换成别的了，标记不能残留
         queueState = .failed
+        // 修 Factory H1：设备可能还在输出时，警告不能被别的红字盖掉
+        let text = deviceMayBeActive ? "\(msg)\n\(Self.mayBeActiveMsg)" : msg
         DispatchQueue.main.async { [weak self] in
-            self?.lastError = msg
+            self?.lastError = text
             self?.state = .failed
         }
     }
@@ -488,7 +543,64 @@ final class BLEManager: NSObject, ObservableObject {
     /// 清掉界面上的旧红字（修 N8）；调用方保证在 bleQueue 上
     private func clearError() {
         stopErrorShown = false // 修 L2
-        DispatchQueue.main.async { [weak self] in self?.lastError = nil }
+        // 修 Factory H1：设备可能还在输出时保留警告，直到重新连上并确认停止帧
+        let text: String? = deviceMayBeActive ? Self.mayBeActiveMsg : nil
+        DispatchQueue.main.async { [weak self] in self?.lastError = text }
+    }
+
+    /// 记下"设备可能仍在输出"并提示关电源、让界面归零；调用方保证在 bleQueue 上（修 Factory H1）
+    private func markDeviceMayBeActive(prefix: String?) {
+        deviceMayBeActive = true
+        stopErrorShown = false
+        notifyForceZero()
+        let text = prefix.map { "\($0)\n\(Self.mayBeActiveMsg)" } ?? Self.mayBeActiveMsg
+        DispatchQueue.main.async { [weak self] in self?.lastError = text }
+    }
+
+    /// 发一帧带确认的停止帧；确认成功且之后没有非零帧时清除"可能仍在输出"（修 Factory H1）。
+    /// 调用方保证在 bleQueue 上
+    private func sendConfirmingStop() {
+        enqueueFrame(BCProtocol.stopFrame, onAck: { [weak self] in
+            guard let self = self else { return }
+            if !self.stopWriteFailed, !self.isActive, self.deviceMayBeActive {
+                self.deviceMayBeActive = false
+                self.clearError()
+            }
+        })
+    }
+
+    /// 停止帧最终未确认时发本地通知（App 可能已在后台，红字用户看不到）（修 Factory M1）
+    private func postStopFailureNotification() {
+        let content = UNMutableNotificationContent()
+        content.title = "BlueCrystal"
+        content.body = "停止帧未得到设备确认，设备可能仍在输出，请关闭设备电源"
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: "bluecrystal.stopFailed", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+    }
+
+    /// 连接建立后服务/特征值发现失败：断开并清空外设，否则 peripheral 残留会让之后的扫描被拒（修 Factory H2 配套）
+    private func failConnection(_ msg: String) {
+        if let p = peripheral { central.cancelPeripheralConnection(p) }
+        peripheral = nil
+        writeChar = nil
+        pendingWrites = []
+        setError(msg)
+    }
+
+    /// 连接超时（修 Factory L6）：10 秒还没到 ready 就取消连接；调用方保证在 bleQueue 上
+    private func scheduleConnectTimeout(for p: CBPeripheral) {
+        connectGen += 1
+        let gen = connectGen
+        bleQueue.asyncAfter(deadline: .now() + Self.connectTimeout) { [weak self] in
+            guard let self = self, self.connectGen == gen,
+                  self.queueState == .connecting || self.queueState == .discovering,
+                  let cur = self.peripheral, cur.identifier == p.identifier else { return }
+            self.central.cancelPeripheralConnection(cur)
+            self.peripheral = nil
+            self.writeChar = nil
+            self.setError("连接超时，请靠近设备、确认没被官方 App 占用后重试")
+        }
     }
 
     /// 显示非停止帧类的红字（看门狗/30 分钟/写失败等），并重置 stopErrorShown（修 L2），
@@ -509,21 +621,23 @@ final class BLEManager: NSObject, ObservableObject {
     private func watchdogTick() {
         let now = Date()
         // stopWriteFailed 时不再重复发停止帧刷屏（修 F）
-        if queueState == .ready, isActive, !stopWriteFailed {
+        // 修 Factory L3：已有停止帧在等结果时不重复入队、不重复通知
+        let hasPendingStop = pendingWrites.contains { $0.isStop && !$0.timedOut }
+        if queueState == .ready, isActive, !stopWriteFailed, !hasPendingStop {
             // 全局 30 分钟上限
             if let since = activeSince, now.timeIntervalSince(since) > Self.maxActiveSeconds {
-                enqueueFrame(Protocol.stopFrame)
+                enqueueFrame(BCProtocol.stopFrame)
                 outputLocked = true
                 notifyForceZero()
-                showError("单次连续输出超过 30 分钟，已自动停止")
-            } else if let hb = lastHeartbeat,
+                showError("单次连续输出超过 30 分钟，正在自动停止")
+            } else if let hb = lastHeartbeat ?? activeSince, // 修 Factory L2：没有心跳时从开始输出算起
                       now.timeIntervalSince(hb) > Self.watchdogInterval,
                       peripheral != nil, writeChar != nil {
                 // 有非零输出在设备上，但界面心跳断了 >5s：UI 线程可能卡死，自动停机
-                enqueueFrame(Protocol.stopFrame)
+                enqueueFrame(BCProtocol.stopFrame)
                 outputLocked = true // 修 高1：看门狗停机也要锁闸
                 notifyForceZero()   // 修 高1：通知 VM 把界面输出归零
-                showError("看门狗：界面心跳丢失，已自动停止")
+                showError("看门狗：界面心跳丢失，正在自动停止")
             }
         }
         bleQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
@@ -544,6 +658,8 @@ extension BLEManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         // N9：蓝牙关闭时系统不会回调 didDisconnect，必须在这里清理一切
         guard central.state == .poweredOn else {
+            // 修 Factory H1：清理前先记下设备是否可能还在输出
+            let mayBeActive = isActive || stopWriteFailed || disconnecting
             peripheral = nil
             writeChar = nil
             pendingPeripheral = nil
@@ -555,14 +671,22 @@ extension BLEManager: CBCentralManagerDelegate {
             outputLocked = true
             disconnecting = false
             updateState(.idle)
-            // 修 N9 小尾巴：unauthorized 和 poweredOff 的文案分开
-            let msg = central.state == .unauthorized
-                ? "蓝牙权限未授权，请去系统设置里打开"
-                : "蓝牙已关闭"
-            stopErrorShown = false // 修 L2
-            DispatchQueue.main.async { [weak self] in
-                self?.lastError = msg
-                self?.showDeviceConfirm = false
+            // 修 N9 小尾巴 / Factory L7：按实际状态给文案
+            let msg: String
+            switch central.state {
+            case .unauthorized: msg = "蓝牙权限未授权，请去系统设置里打开"
+            case .poweredOff: msg = "蓝牙已关闭"
+            case .unsupported: msg = "这台设备不支持蓝牙 BLE"
+            case .resetting: msg = "蓝牙正在重置…"
+            default: msg = "蓝牙暂不可用"
+            }
+            DispatchQueue.main.async { [weak self] in self?.showDeviceConfirm = false }
+            if mayBeActive {
+                markDeviceMayBeActive(prefix: msg)
+            } else {
+                stopErrorShown = false // 修 L2
+                let text = deviceMayBeActive ? "\(msg)\n\(Self.mayBeActiveMsg)" : msg
+                DispatchQueue.main.async { [weak self] in self?.lastError = text }
             }
             return
         }
@@ -572,6 +696,8 @@ extension BLEManager: CBCentralManagerDelegate {
                         didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
+        // 修 Factory H2：只在扫描中处理；stopScan 前已排队的迟到回调直接忽略
+        guard queueState == .scanning, self.peripheral == nil else { return }
         let name = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? ""
         guard name.contains(Self.deviceNameKeyword) else { return }
 
@@ -583,6 +709,7 @@ extension BLEManager: CBCentralManagerDelegate {
             clearError()
             updateState(.connecting)
             central.connect(peripheral, options: nil)
+            scheduleConnectTimeout(for: peripheral)
             return
         }
         // 本轮用户点"取消"拒绝过的设备，不再弹框（修 E）
@@ -601,6 +728,9 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        // 迟到的连接回调（已超时取消/已换外设）忽略
+        guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
+        central.stopScan() // 修 Factory H2
         clearError() // 修 N8：连上就清掉旧红字
         updateState(.discovering)
         peripheral.delegate = self
@@ -624,6 +754,8 @@ extension BLEManager: CBCentralManagerDelegate {
         // finishDisconnect 里 cancelPeripheralConnection 的迟到回调会被忽略，
         // 不会把用户新发起的扫描状态冲回"未连接"
         guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
+        // 修 Factory H1：清理前先记下设备是否可能还在输出
+        let mayBeActive = isActive || stopWriteFailed || disconnecting
         // 意外断开：清理并通知 UI（VM 会订阅 state 变化停掉 Timer、归零滑杆）
         self.peripheral = nil
         self.writeChar = nil
@@ -639,15 +771,17 @@ extension BLEManager: CBCentralManagerDelegate {
         } else {
             updateState(.idle)
         }
+        if mayBeActive { markDeviceMayBeActive(prefix: error.map { "设备意外断开：\($0.localizedDescription)" }) }
     }
 }
 
 // MARK: - CBPeripheralDelegate
 extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        if let error = error { setError("发现服务失败：\(error.localizedDescription)"); return }
+        guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
+        if let error = error { failConnection("发现服务失败：\(error.localizedDescription)"); return }
         guard let svc = peripheral.services?.first(where: { $0.uuid == Self.serviceUUID }) else {
-            setError("未找到 FFA0 服务")
+            failConnection("未找到 FFA0 服务")
             return
         }
         peripheral.discoverCharacteristics([Self.writeUUID, Self.notifyUUID], for: svc)
@@ -656,7 +790,8 @@ extension BLEManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        if let error = error { setError("发现特征值失败：\(error.localizedDescription)"); return }
+        guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
+        if let error = error { failConnection("发现特征值失败：\(error.localizedDescription)"); return }
         for c in service.characteristics ?? [] {
             if c.uuid == Self.writeUUID {
                 writeChar = c
@@ -665,10 +800,18 @@ extension BLEManager: CBPeripheralDelegate {
             }
         }
         if writeChar != nil {
-            clearError() // 修 N8：真正连上后清掉旧红字
+            // 修 Factory L5：每次重新 ready 都清空写入队列，FIFO 从零对齐
+            pendingWrites = []
+            clearError() // 修 N8：真正连上后清掉旧红字（"可能仍在输出"除外）
             updateState(.ready)
+            // 修 Factory H1：连上先发一帧带确认的停止帧，设备停在旧强度上也能归零
+            sendConfirmingStop()
+            if !notificationAuthRequested {
+                notificationAuthRequested = true
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            }
         } else {
-            setError("未找到 FFA1 写特征值")
+            failConnection("未找到 FFA1 写特征值")
         }
     }
 
@@ -676,6 +819,8 @@ extension BLEManager: CBPeripheralDelegate {
                     didWriteValueFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard characteristic.uuid == Self.writeUUID else { return }
+        // 修 Factory L5：只认当前外设的回执
+        guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
         guard !pendingWrites.isEmpty else { return }
         // FIFO：这个回执属于最早发出的那一笔。
         // CoreBluetooth 对同一特征值的 withResponse 写是串行回调的，顺序有保证。
