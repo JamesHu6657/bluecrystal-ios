@@ -123,6 +123,26 @@ check(!delayedShort.isCovered(at: 0.1, previous: 1), "倒退时间不覆盖跨�
 check(!firstShort.isCovered(at: 0.2, previous: 0.1), "不会重复覆盖已经过去的短命令")
 check(delayedShort.isCovered(at: 0.22, previous: nil), "seek 到当前激活命令仍会同步")
 
+// 自然结束必须补采样 [9.90,9.95]，包括最后一次 Timer 未碰到的 [9.91,9.93)。
+check(PlaybackCompletion.reachedEnd(position: 9.95, duration: 9.95), "实际终点判定自然结束")
+check(!PlaybackCompletion.reachedEnd(position: 9.90, duration: 9.95), "末尾外部暂停不判定自然结束")
+check(!PlaybackCompletion.reachedEnd(position: .nan, duration: 9.95), "无效播放位置不判定自然结束")
+check(!PlaybackCompletion.reachedEnd(position: 9.95, duration: .infinity), "未知时长不判定自然结束")
+if let s = script("""
+{"intensityScale":"ten","commands":[
+ {"commandType":"Thrust","startTimeSeconds":9.91,"durationSeconds":0.02,"intensityLevel":5},
+ {"commandType":"Vibration","startTimeSeconds":9.94,"durationSeconds":0.01,"intensityLevel":7},
+ {"commandType":"Suction","startTimeSeconds":9.96,"durationSeconds":0.02,"intensityLevel":9},
+ {"commandType":"Rotation","startTimeSeconds":9.91,"durationSeconds":0.02,"intensityLevel":9}]}
+""") {
+    check(s.levels(at: 9.90, previous: 9.80) == [0, 0, 0, 0], "最后 Timer 采样尚未覆盖末尾命令")
+    check(s.levels(at: 9.95, previous: 9.90) == [60, 80, 0, 0], "终点补采样发送最后区间命令，仍忽略旋转")
+    check(s.levels(at: 9.95, previous: nil) == [0, 0, 0, 0], "seek 到终点不补发跳过的命令")
+    check(s.levels(at: 9.95, previous: 9.95) == [0, 0, 0, 0], "终点区间不重复覆盖已发命令")
+} else {
+    check(false, "最终区间脚本解析")
+}
+
 // MARK: - 安全上限（legacy limits.py / duty_cycle.py）
 
 final class FakeClock {
@@ -139,6 +159,8 @@ func makeLedger() -> DutyCycleLedger {
 check(SafetyLimits.maxRunSeconds == 300, "单次上限 300 秒")
 check(SafetyLimits.dutyWindowSeconds == 1800 && SafetyLimits.dutyBudgetSeconds == 600, "30 分钟 600 秒")
 check(SafetyLimits.minCooldownSeconds == 60 && SafetyLimits.cooldownRatio == 0.5, "冷却 max(60, 0.5×时长)")
+check(SafetyLimits.unknownElapsedCooldownSeconds == 300 && SafetyLimits.checkpointIntervalSeconds == 5,
+      "未知时长最大额度冷却 300 秒，每 5 秒保存下界")
 
 let ledger = makeLedger()
 check(ledger.checkAdmissible() == nil, "初始可以开始")
@@ -204,6 +226,7 @@ fc.advance(1000)
 let orphanRestored = makeLedger()
 if let d = orphanData { orphanRestored.restore(from: d) }
 check(orphanRestored.hasOpenRun && orphanRestored.openOrphaned, "未结束的运行跨进程保留")
+check(!orphanRestored.openElapsedUnknown, "同 boot 遗留运行使用可验证的 uptime，不标记未知")
 fc.advance(20)
 orphanRestored.end()
 check(near(orphanRestored.cooldownRemaining(), 510), "遗留运行 1020 秒含确认前等待，冷却 510 秒")
@@ -276,16 +299,18 @@ if let d = rollbackData { rollbackRestored.restore(from: d) }
 check(near(rollbackRestored.cooldownRemaining(), 150), "uptime 倒退不缩短冷却")
 check(near(rollbackRestored.remainingBudget(), 300), "uptime 倒退不清掉记账")
 
-// 兼容旧墙钟账本；没有可验证的启动锚点时 future openStart 至少按上限记账。
+// 兼容旧墙钟账本；缺少启动锚点时必须保持未知，而非估成 300 秒。
 let legacyFuture = Data("""
 {"completed":[],"openStart":\(fc.wall + 3600),"openAllowed":300,
  "lastEnd":null,"appliedCooldown":0}
 """.utf8)
 let legacyRestored = makeLedger()
 legacyRestored.restore(from: legacyFuture)
+check(legacyRestored.openElapsedUnknown && legacyRestored.checkAdmissible() == .openRun,
+      "旧账本缺锚点保持未知、拒绝新运行")
 legacyRestored.end()
-check(near(legacyRestored.cooldownRemaining(), 150), "旧账本 future openStart 不能按零秒结束")
-check(near(legacyRestored.remainingBudget(), 300), "旧账本 future openStart 至少记账 300 秒")
+check(near(legacyRestored.cooldownRemaining(), 300), "旧账本未知运行按全部额度应用最大冷却")
+check(near(legacyRestored.remainingBudget(), 0), "旧账本未知运行停止后耗尽全部 600 秒额度")
 let legacyCompleted = Data("""
 {"completed":[{"end":\(fc.wall - 86400),"charge":600}],"openStart":null,
  "openAllowed":0,"lastEnd":\(fc.wall - 86400),"appliedCooldown":300}
@@ -307,10 +332,127 @@ fc.t = 5
 fc.wall -= 3600
 let rebootOpenRestored = makeLedger()
 if let d = rebootOpenData { rebootOpenRestored.restore(from: d) }
+check(rebootOpenRestored.openElapsedUnknown, "reboot 后未知区间不能靠已知下界变成可信完整时长")
 fc.advance(20)
 rebootOpenRestored.end()
 check(near(rebootOpenRestored.cooldownRemaining(), 512.5), "reboot 回拨计入已知时长、启动后 5 秒及确认等待")
 check(near(rebootOpenRestored.remainingBudget(), 0), "reboot 回拨的遗留运行不按软件上限封顶")
+
+// 审查重现：begin 快照后失联 1000 秒，reboot 且墙钟回拨，确认前又等 20 秒。
+fc.boot = "unknown-a"
+fc.t = 100
+let unknownRun = makeLedger()
+unknownRun.begin()
+let unknownData = unknownRun.snapshotData()
+fc.advance(1000)
+fc.boot = "unknown-b"
+fc.t = 10
+fc.wall -= 3600
+let unknownRestored = makeLedger()
+if let d = unknownData { unknownRestored.restore(from: d) }
+check(unknownRestored.hasOpenRun && unknownRestored.openElapsedUnknown,
+      "reboot/回拨恢复显式未知运行，不伪造 300 秒")
+check(unknownRestored.checkAdmissible() == .openRun && unknownRestored.begin() == nil,
+      "未知运行在停止恢复前不能开新运行")
+check(near(unknownRestored.remainingBudget(), 0), "未知运行的预留已耗尽全部额度")
+let unknownRebasedData = unknownRestored.snapshotData()
+if let d = unknownRebasedData,
+   let fields = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] {
+    check(fields["openElapsedUnknown"] as? Bool == true, "快照持久化未知标记")
+    check(near(fields["openElapsedLowerBound"] as? Double, 10), "快照保存已验证下界而非 300 秒估计")
+} else {
+    check(false, "未知运行快照编码")
+}
+fc.advance(5)
+let unknownRelaunched = makeLedger()
+if let d = unknownRebasedData { unknownRelaunched.restore(from: d) }
+check(unknownRelaunched.openElapsedUnknown, "重存同 boot 锚点再 relaunch 不能清掉未知状态")
+fc.advance(15)
+unknownRelaunched.end() // BLEManager 的确认停止/物理停机路径；物理锁存由 BLEManager 保留。
+check(!unknownRelaunched.hasOpenRun && !unknownRelaunched.openElapsedUnknown, "确认停止结束未知运行")
+check(near(unknownRelaunched.cooldownRemaining(), 300), "未知运行停止后至少冷却 300 秒")
+check(near(unknownRelaunched.remainingBudget(), 0) && near(unknownRelaunched.secondsUntilBudget(), 1800),
+      "未知运行恢复后完整 30 分钟没有新额度")
+let unknownStoppedData = unknownRelaunched.snapshotData()
+fc.advance(300)
+let unknownStoppedRestored = makeLedger()
+if let d = unknownStoppedData { unknownStoppedRestored.restore(from: d) }
+check(near(unknownStoppedRestored.cooldownRemaining(), 0), "未知运行最大额度冷却计时跨进程保留")
+check(unknownStoppedRestored.checkAdmissible() == .budget(1500), "冷却后仍须等满额度窗口")
+fc.advance(1499)
+check(near(unknownStoppedRestored.remainingBudget(), 0), "确认停止后 1799 秒仍无额度")
+fc.advance(1)
+check(unknownStoppedRestored.checkAdmissible() == nil, "确认停止后完整窗口才恢复额度")
+fc.boot = "unknown-c"
+fc.t = 5
+fc.wall += 86400
+let unknownStopRebootRestored = makeLedger()
+if let d = unknownStoppedData { unknownStopRebootRestored.restore(from: d) }
+check(near(unknownStopRebootRestored.cooldownRemaining(), 300)
+      && near(unknownStopRebootRestored.remainingBudget(), 0)
+      && near(unknownStopRebootRestored.secondsUntilBudget(), 1800),
+      "恢复后的完整预算禁用和最大冷却跨 reboot/前拨继续保守保留")
+
+// 每 5 秒持久化 checkpoint，停止/断链前的已验证时长跨 reboot 成为冷却下界。
+fc.boot = "checkpoint-a"
+fc.t = 100
+let checkpointRun = makeLedger()
+var checkpointData: Data?
+var checkpointWrites = 0
+checkpointRun.onChange = {
+    checkpointWrites += 1
+    checkpointData = checkpointRun.snapshotData()
+}
+checkpointRun.begin()
+fc.advance(4)
+checkpointRun.checkpoint()
+check(checkpointWrites == 1, "checkpoint 不在每次看门狗 tick 写入")
+fc.advance(1)
+checkpointRun.checkpoint()
+check(checkpointWrites == 2, "开放运行每 5 秒写入已验证时长")
+fc.advance(995)
+checkpointRun.checkpoint()
+check(checkpointWrites == 3, "停止未确认的长运行仍持续保存 checkpoint")
+let preRebootCheckpointData = checkpointData
+checkpointRun.end()
+let writesAfterEnd = checkpointWrites
+fc.advance(5)
+checkpointRun.checkpoint()
+check(checkpointWrites == writesAfterEnd, "无开放运行时 checkpoint 不写入")
+fc.boot = "checkpoint-b"
+fc.t = 5
+fc.wall -= 3600
+let checkpointRestored = makeLedger()
+if let d = preRebootCheckpointData { checkpointRestored.restore(from: d) }
+check(checkpointRestored.openElapsedUnknown, "checkpoint 不会掩盖 reboot 的未知区间")
+fc.advance(20)
+checkpointRestored.end()
+check(near(checkpointRestored.cooldownRemaining(), 512.5),
+      "reboot 使用 checkpoint 的 1000 秒下界、启动 5 秒和等待 20 秒，不缩短冷却")
+// 启动标识缺失、uptime 倒退或坏的开始锚点都必须显式未知。
+fc.boot = "anchors-a"
+fc.t = 100
+let anchorsRun = makeLedger()
+anchorsRun.begin()
+fc.advance(10)
+let anchorsData = anchorsRun.snapshotData()
+fc.boot = nil
+let missingBootRestored = makeLedger()
+if let d = anchorsData { missingBootRestored.restore(from: d) }
+check(missingBootRestored.openElapsedUnknown, "当前启动标识缺失时不信任开放运行锚点")
+fc.boot = "anchors-a"
+fc.t = 1
+let openRollbackRestored = makeLedger()
+if let d = anchorsData { openRollbackRestored.restore(from: d) }
+check(openRollbackRestored.openElapsedUnknown, "同 boot 的 uptime 倒退也标记未知运行")
+let invalidStartData = Data("""
+{"completed":[],"openStart":\(fc.wall + 10),"openAllowed":300,
+ "lastEnd":null,"appliedCooldown":0,"savedWall":\(fc.wall),
+ "savedUptime":\(fc.t),"bootIdentity":"anchors-a"}
+""".utf8)
+let invalidStartRestored = makeLedger()
+invalidStartRestored.restore(from: invalidStartData)
+check(invalidStartRestored.openElapsedUnknown, "开始时间晚于保存锚点不能恢复成可信时长")
 
 if failures > 0 {
     print("\(failures) 项检查失败")

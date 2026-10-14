@@ -255,13 +255,14 @@ final class BLEManager: NSObject, ObservableObject {
         super.init()
         let defaults = UserDefaults.standard
         bleQueue.sync {
-            // 恢复后立即保存新锚点，保守推断的时长不能在再次重启时丢失（F3）。
+            // 恢复后立即保存新锚点、未知状态和已验证时长下界。
             if let data = defaults.data(forKey: Self.ledgerKey) {
                 ledger.restore(from: data)
                 persistLedger()
             }
             ledger.onChange = { [weak self] in self?.persistLedger() }
-            physicalAckRequired = defaults.bool(forKey: Self.physicalAckKey)
+            // 未知时长必须走物理停机确认；即使之后停止帧对成功也不清除此锁存。
+            physicalAckRequired = defaults.bool(forKey: Self.physicalAckKey) || ledger.openElapsedUnknown
             // 修 CC M2：上次进程结束时设备可能还在输出，启动即提示
             if defaults.bool(forKey: Self.mayBeActiveKey) || ledger.hasOpenRun {
                 deviceMayBeActive = true
@@ -454,7 +455,7 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// 用户确认设备已物理关机（修 M4/L5，legacy acknowledge_physical_stop）：
-    /// 解除锁存，按实际时长结束本次运行，放弃仍在重试的停止
+    /// 解除锁存，结束本次运行（未知时长耗尽完整窗口额度），放弃仍在重试的停止
     func acknowledgePhysicalStop() {
         bleQueue.async { [weak self] in
             guard let self = self, self.physicalAckRequired || self.deviceMayBeActive else { return }
@@ -1017,6 +1018,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 每秒一次。停止进行中时不另发停止（停止自己会一直重试到确认，修 M4：看门狗不会失明）
     private func watchdogTick() {
+        ledger.checkpoint()
         if canWrite, isActive, stopOp == nil, !disconnecting {
             if let rem = ledger.runRemaining(), rem <= 0 {
                 autoStopForLimit()

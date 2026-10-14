@@ -1,5 +1,12 @@
 import Foundation
 
+/// 自然结束必须到达实际终点；靠近末尾的外部暂停不能算播完。
+enum PlaybackCompletion {
+    static func reachedEnd(position: Double, duration: Double) -> Bool {
+        position.isFinite && duration.isFinite && duration > 0 && position >= duration
+    }
+}
+
 /// 时间轴脚本里的一条命令（字段对应官方 video.js 的 commandType / intensity / duration）
 struct TimelineCommand: Decodable {
     /// Thrust / Vibration / Suction / Rotation（大小写不敏感）
@@ -73,6 +80,17 @@ struct TimelineScript: Decodable {
         let raw = cmd.intensityLevel
         let status = useTenScale ? raw * 10 : raw
         return BCProtocol.officialScriptLevel(status: status)
+    }
+
+    /// 普通采样和自然结束共用覆盖逻辑；seek 的 previous=nil 不覆盖跳过区间。
+    func levels(at time: Double, previous: Double?, fromPlaybackStart: Bool = false) -> [Int] {
+        var vals = [0, 0, 0, 0]
+        for cmd in commands {
+            guard let ch = cmd.channel, ch.isUsed,
+                  cmd.isCovered(at: time, previous: previous, fromPlaybackStart: fromPlaybackStart) else { continue }
+            vals[ch.rawValue] = max(vals[ch.rawValue], deviceLevel(for: cmd))
+        }
+        return vals
     }
 
     /// 脚本里旋转通道的命令数（旋转恒为 0，这些命令会被忽略，修 N5）

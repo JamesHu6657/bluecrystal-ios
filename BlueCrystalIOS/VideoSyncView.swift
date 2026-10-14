@@ -68,11 +68,11 @@ final class VideoSyncPlayer: ObservableObject {
     private func observeTimeControlStatus(_ p: AVPlayer) {
         p.publisher(for: \.timeControlStatus)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in
-                guard let self = self else { return }
+            .sink { [weak self, weak p] status in
+                guard let self = self, let p = p, p === self.player else { return }
                 // 外部把播放器停了，但 vm 还以为在播：同步停机
                 if status == .paused, self.isPlaying, self.seekInFlight == 0 {
-                    self.handleExternalPause()
+                    self.handlePausedPlayer(p)
                 } else if status == .paused, self.isPlaying {
                     // 修 CC r3 L3：seek 期间先记下，由 seek 回调处理
                     self.pausedDuringSeek = true
@@ -81,19 +81,31 @@ final class VideoSyncPlayer: ObservableObject {
             .store(in: &playerCancellables)
     }
 
-    /// 外部暂停/播完的停机处理；seek 完成时也会补查一次（修 CC r2 L4）
-    private func handleExternalPause() {
-        // 修 M4：最后 0.5 秒内停下（自然播完，或来电/耳机暂停）同样必须停机，
-        // 只是提示文案不同；直接 return 会让设备停在最后一帧强度上
-        if self.durationSeconds > 0,
-           self.currentSeconds >= self.durationSeconds - 0.5 {
-            self.stopAll()
-            self.statusLine = "播放结束，设备已停止"
+    /// KVO/Timer 可能比播完通知先到：读实际位置，先覆盖终点再停采样。
+    private func handlePausedPlayer(_ p: AVPlayer) {
+        let duration = p.currentItem?.duration.seconds ?? durationSeconds
+        if PlaybackCompletion.reachedEnd(position: p.currentTime().seconds, duration: duration) {
+            handleNaturalCompletion(p)
             return
         }
-        self.isPlaying = false
-        self.stopTimer(sendZero: true)
-        self.statusLine = "外部暂停，设备已停止"
+        handleExternalPause()
+    }
+
+    /// 外部暂停和 seek 停顿不补发跨越区间，只停止设备。
+    private func handleExternalPause() {
+        isPlaying = false
+        stopTimer(sendZero: true)
+        statusLine = "外部暂停，设备已停止"
+    }
+
+    private func handleNaturalCompletion(_ p: AVPlayer) {
+        guard p === player, isPlaying, seekInFlight == 0 else { return }
+        let end = p.currentTime().seconds
+        if end.isFinite { sample(at: end, force: true) }
+        // sendTick 和 sendStop 按顺序进入 bleQueue，停止帧对仍由 BLEManager 原样发送。
+        isPlaying = false
+        stopTimer(sendZero: true)
+        statusLine = "播放结束，设备已停止"
     }
 
     func loadVideo(url: URL) {
@@ -128,6 +140,13 @@ final class VideoSyncPlayer: ObservableObject {
         let p = AVPlayer(playerItem: item)
         player = p
         observeTimeControlStatus(p)
+        NotificationCenter.default.publisher(for: AVPlayerItem.didPlayToEndTimeNotification, object: item)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak p] _ in
+                guard let self = self, let p = p else { return }
+                self.handleNaturalCompletion(p)
+            }
+            .store(in: &playerCancellables)
         item.publisher(for: \.duration)
             .receive(on: DispatchQueue.main)
             .sink { [weak self, weak p] d in
@@ -268,6 +287,8 @@ final class VideoSyncPlayer: ObservableObject {
         seekGen += 1
         let gen = seekGen
         seekInFlight += 1
+        lastSampleTime = nil
+        samplingFromPlaybackStart = false
         let wasPlaying = isPlaying
         p.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) { [weak self] _ in
             DispatchQueue.main.async { [weak self] in // 修 CC L4
@@ -343,18 +364,28 @@ final class VideoSyncPlayer: ObservableObject {
 
     /// 每 100ms 按当前播放时间计算激活通道，变化时才发帧
     private func tick(force: Bool = false) {
-        guard let p = player, let s = script, let ble = ble else { return }
+        guard let p = player, let ble = ble else { return }
         // 修 CC L6：拖进度条期间界面是活的，心跳照发，避免长时间拖动误触看门狗
         ble.heartbeat()
         guard seekInFlight == 0 else { return }
         // 修 CC r3 L3：心跳只证明 Timer 活着；播放器已停而 vm 仍以为在播时立即停机，
         // 不让心跳替一个不动的画面续命
         if isPlaying, p.timeControlStatus == .paused {
-            handleExternalPause()
+            handlePausedPlayer(p)
             return
         }
         let t = p.currentTime().seconds
         guard t.isFinite else { return }
+        let duration = p.currentItem?.duration.seconds ?? durationSeconds
+        if PlaybackCompletion.reachedEnd(position: t, duration: duration) {
+            handleNaturalCompletion(p)
+            return
+        }
+        sample(at: t, force: force)
+    }
+
+    private func sample(at t: Double, force: Bool = false) {
+        guard let s = script, let ble = ble else { return }
         // 单次 300 秒上限、30 分钟额度、冷却都由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
 
         currentSeconds = t
@@ -364,13 +395,7 @@ final class VideoSyncPlayer: ObservableObject {
         lastSampleTime = t
         samplingFromPlaybackStart = false
 
-        var vals = [0, 0, 0, 0]
-        for cmd in s.commands {
-            // 修 N5：旋转通道恒为 0，脚本里的旋转命令忽略
-            guard let ch = cmd.channel, ch.isUsed else { continue }
-            guard cmd.isCovered(at: t, previous: prev, fromPlaybackStart: fromPlaybackStart) else { continue }
-            vals[ch.rawValue] = max(vals[ch.rawValue], s.deviceLevel(for: cmd))
-        }
+        let vals = s.levels(at: t, previous: prev, fromPlaybackStart: fromPlaybackStart)
         let active = ActiveChannels(values: vals)
         if force || needsResync || active != lastActive {
             needsResync = false
@@ -381,9 +406,6 @@ final class VideoSyncPlayer: ObservableObject {
                 .map { "\($0.displayName):\(vals[$0.rawValue])" }
                 .joined(separator: " ")
             statusLine = String(format: "t=%.1fs %@", t, desc)
-        }
-        if durationSeconds > 0, t >= durationSeconds {
-            stopAll()
         }
     }
 }

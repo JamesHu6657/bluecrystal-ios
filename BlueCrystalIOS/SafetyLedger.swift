@@ -40,6 +40,9 @@ enum SafetyLimits {
     /// 每次确认停止后的冷却 = max(60 秒, 本次运行时长 × 0.5)（MIN_COOLDOWN_SECONDS / COOLDOWN_RATIO）
     static let minCooldownSeconds: TimeInterval = 60
     static let cooldownRatio: Double = 0.5
+    /// 未知时长恢复：耗尽完整窗口额度，冷却至少按全部 600 秒额度计算。
+    static let unknownElapsedCooldownSeconds = dutyBudgetSeconds * cooldownRatio
+    static let checkpointIntervalSeconds: TimeInterval = 5
 }
 
 /// 滚动窗口占空比账本（移植 legacy src/safety/duty_cycle.py 的 DutyCycleLedger）。
@@ -76,6 +79,8 @@ final class DutyCycleLedger {
         var savedWall: TimeInterval?
         var savedUptime: TimeInterval?
         var bootIdentity: String?
+        var openElapsedUnknown: Bool?
+        var openElapsedLowerBound: TimeInterval?
     }
 
     private let clock: () -> TimeInterval
@@ -88,6 +93,9 @@ final class DutyCycleLedger {
     private(set) var openAllowed: TimeInterval = 0
     /// 进行中运行是上次进程留下来的：App 不在时设备跑了多久不可知
     private(set) var openOrphaned = false
+    /// true 时 openStart 只表示已验证时长的下界，绝不当成完整运行时长。
+    private(set) var openElapsedUnknown = false
+    private var lastCheckpointUptime: TimeInterval?
     private var lastEnd: TimeInterval?
     private(set) var appliedCooldown: TimeInterval = 0
 
@@ -131,9 +139,12 @@ final class DutyCycleLedger {
     func begin() -> TimeInterval? {
         guard checkAdmissible() == nil else { return nil }
         let allowed = min(SafetyLimits.maxRunSeconds, remainingBudget())
-        openStart = clock()
+        let now = clock()
+        openStart = now
         openAllowed = allowed
         openOrphaned = false
+        openElapsedUnknown = false
+        lastCheckpointUptime = now
         onChange?()
         return allowed
     }
@@ -141,21 +152,37 @@ final class DutyCycleLedger {
     /// 进行中运行的剩余秒数（到点后为负）；没有运行时为 nil
     func runRemaining() -> TimeInterval? {
         guard let start = openStart else { return nil }
+        if openElapsedUnknown { return 0 }
         return openAllowed - (clock() - start)
     }
 
-    /// 结束进行中的运行：按实际时长记账并开始冷却（legacy end）
+    /// bleQueue 看门狗调用；断链/停止重试时仍保存已验证的单调时长下界。
+    func checkpoint() {
+        guard hasOpenRun else { return }
+        let now = clock()
+        if let last = lastCheckpointUptime, now - last < SafetyLimits.checkpointIntervalSeconds { return }
+        lastCheckpointUptime = now
+        onChange?()
+    }
+
+    /// 确认停止后记账/冷却；未知时长至少耗尽完整窗口额度，已验证下界更长则保留。
     func end() {
         guard let start = openStart else { return }
         let now = clock()
         // 进程不在时无法执行 300s 截止停机；直到确认/物理确认停止都按实际推断时长记账（F2）。
         let elapsed = max(0, now - start)
-        completed.append(Entry(end: now, charge: elapsed))
+        let charge = openElapsedUnknown ? max(SafetyLimits.dutyBudgetSeconds, elapsed) : elapsed
+        completed.append(Entry(end: now, charge: charge))
+        let cooldown = openElapsedUnknown
+            ? max(SafetyLimits.unknownElapsedCooldownSeconds, elapsed * SafetyLimits.cooldownRatio)
+            : max(SafetyLimits.minCooldownSeconds, elapsed * SafetyLimits.cooldownRatio)
         openStart = nil
         openAllowed = 0
         openOrphaned = false
+        openElapsedUnknown = false
+        lastCheckpointUptime = nil
         lastEnd = now
-        appliedCooldown = max(SafetyLimits.minCooldownSeconds, elapsed * SafetyLimits.cooldownRatio)
+        appliedCooldown = cooldown
         onChange?()
     }
 
@@ -186,7 +213,9 @@ final class DutyCycleLedger {
             appliedCooldown: appliedCooldown,
             savedWall: wall,
             savedUptime: now,
-            bootIdentity: bootIdentity()
+            bootIdentity: bootIdentity(),
+            openElapsedUnknown: openElapsedUnknown,
+            openElapsedLowerBound: openStart.map { max(0, now - $0) }
         )
         return try? JSONEncoder().encode(s)
     }
@@ -195,7 +224,6 @@ final class DutyCycleLedger {
     func restore(from data: Data) {
         guard let s = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         let now = clock()
-        let wall = wallClock()
         let currentBoot = bootIdentity()
         // 同一次启动只用快照中的墙钟/uptime 对应关系，完全忽略当前墙钟跳变。
         var anchor: (wall: TimeInterval, uptime: TimeInterval)?
@@ -214,22 +242,35 @@ final class DutyCycleLedger {
         completed = s.completed
             .filter { $0.end.isFinite && valid($0.charge) }
             .map { Entry(end: toUptime($0.end), charge: $0.charge) }
-        if let start = s.openStart, start.isFinite, valid(s.openAllowed) {
-            if anchor != nil {
+        if let start = s.openStart {
+            let anchoredStart = toUptime(start)
+            if anchor != nil, start.isFinite, anchoredStart.isFinite,
+               let savedUptime = s.savedUptime, anchoredStart <= savedUptime,
+               valid(s.openAllowed) {
                 openStart = toUptime(start)
+                // 重新保存锚点不能把未知状态洗成已知时长。
+                openElapsedUnknown = s.openElapsedUnknown ?? false
             } else {
-                let knownElapsed = s.savedWall.map { max(0, $0 - start) } ?? 0
+                var knownElapsed: TimeInterval = 0
+                if let lowerBound = s.openElapsedLowerBound, valid(lowerBound) {
+                    knownElapsed = lowerBound
+                }
+                // 兼容旧快照：只有保存时墙钟/uptime 对应关系完整才验证快照前时长。
+                if start.isFinite, let savedWall = s.savedWall, savedWall.isFinite,
+                   let savedUptime = s.savedUptime, valid(savedUptime) {
+                    let savedElapsed = savedWall - start
+                    if valid(savedElapsed) { knownElapsed = max(knownElapsed, savedElapsed) }
+                }
                 let bootChanged = s.bootIdentity != nil && currentBoot != nil && s.bootIdentity != currentBoot
                 let uptimeReset = s.savedUptime.map { now < $0 } ?? false
                 // 跨设备重启时，当前启动以来的 uptime 也属于尚未确认停止的区间。
-                let inferredElapsed = knownElapsed + ((bootChanged || uptimeReset) ? now : 0)
-                // 时钟不可靠时，至少计入预留上限；future openStart 绝不按零秒结束。
-                let elapsed = max(SafetyLimits.maxRunSeconds,
-                                  max(inferredElapsed, max(0, wall - start)))
-                openStart = now - elapsed
+                let lowerBound = knownElapsed + ((bootChanged || uptimeReset) ? now : 0)
+                openStart = now - lowerBound
+                openElapsedUnknown = true
             }
-            openAllowed = min(s.openAllowed, SafetyLimits.maxRunSeconds)
+            openAllowed = valid(s.openAllowed) ? min(s.openAllowed, SafetyLimits.maxRunSeconds) : 0
             openOrphaned = true
+            lastCheckpointUptime = now
         }
         if let end = s.lastEnd, end.isFinite, valid(s.appliedCooldown) {
             lastEnd = toUptime(end)
@@ -241,7 +282,8 @@ final class DutyCycleLedger {
     // MARK: - 内部
 
     private func usedSeconds() -> TimeInterval {
-        completed.reduce(0.0) { $0 + $1.charge } + (openStart == nil ? 0 : openAllowed)
+        let reservation = openElapsedUnknown ? SafetyLimits.dutyBudgetSeconds : openAllowed
+        return completed.reduce(0.0) { $0 + $1.charge } + (openStart == nil ? 0 : reservation)
     }
 
     /// 丢掉结束时间已经滑出 30 分钟窗口的条目（legacy _prune）
