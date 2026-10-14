@@ -44,7 +44,7 @@ struct AIStep: Equatable {
 ///   （调用方此时如果在输出，要安全停止）。
 /// - CH 任何一个值超过 BCProtocol.maxManualLevel（99）都算格式错，整条作废（不夹紧）。
 /// - 合法时 c3（旋转）恒为 0，HOLD 夹到 500~60000 毫秒。
-///   AI 强度上限 70、每步最多 +20、从 0 爬升由执行前的 AISafety.enforce 处理。
+///   AI 强度上限 70、每秒每通道最多 +20、从 0 爬升、总时长上限由执行前的 AISafety 处理。
 struct AIReply {
     /// 去掉合法指令行之后给用户看的文字
     var text: String
@@ -301,19 +301,24 @@ struct ReplyAuthorization {
 ///   超过 99 的值在 AIReply.parse 里已经整条作废，到不了这里。
 /// - 相邻两步之间每通道最多升高 maxStepIncrease（20）：升得更多时，在目标步前面插入
 ///   rampStepSeconds（1 秒）一步的爬升步，每步 +20，直到差距不超过 20 再到目标步。
-///   降低不受限制、立刻生效（降强度是安全方向，用户喊"慢"时不能拖几秒）。
+/// - 时间限速（M2）：任意两次升高之间至少隔 rampStepSeconds（1 秒），所以真的是"每秒每通道最多 +20"。
+///   不够 1 秒就先插一步等待；等待步里降低的通道立即生效（降强度是安全方向，用户喊"慢"时不能拖）。
+///   跨回复也算：调用方传入距上次升高过了多久（从空闲开始传 .infinity）。
 /// - 起点：从空闲开始的程序从 0 算起（所以第一步也是每秒最多 +20 爬上去）；
 ///   接着上一条回复保持的强度继续时，从保持的强度算起。
+/// - BLEManager 发出前还会按实际发出的上一帧再限一次升幅（M1，见 OutputWriteCoalescer）。
 enum AISafety {
     static let maxLevel = 70
     static let maxStepIncrease = 20
     static let rampStepSeconds: Double = 1
-    /// 程序走完、保持最后强度时：从开始保持和最近一条用户消息中较晚的那个算起，
-    /// 这么久没有新的用户消息就停止（不在场的人不能被一直保持输出）
+    /// 在场时限（H1）：运行中（执行程序或保持最后强度）离最近一条用户消息这么久就停止
+    /// （不在场的人不能被一直保持输出）
     static let holdIdleTimeout: TimeInterval = 120
+    /// 单条程序（含插入的爬升/等待步）总时长上限（H1）：超过的回复整条不执行
+    static let maxProgramSeconds: TimeInterval = holdIdleTimeout
 
     struct Program: Equatable {
-        /// 实际执行的步骤（含插入的爬升步）
+        /// 实际执行的步骤（含插入的爬升步、等待步）
         var steps: [AIStep]
         /// 压到上限后的原步骤，给界面显示
         var displaySteps: [AIStep]
@@ -321,18 +326,28 @@ enum AISafety {
         var clampedValues: Int
         /// 插入的爬升步数
         var rampSteps: Int
+        /// 为了"两次升高至少隔 1 秒"插入的等待步数（M2）
+        var waitSteps: Int
+
+        /// 实际执行的总时长（最后一步保持的 0 秒不算）
+        var totalSeconds: Double { steps.reduce(0) { $0 + $1.duration } }
     }
 
-    static func enforce(_ steps: [AIStep], from start: [Int]) -> Program {
+    static func enforce(_ steps: [AIStep], from start: [Int],
+                        secondsSinceRise: TimeInterval = .infinity) -> Program {
         var cur = (0..<4).map { i in i < start.count ? max(0, min(maxLevel, start[i])) : 0 }
+        // 距上一次升高（那一步开始的时刻）过了多久
+        var sinceRise = secondsSinceRise
         var out: [AIStep] = []
         var display: [AIStep] = []
         var clamped = 0
         var ramps = 0
+        var waits = 0
         for s in steps {
             guard let lv = s.levels else {
                 out.append(s)
                 display.append(s)
+                sinceRise += s.duration
                 continue
             }
             var target = (0..<4).map { i in i < lv.count ? max(0, lv[i]) : 0 }
@@ -349,18 +364,35 @@ enum AISafety {
                     next[i] = cur[i] + maxStepIncrease
                     needsRamp = true
                 }
+                // 下一次要发的强度有升高、离上次升高还不到 1 秒：先等，降低的通道在等待步里立即生效
+                if next.indices.contains(where: { next[$0] > cur[$0] }), sinceRise < rampStepSeconds {
+                    let lowered = cur.indices.map { min(cur[$0], next[$0]) }
+                    out.append(AIStep(levels: lowered == cur ? nil : lowered, duration: rampStepSeconds - sinceRise))
+                    waits += 1
+                    cur = lowered
+                    sinceRise = rampStepSeconds
+                }
                 guard needsRamp else { break }
                 out.append(AIStep(levels: next, duration: rampStepSeconds))
                 ramps += 1
                 cur = next
+                sinceRise = rampStepSeconds
             }
+            let rises = target.indices.contains { target[$0] > cur[$0] }
             out.append(shaped)
+            sinceRise = rises ? s.duration : sinceRise + s.duration
             cur = target
         }
-        return Program(steps: out, displaySteps: display, clampedValues: clamped, rampSteps: ramps)
+        return Program(steps: out, displaySteps: display, clampedValues: clamped, rampSteps: ramps, waitSteps: waits)
     }
 
-    /// 界面上的程序说明：显示压到上限后的强度，并注明压低和爬升
+    /// 程序总时长超过上限时返回作废原因（H1）
+    static func programTooLong(_ p: Program) -> String? {
+        guard p.totalSeconds > maxProgramSeconds else { return nil }
+        return "程序总时长 \(Int(p.totalSeconds.rounded(.up))) 秒，超过上限 \(Int(maxProgramSeconds)) 秒，整条不执行"
+    }
+
+    /// 界面上的程序说明：显示压到上限后的强度，并注明压低、爬升和等待
     static func describe(_ p: Program, stop: Bool) -> String {
         var text = p.displaySteps.map(\.summary).joined(separator: " → ") + (stop ? " → 停止" : "")
         if p.clampedValues > 0 {
@@ -368,6 +400,9 @@ enum AISafety {
         }
         if p.rampSteps > 0 {
             text += "\n（自动插入 \(p.rampSteps) 步爬升，每秒每通道最多 +\(maxStepIncrease)）"
+        }
+        if p.waitSteps > 0 {
+            text += "\n（自动插入 \(p.waitSteps) 步等待：两次升高至少间隔 \(AIStep.fmt(rampStepSeconds)) 秒）"
         }
         return text
     }
@@ -377,6 +412,14 @@ enum AISafety {
                                 lastUserMessageAt: TimeInterval?) -> Bool {
         guard let h = holdStartedAt else { return false }
         return now - max(h, lastUserMessageAt ?? h) >= holdIdleTimeout
+    }
+
+    /// 在场超时（H1）：运行中不论在执行程序还是保持，离最近一条用户消息 holdIdleTimeout 就停止。
+    /// 没有用户消息记录时从开始运行算；两个都没有表示没在运行
+    static func presenceExpired(now: TimeInterval, lastUserMessageAt: TimeInterval?,
+                                runStartedAt: TimeInterval?) -> Bool {
+        guard let ref = lastUserMessageAt ?? runStartedAt else { return false }
+        return now - ref >= holdIdleTimeout
     }
 }
 
@@ -389,6 +432,13 @@ enum AIHistory {
         var isUser: Bool
         var isError: Bool
         var content: String
+    }
+
+    /// 一条消息回传给模型的内容（L6）：执行过的回复回传原文（含指令）；没执行的回传显示文字；
+    /// 显示文字为空时用"…"，绝不把"未执行：…"这类本地说明当成模型自己说过的话
+    static func content(raw: String?, text: String) -> String {
+        if let r = raw { return r }
+        return text.isEmpty ? "…" : text
     }
 
     static func window(_ turns: [Turn], limit: Int) -> [[String: String]] {
@@ -425,6 +475,14 @@ enum AIStopWords {
         let words = normalized.split(whereSeparator: { (c: Character) -> Bool in !(c >= "a" && c <= "z") })
         return words.contains { englishWords.contains(String($0)) }
     }
+}
+
+// MARK: - 请求时限
+
+enum AIRequestPolicy {
+    /// 单次请求总时长上限（L5）：URLRequest.timeoutInterval 只是两次收到数据之间的空闲超时，
+    /// 慢慢滴流的响应可以一直挂着。到点按请求错误处理（运行中就停止）
+    static let totalTimeoutSeconds: TimeInterval = 45
 }
 
 // MARK: - 接口回复：取文字 + 完整性检查
@@ -465,5 +523,29 @@ enum LLMResponse {
             let status = obj["status"] as? String
             return status == "completed" ? nil : "回复没有正常结束（status=\(status ?? "缺失")）"
         }
+    }
+
+    /// 接口出错时给界面看的摘要（L4）：只取 JSON 里的 error.message / error / message，
+    /// 遮掉 Key、疑似 Key 的片段和 20 位以上的长串标识，最多 200 字；不是 JSON 的正文（HTML 错误页等）不显示
+    static func errorSummary(_ data: Data, apiKey: String) -> String {
+        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return "" }
+        var text: String
+        if let e = obj["error"] as? [String: Any], let m = e["message"] as? String {
+            text = m
+        } else if let m = obj["error"] as? String {
+            text = m
+        } else if let m = obj["message"] as? String {
+            text = m
+        } else {
+            text = ""
+        }
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.count >= 4 { text = text.replacingOccurrences(of: key, with: "***") }
+        for pattern in ["\\b(sk|fw|key)[-_][A-Za-z0-9*_\\-]{2,}", "[A-Za-z0-9_\\-]{20,}"] {
+            guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            text = re.stringByReplacingMatches(in: text, range: NSRange(location: 0, length: (text as NSString).length),
+                                               withTemplate: "***")
+        }
+        return String(text.prefix(200))
     }
 }

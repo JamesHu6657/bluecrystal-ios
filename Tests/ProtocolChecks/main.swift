@@ -26,7 +26,7 @@ func hex(_ d: Data) -> String { BCProtocol.hex(d) }
 // 实抓（legacy research/protocol.md）
 check(hex(BCProtocol.stopFrame) == "AA06050000000000B5", "停止帧 = 实抓暂停帧")
 check(hex(BCProtocol.officialStartFrame) == "AA06050406050000C4", "如影随形 = 实抓启动帧")
-// 官方源码 at([0,0,0,0], 0)
+// 官方源码 at([0,0,0,0], 255)（迷姬专用停止，video.js handleSlide；L7：之前注释误写成 at(…, 0)）
 check(hex(BCProtocol.manualZeroFrame) == "AA08060000000000FFB7", "0x08 停止帧 at([0,0,0,0],255)")
 check(hex(BCProtocol.manualFrame(channels: [0, 0, 0, 0])) == "AA0806000000000000B8", "0x08 强度 0 帧")
 // 旋转通道恒为 0（N5），0x06 夹到 9，0x08 夹到 99
@@ -93,6 +93,89 @@ check(coalescer.writeFinished(canSend: false) == nil && coalescer.pending == nil
 _ = coalescer.submit(frameA)
 coalescer.reset()
 check(!coalescer.inFlight && coalescer.submit(frameB) == .write(frameB), "断链重置后重新开始")
+
+// MARK: - Brain 审查 M1/L3：升幅在出口按实际发出的上一帧再限一次
+
+let r20 = BCProtocol.manualFrame(channels: [20, 0, 0, 0])
+let r40 = BCProtocol.manualFrame(channels: [40, 0, 0, 0])
+let r60 = BCProtocol.manualFrame(channels: [60, 0, 0, 0])
+var ramp = OutputWriteCoalescer()
+check(ramp.submit(r20, maxRise: 20) == .write(r20), "从 0 升 20：原样发出")
+check(ramp.submit(r40, maxRise: 20) == .coalesced && ramp.submit(r60, maxRise: 20) == .coalesced,
+      "回执慢：40、60 都在合并，40 被 60 覆盖")
+check(ramp.writeFinished(canSend: true) == r40, "合并后发出的是 20+20=40，设备不会一步从 20 跳到 60（M1）")
+check(ramp.baseline == [40, 0, 0, 0], "基准跟着实际发出的帧走")
+check(ramp.writeFinished(canSend: true) == nil && !ramp.inFlight, "夹掉的差距不自动补（偏低方向安全）")
+check(ramp.submit(r60, maxRise: 20) == .write(r60), "下一步从实际的 40 再升 20 到 60")
+_ = ramp.writeFinished(canSend: true)
+var idleJump = OutputWriteCoalescer()
+check(idleJump.submit(BCProtocol.manualFrame(channels: [70, 70, 0, 0]), maxRise: 20)
+      == .write(BCProtocol.manualFrame(channels: [20, 20, 0, 0])),
+      "基准为 0（VM 起点偏高、帧被丢等，L3）：AI 帧要 70 也只发 20")
+_ = idleJump.writeFinished(canSend: true)
+check(idleJump.submit(BCProtocol.manualFrame(channels: [5, 0, 0, 0]), maxRise: 20)
+      == .write(BCProtocol.manualFrame(channels: [5, 0, 0, 0])), "降低不受限、立即生效")
+var manualCo = OutputWriteCoalescer()
+let manual99 = BCProtocol.manualFrame(channels: [99, 0, 0, 0])
+check(manualCo.submit(manual99) == .write(manual99), "手动/视频帧（不带 maxRise）不限速")
+_ = manualCo.writeFinished(canSend: true)
+manualCo.resetBaseline()
+check(manualCo.submit(BCProtocol.manualFrame(channels: [50, 0, 0, 0]), maxRise: 20) == .write(r20),
+      "停止帧对确认后基准归 0，AI 重新从 0 限速")
+_ = manualCo.writeFinished(canSend: true)
+manualCo.reset()
+check(manualCo.baseline == nil, "断链重置清掉基准")
+let mode999 = BCProtocol.modeFrame(channels: [9, 9, 9, 0])
+check(OutputWriteCoalescer.limitRise(mode999, from: [0, 0, 0, 0], maxRise: 20) == mode999, "0x06 帧不改（AI 只发 0x08）")
+check(BCProtocol.manualLevels(mode999) == nil && BCProtocol.manualLevels(r40) == [40, 0, 0, 0], "只从 0x08 帧取强度")
+check(hex(OutputWriteCoalescer.limitRise(BCProtocol.manualFrame(channels: [90, 0, 0, 0], tail: 0x0102),
+                                         from: [0, 0, 0, 0], maxRise: 20))
+      == hex(BCProtocol.manualFrame(channels: [20, 0, 0, 0], tail: 0x0102)), "限速保留帧尾")
+
+// MARK: - Brain 审查 M3：submitOutput 的完整准入顺序（OutputAdmission）
+
+check(OutputAdmission.decide(.init(linkWritable: false)) == .drop, "链路不可写/后台/断开中：丢掉")
+check(OutputAdmission.decide(.init(linkWritable: false, mayStillBeOutputting: true)) == .drop,
+      "链路不可写时不提示（之后重连会先发停止）")
+check(OutputAdmission.decide(.init(gateOpen: false)) == .drop, "闸门关着（停止后的尾帧、tick）：丢掉")
+check(OutputAdmission.decide(.init(gateOpen: false, allZero: true, isActive: true)) == .drop,
+      "闸门关着时全零帧也不另发停止")
+check(OutputAdmission.decide(.init(mayStillBeOutputting: true, stopInProgress: true)) == .rejectMayBeActive,
+      "设备可能仍在输出（锁存）：拒绝并提示，优先于停止进行中")
+check(OutputAdmission.decide(.init(stopInProgress: true)) == .deferUntilStopped,
+      "停止帧对在路上：输出挂起，绝不插进两帧之间")
+check(OutputAdmission.decide(.init(stopInProgress: true, allZero: true, isActive: true)) == .deferUntilStopped,
+      "停止进行中连全零帧也只挂起")
+check(OutputAdmission.decide(.init(stopInProgress: true, stopFailed: true)) == .rejectStopUnconfirmed,
+      "停止失败过还在重试：拒绝输出")
+check(OutputAdmission.decide(.init(allZero: true, isActive: true)) == .zeroStopPair, "运行中全零：完整停止帧对")
+check(OutputAdmission.decide(.init(allZero: true, isActive: true, zeroHeld: true)) == .alreadyZeroed, "重复全零不再发")
+check(OutputAdmission.decide(.init(allZero: true)) == .skipIdleZero, "空闲全零：丢掉，不开始运行")
+check(OutputAdmission.decide(.init()) == .write(startsRun: true), "空闲时的非零帧：先过冷却/额度再开始运行")
+check(OutputAdmission.decide(.init(isActive: true)) == .write(startsRun: false), "运行中的非零帧：直接写")
+
+// MARK: - Brain 审查 M5：开闸核对被动停机代次
+
+check(OutputGate.mayOpen(requestEpoch: nil, currentEpoch: 7), "用户直接操作（手动拖动、视频页播放）不比代次")
+check(OutputGate.mayOpen(requestEpoch: 7, currentEpoch: 7), "执行前读到的代次仍是最新：可以开闸")
+check(!OutputGate.mayOpen(requestEpoch: 6, currentEpoch: 7), "执行前检查之后发生过被动停机：不开闸，不再只靠冷却兜底")
+
+// MARK: - Brain 审查 L1：回执 FIFO 重新对齐
+
+check(!WriteAckFIFO.canRealign([]), "空队列不用对齐")
+check(WriteAckFIFO.canRealign([(isStop: true, timedOut: true), (isStop: true, timedOut: true)]),
+      "只剩已超时的停止帧：清空重新对齐，丢失的回执不再让之后的停止永远确认不了")
+check(!WriteAckFIFO.canRealign([(isStop: false, timedOut: true), (isStop: true, timedOut: true)]),
+      "还有输出帧：不清，不能把输出帧的回执当成停止确认")
+check(!WriteAckFIFO.canRealign([(isStop: true, timedOut: true), (isStop: true, timedOut: false)]),
+      "还有没超时的条目（回执可能马上到）：不清")
+
+// MARK: - Brain 审查 M3：手动页 300 秒空闲停机（ManualIdle）
+
+check(ManualIdle.timeoutSeconds == 300, "手动页空闲时限 300 秒")
+check(!ManualIdle.expired(now: 1299, lastInteraction: 1000, outputSinceStop: true), "299 秒没操作：继续")
+check(ManualIdle.expired(now: 1300, lastInteraction: 1000, outputSinceStop: true), "300 秒没操作：停止")
+check(!ManualIdle.expired(now: 9999, lastInteraction: 1000, outputSinceStop: false), "停止后没有输出：不计时")
 
 // MARK: - 官方脚本强度换算（video.js executeIntensityCommand → BV(…, 10)）
 
@@ -684,6 +767,74 @@ check(zeroEnding.steps.first == AIStep(levels: [20, 0, 0, 0], duration: 1)
       && ReplyAuthorization.programEndIsTerminal(steps: zeroEnding.steps, endWithStop: false),
       "爬升不改变全零结尾的停止判断")
 
+// Brain 审查 M2：时间限速，两次升高至少隔 1 秒（真正的"每秒每通道最多 +20"）
+
+/// 按执行时间轴检查：每次升高每通道 ≤20，且离上次升高 ≥ 1 秒
+func riseGapsOK(_ steps: [AIStep], from start: [Int], sinceRise: Double = .infinity) -> Bool {
+    var cur = start
+    var t = 0.0
+    var lastRise = -sinceRise
+    for s in steps {
+        if let lv = s.levels {
+            if lv.indices.contains(where: { lv[$0] > cur[$0] }) {
+                if t - lastRise < AISafety.rampStepSeconds - 1e-9 { return false }
+                if lv.indices.contains(where: { lv[$0] - cur[$0] > AISafety.maxStepIncrease }) { return false }
+                lastRise = t
+            }
+            cur = lv
+        }
+        t += s.duration
+    }
+    return true
+}
+
+let fastClimbSteps = AIReply.parse("[CH 20 0 0 0]\n[HOLD 500]\n[CH 40 0 0 0]\n[HOLD 500]\n[CH 60 0 0 0]").steps
+check(!riseGapsOK(fastClimbSteps, from: [0, 0, 0, 0]), "原始程序 0.5 秒升一次 20（审查重现）")
+let fastClimb = AISafety.enforce(fastClimbSteps, from: [0, 0, 0, 0])
+check(fastClimb.steps == [AIStep(levels: [20, 0, 0, 0], duration: 0.5), AIStep(levels: nil, duration: 0.5),
+                          AIStep(levels: [40, 0, 0, 0], duration: 0.5), AIStep(levels: nil, duration: 0.5),
+                          AIStep(levels: [60, 0, 0, 0], duration: 0)] && fastClimb.waitSteps == 2,
+      "HOLD 500 连续 +20：每次升高前补等待到满 1 秒")
+check(riseGapsOK(fastClimb.steps, from: [0, 0, 0, 0]), "限速后每秒每通道最多 +20")
+check(AISafety.describe(fastClimb, stop: false).contains("等待"), "程序说明标出插入的等待")
+check(riseGapsOK(fullIdle.steps, from: [0, 0, 0, 0]) && riseGapsOK(chained.steps, from: [0, 0, 0, 0]),
+      "爬升步本身就是 1 秒一步")
+let crossReply = AISafety.enforce([AIStep(levels: [40, 0, 0, 0], duration: 0)], from: [20, 0, 0, 0],
+                                  secondsSinceRise: 0.3)
+check(crossReply.steps.count == 2 && crossReply.steps[0].levels == nil && near(crossReply.steps[0].duration, 0.7)
+      && crossReply.steps[1] == AIStep(levels: [40, 0, 0, 0], duration: 0),
+      "跨回复：上次升高 0.3 秒前，先等 0.7 秒再升")
+let waitLowers = AISafety.enforce([AIStep(levels: [40, 0, 0, 0], duration: 1.5)], from: [20, 60, 0, 0],
+                                  secondsSinceRise: 0.5)
+check(waitLowers.steps == [AIStep(levels: [20, 0, 0, 0], duration: 0.5), AIStep(levels: [40, 0, 0, 0], duration: 1.5)],
+      "等待期间降低的通道立即生效，只有升高要等")
+check(AISafety.enforce([AIStep(levels: [10, 0, 0, 0], duration: 1)], from: [50, 0, 0, 0], secondsSinceRise: 0).waitSteps == 0,
+      "只降低不用等")
+
+var seed: UInt64 = 0x5EED
+func nextRand(_ n: Int) -> Int {
+    seed = seed &* 6364136223846793005 &+ 1442695040888963407
+    return Int((seed >> 33) % UInt64(n))
+}
+var fuzzOK = true
+for _ in 0..<300 {
+    var program: [AIStep] = []
+    for _ in 0..<(1 + nextRand(10)) {
+        if nextRand(4) == 0 {
+            program.append(AIStep(levels: nil, duration: [0.5, 1, 3][nextRand(3)]))
+        } else {
+            program.append(AIStep(levels: [nextRand(100), nextRand(100), nextRand(100), 0],
+                                  duration: [0.5, 1, 1.5, 3][nextRand(4)]))
+        }
+    }
+    let start = [nextRand(71), nextRand(71), nextRand(71), 0]
+    let since = [0.0, 0.3, 0.9, 5][nextRand(4)]
+    let p = AISafety.enforce(program, from: start, secondsSinceRise: since)
+    let capped = p.steps.allSatisfy { ($0.levels ?? [0]).allSatisfy { $0 <= AISafety.maxLevel } }
+    if !capped || !riseGapsOK(p.steps, from: start, sinceRise: since) { fuzzOK = false }
+}
+check(fuzzOK, "随机 300 段程序：每次升高 ≤20、两次升高至少隔 1 秒、强度 ≤70（M2）")
+
 // H2：保持最后强度时，120 秒没有新的用户消息就停止
 check(!AISafety.holdIdleExpired(now: 5000, holdStartedAt: nil, lastUserMessageAt: 0), "没在保持时不计时")
 check(!AISafety.holdIdleExpired(now: 1119, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 119 秒未超时")
@@ -691,6 +842,24 @@ check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt
 check(!AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: 1050), "保持期间的新消息重新计时")
 check(AISafety.holdIdleExpired(now: 1170, holdStartedAt: 1000, lastUserMessageAt: 1050), "新消息之后 120 秒仍没有回应就停止")
 check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: nil), "没有用户消息记录时从保持开始算")
+
+// Brain 审查 H1：在场超时覆盖整个运行（执行程序期间也算），单条程序总时长 ≤120 秒
+check(!AISafety.presenceExpired(now: 1119, lastUserMessageAt: 1000, runStartedAt: 1010), "最近一条消息后 119 秒：继续")
+check(AISafety.presenceExpired(now: 1120, lastUserMessageAt: 1000, runStartedAt: 1010),
+      "程序还在执行，离最近一条消息 120 秒也停止")
+check(AISafety.presenceExpired(now: 1130, lastUserMessageAt: nil, runStartedAt: 1010), "没有用户消息记录时从开始运行算")
+check(!AISafety.presenceExpired(now: 5000, lastUserMessageAt: nil, runStartedAt: nil), "没在运行不计时")
+check(AISafety.maxProgramSeconds == AISafety.holdIdleTimeout, "单条程序总时长上限 = 在场时限 120 秒")
+let longHolds = (0..<AIReply.maxSteps).map { _ in "[CH 20 0 0 0]\n[HOLD 60000]" }.joined(separator: "\n")
+let longReply = AIReply.parse(longHolds)
+check(longReply.rejection == nil && longReply.steps.count == AIReply.maxSteps, "40 × HOLD 60000 的格式本身合法")
+let longProgram = AISafety.enforce(longReply.steps, from: [0, 0, 0, 0])
+check(longProgram.totalSeconds >= 2400 && AISafety.programTooLong(longProgram) != nil,
+      "40 分钟的程序整条不执行（审查重现：之前能无人值守跑到 1200 秒单次上限）")
+check(AISafety.programTooLong(AISafety.enforce(okReply.steps, from: [0, 0, 0, 0])) == nil, "普通程序不受影响")
+let edgeProgram = AISafety.enforce([AIStep(levels: [20, 0, 0, 0], duration: 60), AIStep(levels: nil, duration: 60)],
+                                   from: [0, 0, 0, 0])
+check(near(edgeProgram.totalSeconds, 120) && AISafety.programTooLong(edgeProgram) == nil, "正好 120 秒可以执行")
 
 // L2：请求历史不含出错提示，从用户消息开始，同角色相邻合并
 let historyTurns = [
@@ -709,6 +878,11 @@ let shortWindow = AIHistory.window(historyTurns, limit: 2)
 check(shortWindow.count == 2 && shortWindow[0]["role"] == "user" && shortWindow[0]["content"] == "u2",
       "截断后的窗口仍从用户消息开始")
 check(AIHistory.window(historyTurns, limit: 1).isEmpty, "窗口里只剩 assistant 时整段丢掉")
+
+// Brain 审查 L6：回传给模型的内容
+check(AIHistory.content(raw: "[CH 20 0 0 0]\n乖", text: "乖") == "[CH 20 0 0 0]\n乖", "执行过的回复回传原文")
+check(AIHistory.content(raw: nil, text: "乖") == "乖", "没执行的回复回传显示文字")
+check(AIHistory.content(raw: nil, text: "") == "…", "没执行且没有文字：回传…，不把\"未执行：…\"当成模型发言")
 
 // MARK: - 回复授权（AIControlVM 的 send → 停止 → 执行前验票）
 
@@ -774,6 +948,22 @@ check(LLMResponse.incompleteReason(["stop_reason": "max_tokens"], wire: .anthrop
       "Anthropic max_tokens 不完整")
 check(LLMResponse.incompleteReason(["status": "completed"], wire: .responses) == nil, "Responses completed 完整")
 check(LLMResponse.incompleteReason(["status": "incomplete"], wire: .responses) != nil, "Responses incomplete 不完整")
+
+// Brain 审查 L4：接口错误只显示说明，遮掉 Key 和长串标识
+let echoed = Data(#"{"error":{"message":"Incorrect API key provided: sk-abc1*****wxyz. req_0123456789abcdefghij"}}"#.utf8)
+let echoedSummary = LLMResponse.errorSummary(echoed, apiKey: "sk-abc1secretwxyz")
+check(echoedSummary.contains("Incorrect API key") && !echoedSummary.contains("sk-abc1")
+      && !echoedSummary.contains("0123456789abcdefghij"), "错误说明保留，回显的部分 Key 和长串标识被遮掉")
+let fullKeyEcho = Data(#"{"message":"bad key sk-live-SECRET"}"#.utf8)
+check(!LLMResponse.errorSummary(fullKeyEcho, apiKey: "sk-live-SECRET").contains("SECRET"), "回显的完整 Key 被遮掉")
+check(LLMResponse.errorSummary(Data(#"{"error":"rate limited"}"#.utf8), apiKey: "k") == "rate limited", "error 是字符串时照常显示")
+check(LLMResponse.errorSummary(Data("<html>502 Bad Gateway</html>".utf8), apiKey: "k") == "", "不是 JSON 的正文不显示")
+let longMessage = Data("{\"error\":{\"message\":\"\(String(repeating: "慢 ", count: 300))\"}}".utf8)
+check(LLMResponse.errorSummary(longMessage, apiKey: "k").count <= 200, "错误说明最多 200 字")
+
+// Brain 审查 L5：请求总时长上限
+check(AIRequestPolicy.totalTimeoutSeconds == 45 && AIRequestPolicy.totalTimeoutSeconds < AISafety.holdIdleTimeout,
+      "单次请求总时长 45 秒，短于在场时限")
 
 if failures > 0 {
     print("\(failures) 项检查失败")
