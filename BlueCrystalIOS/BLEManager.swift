@@ -602,7 +602,9 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 唯一的输出准入点（修 M2/M3/L5/N1）：手动、技能、视频的每一帧非停止帧都从这里过
     private func submitOutput(_ data: Data, opensGate: Bool) {
-        guard canWrite, !disconnecting else { return }
+        // 后台期间（emergencyStop 之后、resumeFromBackground 之前）任何输出都不许开闸，
+        // 主线程上迟到的回复/定时器在这里兜底
+        guard canWrite, !disconnecting, !appInBackground else { return }
         if opensGate { outputLocked = false }
         guard !outputLocked else { return }
         // 修 L5 / M4：设备可能仍在输出、或锁存未解除：确认停止前不许新的输出

@@ -1,14 +1,9 @@
 import SwiftUI
+import UIKit
 import Combine
 import Security
 
 // MARK: - 配置：三家服务商预设，每家一个 Key（存钥匙串）
-
-enum WireProtocol {
-    case chatCompletions // OpenAI /chat/completions
-    case anthropicMessages // Anthropic /messages
-    case responses // OpenAI /responses
-}
 
 struct AIModel: Identifiable, Hashable {
     let id: String
@@ -94,8 +89,10 @@ enum AIConfig {
     - [HOLD 毫秒] —— 保持当前强度等待，500~60000，如 [HOLD 3000]。用来"停在边缘"折磨他。
     - [STOP] —— 全部停止，结束本轮控制。
 
-    一条回复里可以写多条指令，按顺序执行；两条 [CH] 之间没写 [HOLD] 时间隔约 1.5 秒。
+    一条回复里可以写多条指令（最多 40 步），按顺序执行；两条 [CH] 之间没写 [HOLD] 时间隔约 1.5 秒。
     回复结束时最后的强度会一直保持到他下一句话。
+    每条指令必须独占一行，不要写在句子中间、引号里或代码块里，参数个数和整数写法要完全正确；
+    否则控制器会把整条回复的指令全部作废并停止。
 
     ## 行为准则
     1. 中文，简短撩人，一次 1~3 句；每 2~3 句话必须有一次 [CH]/[HOLD] 动作，光说不练不许。
@@ -113,135 +110,85 @@ enum AIConfig {
     """
 
     static func apiKey(for p: AIProvider) -> String { Keychain.read(account: p.keychainAccount) ?? "" }
-    static func setAPIKey(_ key: String, for p: AIProvider) { Keychain.write(account: p.keychainAccount, value: key) }
+    static func setAPIKey(_ key: String, for p: AIProvider) throws {
+        try Keychain.write(account: p.keychainAccount, value: key)
+    }
+}
+
+enum KeychainError: LocalizedError {
+    case status(String, OSStatus)
+    var errorDescription: String? {
+        switch self {
+        case .status(let op, let s):
+            let msg = (SecCopyErrorMessageString(s, nil) as String?) ?? "未知错误"
+            return "钥匙串\(op)失败（\(s)）：\(msg)"
+        }
+    }
 }
 
 enum Keychain {
     private static let service = "com.bluecrystal.ios"
 
-    static func read(account: String) -> String? {
-        let q: [String: Any] = [
+    private static func base(_ account: String) -> [String: Any] {
+        [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
         ]
+    }
+
+    static func read(account: String) -> String? {
+        var q = base(account)
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: AnyObject?
         guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
               let d = out as? Data else { return nil }
         return String(data: d, encoding: .utf8)
     }
 
-    static func write(account: String, value: String) {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+    /// 已有条目用 SecItemUpdate 原地替换，没有才 SecItemAdd；失败时原条目保持不变。空值表示删除
+    static func write(account: String, value: String) throws {
+        let query = base(account)
+        guard !value.isEmpty else {
+            let s = SecItemDelete(query as CFDictionary)
+            guard s == errSecSuccess || s == errSecItemNotFound else { throw KeychainError.status("删除", s) }
+            return
+        }
+        let data = Data(value.utf8)
+        let attrs: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
         ]
-        SecItemDelete(base as CFDictionary)
-        guard !value.isEmpty else { return }
-        var add = base
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(add as CFDictionary, nil)
+        let s = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
+        if s == errSecSuccess { return }
+        guard s == errSecItemNotFound else { throw KeychainError.status("更新", s) }
+        var add = query
+        add.merge(attrs) { _, new in new }
+        let a = SecItemAdd(add as CFDictionary, nil)
+        guard a == errSecSuccess else { throw KeychainError.status("写入", a) }
     }
 }
 
-// MARK: - 指令格式：[CH c0 c1 c2 c3] / [HOLD 毫秒] / [STOP]（提示词里约定，控制器解析）
-
-/// 一步：设置强度（nil = 不改强度，只等待）+ 持续秒数
-struct AIStep: Equatable {
-    var levels: [Int]?
-    var duration: Double
-
-    var isZero: Bool { levels?.allSatisfy { $0 <= 0 } ?? false }
-
-    var summary: String {
-        guard let lv = levels else { return "保持 \(Self.fmt(duration)) 秒" }
-        return "伸缩 \(lv[0]) · 震动 \(lv[1]) · 吮吸 \(lv[2])" + (duration > 0 ? " · \(Self.fmt(duration)) 秒" : "")
-    }
-
-    static func fmt(_ d: Double) -> String {
-        d == d.rounded() ? String(Int(d)) : String(format: "%.1f", d)
-    }
-}
-
-/// 模型回复解析后的结果
-struct AIReply {
-    /// 去掉指令行之后给用户看的文字
-    var text: String
-    /// 本条回复里的强度序列；最后一步的强度会一直保持到下一条回复（或安全上限）
-    var steps: [AIStep]
-    var stop: Bool
-
-    static let maxSteps = 40
-    static let maxHoldMs = 60_000
-    /// 两条 [CH] 之间没写 [HOLD] 时的默认间隔
-    static let defaultGap: Double = 1.5
-
-    static func parse(_ raw: String) -> AIReply {
-        let pattern = #"\[\s*(CH|HOLD|STOP)\b([^\]]*)\]"#
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
-            return AIReply(text: raw, steps: [], stop: false)
-        }
-        let ns = raw as NSString
-        var steps: [AIStep] = []
-        var stop = false
-        var lastHeld = false // 最后一步后面是否已经跟了 HOLD
-        for m in re.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
-            if stop || steps.count >= maxSteps { break }
-            let cmd = ns.substring(with: m.range(at: 1)).uppercased()
-            let args = ns.substring(with: m.range(at: 2))
-                .split(whereSeparator: { $0 == " " || $0 == "," || $0 == "，" || $0 == "\t" })
-                .compactMap { Double($0) }
-                .filter { $0.isFinite }
-            switch cmd {
-            case "CH":
-                guard !args.isEmpty else { continue }
-                var lv = [0, 0, 0, 0]
-                for (i, v) in args.prefix(3).enumerated() {
-                    lv[i] = Int(max(0, min(Double(BCProtocol.maxManualLevel), v.rounded())))
-                }
-                // 第 4 通道（旋转）这台设备不用，恒 0
-                steps.append(AIStep(levels: lv, duration: defaultGap))
-                lastHeld = false
-            case "HOLD":
-                guard let ms = args.first, ms > 0 else { continue }
-                let sec = Double(min(Double(maxHoldMs), ms)) / 1000
-                if let i = steps.indices.last, steps[i].levels != nil, !lastHeld {
-                    steps[i].duration = sec
-                } else {
-                    steps.append(AIStep(levels: nil, duration: sec))
-                }
-                lastHeld = true
-            default: // STOP
-                stop = true
-            }
-        }
-        // 最后一步保持到下一条回复：持续时间置 0，表示"不再推进"
-        if !stop, let i = steps.indices.last, !lastHeld { steps[i].duration = 0 }
-        let text = re.stringByReplacingMatches(in: raw, range: NSRange(location: 0, length: ns.length), withTemplate: "")
-            .split(separator: "\n", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-        return AIReply(text: text, steps: steps, stop: stop)
-    }
-}
-
-// MARK: - 大模型客户端（OpenAI 兼容 /chat/completions）
+// MARK: - 大模型客户端（三种接口：chat completions / Anthropic messages / responses）
 
 enum LLMError: LocalizedError {
-    case missingKey, badURL, http(Int, String), empty
+    case missingKey, badURL, http(Int, String), empty, incomplete(String)
     var errorDescription: String? {
         switch self {
         case .missingKey: return "还没填 API Key，点右上角设置"
         case .badURL: return "接口地址不对"
         case .http(let code, let body): return "接口返回 \(code)：\(body.prefix(200))"
         case .empty: return "模型没有返回内容"
+        case .incomplete(let why): return "\(why)，没有内容"
         }
     }
+}
+
+struct LLMResult {
+    var text: String
+    /// 非 nil：回复没有正常结束（被截断等），里面的指令一律不执行
+    var incompleteReason: String?
 }
 
 struct LLMClient {
@@ -250,7 +197,7 @@ struct LLMClient {
     var apiKey: String
 
     /// messages 第一条是 system，其余 user/assistant 交替
-    func chat(_ messages: [[String: String]]) async throws -> String {
+    func chat(_ messages: [[String: String]]) async throws -> LLMResult {
         guard !apiKey.isEmpty else { throw LLMError.missingKey }
         var base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
@@ -288,31 +235,15 @@ struct LLMClient {
         guard (200..<300).contains(code) else {
             throw LLMError.http(code, String(data: data, encoding: .utf8) ?? "")
         }
-        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let text = Self.extractText(obj, wire: model.wire), !text.isEmpty else {
+        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw LLMError.empty
         }
-        return text
-    }
-
-    static func extractText(_ obj: [String: Any], wire: WireProtocol) -> String? {
-        switch wire {
-        case .chatCompletions:
-            let choices = obj["choices"] as? [[String: Any]]
-            let msg = choices?.first?["message"] as? [String: Any]
-            return msg?["content"] as? String
-        case .anthropicMessages:
-            let blocks = obj["content"] as? [[String: Any]] ?? []
-            return blocks.filter { ($0["type"] as? String) == "text" }
-                .compactMap { $0["text"] as? String }.joined()
-        case .responses:
-            if let t = obj["output_text"] as? String, !t.isEmpty { return t }
-            let output = obj["output"] as? [[String: Any]] ?? []
-            return output.filter { ($0["type"] as? String) == "message" }
-                .flatMap { ($0["content"] as? [[String: Any]]) ?? [] }
-                .filter { ($0["type"] as? String) == "output_text" }
-                .compactMap { $0["text"] as? String }.joined()
+        let incomplete = LLMResponse.incompleteReason(obj, wire: model.wire)
+        guard let text = LLMResponse.extractText(obj, wire: model.wire), !text.isEmpty else {
+            if let why = incomplete { throw LLMError.incomplete(why) }
+            throw LLMError.empty
         }
+        return LLMResult(text: text, incompleteReason: incomplete)
     }
 }
 
@@ -324,7 +255,7 @@ final class AIControlVM: ObservableObject {
         let isUser: Bool
         var text: String
         var program: String?
-        /// 模型原始输出（含指令行），回传给模型保持格式
+        /// 模型原始输出（含指令行）：只有程序真的执行了才保存并回传给模型；没执行的回复回传显示文字
         var raw: String?
     }
 
@@ -334,102 +265,184 @@ final class AIControlVM: ObservableObject {
     @Published var running = false
     @Published var statusLine = "未运行"
 
+    /// 每次请求带上最近这么多条消息（不是轮数）
+    static let historyLimit = 20
+
     private weak var ble: BLEManager?
     private var cancellables = Set<AnyCancellable>()
-    /// 停止/换指令就 +1：旧的步骤定时器和迟到的模型回复都不再动设备
+    /// 停止/换指令就 +1：旧的步骤定时器不再动设备
     private var programGen = 0
     private var steps: [AIStep] = []
     private var heartbeatTimer: Timer?
     private var stepWork: DispatchWorkItem?
-    /// 发消息时的停止代次：模型回复回来前用户点了停止，回复就不再启动设备
-    private var requestStopGen = 0
-    private var stopCount = 0
+    private var endWithStop = false
+    /// 授权代次（只在主线程读写）：用户停止、本地停止词、被动停机（看门狗/上限/冷却/输出被拒/退后台）、
+    /// 连接离开 ready（不论是否在运行）、离开 AI 页面都会 +1。发消息时记下，执行前在主线程再比一次，
+    /// 不一致的回复只显示文字，绝不启动设备
+    private var authGen = 0
+    /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断）结果直接丢弃
+    private var requestID = 0
+    private var requestTask: Task<Void, Never>?
+    private var tabActive = false
+    private var sceneActive = true
+
+    /// 输入框有字、且（没在等回复，或这句是停止词）时可以发
+    var canSubmit: Bool {
+        let t = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return false }
+        return !isThinking || AIStopWords.matches(t)
+    }
 
     func attach(ble: BLEManager) {
         cancellables.removeAll()
         self.ble = ble
-        // 被动停机（看门狗/单次上限/冷却/输出被拒）：BLEManager 已经发了停止，这里只停程序
+        // 被动停机（看门狗/单次上限/冷却/输出被拒/退后台）：BLEManager 已经发了停止，这里停程序并作废待执行的回复
         ble.forceZeroOutputs
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] reason in self?.haltProgram(reason: reason ?? "已自动停止", sendStop: false) }
+            .sink { [weak self] reason in
+                guard let self = self else { return }
+                self.revokeAuthorization()
+                self.haltProgram(reason: reason ?? "已自动停止", sendStop: false)
+            }
             .store(in: &cancellables)
         ble.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] s in
-                guard let self = self, s != .ready, self.running else { return }
-                self.haltProgram(reason: "设备已断开，AI 控制已停止", sendStop: false)
+                guard let self = self, s != .ready else { return }
+                // 没在运行也作废：断开期间发出的请求，重连后回来也不许执行
+                self.revokeAuthorization()
+                if self.running { self.haltProgram(reason: "设备已断开，AI 控制已停止", sendStop: false) }
             }
             .store(in: &cancellables)
     }
 
-    /// 用户点停止 / 离开页面
+    func viewAppeared(ble: BLEManager, scenePhase: ScenePhase) {
+        attach(ble: ble)
+        tabActive = true
+        sceneActive = scenePhase == .active
+    }
+
+    /// 离开 AI 页面：停止并作废所有待执行的回复
+    func viewDisappeared() {
+        tabActive = false
+        stopAll(reason: "已离开 AI 页面，已停止")
+    }
+
+    func scenePhaseChanged(_ phase: ScenePhase) {
+        sceneActive = phase == .active
+        if phase == .background {
+            // 停止帧对由 BLEManager.emergencyStop 发，这里只停程序并作废回复
+            revokeAuthorization()
+            haltProgram(reason: "App 已退到后台，已停止", sendStop: false)
+        }
+    }
+
+    /// 用户点停止 / 说了停止词 / 离开页面
     func stopAll(reason: String = "已停止") {
-        stopCount += 1
+        revokeAuthorization()
         haltProgram(reason: reason, sendStop: true)
+    }
+
+    private func revokeAuthorization() {
+        authGen &+= 1
     }
 
     func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isThinking else { return }
+        guard !text.isEmpty else { return }
+        let isStop = AIStopWords.matches(text)
+        // 在本地停止之前取代次：说了停止词，模型这次回什么强度都不执行，只显示文字
+        let authAtSend = authGen
+        // 停止词先于"等待回复"检查：请求进行中也必须立刻本地停
+        if isStop {
+            stopAll(reason: "已停止（本地停止词）")
+        } else if isThinking {
+            statusLine = "她还在回复；说“停”或点停止随时有效"
+            return
+        }
         input = ""
         messages.append(ChatMessage(isUser: true, text: text, program: nil, raw: nil))
-        // 在本地停止之前取代次：说了"停"，模型这次回什么强度都不执行，只显示文字
-        let stopAtSend = stopCount
-        // 明确的停止词本地立刻停，不等模型
-        if Self.isStopWord(text) {
-            stopAll(reason: "已停止")
-        }
-        let history = messages.suffix(20).map { m -> [String: String] in
-            ["role": m.isUser ? "user" : "assistant", "content": m.raw ?? m.text]
+        // 停止词打断进行中的请求：旧请求作废（授权已撤销，结果也不再处理），带上停止这句重新问
+        requestTask?.cancel()
+        requestID &+= 1
+        let id = requestID
+        let history = messages.suffix(Self.historyLimit).map { m -> [String: String] in
+            let content = m.raw ?? (m.text.isEmpty ? (m.program ?? "…") : m.text)
+            return ["role": m.isUser ? "user" : "assistant", "content": content]
         }
         let payload = [["role": "system", "content": AIConfig.systemPrompt]] + history
         let provider = AIConfig.provider
         let client = LLMClient(baseURL: provider.baseURL, model: AIConfig.model, apiKey: AIConfig.apiKey(for: provider))
         isThinking = true
-        Task { [weak self] in
+        requestTask = Task { [weak self] in
             do {
-                let raw = try await client.chat(payload)
-                await MainActor.run { self?.handle(raw: raw, stopAtSend: stopAtSend) }
+                let result = try await client.chat(payload)
+                await MainActor.run { self?.handle(result, requestID: id, authAtSend: authAtSend) }
             } catch {
-                await MainActor.run {
-                    guard let self = self else { return }
-                    self.isThinking = false
-                    self.messages.append(ChatMessage(isUser: false, text: "出错了：\(error.localizedDescription)", program: nil, raw: nil))
-                }
+                await MainActor.run { self?.handleError(error, requestID: id) }
             }
         }
     }
 
-    private func handle(raw: String, stopAtSend: Int) {
+    private func handleError(_ error: Error, requestID id: Int) {
+        guard id == requestID else { return }
         isThinking = false
-        let reply = AIReply.parse(raw)
+        requestTask = nil
+        if let e = error as? LLMError, case .incomplete(_) = e, running {
+            stopAll(reason: "回复不完整，已停止")
+        }
+        messages.append(ChatMessage(isUser: false, text: "出错了：\(error.localizedDescription)", program: nil, raw: nil))
+    }
+
+    /// 执行前的最后检查（主线程，紧挨着 start）：返回不能执行的原因
+    private func executionBlock(authAtSend: Int) -> String? {
+        if authGen != authAtSend { return "发送后已停止或连接/页面状态变化" }
+        if !tabActive { return "已离开 AI 页面" }
+        if !sceneActive || UIApplication.shared.applicationState != .active { return "App 不在前台" }
+        guard let ble = ble, ble.state == .ready else { return "设备未连接" }
+        if let reason = ble.safety.blockReason { return reason }
+        return nil
+    }
+
+    /// 程序作废：一步都不执行；正在输出就安全停止
+    private func rejectProgram(_ reason: String) {
+        if running { stopAll(reason: reason) }
+    }
+
+    private func handle(_ result: LLMResult, requestID id: Int, authAtSend: Int) {
+        guard id == requestID else { return }
+        isThinking = false
+        requestTask = nil
+        let reply = AIReply.parse(result.text)
         var programText: String?
-        if !reply.steps.isEmpty {
-            if stopCount != stopAtSend {
-                // 等回复期间用户点过停止：只显示文字，不启动设备
-                programText = "未执行（你已停止）"
+        var executed = false
+        if let why = result.incompleteReason {
+            programText = "\(why)，指令未执行"
+            rejectProgram("回复不完整，已停止")
+        } else if let why = reply.rejection {
+            programText = "未执行：\(why)"
+            rejectProgram("回复指令无效，已停止")
+        } else if !reply.steps.isEmpty {
+            if let block = executionBlock(authAtSend: authAtSend) {
+                programText = "未执行（\(block)）"
+                rejectProgram("已停止")
             } else {
                 start(steps: reply.steps, endWithStop: reply.stop)
+                executed = true
                 programText = reply.steps.map(\.summary).joined(separator: " → ") + (reply.stop ? " → 停止" : "")
             }
         } else if reply.stop {
             stopAll(reason: "已停止")
+            executed = true
             programText = "停止"
         }
-        messages.append(ChatMessage(isUser: false, text: reply.text, program: programText, raw: raw))
+        messages.append(ChatMessage(isUser: false, text: reply.text, program: programText,
+                                    raw: executed ? result.text : nil))
     }
 
-    private var endWithStop = false
-
+    /// 调用方先用 executionBlock 确认授权、连接、安全状态和前台
     private func start(steps: [AIStep], endWithStop: Bool) {
-        guard let ble = ble, ble.state == .ready else {
-            statusLine = "设备未连接，没有执行"
-            return
-        }
-        if let reason = ble.safety.blockReason {
-            statusLine = reason
-            return
-        }
+        guard let ble = ble else { return }
         programGen += 1
         stepWork?.cancel()
         self.steps = steps
@@ -494,18 +507,13 @@ final class AIControlVM: ObservableObject {
         RunLoop.main.add(t, forMode: .common)
         heartbeatTimer = t
     }
-
-    static func isStopWord(_ text: String) -> Bool {
-        let t = text.lowercased().trimmingCharacters(in: .punctuationCharacters.union(.whitespaces))
-        let words = ["停", "停下", "停止", "停一下", "别动了", "够了", "不要了", "疼", "受不了", "stop"]
-        return words.contains(t) || t.hasPrefix("停") || t.contains("受不了")
-    }
 }
 
 // MARK: - 界面
 
 struct AIControlView: View {
     @EnvironmentObject var ble: BLEManager
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var vm = AIControlVM()
     @State private var showSettings = false
 
@@ -546,14 +554,15 @@ struct AIControlView: View {
                 }
             }
             HStack {
-                TextField("说点什么…", text: $vm.input)
+                // 等回复期间输入框也保持可用：停止词随时能发
+                TextField(vm.isThinking ? "她在回复…说“停”随时停" : "说点什么…", text: $vm.input)
                     .textFieldStyle(.roundedBorder)
                     .submitLabel(.send)
                     .onSubmit { vm.send() }
                 Button { vm.send() } label: {
                     Image(systemName: "paperplane.fill")
                 }
-                .disabled(vm.isThinking || vm.input.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(!vm.canSubmit)
             }
             .padding(10)
             .background(.bar)
@@ -565,8 +574,9 @@ struct AIControlView: View {
             }
         }
         .sheet(isPresented: $showSettings) { AISettingsView() }
-        .onAppear { vm.attach(ble: ble) }
-        .onDisappear { if !showSettings { vm.stopAll() } }
+        .onAppear { vm.viewAppeared(ble: ble, scenePhase: scenePhase) }
+        .onDisappear { if !showSettings { vm.viewDisappeared() } }
+        .onChange(of: scenePhase) { phase in vm.scenePhaseChanged(phase) }
     }
 }
 
@@ -575,12 +585,23 @@ struct AISettingsView: View {
     @State private var provider = AIConfig.provider
     @State private var modelID = AIConfig.model.id
     @State private var prompt = AIConfig.systemPrompt
-    @State private var keys: [AIProvider: String] = Dictionary(
-        uniqueKeysWithValues: AIProvider.allCases.map { ($0, AIConfig.apiKey(for: $0)) })
+    @State private var keys: [AIProvider: String] = AISettingsView.loadKeys()
+    /// 钥匙串里当前的值：只写改过的 Key
+    @State private var savedKeys: [AIProvider: String] = AISettingsView.loadKeys()
+    @State private var saveError: String?
+
+    private static func loadKeys() -> [AIProvider: String] {
+        Dictionary(uniqueKeysWithValues: AIProvider.allCases.map { ($0, AIConfig.apiKey(for: $0)) })
+    }
 
     var body: some View {
         NavigationView {
             Form {
+                if let err = saveError {
+                    Section {
+                        Text(err).font(.caption).foregroundColor(.red)
+                    }
+                }
                 Section("服务商") {
                     Picker("服务商", selection: $provider) {
                         ForEach(AIProvider.allCases) { Text($0.title).tag($0) }
@@ -606,7 +627,7 @@ struct AISettingsView: View {
                 } header: {
                     Text("提示词")
                 } footer: {
-                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99）、[HOLD 毫秒]、[STOP]。改提示词时别改这三条的写法。")
+                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。")
                 }
             }
             .onChange(of: provider) { p in
@@ -617,17 +638,31 @@ struct AISettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") {
-                        AIConfig.provider = provider
-                        AIConfig.systemPrompt = prompt
-                        if let m = provider.models.first(where: { $0.id == modelID }) { AIConfig.model = m }
-                        for p in AIProvider.allCases {
-                            AIConfig.setAPIKey((keys[p] ?? "").trimmingCharacters(in: .whitespacesAndNewlines), for: p)
-                        }
-                        dismiss()
-                    }
+                    Button("保存") { save() }
                 }
             }
         }
+    }
+
+    private func save() {
+        AIConfig.provider = provider
+        AIConfig.systemPrompt = prompt
+        if let m = provider.models.first(where: { $0.id == modelID }) { AIConfig.model = m }
+        var failures: [String] = []
+        for p in AIProvider.allCases {
+            let key = (keys[p] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard key != (savedKeys[p] ?? "") else { continue }
+            do {
+                try AIConfig.setAPIKey(key, for: p)
+                savedKeys[p] = key
+            } catch {
+                failures.append("\(p.title)：\(error.localizedDescription)")
+            }
+        }
+        guard failures.isEmpty else {
+            saveError = "API Key 保存失败，钥匙串里原来的 Key 保持不变：\n" + failures.joined(separator: "\n")
+            return
+        }
+        dismiss()
     }
 }

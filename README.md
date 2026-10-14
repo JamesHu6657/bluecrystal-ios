@@ -36,7 +36,7 @@
 
 ## 出包（GitHub Actions）
 
-push 到 main 后先跑 `Tests/ProtocolChecks`（钉住帧字节、官方换算、安全上限），再编译 unsigned IPA，
+push 到 main 后先跑 `Tests/ProtocolChecks`（钉住帧字节、官方换算、安全上限、AI 指令解析和停止词），再编译 unsigned IPA，
 在 Actions 页下载 `BlueCrystalIOS-unsigned`。App 里「最后一帧」区块显示版本号和构建提交。
 Publish Release 会核对运行结果、构建提交、sha256 和 tag 与版本号是否一致。
 
@@ -84,6 +84,13 @@ unsigned 包不能直接装，需要自签（二选一）：
 - 单次连续输出上限调到 20 分钟；滚动 30 分钟额度同步调到 1200 秒，未知时长恢复冷却随之为 600 秒。
 - 视频联动新增全屏播放：点画面显示/隐藏控制条，播放、暂停、拖动、停止都走联动逻辑；支持横屏。
 - 新增「AI 控制」页：服务商 DeepSeek 官方（deepseek-flash）、Fireworks（deepseek-v4p1-flash）、Command Code GOAT（deepseek-v4.1-flash / claude-haiku-5-5 / muse-spark-1.3-contributor，分别走 chat/completions、messages、responses），每家 Key 分开存钥匙串；默认提示词「明月栞那」可在设置里改；指令 [CH 伸缩 震动 吮吸 0]（0~99，0x08 帧）/ [HOLD 毫秒] / [STOP]，最后强度保持到下一句；说“停/受不了”本地立即停且本轮回复不再执行；全零中途暂停用官方 at(0,255)；所有输出仍受单次上限、额度、冷却和看门狗约束。
+- AI 控制安全收紧：
+  - 停止词随时本地生效，等回复时也能发；中文安全短语（停/停止/别动了/够了/不要了/疼/受不了/慢点停…）出现在消息任意位置、英文独立单词 stop（不分大小写）都会停；“慢”仍交给模型降档。
+  - 用户停止、被动停机（看门狗/上限/冷却/输出被拒/退后台）、连接离开“已连接”、离开 AI 页都会作废待执行的回复；执行前在主线程再核对授权代次、连接、安全状态、前台和当前页面，后台期间 BLEManager 也拒绝输出。
+  - 指令必须独占一行、不在代码块/引用/句中；CH 恰好 4 个非负整数、HOLD 恰好 1 个正整数、STOP 无参数；格式错、行内指令、STOP 后还有指令、超过 40 步时整条回复一步都不执行，正在输出则安全停止。
+  - 回复未正常结束（finish_reason≠stop / stop_reason≠end_turn、stop_sequence / status≠completed）只显示文字、不执行，正在输出则停止。
+  - 没执行的回复回传显示文字而非指令原文；每次请求带最近 20 条消息。
+  - API Key 保存改用 SecItemUpdate/SecItemAdd 并检查结果，只写改过的 Key；失败时设置页不关、显示错误，原 Key 不丢。
 
 ### 1.7.3（build 173）
 

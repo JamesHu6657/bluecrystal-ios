@@ -451,6 +451,96 @@ let invalidStartRestored = makeLedger()
 invalidStartRestored.restore(from: invalidStartData)
 check(invalidStartRestored.openElapsedUnknown, "开始时间晚于保存锚点不能恢复成可信时长")
 
+// MARK: - AI 指令解析（AIProgram.swift）
+
+func executable(_ r: AIReply) -> Bool { r.rejection == nil && (!r.steps.isEmpty || r.stop) }
+
+let okReply = AIReply.parse("宝宝，开始了哦\n[CH 30 20 10 0]\n  [HOLD 3000]  \n[CH 0 0 0 0]\n[STOP]")
+check(okReply.rejection == nil && okReply.stop, "合法程序：独占一行（允许前后空白）")
+check(okReply.steps == [AIStep(levels: [30, 20, 10, 0], duration: 3), AIStep(levels: [0, 0, 0, 0], duration: 1.5)],
+      "CH + HOLD 合并、默认间隔 1.5 秒")
+check(okReply.text == "宝宝，开始了哦", "显示文字去掉指令行")
+
+let persist = AIReply.parse("[CH 40 0 0 0]")
+check(persist.rejection == nil && persist.steps == [AIStep(levels: [40, 0, 0, 0], duration: 0)] && !persist.stop,
+      "没有 STOP 时最后一步保持（duration 0）")
+
+let clamped = AIReply.parse("[ch 150 0 0 77]\n[HOLD 100]\n[CH 5 5 5 5]\n[HOLD 999999]")
+check(clamped.steps.first?.levels == [99, 0, 0, 0], "强度夹到 99，c3 恒 0，关键字不分大小写")
+check(clamped.steps.first?.duration == 0.5, "HOLD 夹到最少 500 毫秒")
+check(clamped.steps.last?.levels == [5, 5, 5, 0] && clamped.steps.last?.duration == 60, "HOLD 夹到最多 60000 毫秒")
+
+// 只有独占一行才算指令；行内、引用、代码块里的指令样式文字让整条作废
+for (raw, name) in [
+    ("不要执行 [CH 99 0 0 0]", "行内指令"),
+    ("[CH 30 0 0 0] 宝宝来了", "指令后面跟文字"),
+    ("宝宝\n> [CH 60 0 0 0]", "引用里的指令"),
+    ("例子：\n```\n[CH 60 0 0 0]\n```", "代码块里的指令"),
+    ("“[CH 60 0 0 0]”", "引号里的指令"),
+    ("[CH 30 0 0 0]\n宝宝说[STOP]我就停", "合法行 + 行内 STOP"),
+] {
+    let r = AIReply.parse(raw)
+    check(r.rejection != nil && !executable(r), "\(name)：整条不执行")
+}
+
+// 参数必须精确
+for (raw, name) in [
+    ("[CH bad 99 0 0]", "坏参数不挪通道"),
+    ("[CH 30 20 0]", "CH 少一个参数"),
+    ("[CH 30 20 0 0 0]", "CH 多一个参数"),
+    ("[CH 1e2 0 0 0]", "科学计数法"),
+    ("[CH 30.5 0 0 0]", "小数"),
+    ("[CH -5 0 0 0]", "负数"),
+    ("[CH 30,20,0,0]", "逗号分隔"),
+    ("[CH30 0 0 0]", "关键字粘连"),
+    ("[CH 99999999999999999999999 0 0 0]", "溢出整数"),
+    ("[HOLD]", "HOLD 缺参数"),
+    ("[HOLD 0]", "HOLD 0"),
+    ("[HOLD 1000 2000]", "HOLD 多参数"),
+    ("[HOLD 1.5e3]", "HOLD 科学计数法"),
+    ("[STOP now]", "STOP 带参数"),
+    ("[CH 30 20 0 0", "缺右括号"),
+    ("[STOP]\n[CH 30 0 0 0]", "STOP 之后还有指令"),
+] {
+    let r = AIReply.parse("宝宝\n[CH 10 0 0 0]\n" + raw)
+    check(r.rejection != nil && r.steps.isEmpty && !r.stop, "\(name)：整条作废，前面的合法指令也不执行")
+}
+
+// 超过步数上限：整条作废，不执行前缀，也不丢 STOP
+let fortyCH = (0..<AIReply.maxSteps).map { _ in "[CH 20 0 0 0]" }.joined(separator: "\n")
+let atLimit = AIReply.parse(fortyCH + "\n[STOP]")
+check(atLimit.rejection == nil && atLimit.steps.count == AIReply.maxSteps && atLimit.stop,
+      "正好 40 步 + 末尾 STOP：STOP 保留")
+let oversized = AIReply.parse(fortyCH + "\n[CH 0 0 0 0]\n[STOP]")
+check(oversized.rejection != nil && oversized.steps.isEmpty && !oversized.stop, "41 步：整条作废，不执行前缀")
+check(AIReply.parse("[STOP]").stop && AIReply.parse("[STOP]").steps.isEmpty, "单独 STOP")
+check(AIReply.parse("[笑] 宝宝乖").rejection == nil, "非指令的方括号文字不受影响")
+
+// MARK: - 本地停止词
+
+for s in ["停", "停下", "停止", "别动了", "够了", "不要了", "疼", "受不了", "慢点停", "我疼，停止",
+          "宝宝受不了了", "stop", "STOP!", "please stop", "Stop now", "ｓｔｏｐ", "停一下好吗"] {
+    check(AIStopWords.matches(s), "停止词：\(s)")
+}
+for s in ["慢", "慢一点", "再快点", "继续", "stopped", "nonstop", "unstoppable", "好舒服"] {
+    check(!AIStopWords.matches(s), "不是停止词：\(s)")
+}
+
+// MARK: - 接口完整性
+
+check(LLMResponse.incompleteReason(["choices": [["finish_reason": "stop"]]], wire: .chatCompletions) == nil,
+      "chat finish_reason=stop 完整")
+check(LLMResponse.incompleteReason(["choices": [["finish_reason": "length"]]], wire: .chatCompletions) != nil,
+      "chat finish_reason=length 不完整")
+check(LLMResponse.incompleteReason([:], wire: .chatCompletions) != nil, "chat 缺 finish_reason 不完整")
+check(LLMResponse.incompleteReason(["stop_reason": "end_turn"], wire: .anthropicMessages) == nil, "Anthropic end_turn 完整")
+check(LLMResponse.incompleteReason(["stop_reason": "stop_sequence"], wire: .anthropicMessages) == nil,
+      "Anthropic stop_sequence 完整")
+check(LLMResponse.incompleteReason(["stop_reason": "max_tokens"], wire: .anthropicMessages) != nil,
+      "Anthropic max_tokens 不完整")
+check(LLMResponse.incompleteReason(["status": "completed"], wire: .responses) == nil, "Responses completed 完整")
+check(LLMResponse.incompleteReason(["status": "incomplete"], wire: .responses) != nil, "Responses incomplete 不完整")
+
 if failures > 0 {
     print("\(failures) 项检查失败")
     exit(1)

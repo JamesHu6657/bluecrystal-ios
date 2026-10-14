@@ -35,7 +35,7 @@ jobs:
           # 不用 grep -q 接管道：grep 提前退出会让 xcodebuild 收到 SIGPIPE，pipefail 下误判失败
           [ "$(printf '%s\n' "$V" | head -n1)" = "Xcode 16.4" ]
 
-      # 钉住实抓帧字节、官方换算和安全上限（Tests/ProtocolChecks/main.swift）
+      # 钉住实抓帧字节、官方换算、安全上限和 AI 指令解析/停止词（Tests/ProtocolChecks/main.swift）
       - name: Protocol and safety checks
         run: |
           set -euo pipefail
@@ -43,6 +43,7 @@ jobs:
             BlueCrystalIOS/Protocol.swift \
             BlueCrystalIOS/Models.swift \
             BlueCrystalIOS/SafetyLedger.swift \
+            BlueCrystalIOS/AIProgram.swift \
             Tests/ProtocolChecks/main.swift \
             -o "$RUNNER_TEMP/protocol-checks" 2>&1 | tee tests.log
           "$RUNNER_TEMP/protocol-checks" 2>&1 | tee -a tests.log
