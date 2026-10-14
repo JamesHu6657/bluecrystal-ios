@@ -30,8 +30,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo xcode-select -s /Applications/Xcode_16.4.app
-          xcodebuild -version
-          xcodebuild -version | grep -qx 'Xcode 16\.4'
+          V="$(xcodebuild -version)"
+          echo "$V"
+          # 不用 grep -q 接管道：grep 提前退出会让 xcodebuild 收到 SIGPIPE，pipefail 下误判失败
+          [ "$(printf '%s\n' "$V" | head -n1)" = "Xcode 16.4" ]
 
       # 钉住实抓帧字节、官方换算和安全上限（Tests/ProtocolChecks/main.swift）
       - name: Protocol and safety checks
