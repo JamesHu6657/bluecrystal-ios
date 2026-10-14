@@ -237,10 +237,18 @@ enum OutputGate {
         guard let e = requestEpoch else { return true }
         return e == currentEpoch
     }
+
+    /// 开闸的完整前提（第三轮 L2）：链路可写（已连接、不在断开流程、不在后台）且代次对得上。
+    /// submitOutput 和 userResumeOutput 共用：之前 userResumeOutput 不看链路，断链 / 断开中 / 后台期间到的
+    /// 开闸请求会把闸门打开，一直开到重连 / 回到前台之后，下一帧自动帧（tick、节流尾帧、AI 后续步）不用用户操作就能出去
+    static func mayResume(linkWritable: Bool, requestEpoch: Int?, currentEpoch: Int) -> Bool {
+        linkWritable && mayOpen(requestEpoch: requestEpoch, currentEpoch: currentEpoch)
+    }
 }
 
 /// BLEManager.submitOutput 的完整准入顺序（纯决策，M3）。顺序本身就是安全约束：
-/// 链路/后台 → 闸门 → 设备可能仍在输出 → 停止进行中（绝不插进停止帧对两帧之间）→ 全零 → 写入（空闲时开始一次运行）。
+/// 链路/后台 → 闸门 → 设备可能仍在输出 → 停止进行中（绝不插进停止帧对两帧之间）→ 运行到点（第三轮 L1）
+/// → 全零 → 写入（空闲时开始一次运行）。
 /// BLEManager 只负责把决策落地（锁闸、提示、记账、写入）。
 enum OutputAdmission {
     struct Inputs {
@@ -257,6 +265,8 @@ enum OutputAdmission {
         var allZero = false
         var isActive = false
         var zeroHeld = false
+        /// 本次运行已经到点（单次上限或额度用完，ledger.runRemaining() ≤ 0）（第三轮 L1）
+        var runExpired = false
     }
 
     enum Decision: Equatable {
@@ -268,6 +278,9 @@ enum OutputAdmission {
         case rejectStopUnconfirmed
         /// 停止帧对在路上：记下最新一帧，确认后重新走准入
         case deferUntilStopped
+        /// 运行已经到点：这一帧不写（全零也不再走保持运行的停止帧对），直接按上限停机（第三轮 L1）。
+        /// 到点定时器和看门狗在停止进行中都会跳过检查，之前停止帧对确认后重放挂起的帧会让设备越过上限再输出到下一次 tick
+        case stopForLimit
         /// 全零：见 OutputGate
         case skipIdleZero
         case alreadyZeroed
@@ -280,6 +293,7 @@ enum OutputAdmission {
         guard i.linkWritable, i.gateOpen else { return .drop }
         if i.mayStillBeOutputting { return .rejectMayBeActive }
         if i.stopInProgress { return i.stopFailed ? .rejectStopUnconfirmed : .deferUntilStopped }
+        if i.isActive, i.runExpired { return .stopForLimit }
         switch OutputGate.decide(allZero: i.allZero, isActive: i.isActive, zeroHeld: i.zeroHeld) {
         case .skipIdleZero: return .skipIdleZero
         case .alreadyZeroed: return .alreadyZeroed
@@ -453,5 +467,26 @@ enum BackgroundResume {
     static func shouldRequestStop(wasBackground: Bool, linkWritable: Bool,
                                   stopInProgress: Bool, stopNeeded: Bool) -> Bool {
         wasBackground && linkWritable && (stopInProgress || stopNeeded)
+    }
+}
+
+/// 设备可能仍在输出、链路却没了时自动重连（第三轮 M1）。
+/// 之前意外断链 / 蓝牙重新打开 / 被杀后重启只提示"请关闭设备电源"，要等用户自己点"连接"才会发停止帧对。
+/// 只连绑定过的那台（retrievePeripherals，不扫描、不弹框，陌生设备照旧必须确认）；连上后 didDiscoverCharacteristicsFor
+/// 照常先发一对必须确认的停止帧。用户点"断开"/"强制断开"的那一刻不触发（没有断链回调）；之后蓝牙重新打开或重启 App 时
+/// 设备仍可能在输出，照样重连去停。连接失败 / 超时不自动重试（不做重连循环），用户仍可手动点"连接"
+enum AutoReconnect {
+    static func shouldReconnect(mayBeActive: Bool, poweredOn: Bool, linkIdle: Bool,
+                                hasPeripheral: Bool, disconnecting: Bool, hasBondedDevice: Bool) -> Bool {
+        mayBeActive && poweredOn && linkIdle && !hasPeripheral && !disconnecting && hasBondedDevice
+    }
+}
+
+/// 用户确认已物理关机时要不要补发一对冗余停止（第三轮 L3）。
+/// 解除锁定会放弃进行中的停止：如果正好在两帧之间的 100ms 里点，0x06 那一帧再也不会发出去。
+/// 链路还在就补一对（不报警、不重试、不锁存），不让设备停在只收到半对停止帧的状态
+enum PhysicalAck {
+    static func shouldResendStop(abandonedStop: Bool, linkWritable: Bool) -> Bool {
+        abandonedStop && linkWritable
     }
 }
