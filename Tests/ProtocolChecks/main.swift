@@ -1,7 +1,7 @@
 import Foundation
 
-// CI 检查（修 L15）：swiftc 直接编译 Protocol.swift + Models.swift + SafetyLedger.swift + 本文件后运行。
-// 钉住实抓帧字节、官方换算和 legacy 安全上限，任何一项不符就以非零退出码失败。
+// CI 检查（修 L15）：swiftc 直接编译 Protocol.swift + Models.swift + SafetyLedger.swift + AIProgram.swift + 本文件后运行。
+// 钉住实抓帧字节、官方换算、legacy 安全上限、AI 指令解析/停止词/回复授权，任何一项不符就以非零退出码失败。
 
 var failures = 0
 
@@ -524,6 +524,10 @@ for (raw, name) in [
     ("<PRE class=\"x\">\n[CH 99 0 0 0]\n</PRE>", "大写 <PRE>"),
     ("<Code>\n[CH 99 0 0 0]\n</Code>", "<code> 里的指令"),
     ("<!--\n[CH 99 0 0 0]\n-->", "HTML 注释里的指令"),
+    ("<textarea>\n[CH 99 0 0 0]\n</textarea>", "<textarea> 里的指令"),
+    ("<SCRIPT>\n[CH 99 0 0 0]\n</SCRIPT>", "<script> 里的指令"),
+    ("<style>\n[CH 99 0 0 0]\n</style>", "<style> 里的指令"),
+    ("<template>\n[CH 99 0 0 0]\n</template>", "<template> 里的指令"),
     ("[CH 30 0 0 0]\n<!-- 注释 -->", "合法指令 + HTML 注释"),
     ("```\u{301}\n[CH 99 0 0 0]", "反引号后紧跟组合符号的围栏"),
     ("~~~\u{300}\n[CH 99 0 0 0]\n~~~", "波浪线后紧跟组合符号的围栏"),
@@ -543,6 +547,11 @@ for (raw, name) in [
 }
 check(AIReply.parse("宝宝\n    继续缩进的文字").rejection == nil, "没有指令时缩进文字不影响")
 check(AIReply.parse("<pre>乖</pre>\n<!-- 嘘 -->").rejection == nil, "没有指令时 HTML 不影响")
+do {
+    // 代码块里的 HTML 只是示例文字，不让代码块外的合法指令作废
+    let r = AIReply.parse("```\n<pre>示例</pre>\n<textarea>\n```\n[CH 20 0 0 0]")
+    check(r.rejection == nil && r.steps == [AIStep(levels: [20, 0, 0, 0], duration: 0)], "代码块里的 HTML 不影响块外指令")
+}
 
 // 参数必须精确
 for (raw, name) in [

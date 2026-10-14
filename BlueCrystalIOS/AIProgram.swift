@@ -35,7 +35,7 @@ struct AIStep: Equatable {
 ///   代码块按 CommonMark 围栏判断：记住开头的字符和长度，只有同一种字符、长度不短于开头、
 ///   后面只剩空白的行才闭合；没闭合就算到回复结尾。围栏长度按 Unicode 标量数（和 CommonMark 一致）。
 ///   围栏样式含糊（缩进 4 格以上/制表符、引用或列表里的围栏、行内 ```、` / ~ 后紧跟组合符号）
-///   或出现 <pre / <code / <!--（HTML 可能把指令藏起来）时，只要有指令就整条作废。
+///   或出现 <pre / <code / <textarea / <script / <style / <template / <!--（HTML 可能把指令藏起来）时，只要有指令就整条作废。
 /// - 代码块外的指令行只允许 0~3 个空格缩进；制表符或 4 格以上可能是缩进代码块，整条作废。
 /// - 参数个数精确：CH 恰好 4 个非负十进制整数，HOLD 恰好 1 个正十进制整数，STOP 没有参数。
 ///   不接受小数、负号、科学计数法、逗号分隔，不补齐、不跳过坏参数、不挪通道。
@@ -122,11 +122,14 @@ struct AIReply {
         return (Fence(char: c, count: n), Substring(scalars.dropFirst(n)))
     }
 
-    /// 渲染时可能藏住指令、但这里不解析的写法：<pre、<code、<!--（不分大小写），
+    /// 渲染时可能藏住指令、但这里不解析的写法：<pre、<code、<textarea、<script、<style、<template、<!--
+    /// （不分大小写；后几个是 CommonMark 的原样文本块，里面的内容不会显示成正文），
     /// 或 ` / ~ 后紧跟组合符号（U+0300~U+036F，各家渲染器对围栏的判断可能不同）
     private static func hasHidingMarkup(_ line: Substring) -> Bool {
         let lower = line.lowercased()
-        if lower.contains("<pre") || lower.contains("<code") || lower.contains("<!--") { return true }
+        for tag in ["<pre", "<code", "<textarea", "<script", "<style", "<template", "<!--"] where lower.contains(tag) {
+            return true
+        }
         var prev: Unicode.Scalar?
         for u in line.unicodeScalars {
             if let p = prev, p == "`" || p == "~", (0x300...0x36F).contains(u.value) { return true }
@@ -154,7 +157,7 @@ struct AIReply {
         // 当前所在代码块的开头围栏；没闭合就一直算在代码块里，直到回复结束
         var fence: Fence?
         // 出现了无法和 Markdown 渲染结果对齐的写法（缩进 4 格/制表符、引用或列表里的围栏、行内 ```、
-        // HTML 的 <pre / <code / <!--、围栏字符后的组合符号）
+        // 代码块外 HTML 的 <pre / <code / <textarea / <script / <style / <template / <!--、围栏字符后的组合符号）
         var markupAmbiguous = false
 
         let lines = raw.replacingOccurrences(of: "\r\n", with: "\n")
@@ -165,8 +168,8 @@ struct AIReply {
             let indent = rawLine.prefix(while: { $0.isWhitespace })
             let plainIndent = indent.count <= 3 && indent.allSatisfy { $0 == " " }
             let run = fenceRun(rawLine.dropFirst(indent.count))
-            if hasHidingMarkup(rawLine) { markupAmbiguous = true }
 
+            // 代码块里的内容本来就不执行（有指令直接作废），HTML 写法只在代码块外判断
             if let open = fence {
                 // CommonMark 闭合围栏：同一种字符、长度不短于开头、后面只有空格/制表符
                 if let r = run, r.fence.char == open.char, r.fence.count >= open.count,
@@ -187,7 +190,7 @@ struct AIReply {
                 textLines.append(line)
                 continue
             }
-            if hasFenceLikeRun(rawLine) { markupAmbiguous = true }
+            if hasFenceLikeRun(rawLine) || hasHidingMarkup(rawLine) { markupAmbiguous = true }
             // 制表符或 4 格以上缩进的行可能在缩进代码块里（渲染成代码，不是指令）
             if hasToken, !plainIndent, rejection == nil {
                 rejection = "指令有缩进（制表符或 4 格以上），可能在代码块里：\(line)"
