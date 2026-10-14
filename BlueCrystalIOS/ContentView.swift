@@ -18,6 +18,13 @@ struct ContentView: View {
             .tabItem {
                 Label("视频联动", systemImage: "play.rectangle")
             }
+
+            NavigationView {
+                AIControlView()
+            }
+            .tabItem {
+                Label("AI 控制", systemImage: "sparkles")
+            }
         }
         // 发现未绑定过的设备时弹确认框（防连到别人的设备）。
         // 直接用 showDeviceConfirm 做 binding：点"连接"和点"取消"走各自的方法，
