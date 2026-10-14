@@ -632,85 +632,332 @@ final class AIControlVM: ObservableObject {
 
 // MARK: - 界面
 
+/// 页头显示的服务商 / 模型：设置保存或快捷切换写进 UserDefaults 后立刻刷新。
+/// 不用 @AppStorage：键名带点（bc.ai.provider），KVO 会把点当成路径，外部写入时收不到更新
+final class AIConfigWatcher: ObservableObject {
+    @Published private(set) var provider = AIConfig.provider
+    @Published private(set) var model = AIConfig.model
+    private var token: NSObjectProtocol?
+
+    init() {
+        token = NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification,
+                                                       object: nil, queue: .main) { [weak self] _ in
+            self?.refresh()
+        }
+    }
+
+    deinit {
+        if let t = token { NotificationCenter.default.removeObserver(t) }
+    }
+
+    func refresh() {
+        let p = AIConfig.provider
+        let m = AIConfig.model
+        if p != provider { provider = p }
+        if m != model { model = m }
+    }
+
+    /// 页头的快捷切换：只改下一次请求用哪家，不影响正在执行的程序和任何安全规则
+    func select(_ p: AIProvider, _ m: AIModel) {
+        AIConfig.provider = p
+        AIConfig.model = m
+        refresh()
+    }
+}
+
 struct AIControlView: View {
     @EnvironmentObject var ble: BLEManager
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var vm = AIControlVM()
+    @StateObject private var config = AIConfigWatcher()
     @State private var showSettings = false
+    @FocusState private var inputFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
-            Form {
-                DeviceStatusSection(allowDisconnect: false, connectTitle: "连接")
-                Section("当前") {
-                    HStack {
-                        Text(vm.statusLine).font(.caption).foregroundColor(.secondary)
-                        Spacer()
-                        Button("停止", role: .destructive) { vm.stopAll() }
-                    }
-                    .buttonStyle(.borderless)
-                }
-                Section("对话") {
-                    if vm.messages.isEmpty {
-                        Text("跟她说句话就开始。随时说“停”或点停止，本地立刻停。")
-                            .font(.caption).foregroundColor(.secondary)
-                    }
-                    ForEach(vm.messages) { m in
-                        VStack(alignment: m.isUser ? .trailing : .leading, spacing: 4) {
-                            if !m.text.isEmpty {
-                                Text(m.text)
-                                    .foregroundColor(m.isError ? .red : .primary)
-                                    .padding(8)
-                                    .background(m.isUser ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12))
-                                    .cornerRadius(10)
-                            }
-                            if let p = m.program {
-                                Text(p).font(.caption2).foregroundColor(.secondary)
-                            }
+            header
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接")
+                            .padding(.bottom, 4)
+                        if vm.messages.isEmpty {
+                            emptyState
                         }
-                        .frame(maxWidth: .infinity, alignment: m.isUser ? .trailing : .leading)
+                        ForEach(vm.messages) { m in
+                            ChatBubble(message: m)
+                                .id(m.id)
+                                .transition(.asymmetric(insertion: .move(edge: .bottom).combined(with: .opacity),
+                                                        removal: .opacity))
+                        }
+                        if vm.isThinking {
+                            TypingIndicator()
+                                .transition(.opacity)
+                        }
+                        Color.clear.frame(height: 1).id(Self.bottomID)
                     }
-                    if vm.isThinking {
-                        ProgressView().frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .animation(.spring(response: 0.4, dampingFraction: 0.85), value: vm.messages.count)
+                    .animation(.easeInOut(duration: 0.2), value: vm.isThinking)
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onChange(of: vm.messages.count) { _ in
+                    withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
+                }
+                .onChange(of: vm.isThinking) { _ in
+                    withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
                 }
             }
-            HStack {
-                // 第三轮 M2：停止键常驻输入栏。"当前"区块里的停止键在 Form 里，聊天记录一长就会滚出屏幕，
-                // 输入栏始终在底部，不用滚动、不用打字也能一下停
-                Button(role: .destructive) { vm.stopAll() } label: {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.title2)
-                        .foregroundColor(.red)
-                }
-                .accessibilityLabel("停止")
-                // 等回复期间输入框也保持可用：停止词随时能发
-                TextField(vm.isThinking ? "她在回复…说“停”随时停" : "说点什么…", text: $vm.input)
-                    .textFieldStyle(.roundedBorder)
-                    .submitLabel(.send)
-                    .onSubmit { vm.send() }
-                Button { vm.send() } label: {
-                    Image(systemName: "paperplane.fill")
-                }
-                .disabled(!vm.canSubmit)
-            }
-            .padding(10)
-            .background(.bar)
+            inputBar
         }
-        .navigationTitle("AI 控制")
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                // L2：设置页会盖住停止键，打开前先停止
-                Button {
-                    vm.willOpenSettings()
-                    showSettings = true
-                } label: { Image(systemName: "gearshape") }
-            }
+        .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
+        .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) { AISettingsView() }
+        .onAppear {
+            config.refresh()
+            vm.viewAppeared(ble: ble, scenePhase: scenePhase)
         }
-        .sheet(isPresented: $showSettings) { AISettingsView() }
-        .onAppear { vm.viewAppeared(ble: ble, scenePhase: scenePhase) }
         .onDisappear { if !showSettings { vm.viewDisappeared() } }
         .onChange(of: scenePhase) { phase in vm.scenePhaseChanged(phase) }
+    }
+
+    private static let bottomID = "chat-bottom"
+
+    /// 页头：她的名字、当前服务商/模型（可快捷切换）、设置；下面一行是状态和停止（原"当前"区块）
+    private var header: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(Velvet.roseGradient)
+                        .frame(width: 44, height: 44)
+                        .shadow(color: Velvet.rose.opacity(vm.running ? 0.7 : 0.3), radius: vm.running ? 12 : 6)
+                    Text("栞")
+                        .font(Velvet.serif(20, .semibold))
+                        .foregroundColor(.white)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("她")
+                            .font(Velvet.serif(26, .semibold))
+                            .foregroundColor(Velvet.text)
+                        Text("明月栞那")
+                            .font(.footnote)
+                            .foregroundColor(Velvet.textSecondary)
+                    }
+                    modelMenu
+                }
+                Spacer(minLength: 4)
+                Button {
+                    // L2：设置页会盖住停止键，打开前先停止
+                    vm.willOpenSettings()
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(Velvet.text)
+                        .frame(width: 40, height: 40)
+                        .background(Circle().fill(Color.white.opacity(0.07)))
+                }
+                .buttonStyle(PressableStyle())
+                .accessibilityLabel("AI 设置")
+            }
+            HStack(spacing: 10) {
+                StatusOrb(color: vm.running ? Velvet.rose : (vm.isThinking ? Velvet.gold : Velvet.textMuted),
+                          pulsing: vm.running || vm.isThinking)
+                Text(vm.statusLine)
+                    .font(.caption)
+                    .foregroundColor(Velvet.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Button("停止", role: .destructive) {
+                    vm.stopAll()
+                    Haptics.stop()
+                }
+                .buttonStyle(PillButtonStyle(kind: .danger))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.05)))
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .background(
+            LinearGradient(colors: [Velvet.ink.opacity(0.95), Velvet.ink.opacity(0.6)], startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea(edges: .top)
+        )
+    }
+
+    /// 当前服务商 · 模型；点开可以快捷切换（只影响下一次请求）
+    private var modelMenu: some View {
+        Menu {
+            ForEach(AIProvider.allCases) { p in
+                Section(p.title) {
+                    ForEach(p.models) { m in
+                        Button {
+                            config.select(p, m)
+                            Haptics.select()
+                        } label: {
+                            if p == config.provider && m.id == config.model.id {
+                                Label(m.name, systemImage: "checkmark")
+                            } else {
+                                Text(m.name)
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("\(config.provider.title) · \(config.model.name)")
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+            }
+            .font(.caption)
+            .foregroundColor(Velvet.gold)
+        }
+        .accessibilityLabel("当前模型：\(config.provider.title) \(config.model.name)")
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "heart.fill")
+                .font(.system(size: 30))
+                .foregroundStyle(Velvet.roseGradient)
+                .shadow(color: Velvet.rose.opacity(0.6), radius: 12)
+            Text("她在等你开口")
+                .font(Velvet.serif(20, .medium))
+                .foregroundColor(Velvet.text)
+            Text("跟她说句话就开始。随时说“停”或点停止，本地立刻停。")
+                .font(.caption)
+                .foregroundColor(Velvet.textSecondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+    }
+
+    private var inputBar: some View {
+        HStack(spacing: 10) {
+            // 第三轮 M2：停止键常驻输入栏。聊天记录一长页头之外的内容会滚走，
+            // 输入栏始终在底部，不用滚动、不用打字也能一下停
+            Button(role: .destructive) {
+                vm.stopAll()
+                Haptics.stop()
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 17, weight: .black))
+                    .foregroundColor(.white)
+                    .frame(width: 46, height: 46)
+                    .background(Circle().fill(Velvet.stopGradient))
+                    .shadow(color: Velvet.danger.opacity(0.5), radius: 8)
+            }
+            .buttonStyle(PressableStyle())
+            .accessibilityLabel("停止")
+            // 等回复期间输入框也保持可用：停止词随时能发
+            TextField(vm.isThinking ? "她在回复…说“停”随时停" : "说点什么…", text: $vm.input)
+                .focused($inputFocused)
+                .submitLabel(.send)
+                .onSubmit { vm.send() }
+                .foregroundColor(Velvet.text)
+                .padding(.horizontal, 16)
+                .frame(minHeight: 44)
+                .background(Capsule().fill(Color.white.opacity(0.08)))
+                .overlay(Capsule().strokeBorder(inputFocused ? Velvet.rose.opacity(0.6) : Velvet.stroke, lineWidth: 1))
+            Button { vm.send() } label: {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: 44, height: 44)
+                    .background(Circle().fill(Velvet.roseGradient))
+            }
+            .buttonStyle(PressableStyle())
+            .disabled(!vm.canSubmit)
+            .accessibilityLabel("发送")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+        .background(Velvet.ink.opacity(0.5))
+    }
+}
+
+/// 一条消息：用户在右（玫瑰色），她在左（深色丝绒），出错红色；程序说明以小字附在下面（不隐藏）
+private struct ChatBubble: View {
+    let message: AIControlVM.ChatMessage
+
+    var body: some View {
+        let isUser = message.isUser
+        VStack(alignment: isUser ? .trailing : .leading, spacing: 5) {
+            if !message.text.isEmpty {
+                Text(message.text)
+                    .font(.body)
+                    .foregroundColor(message.isError ? Velvet.danger : (isUser ? Color.white : Velvet.text))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(bubbleBackground)
+                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .strokeBorder(message.isError ? Velvet.danger.opacity(0.5)
+                                          : Color.white.opacity(isUser ? 0.0 : 0.08), lineWidth: 1)
+                    )
+                    .shadow(color: isUser ? Velvet.rose.opacity(0.3) : .clear, radius: 10, y: 3)
+                    .textSelection(.enabled)
+            }
+            if let p = message.program {
+                HStack(alignment: .top, spacing: 5) {
+                    Image(systemName: "waveform.path")
+                    Text(p).fixedSize(horizontal: false, vertical: true)
+                }
+                .font(.caption2)
+                .foregroundColor(Velvet.textMuted)
+                .padding(.horizontal, 6)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .padding(isUser ? .leading : .trailing, 44)
+    }
+
+    @ViewBuilder private var bubbleBackground: some View {
+        if message.isError {
+            Velvet.danger.opacity(0.12)
+        } else if message.isUser {
+            Velvet.roseGradient
+        } else {
+            LinearGradient(colors: [Color.white.opacity(0.09), Color.white.opacity(0.04)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+        }
+    }
+}
+
+/// 她在打字：三个依次亮起的点
+private struct TypingIndicator: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 20, paused: false)) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate
+            HStack(spacing: 6) {
+                ForEach(0..<3, id: \.self) { i in
+                    let phase = sin((t * 2 * .pi / 1.2) - Double(i) * 0.7)
+                    Circle()
+                        .fill(Velvet.blush)
+                        .frame(width: 7, height: 7)
+                        .opacity(0.35 + 0.65 * max(0, phase))
+                        .scaleEffect(CGFloat(0.85 + 0.25 * max(0, phase)))
+                }
+                Text("她在想…")
+                    .font(.caption)
+                    .foregroundColor(Velvet.textMuted)
+                    .padding(.leading, 4)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Color.white.opacity(0.06)))
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("她在回复")
     }
 }
 
@@ -784,6 +1031,9 @@ struct AISettingsView: View {
             .onChange(of: provider) { p in
                 if !p.models.contains(where: { $0.id == modelID }) { modelID = p.models[0].id }
             }
+            .scrollContentBackground(.hidden)
+            .background(VelvetBackground(glow: 0.1).ignoresSafeArea())
+            .tint(Velvet.rose)
             .navigationTitle("AI 设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
