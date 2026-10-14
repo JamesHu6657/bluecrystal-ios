@@ -322,7 +322,7 @@ struct AgeGateView: View {
                             .multilineTextAlignment(.center)
                             .fixedSize(horizontal: false, vertical: true)
                     }
-                    .velvetAppear(delay: 0.12)
+                    .velvetAppear(delay: 0.08)
                     VStack(alignment: .leading, spacing: 10) {
                         Label("点红色「停止」（「她」页面也可以输入“停”）会立刻发送停止，设备确认后才算停下", systemImage: "stop.circle.fill")
                         Label("第一次使用前，先在不接触身体时试一次停止", systemImage: "hand.raised.fill")
@@ -331,7 +331,7 @@ struct AgeGateView: View {
                     .font(.footnote)
                     .foregroundColor(Velvet.textSecondary)
                     .velvetCard()
-                    .velvetAppear(delay: 0.24)
+                    .velvetAppear(delay: 0.14)
 
                     if let name = lock.biometry?.name {
                         Toggle(isOn: $useBiometric) {
@@ -342,7 +342,7 @@ struct AgeGateView: View {
                         }
                         .tint(Velvet.rose)
                         .velvetCard()
-                        .velvetAppear(delay: 0.32)
+                        .velvetAppear(delay: 0.18)
                     }
 
                     VStack(spacing: 12) {
@@ -359,7 +359,7 @@ struct AgeGateView: View {
                             .font(.caption)
                             .foregroundColor(Velvet.textMuted)
                     }
-                    .velvetAppear(delay: 0.4)
+                    .velvetAppear(delay: 0.2)
                     Spacer(minLength: 20)
                 }
                 .padding(.horizontal, 24)

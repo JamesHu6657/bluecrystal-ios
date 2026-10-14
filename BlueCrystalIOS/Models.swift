@@ -122,6 +122,8 @@ struct ActiveChannels: Equatable {
 struct FavoriteSetting: Codable, Identifiable, Equatable {
     static let maxCount = 8
     static let maxNameLength = 12
+    /// 打字过程中的草稿上限：比 maxNameLength 宽松得多，拼音还没上屏时不会被截断（完成时再截到 maxNameLength）
+    static let maxDraftLength = 40
     /// 自动起的名字（按顺序取第一个没用过的）
     static let suggestedNames = ["微醺", "心动", "缠绵", "悸动", "沉溺", "迷离", "余温", "失控边缘"]
 
@@ -221,6 +223,47 @@ enum FavoriteGlide {
             if out.last != step { out.append(step) }
         }
         return out
+    }
+}
+
+/// 收藏现在能不能点、为什么（纯展示规则，ProtocolChecks 覆盖）。真正的拦截仍在 ManualControlVM.applyFavorite
+/// 和 BLEManager 的准入里；这里只决定卡片灰不灰、旁边写什么
+struct FavoriteRecallRules {
+    let mode: BCProtocol.Mode
+    /// 滑杆当前值（技能模式下是预设的值）
+    let levels: [Int]
+    /// 已连接且安全规则允许输出
+    let canOutput: Bool
+    /// 不能输出的原因（未连接 / 冷却 / 额度 / 锁存）；canOutput 为 true 时为 nil
+    let blockReason: String?
+    /// 本次运行还开着（runRemaining != nil）
+    let running: Bool
+
+    /// 正在运行时别的模式的收藏：切模式要先停机，停机后还要冷却，点了也只会停下，所以先锁住
+    func locked(_ fav: FavoriteSetting) -> Bool {
+        running && fav.mode != mode
+    }
+
+    func usable(_ fav: FavoriteSetting) -> Bool {
+        canOutput && fav.clampedLevels != nil && !locked(fav)
+    }
+
+    /// 一张卡片的旁白提示
+    func hint(for fav: FavoriteSetting) -> String {
+        if let r = blockReason { return r }
+        if locked(fav) { return "正在输出，切换模式要先停止并冷却" }
+        return "缓缓推到这组强度"
+    }
+
+    /// 收藏区下面的一句状态（不能点时说为什么）；都能点时为 nil
+    func status(for items: [FavoriteSetting]) -> String? {
+        if let r = blockReason { return r }
+        guard running, items.contains(where: { $0.mode != mode }) else { return nil }
+        // 滑杆都拉到 0 时运行仍在计时（设备停在 0）：别说"正在输出"，说清楚要先点停止
+        if !levels.contains(where: { $0 > 0 }) {
+            return "本次运行仍在计时：先点停止，冷却结束后再点其他模式的收藏"
+        }
+        return "正在输出：其他模式的收藏要先停止，冷却结束后再点"
     }
 }
 

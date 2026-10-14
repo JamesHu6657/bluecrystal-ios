@@ -718,10 +718,11 @@ struct AIControlView: View {
                 }
                 inputBar
             }
+            // 只给快捷话这一层做动画，不把聊天记录一起带着动
+            .animation(.easeInOut(duration: 0.2), value: showQuickReplies)
             .background(.ultraThinMaterial)
             .background(Velvet.ink.opacity(0.5))
         }
-        .animation(.easeInOut(duration: 0.2), value: showQuickReplies)
         .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
         .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) {
             // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，自己也要挂一份
@@ -862,9 +863,10 @@ struct AIControlView: View {
         vm.send()
     }
 
-    /// 输入框空着、没在等回复时才出快捷话（不会盖掉自己打了一半的字）
+    /// 输入框空着时才出快捷话（不会盖掉自己打了一半的字）。
+    /// 等回复期间不收起（之前每发一句都收起再弹出，聊天区跟着上下跳），只是暂时点不了
     private var showQuickReplies: Bool {
-        vm.input.isEmpty && !vm.isThinking
+        vm.input.isEmpty
     }
 
     /// 快捷话：一点就发，和自己打字回车完全同一条路径（submit → vm.send）。
@@ -890,7 +892,8 @@ struct AIControlView: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(PressableStyle())
-                    .accessibilityHint("发送这句话")
+                    .disabled(vm.isThinking)
+                    .accessibilityHint(vm.isThinking ? "她回复后可以点" : "发送这句话")
                 }
             }
             .padding(.horizontal, 12)

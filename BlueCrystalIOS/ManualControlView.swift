@@ -229,7 +229,7 @@ struct ManualControlView: View {
     @EnvironmentObject var privacy: PrivacyLock
     @StateObject private var vm = ManualControlVM()
     @StateObject private var favorites = FavoriteStore()
-    /// 设备详情（最后一帧 / FFA2 / 版本）默认收起：调试信息不抢主角
+    /// 「隐私与设备」默认收起：面容 ID 开关、最后一帧、FFA2、版本都不抢主角
     @State private var showDetails = false
 
     private var modeFooter: String {
@@ -255,6 +255,17 @@ struct ManualControlView: View {
     private var favoritesBlockReason: String? {
         if ble.state != .ready { return "连上设备后，点一下就回到收藏的手感" }
         return ble.safety.blockReason
+    }
+
+    /// 收藏卡片能不能点（纯展示；applyFavorite 和 BLEManager 另有兜底）
+    private var recallRules: FavoriteRecallRules {
+        FavoriteRecallRules(mode: vm.mode, levels: currentLevels, canOutput: canOutput,
+                            blockReason: favoritesBlockReason, running: ble.safety.runRemaining != nil)
+    }
+
+    /// 空闲停机说明只在它管得着的时候出现：正在输出，或者刚因为空闲停了
+    private var showsIdleNote: Bool {
+        vm.idleNotice != nil || ble.safety.runRemaining != nil
     }
 
     /// 连上了且现在允许开始/继续输出（冷却、额度、锁存、停止未确认时禁用；停止按钮不受影响）
@@ -284,7 +295,8 @@ struct ManualControlView: View {
             VStack(alignment: .leading, spacing: 18) {
                 PageHeader(title: "手感", subtitle: Velvet.greeting())
 
-                DeviceStatusCard(allowDisconnect: true, connectTitle: "连接 mizzzee_0032")
+                // 型号写在卡片里的设备名上，按钮只说要做什么
+                DeviceStatusCard(allowDisconnect: true, connectTitle: "连接设备")
 
                 HeatCore(heat: heat, active: ble.state == .ready)
                     .frame(maxWidth: .infinity)
@@ -292,21 +304,28 @@ struct ManualControlView: View {
 
                 modeSection
 
+                // 收藏放在滑杆上面：一点就回到那一下，不用先滚过三根滑杆
+                if !favorites.items.isEmpty {
+                    FavoriteQuickRow(store: favorites, rules: recallRules) { vm.applyFavorite($0) }
+                        .transition(.opacity)
+                }
+
                 controlsSection
 
                 // 空闲停机说明紧跟在滑杆下面：它说的就是这几根滑杆
-                idleNote
+                if showsIdleNote {
+                    idleNote
+                        .transition(.opacity)
+                }
 
-                FavoritesPanel(store: favorites, mode: vm.mode, levels: currentLevels,
-                               canOutput: canOutput, blockReason: favoritesBlockReason,
-                               running: ble.safety.runRemaining != nil) { vm.applyFavorite($0) }
+                FavoritesPanel(store: favorites, mode: vm.mode, levels: currentLevels)
 
-                privacyCard
-
-                deviceDetails
+                settingsCard
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 16)
+            .animation(.easeInOut(duration: 0.25), value: favorites.items.isEmpty)
+            .animation(.easeInOut(duration: 0.25), value: showsIdleNote)
         }
         .background(VelvetBackground(glow: heat).ignoresSafeArea())
         // 停止常驻底部：不随内容滚走，一下就停。任何连接状态下都可以点（修：之前未连接 / 断开中时被禁用，
@@ -386,9 +405,63 @@ struct ManualControlView: View {
         .padding(.horizontal, 6)
     }
 
-    private var privacyCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(title: "隐私", systemImage: "eye.slash")
+    /// 收起时的一句概要：不展开也知道隐私保护开着没有
+    private var settingsSummary: String {
+        if privacy.biometricEnabled {
+            let name: String = privacy.biometry?.name ?? "面容 ID"
+            return "打开时用\(name)解锁 · 后台自动模糊"
+        }
+        return "后台自动模糊 · 可开启面容 ID 解锁"
+    }
+
+    /// 隐私与设备（点标题展开）：面容 ID 开关、最后一帧、FFA2 通知、协议说明、版本。
+    /// 隐私提示（privacy.message）不收起，任何时候都看得到
+    private var settingsCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) { showDetails.toggle() }
+                Haptics.select()
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        SectionLabel(title: "隐私与设备", systemImage: "eye.slash")
+                        Text(settingsSummary)
+                            .font(.caption)
+                            .foregroundColor(Velvet.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Velvet.gold.opacity(0.9))
+                        .rotationEffect(.degrees(showDetails ? 180 : 0))
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("隐私与设备，\(settingsSummary)")
+            .accessibilityValue(showDetails ? "已展开" : "已收起")
+            .accessibilityHint("面容 ID 解锁、最后一帧、设备通知和版本号")
+            if let m = privacy.message {
+                Text(m)
+                    .font(.caption)
+                    .foregroundColor(Velvet.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if showDetails {
+                privacyControls
+                    .transition(.opacity)
+                Divider().overlay(Velvet.stroke)
+                deviceDetailRows
+                    .transition(.opacity)
+            }
+        }
+        .velvetCard()
+    }
+
+    @ViewBuilder private var privacyControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
             // 已开启时即使生物识别暂不可用也保留开关，随时能关掉
             if privacy.biometry != nil || privacy.biometricEnabled {
                 // 打开开关会弹系统验证框（失败时是全屏密码页），会盖住底部停止键：
@@ -405,63 +478,33 @@ struct ManualControlView: View {
                         .foregroundColor(Velvet.textMuted)
                 }
             }
-            if let m = privacy.message {
-                Text(m).font(.caption).foregroundColor(Velvet.warning)
-            }
             Text("切到后台或多任务界面时，画面会自动模糊。")
                 .font(.caption)
                 .foregroundColor(Velvet.textMuted)
         }
-        .velvetCard()
     }
 
-    /// 设备详情：最后一帧、FFA2 通知、协议说明、版本（点标题展开）
-    private var deviceDetails: some View {
+    private var deviceDetailRows: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.25)) { showDetails.toggle() }
-                Haptics.select()
-            } label: {
-                HStack {
-                    SectionLabel(title: "设备详情", systemImage: "waveform.path.ecg")
-                    Spacer()
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(Velvet.gold.opacity(0.9))
-                        .rotationEffect(.degrees(showDetails ? 180 : 0))
-                }
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("设备详情")
-            .accessibilityValue(showDetails ? "已展开" : "已收起")
-            .accessibilityHint("最后一帧、设备通知和版本号")
-            if showDetails {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("最后一帧")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundColor(Velvet.textSecondary)
-                    Text(ble.lastSentHex)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(Velvet.textSecondary)
-                    Text("仅在收到写入回执后更新（链路层回执，不代表设备已执行）")
-                        .font(.caption2).foregroundColor(Velvet.textMuted)
-                    // 修 L1：FFA2 通知原样显示（含义未知，只记录）
-                    Text("设备通知（FFA2）：\(ble.lastNotifyHex)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundColor(Velvet.textMuted)
-                    Text(modeProtocolNote)
-                        .font(.caption2).foregroundColor(Velvet.textMuted)
-                    Text("旋转通道官方 mizzzee 配置未使用，已隐藏（恒发 0）")
-                        .font(.caption2).foregroundColor(Velvet.textMuted)
-                    Text(versionText)
-                        .font(.caption2).foregroundColor(Velvet.textMuted)
-                }
-                .transition(.opacity)
-            }
+            Text("最后一帧")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(Velvet.textSecondary)
+            Text(ble.lastSentHex)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(Velvet.textSecondary)
+            Text("仅在收到写入回执后更新（链路层回执，不代表设备已执行）")
+                .font(.caption2).foregroundColor(Velvet.textMuted)
+            // 修 L1：FFA2 通知原样显示（含义未知，只记录）
+            Text("设备通知（FFA2）：\(ble.lastNotifyHex)")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundColor(Velvet.textMuted)
+            Text(modeProtocolNote)
+                .font(.caption2).foregroundColor(Velvet.textMuted)
+            Text("旋转通道官方 mizzzee 配置未使用，已隐藏（恒发 0）")
+                .font(.caption2).foregroundColor(Velvet.textMuted)
+            Text(versionText)
+                .font(.caption2).foregroundColor(Velvet.textMuted)
         }
-        .velvetCard()
     }
 }
 

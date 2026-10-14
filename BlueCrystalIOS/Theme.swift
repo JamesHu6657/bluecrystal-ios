@@ -103,7 +103,7 @@ enum Haptics {
     private static var lastWarningAt: TimeInterval = -.infinity
 }
 
-// MARK: - 入场：轻轻浮上来（减弱动态效果时只淡入、不位移）
+// MARK: - 入场：轻轻浮上来（减弱动态效果时只淡入、不位移；旁白开着时不做入场）
 
 struct VelvetAppear: ViewModifier {
     var delay: Double = 0
@@ -116,7 +116,12 @@ struct VelvetAppear: ViewModifier {
             .opacity(shown ? 1 : 0)
             .offset(y: offset)
             .onAppear {
-                let duration: Double = reduceMotion ? 0.2 : 0.7
+                // 旁白开着：直接显示（透明的元素拿不到第一个焦点，也点不到）
+                if UIAccessibility.isVoiceOverRunning {
+                    shown = true
+                    return
+                }
+                let duration: Double = reduceMotion ? 0.2 : 0.55
                 let wait: Double = reduceMotion ? 0 : delay
                 withAnimation(.easeOut(duration: duration).delay(wait)) { shown = true }
             }

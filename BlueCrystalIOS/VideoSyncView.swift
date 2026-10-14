@@ -522,22 +522,26 @@ struct VideoSyncView: View {
         .onAppear { vm.attach(ble: ble) }
         // 弹出层（选择器、全屏）盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
         .sheet(item: $picker) { kind in
-            Group {
-                switch kind {
-                case .video:
-                    DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
-                                   onCancel: { picker = nil }) { url in
-                        picker = nil
-                        vm.loadVideo(url: url)
-                    }
-                case .script:
-                    DocumentPicker(contentTypes: [UTType.json], onCancel: { picker = nil }) { url in
-                        picker = nil
-                        vm.loadScript(url: url)
+            // 选择器和底部停止条上下排（不用 safeAreaInset：系统选择器是远程界面，未必让出底部的
+            // 「最近使用 / 浏览」标签栏，停止条可能压在上面）
+            VStack(spacing: 0) {
+                Group {
+                    switch kind {
+                    case .video:
+                        DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
+                                       onCancel: { picker = nil }) { url in
+                            picker = nil
+                            vm.loadVideo(url: url)
+                        }
+                    case .script:
+                        DocumentPicker(contentTypes: [UTType.json], onCancel: { picker = nil }) { url in
+                            picker = nil
+                            vm.loadScript(url: url)
+                        }
                     }
                 }
+                pickerStopBar
             }
-            .safeAreaInset(edge: .bottom) { pickerStopBar }
             .privacyCover()
             .environmentObject(privacy)
             .environmentObject(ble)
@@ -596,9 +600,16 @@ struct VideoSyncView: View {
                     Text("选一段视频，和她一起看")
                         .font(Velvet.display(.title3, .medium))
                         .foregroundColor(Velvet.text)
-                    Text("再载入时间轴脚本，画面和身体就会同步")
-                        .font(.caption)
-                        .foregroundColor(Velvet.textSecondary)
+                    if pickerBlocked {
+                        // 设备需要先处理时选择器不弹：写明原因，不只是震一下
+                        Label("先处理上方设备卡片的提示，再选视频", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundColor(Velvet.warning)
+                    } else {
+                        Text("再载入时间轴脚本，画面和身体就会同步")
+                            .font(.caption)
+                            .foregroundColor(Velvet.textSecondary)
+                    }
                 }
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 16)
@@ -614,6 +625,8 @@ struct VideoSyncView: View {
                 )
             }
             .buttonStyle(PressableStyle())
+            // 不用 disabled：变灰会把原因那行字一起压暗。点了由 openPicker 拦下（震动 + 旁白说明）
+            .accessibilityHint(pickerBlocked ? "先处理设备卡片上的提示" : "选择视频")
         }
     }
 
@@ -634,7 +647,7 @@ struct VideoSyncView: View {
                 .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(vm.isPlaying ? "正在一起看" : (vm.canPlay ? "准备好了" : "播放控制"))
+                    Text(playbackTitle)
                         .font(Velvet.display(.headline, .medium))
                         .foregroundColor(Velvet.text)
                     if vm.durationSeconds > 0 {
@@ -685,6 +698,13 @@ struct VideoSyncView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .velvetCard()
+    }
+
+    /// 播放键旁边的标题：三样齐了但冷却 / 额度暂时不许输出时不说"准备好了"
+    private var playbackTitle: String {
+        if vm.isPlaying { return "正在一起看" }
+        guard vm.canPlay else { return "播放控制" }
+        return ble.safety.blockReason == nil ? "准备好了" : "稍等片刻"
     }
 
     /// 还差什么才能播：设备 / 视频 / 脚本，缺哪个点哪个（之前播放键只是灰着，不说为什么）
@@ -1033,7 +1053,8 @@ struct FullScreenVideoView: View {
     private static let stopInset: CGFloat = 20
     private static let stopReserve: CGFloat = stopSize + stopInset + 8
 
-    /// 旁白、切换控制、全键盘控制开着时不自动收起（找不到控件）
+    /// 旁白、切换控制开着时不自动收起（找不到控件）。全键盘控制系统没有公开的检测接口，
+    /// 点任何地方都会把控制条叫回来，停止键也一直在
     private static var assistiveTechRunning: Bool {
         UIAccessibility.isVoiceOverRunning || UIAccessibility.isSwitchControlRunning
     }

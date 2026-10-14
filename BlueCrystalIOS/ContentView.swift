@@ -73,6 +73,7 @@ struct DeviceStatusCard: View {
     var collapsed = false
     @State private var confirmForceDisconnect = false
     @State private var confirmPhysicalAck = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var orbColor: Color {
         switch ble.state {
@@ -197,7 +198,7 @@ struct DeviceStatusCard: View {
                 }
             }
             .frame(height: 4)
-            .animation(.linear(duration: 1), value: remaining)
+            .animation(reduceMotion ? nil : .linear(duration: 1), value: remaining)
             .accessibilityHidden(true)
         }
     }

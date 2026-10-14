@@ -1213,6 +1213,28 @@ check(FavoriteGlide.plan(from: [0, 0, 0, 0], to: [2, 0, 0, 0]).count <= Favorite
 check(FavoriteGlide.plan(from: [0, 50, 0, 0], to: [3, 0, 0, 0]).allSatisfy { (s: [Int]) -> Bool in s.contains { $0 > 0 } },
       "缓推：一边降一边升时中间步骤不会全零（全零会变成停止帧对）")
 
+// 收藏能不能点（纯展示规则）：没输出权限全锁；运行中只锁别的模式；滑杆全 0 时提示先停止
+let freqFav = FavoriteSetting(id: UUID(), name: "f", modeRaw: BCProtocol.Mode.frequency.rawValue, levels: [3, 3, 3, 0])
+let manFav = FavoriteSetting(id: UUID(), name: "m", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [30, 0, 0, 0])
+let rulesBlocked = FavoriteRecallRules(mode: .frequency, levels: [0, 0, 0, 0], canOutput: false,
+                                       blockReason: "冷却中", running: false)
+check(!rulesBlocked.usable(freqFav) && !rulesBlocked.usable(manFav) && rulesBlocked.status(for: [freqFav]) == "冷却中",
+      "收藏：不许输出时全部点不了，并说原因")
+let rulesIdle = FavoriteRecallRules(mode: .frequency, levels: [0, 0, 0, 0], canOutput: true,
+                                    blockReason: nil, running: false)
+check(rulesIdle.usable(freqFav) && rulesIdle.usable(manFav) && rulesIdle.status(for: [freqFav, manFav]) == nil,
+      "收藏：没在运行时别的模式也能点（召回时先停机再切）")
+let rulesRunning = FavoriteRecallRules(mode: .frequency, levels: [2, 0, 0, 0], canOutput: true,
+                                       blockReason: nil, running: true)
+check(rulesRunning.usable(freqFav) && !rulesRunning.usable(manFav), "收藏：运行中别的模式锁住，同模式照常")
+check(rulesRunning.status(for: [freqFav]) == nil, "收藏：运行中只有同模式收藏时不提示")
+check(rulesRunning.status(for: [manFav])?.hasPrefix("正在输出") == true, "收藏：运行中提示别的模式要先停止")
+let rulesHeldZero = FavoriteRecallRules(mode: .frequency, levels: [0, 0, 0, 0], canOutput: true,
+                                        blockReason: nil, running: true)
+check(rulesHeldZero.status(for: [manFav])?.hasPrefix("本次运行仍在计时") == true,
+      "收藏：滑杆全 0 但运行还开着时，不说\"正在输出\"")
+check(FavoriteSetting.maxDraftLength > FavoriteSetting.maxNameLength, "收藏改名：打字草稿上限比最终名字宽松（拼音不被截断）")
+
 // 快捷话一点就发：不能误中本地停止词（"再快一点"不能变成停）
 check(AIQuickReplies.phrases.allSatisfy { !AIStopWords.matches($0) }, "快捷话都不是停止词")
 check(AIQuickReplies.current(running: false) == AIQuickReplies.idle
