@@ -112,6 +112,8 @@ final class VideoSyncPlayer: ObservableObject {
         // 拷到 App 自己的目录、文件名加唯一前缀：选择器给的临时副本可能被系统清掉，
         // 同名文件也不会互相覆盖
         guard let local = Self.importVideo(from: url) else {
+            if let old = currentVideoFile { try? FileManager.default.removeItem(at: old) }
+            currentVideoFile = nil
             player = nil
             videoName = "导入失败：\(displayName)"
             statusLine = "视频文件无法读取，请重新选择"
@@ -153,6 +155,12 @@ final class VideoSyncPlayer: ObservableObject {
 
     /// 当前视频在 App 目录里的副本（换视频时删旧的，避免占空间）
     private var currentVideoFile: URL?
+
+    init() {
+        // 上次运行留下的视频副本清掉
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SyncVideos", isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)
+    }
 
     private static func importVideo(from url: URL) -> URL? {
         let fm = FileManager.default
@@ -468,12 +476,13 @@ struct VideoSyncView: View {
         .sheet(item: $picker) { kind in
             switch kind {
             case .video:
-                DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie]) { url in
+                DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
+                               onCancel: { picker = nil }) { url in
                     picker = nil
                     vm.loadVideo(url: url)
                 }
             case .script:
-                DocumentPicker(contentTypes: [UTType.json]) { url in
+                DocumentPicker(contentTypes: [UTType.json], onCancel: { picker = nil }) { url in
                     picker = nil
                     vm.loadScript(url: url)
                 }
@@ -492,6 +501,7 @@ struct VideoSyncView: View {
 /// 系统文件选择器（asCopy: true，文件拷进沙盒，不玩 security-scoped 杂技）
 struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
+    var onCancel: () -> Void = {}
     let onPick: (URL) -> Void
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
@@ -503,11 +513,19 @@ struct DocumentPicker: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
 
-    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         let onPick: (URL) -> Void
-        init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
+        let onCancel: () -> Void
+        init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            onCancel()
+        }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
