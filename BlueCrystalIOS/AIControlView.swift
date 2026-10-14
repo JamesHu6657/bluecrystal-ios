@@ -954,7 +954,7 @@ private struct ChatBubble: View {
         if message.isError {
             Velvet.danger.opacity(0.12)
         } else if message.isUser {
-            Velvet.roseGradient
+            Velvet.chatGradient
         } else {
             LinearGradient(colors: [Color.white.opacity(0.09), Color.white.opacity(0.04)],
                            startPoint: .topLeading, endPoint: .bottomTrailing)

@@ -34,8 +34,11 @@ enum Velvet {
     static let warning = Color(hex: 0xFFB04A)
     static let ok = Color(hex: 0x7BE3B6)
 
-    /// 上面压白字（进入 / 解锁 / 连接 / 用户气泡）：浅端白字约 3.7:1、深端约 5.4:1，配粗体
+    /// 上面压白字（进入 / 解锁 / 连接）：浅端白字约 3.7:1、深端约 5.4:1，配粗体
     static let roseGradient = LinearGradient(colors: [Color(hex: 0xE8487A), Color(hex: 0xC2306A)],
+                                             startPoint: .topLeading, endPoint: .bottomTrailing)
+    /// 用户气泡用深玫瑰色：整段渐变上的白色正文对比度 ≥5.35:1，不依赖粗体
+    static let chatGradient = LinearGradient(colors: [Color(hex: 0xC2306A), Color(hex: 0x96234F)],
                                              startPoint: .topLeading, endPoint: .bottomTrailing)
     /// 停止键底色：浅端白字约 4.2:1、深端约 5.4:1
     static let stopGradient = LinearGradient(colors: [Color(hex: 0xE8344A), Color(hex: 0xD3172C)],
