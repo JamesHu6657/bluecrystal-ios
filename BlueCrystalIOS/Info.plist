@@ -28,6 +28,8 @@
 	<string>需要蓝牙来连接和控制你的设备（mizzzee_0032）。</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>需要蓝牙来连接和控制你的设备（mizzzee_0032）。</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>用面容 ID 解锁 BlueCrystal，只让你自己打开。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>需要访问相册来选择用于联动的本地视频。</string>
 	<key>UIBackgroundModes</key>
