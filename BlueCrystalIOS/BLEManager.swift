@@ -17,6 +17,7 @@ import os
 /// 任何一帧失败/超时就整对重发，按 1→2→4→8→16→30 秒退避一直重试到确认；
 /// 30 秒仍未确认时拉起操作员锁存，只有用户确认已物理关机才解除（修 M4，legacy watchdog.py）。
 /// 停止进行中绝不发非停止帧：期间到来的输出帧先记下，停止确认后再重新走准入。
+/// 意外断链 / 蓝牙重新打开 / 重启后设备可能仍在输出时，自动重连已绑定的设备去发停止帧对（第三轮 M1，见 AutoReconnect）。
 ///
 /// 输出准入（修 M2/M3/L5）：手动、技能、视频的每一帧非停止帧都只经过 submitOutput：
 /// 锁存/设备可能仍在输出时拒绝；停机状态下开始新一次运行要过冷却和 30 分钟额度检查，
@@ -476,7 +477,8 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// 用户确认设备已物理关机（修 M4/L5，legacy acknowledge_physical_stop）：
-    /// 解除锁存，结束本次运行（未知时长耗尽完整窗口额度），放弃仍在重试的停止
+    /// 解除锁存，结束本次运行（未知时长耗尽完整窗口额度），放弃仍在重试的停止。
+    /// 第三轮 L3：放弃的停止帧对可能正停在两帧之间的 100ms 里（0x06 还没发），链路还在就补一对冗余停止
     func acknowledgePhysicalStop() {
         bleQueue.async { [weak self] in
             guard let self = self, self.physicalAckRequired || self.deviceMayBeActive else { return }
@@ -495,10 +497,16 @@ final class BLEManager: NSObject, ObservableObject {
                 self.stopErrorShown = false
                 DispatchQueue.main.async { [weak self] in self?.lastError = nil }
             }
-            if let op = self.stopOp {
+            let abandoned = self.stopOp
+            if let op = abandoned {
                 self.stopOp = nil
                 self.deferredFrame = nil
                 op.completions.forEach { $0(.acknowledged) }
+            }
+            // completions 可能已经把断开流程收尾（链路没了就不补）
+            if PhysicalAck.shouldResendStop(abandonedStop: abandoned != nil,
+                                            linkWritable: self.canWrite && !self.disconnecting) {
+                self.requestStop(needed: false)
             }
             self.publishSafety()
         }
@@ -601,11 +609,14 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// 用户在视频页点了"播放"、或 AI 开始执行一条回复：显式打开输出闸门（修 C）。
-    /// AI 带 epoch：执行前检查之后发生过被动停机就不开（M5，不再只靠冷却兜底）
+    /// AI 带 epoch：执行前检查之后发生过被动停机就不开（M5，不再只靠冷却兜底）。
+    /// 第三轮 L2：和 submitOutput 同一个开闸前提（OutputGate.mayResume），链路不可写（断链 / 断开中 / 后台）时不开，
+    /// 闸门不会带着"开"跨过重连 / 回到前台
     func userResumeOutput(epoch: Int? = nil) {
         bleQueue.async { [weak self] in
             guard let self = self,
-                  OutputGate.mayOpen(requestEpoch: epoch, currentEpoch: self.queueGateEpoch) else { return }
+                  OutputGate.mayResume(linkWritable: self.canWrite && !self.disconnecting && !self.appInBackground,
+                                       requestEpoch: epoch, currentEpoch: self.queueGateEpoch) else { return }
             self.outputLocked = false
         }
     }
@@ -642,8 +653,8 @@ final class BLEManager: NSObject, ObservableObject {
         // 后台期间（emergencyStop 之后、resumeFromBackground 之前）任何输出都不许开闸，
         // 主线程上迟到的回复/定时器在这里兜底
         let linkWritable = canWrite && !disconnecting && !appInBackground
-        // M5：带代次的开闸请求，中间发生过被动停机就不开
-        if linkWritable, opensGate, OutputGate.mayOpen(requestEpoch: epoch, currentEpoch: queueGateEpoch) {
+        // M5：带代次的开闸请求，中间发生过被动停机就不开（第三轮 L2：和 userResumeOutput 同一个前提）
+        if opensGate, OutputGate.mayResume(linkWritable: linkWritable, requestEpoch: epoch, currentEpoch: queueGateEpoch) {
             outputLocked = false
         }
         let decision = OutputAdmission.decide(OutputAdmission.Inputs(
@@ -654,7 +665,8 @@ final class BLEManager: NSObject, ObservableObject {
             stopFailed: (stopOp?.failures ?? 0) > 0,
             allZero: BCProtocol.isAllZeroOutput(data),
             isActive: isActive,
-            zeroHeld: zeroHeld))
+            zeroHeld: zeroHeld,
+            runExpired: ledger.runRemaining().map { $0 <= 0 } ?? false))
         switch decision {
         case .drop, .skipIdleZero, .alreadyZeroed:
             return
@@ -667,6 +679,9 @@ final class BLEManager: NSObject, ObservableObject {
             // 修 N1/N4：停止帧对还在路上，期间不许插入非停止帧；等它确认后再按这次请求处理
             deferredFrame = data
             deferredMaxRise = maxRise
+        case .stopForLimit:
+            // 第三轮 L1：运行已经到点（到点定时器 / 看门狗在停止进行中会跳过），这一帧不写，直接按上限停机
+            autoStopForLimit()
         case .zeroStopPair:
             // H1 / L5：运行中的全零输出换成完整停止帧对、运行继续
             zeroHeld = true
@@ -1116,6 +1131,29 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// 第三轮 M1：设备可能仍在输出、链路却没了（意外断链 / 蓝牙重新打开 / 被杀后重启）时，
+    /// 自动重连已绑定的设备；连上后 didDiscoverCharacteristicsFor 照常先发一对必须确认的停止帧。
+    /// 之前只能等用户自己点"连接"。只连绑定过的那台（不扫描、不弹框），超时照旧 10 秒、不自动重试；
+    /// 判断见 AutoReconnect（ProtocolChecks 覆盖）。调用方保证在 bleQueue 上
+    private func reconnectForStopIfNeeded() {
+        let bonded = UserDefaults.standard.string(forKey: Self.bondedDeviceKey).flatMap { UUID(uuidString: $0) }
+        guard AutoReconnect.shouldReconnect(
+                mayBeActive: deviceMayBeActive || physicalAckRequired || ledger.hasOpenRun,
+                poweredOn: central.state == .poweredOn,
+                linkIdle: queueState == .idle || queueState == .failed,
+                hasPeripheral: peripheral != nil || pendingPeripheral != nil,
+                disconnecting: disconnecting,
+                hasBondedDevice: bonded != nil),
+              let uuid = bonded,
+              let p = central.retrievePeripherals(withIdentifiers: [uuid]).first else { return }
+        Self.log.notice("设备可能仍在输出：自动重连已绑定设备以发送停止")
+        central.stopScan()
+        peripheral = p
+        updateState(.connecting)
+        central.connect(p, options: nil)
+        scheduleConnectTimeout(for: p)
+    }
+
     /// 显示非停止类的红字（看门狗/写失败等），并重置 stopErrorShown（修 L2），
     /// 避免之后停止确认成功时把这条提示误删；调用方保证在 bleQueue 上
     private func showError(_ msg: String) {
@@ -1248,6 +1286,8 @@ extension BLEManager: CBCentralManagerDelegate {
             }
             return
         }
+        // 第三轮 M1：蓝牙（重新）可用、设备可能仍在输出（含被杀后重启）：自动重连已绑定的设备去发停止
+        reconnectForStopIfNeeded()
     }
 
     func centralManager(_ central: CBCentralManager,
@@ -1324,6 +1364,8 @@ extension BLEManager: CBCentralManagerDelegate {
             updateState(.idle)
         }
         if mayBeActive { markDeviceMayBeActive(prefix: error.map { "设备意外断开：\($0.localizedDescription)" }) }
+        // 第三轮 M1：设备可能仍在输出时自动重连已绑定的设备去发停止（之前要等用户点"连接"）
+        reconnectForStopIfNeeded()
     }
 }
 
