@@ -1,0 +1,78 @@
+# PR 上的检查（Brain 第二轮审查 M5）：Build Unsigned IPA 只在 push 到 main 时跑，
+# 安全相关的改动合并前没有任何编译或测试。这里只跑 ProtocolChecks + 编译：不打包、不上传 IPA、不发布、不推任何分支。
+# 失败时把测试/编译错误摘要评论到 PR 上，便于排查。
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode 16.4
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          V="$(xcodebuild -version)"
+          echo "$V"
+          [ "$(printf '%s\n' "$V" | head -n1)" = "Xcode 16.4" ]
+
+      # 和 Build Unsigned IPA 里的检查完全同一条命令
+      - name: Protocol and safety checks
+        run: |
+          set -euo pipefail
+          xcrun swiftc \
+            BlueCrystalIOS/Protocol.swift \
+            BlueCrystalIOS/Models.swift \
+            BlueCrystalIOS/SafetyLedger.swift \
+            BlueCrystalIOS/AIProgram.swift \
+            Tests/ProtocolChecks/main.swift \
+            -o "$RUNNER_TEMP/protocol-checks" 2>&1 | tee tests.log
+          "$RUNNER_TEMP/protocol-checks" 2>&1 | tee -a tests.log
+
+      # 只编译（BLEManager / 各 View 只有这里能验证），不打包、不上传
+      - name: Compile app (no signing, no IPA)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project BlueCrystalIOS.xcodeproj \
+            -scheme BlueCrystalIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log
+
+      - name: Report failure on PR
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          touch tests.log build.log
+          {
+            echo "PR Checks 失败（${GITHUB_SHA}）"
+            echo
+            echo '```'
+            grep -E "FAIL|error:" tests.log | head -n 60 || true
+            grep -E "error:" build.log | head -n 60 || true
+            echo '```'
+          } > report.md
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file report.md || true
