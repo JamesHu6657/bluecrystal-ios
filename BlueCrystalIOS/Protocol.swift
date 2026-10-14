@@ -200,6 +200,13 @@ extension BCProtocol {
         guard b.count >= 8, b[0] == header, b[1] == manualCmd || b[1] == modeCmd else { return false }
         return b[3...6].allSatisfy { $0 == 0 }
     }
+
+    /// 完整 0x08 帧的四通道强度；不是 0x08 帧（含 0x06）时返回 nil（M1 限速基准用）
+    static func manualLevels(_ data: Data) -> [Int]? {
+        let b = [UInt8](data)
+        guard b.count >= 10, b[0] == header, b[1] == manualCmd else { return nil }
+        return (3...6).map { Int(b[$0]) }
+    }
 }
 
 /// 输出准入中和停止帧对有关的纯决策（BLEManager.submitOutput 用，ProtocolChecks 覆盖）。
@@ -222,12 +229,74 @@ enum OutputGate {
         if !isActive { return .skipIdleZero }
         return zeroHeld ? .alreadyZeroed : .zeroStopPair
     }
+
+    /// 开闸请求是否仍然有效（M5）：AI 带着执行前读到的被动停机代次来开闸，
+    /// 中间发生过被动停机（看门狗/上限/输出被拒/写失败/锁存/退后台/断开/断链）代次就变了，不开。
+    /// nil = 用户直接操作（手动页拖动、视频页点播放），不比代次
+    static func mayOpen(requestEpoch: Int?, currentEpoch: Int) -> Bool {
+        guard let e = requestEpoch else { return true }
+        return e == currentEpoch
+    }
+}
+
+/// BLEManager.submitOutput 的完整准入顺序（纯决策，M3）。顺序本身就是安全约束：
+/// 链路/后台 → 闸门 → 设备可能仍在输出 → 停止进行中（绝不插进停止帧对两帧之间）→ 全零 → 写入（空闲时开始一次运行）。
+/// BLEManager 只负责把决策落地（锁闸、提示、记账、写入）。
+enum OutputAdmission {
+    struct Inputs {
+        /// canWrite && !disconnecting && !appInBackground
+        var linkWritable = true
+        /// 处理完本次开闸请求后闸门是否开着
+        var gateOpen = true
+        /// physicalAckRequired || deviceMayBeActive
+        var mayStillBeOutputting = false
+        /// 有停止帧对在进行
+        var stopInProgress = false
+        /// 进行中的停止已经失败过（重试中）
+        var stopFailed = false
+        var allZero = false
+        var isActive = false
+        var zeroHeld = false
+    }
+
+    enum Decision: Equatable {
+        /// 静默丢弃：链路不可写/后台/断开中，或闸门关着（停止后的尾帧、tick）
+        case drop
+        /// 锁闸、界面归零并提示：设备可能仍在输出（锁存未解除）
+        case rejectMayBeActive
+        /// 锁闸、界面归零并提示：停止失败过、仍未确认
+        case rejectStopUnconfirmed
+        /// 停止帧对在路上：记下最新一帧，确认后重新走准入
+        case deferUntilStopped
+        /// 全零：见 OutputGate
+        case skipIdleZero
+        case alreadyZeroed
+        case zeroStopPair
+        /// 写入；startsRun 为 true 时先过冷却/额度并开始一次运行
+        case write(startsRun: Bool)
+    }
+
+    static func decide(_ i: Inputs) -> Decision {
+        guard i.linkWritable, i.gateOpen else { return .drop }
+        if i.mayStillBeOutputting { return .rejectMayBeActive }
+        if i.stopInProgress { return i.stopFailed ? .rejectStopUnconfirmed : .deferUntilStopped }
+        switch OutputGate.decide(allZero: i.allZero, isActive: i.isActive, zeroHeld: i.zeroHeld) {
+        case .skipIdleZero: return .skipIdleZero
+        case .alreadyZeroed: return .alreadyZeroed
+        case .zeroStopPair: return .zeroStopPair
+        case .write: return .write(startsRun: !i.isActive)
+        }
+    }
 }
 
 /// 输出写入合并（纯状态，BLEManager 在 bleQueue 上用）：
 /// - 同一时间最多一笔非停止帧在途（写入回执、失败或超时之前不发下一笔）；
 /// - 在途期间到来的帧只保留最新一帧；
-/// - 停止帧对不经过这里，发停止前先 dropPending()，停止帧永远排在待发输出前面。
+/// - 停止帧对不经过这里，发停止前先 dropPending()，停止帧永远排在待发输出前面；
+/// - 升幅限速（M1）：带 maxRise 的帧（AI）在真正发出前，按实际发出的上一笔 0x08 帧再夹一次，
+///   每通道最多升 maxRise。在途合并把中间的爬升步覆盖掉时，设备也不会一步跳过上限；
+///   夹掉的差距不自动补（偏低是安全方向），由下一步/下一条回复继续爬。降低不受限制。
+///   基准在启动、reset、停止帧对确认（resetBaseline）后按全 0 算；上一笔是 0x06 帧时也按全 0 算（刻度不同，偏保守）。
 struct OutputWriteCoalescer {
     enum Action: Equatable {
         case write(Data)
@@ -236,30 +305,84 @@ struct OutputWriteCoalescer {
 
     private(set) var inFlight = false
     private(set) var pending: Data?
+    /// pending 的升幅上限；nil = 不限（手动、技能、视频）
+    private var pendingMaxRise: Int?
+    /// 最近一笔发出的 0x08 帧的四通道强度（限速基准）；nil 按全 0 算
+    private(set) var baseline: [Int]?
 
-    mutating func submit(_ frame: Data) -> Action {
+    mutating func submit(_ frame: Data, maxRise: Int? = nil) -> Action {
         if inFlight {
             pending = frame
+            pendingMaxRise = maxRise
             return .coalesced
         }
-        inFlight = true
-        return .write(frame)
+        return .write(markWritten(frame, maxRise: maxRise))
     }
 
-    /// 在途那笔有了结果。canSend 为 false 时丢掉待发帧；返回值是现在要写的下一帧（已标记在途）
+    /// 在途那笔有了结果。canSend 为 false 时丢掉待发帧；返回值是现在要写的下一帧（已标记在途、已限速）
     mutating func writeFinished(canSend: Bool) -> Data? {
         inFlight = false
         guard let next = pending else { return nil }
+        let rise = pendingMaxRise
         pending = nil
+        pendingMaxRise = nil
         guard canSend else { return nil }
-        inFlight = true
-        return next
+        return markWritten(next, maxRise: rise)
     }
 
-    mutating func dropPending() { pending = nil }
+    mutating func dropPending() {
+        pending = nil
+        pendingMaxRise = nil
+    }
+
+    /// 停止帧对确认后设备在 0：之后的限速从 0 算
+    mutating func resetBaseline() { baseline = nil }
 
     mutating func reset() {
         inFlight = false
-        pending = nil
+        dropPending()
+        baseline = nil
+    }
+
+    private mutating func markWritten(_ frame: Data, maxRise: Int?) -> Data {
+        var out = frame
+        if let rise = maxRise {
+            out = Self.limitRise(frame, from: baseline ?? [0, 0, 0, 0], maxRise: rise)
+        }
+        inFlight = true
+        baseline = BCProtocol.manualLevels(out)
+        return out
+    }
+
+    /// 0x08 帧每通道最多比 base 高 maxRise（降低不受限）；不是 0x08 帧原样返回（AI 只发 0x08）
+    static func limitRise(_ frame: Data, from base: [Int], maxRise: Int) -> Data {
+        guard let target = BCProtocol.manualLevels(frame) else { return frame }
+        let step = max(0, maxRise)
+        let limited = (0..<4).map { i in min(target[i], (i < base.count ? base[i] : 0) + step) }
+        guard limited != target else { return frame }
+        let b = [UInt8](frame)
+        let tail = UInt16(b[7]) << 8 | UInt16(b[8])
+        return BCProtocol.manualFrame(channels: limited, tail: tail)
+    }
+}
+
+/// 写入回执按 FIFO 配对（L1）。某个回执丢了（不是迟到）会让之后的配对永久错位，停止帧对永远凑不齐。
+/// 新一轮停止帧对发出前，如果队里剩下的全是已超时的停止帧，就清空重新对齐。
+/// 理由：ATT 写请求是串行的，后面任何一笔的回执都意味着前面的已经处理完；清空后可能被误配的
+/// 只会是更早那几笔停止帧的迟到回执（同样是停止帧，在最后一笔输出之后发出），不会把输出帧的回执当成停止确认。
+/// 队里还有输出帧（哪怕已超时）或还没超时的条目就不清：宁可确认不了、走 30 秒锁存。
+enum WriteAckFIFO {
+    static func canRealign(_ entries: [(isStop: Bool, timedOut: Bool)]) -> Bool {
+        !entries.isEmpty && entries.allSatisfy { $0.isStop && $0.timedOut }
+    }
+}
+
+/// 手动页空闲停机（L7 / M3）：心跳只证明界面活着，不证明有人在操作。
+/// 上次停止以来发过输出、且这么久没有任何操作就停止。
+enum ManualIdle {
+    static let timeoutSeconds: TimeInterval = 300
+
+    static func expired(now: TimeInterval, lastInteraction: TimeInterval, outputSinceStop: Bool) -> Bool {
+        outputSinceStop && now - lastInteraction >= timeoutSeconds
     }
 }

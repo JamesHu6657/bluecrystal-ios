@@ -93,16 +93,17 @@ enum AIConfig {
     - [STOP] —— 全部停止，结束本轮控制。
 
     一条回复里可以写多条指令（最多 40 步），按顺序执行；两条 [CH] 之间没写 [HOLD] 时间隔约 1.5 秒。
-    回复结束时最后的强度会一直保持到他下一句话。
+    整段程序（所有 HOLD 和间隔加起来）不能超过 120 秒，超过的话整条回复都不执行。
+    回复结束时最后的强度会一直保持到他下一句话；他 120 秒没说话，控制器会自动停止。
     每条指令必须独占一行，不要写在句子中间、引号里或代码块里，参数个数和整数写法要完全正确；
     否则控制器会把整条回复的指令全部作废并停止。
 
     ## 行为准则
     1. 中文，简短撩人，一次 1~3 句；每 2~3 句话必须有一次 [CH]/[HOLD] 动作，光说不练不许。
     2. 节奏：[CH 10 10 0 0] 慢热开场 → 逐步升温 → 小恶魔捉弄
-       （突然拉到 60、突然 [HOLD 5000] 停在边缘、快到时降回 15）→ 最后放他释放。
+       （突然 [HOLD 5000] 停在边缘、快到时降回 15）→ 最后放他释放。
     3. 安全词优先：他说"停"或"受不了"，立刻 [STOP]；说"慢"，立刻降档。
-    4. 单通道最高 70（控制器会把更高的值压到 70），每步最多加 20，全程循序渐进。
+    4. 单通道最高 70（控制器会把更高的值压到 70），每秒每通道最多加 20（控制器会自动插入爬升和等待），全程循序渐进。
     5. 坏得温柔，例如："宝宝忍得住吗？忍不住要求我哦。"、"不许自己偷偷动，只能我来。"
     6. 结束发 [STOP]，说句温柔的话让他休息。
 
@@ -186,14 +187,17 @@ enum Keychain {
 // MARK: - 大模型客户端（三种接口：chat completions / Anthropic messages / responses）
 
 enum LLMError: LocalizedError {
-    case missingKey, badURL, http(Int, String), empty, incomplete(String)
+    case missingKey, badURL, http(Int, String), empty, incomplete(String), timeout(TimeInterval)
     var errorDescription: String? {
         switch self {
         case .missingKey: return "还没填 API Key，点右上角设置"
         case .badURL: return "接口地址不对"
-        case .http(let code, let body): return "接口返回 \(code)：\(body.prefix(200))"
+        case .http(let code, let summary):
+            // L4：只显示状态码和接口给的错误说明（已遮掉 Key 和长串标识），不显示原始正文
+            return summary.isEmpty ? "接口返回 \(code)" : "接口返回 \(code)：\(summary.prefix(200))"
         case .empty: return "模型没有返回内容"
         case .incomplete(let why): return "\(why)，没有内容"
+        case .timeout(let s): return "请求超过 \(Int(s)) 秒没有完成"
         }
     }
 }
@@ -248,7 +252,7 @@ struct LLMClient {
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard (200..<300).contains(code) else {
-            throw LLMError.http(code, String(data: data, encoding: .utf8) ?? "")
+            throw LLMError.http(code, LLMResponse.errorSummary(data, apiKey: apiKey))
         }
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw LLMError.empty
@@ -295,7 +299,7 @@ final class AIControlVM: ObservableObject {
     private var endWithStop = false
     /// 回复授权（只在主线程读写，规则见 ReplyAuthorization）：所有停止都经 terminalStop 作废
     private var auth = ReplyAuthorization()
-    /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断）结果直接丢弃
+    /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断、总时长到点）结果直接丢弃
     private var requestID = 0
     private var requestTask: Task<Void, Never>?
     private var tabActive = false
@@ -306,6 +310,12 @@ final class AIControlVM: ObservableObject {
     private var holdStartedAt: TimeInterval?
     /// 最近一条用户消息的时间（单调时钟）
     private var lastUserMessageAt: TimeInterval?
+    /// 这次运行开始的时间（单调时钟）：没有用户消息记录时的在场计时起点（H1）
+    private var runStartedAt: TimeInterval?
+    /// 最近一次升高强度的时间（单调时钟）：下一条回复的时间限速起点（M2）
+    private var lastRiseAt: TimeInterval?
+    /// 执行前读到的被动停机代次：开闸时交给 BLEManager 核对（M5）
+    private var runEpoch: Int?
 
     private static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
@@ -346,6 +356,11 @@ final class AIControlVM: ObservableObject {
     func viewDisappeared() {
         tabActive = false
         stopAll(reason: "已离开 AI 页面，已停止")
+    }
+
+    /// 打开设置页（L2）：设置页会盖住停止键，打开前先停止并作废待执行的回复
+    func willOpenSettings() {
+        if running || isThinking { stopAll(reason: "已打开 AI 设置，AI 控制已停止") }
     }
 
     func scenePhaseChanged(_ phase: ScenePhase) {
@@ -390,8 +405,7 @@ final class AIControlVM: ObservableObject {
         requestID &+= 1
         let id = requestID
         let turns = messages.map { m in
-            AIHistory.Turn(isUser: m.isUser, isError: m.isError,
-                           content: m.raw ?? (m.text.isEmpty ? (m.program ?? "…") : m.text))
+            AIHistory.Turn(isUser: m.isUser, isError: m.isError, content: AIHistory.content(raw: m.raw, text: m.text))
         }
         let history = AIHistory.window(turns, limit: Self.historyLimit)
         let payload = [["role": "system", "content": AIConfig.systemPrompt]] + history
@@ -415,6 +429,19 @@ final class AIControlVM: ObservableObject {
                 await MainActor.run { self?.handleError(error, requestID: id) }
             }
         }
+        // L5：请求总时长上限（URLRequest 的 timeoutInterval 只是空闲超时）
+        DispatchQueue.main.asyncAfter(deadline: .now() + AIRequestPolicy.totalTimeoutSeconds) { [weak self] in
+            self?.requestDeadlinePassed(requestID: id)
+        }
+    }
+
+    /// 请求总时长到点（L5）：按请求错误处理（运行中就停止），然后作废这次请求，被取消后的报错不再处理
+    private func requestDeadlinePassed(requestID id: Int) {
+        guard id == requestID, isThinking else { return }
+        let task = requestTask
+        handleError(LLMError.timeout(AIRequestPolicy.totalTimeoutSeconds), requestID: id)
+        requestID &+= 1
+        task?.cancel()
     }
 
     /// 任何请求错误（HTTP、超时、429、断网、回复不完整、钥匙串读取失败）在输出中都停止：
@@ -467,11 +494,24 @@ final class AIControlVM: ObservableObject {
                 programText = "未执行（\(block)）"
                 rejectProgram("已停止")
             } else {
-                // 上限 70、每步最多 +20、从空闲开始时从 0 爬升（H3）：在代码里执行，不靠提示词
-                let safe = AISafety.enforce(reply.steps, from: running ? currentLevels : [0, 0, 0, 0])
-                start(steps: safe.steps, endWithStop: reply.stop)
-                executed = true
-                programText = AISafety.describe(safe, stop: reply.stop)
+                // M5：被动停机代次和执行前检查在同一时刻读；开闸时 BLEManager 在自己的队列上再核对
+                let epoch = ble?.gateEpoch ?? -1
+                let now = Self.now()
+                // M2：接着上一条回复继续时，时间限速从上次升高算起
+                let sinceRise: TimeInterval = running ? (lastRiseAt.map { now - $0 } ?? TimeInterval.infinity)
+                    : TimeInterval.infinity
+                // 上限 70、每秒每通道最多 +20、从空闲开始时从 0 爬升（H3/M2）：在代码里执行，不靠提示词
+                let safe = AISafety.enforce(reply.steps, from: running ? currentLevels : [0, 0, 0, 0],
+                                            secondsSinceRise: sinceRise)
+                if let tooLong = AISafety.programTooLong(safe) {
+                    // H1：单条程序不能比在场时限还长
+                    programText = "未执行：\(tooLong)"
+                    rejectProgram("回复程序太长，已停止")
+                } else {
+                    start(steps: safe.steps, endWithStop: reply.stop, epoch: epoch)
+                    executed = true
+                    programText = AISafety.describe(safe, stop: reply.stop)
+                }
             }
         } else if reply.stop {
             stopAll(reason: "已停止")
@@ -483,16 +523,19 @@ final class AIControlVM: ObservableObject {
     }
 
     /// 调用方先用 executionBlock 确认授权、连接、安全状态和前台
-    private func start(steps: [AIStep], endWithStop: Bool) {
+    private func start(steps: [AIStep], endWithStop: Bool, epoch: Int) {
         guard let ble = ble else { return }
         programGen += 1
         stepWork?.cancel()
         self.steps = steps
         self.endWithStop = endWithStop
         holdStartedAt = nil
+        if !running { runStartedAt = Self.now() }
         running = true
-        // 用户刚发了消息、模型回了指令：显式开闸（和手动/视频页点"播放"一样）
-        ble.userResumeOutput()
+        runEpoch = epoch
+        // 用户刚发了消息、模型回了指令：显式开闸（和手动/视频页点"播放"一样）；
+        // 执行前检查之后发生过被动停机（代次变了）时 BLEManager 不开（M5）
+        ble.userResumeOutput(epoch: epoch)
         startHeartbeat()
         runStep(0, gen: programGen, first: true)
     }
@@ -512,9 +555,15 @@ final class AIControlVM: ObservableObject {
         let step = steps[i]
         if let lv = step.levels {
             // 全零步照常发强度 0 帧：BLEManager 在运行中把它换成完整停止帧对（at(0,255) → 100ms → Tt(0)），
-            // 不锁闸、运行继续，后面还能接着加；空闲时直接丢掉
+            // 不锁闸、运行继续，后面还能接着加；空闲时直接丢掉。
+            // M1：带升幅上限交给 BLEManager，按实际发出的上一帧再限一次，在途合并也不会一步跳过 +20
             let frame = BCProtocol.manualFrame(channels: lv)
-            if first { ble.send(frame: frame) } else { ble.sendThrottled(frame: frame) }
+            if first {
+                ble.send(frame: frame, maxRise: AISafety.maxStepIncrease, epoch: runEpoch)
+            } else {
+                ble.sendThrottled(frame: frame, maxRise: AISafety.maxStepIncrease)
+            }
+            if lv.indices.contains(where: { lv[$0] > currentLevels[$0] }) { lastRiseAt = Self.now() }
             currentLevels = lv
         }
         ble.heartbeat()
@@ -540,6 +589,9 @@ final class AIControlVM: ObservableObject {
         steps = []
         currentLevels = [0, 0, 0, 0]
         holdStartedAt = nil
+        runStartedAt = nil
+        lastRiseAt = nil
+        runEpoch = nil
         let wasRunning = running
         running = false
         if sendStop { ble?.sendStop() }
@@ -555,9 +607,13 @@ final class AIControlVM: ObservableObject {
         heartbeatTimer?.invalidate()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self, self.running else { return }
-            if AISafety.holdIdleExpired(now: Self.now(), holdStartedAt: self.holdStartedAt,
-                                        lastUserMessageAt: self.lastUserMessageAt) {
-                self.stopAll(reason: "保持 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息，已停止")
+            let now = Self.now()
+            // H1：不论在执行程序还是保持，离最近一条用户消息 120 秒就停止
+            if AISafety.presenceExpired(now: now, lastUserMessageAt: self.lastUserMessageAt,
+                                        runStartedAt: self.runStartedAt)
+                || AISafety.holdIdleExpired(now: now, holdStartedAt: self.holdStartedAt,
+                                            lastUserMessageAt: self.lastUserMessageAt) {
+                self.stopAll(reason: "\(Int(AISafety.holdIdleTimeout)) 秒没有新消息，已停止")
                 return
             }
             self.ble?.heartbeat()
@@ -629,7 +685,11 @@ struct AIControlView: View {
         .navigationTitle("AI 控制")
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                // L2：设置页会盖住停止键，打开前先停止
+                Button {
+                    vm.willOpenSettings()
+                    showSettings = true
+                } label: { Image(systemName: "gearshape") }
             }
         }
         .sheet(isPresented: $showSettings) { AISettingsView() }
@@ -703,7 +763,7 @@ struct AISettingsView: View {
                 } header: {
                     Text("提示词")
                 } footer: {
-                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99，超过 99 整条不执行）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)，保持 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息就停止。")
+                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99，超过 99 整条不执行）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)，单条程序总长超过 \(Int(AISafety.maxProgramSeconds)) 秒整条不执行，离最近一条消息 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息就停止。")
                 }
             }
             .onChange(of: provider) { p in

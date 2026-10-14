@@ -21,6 +21,7 @@ import os
 /// 输出准入（修 M2/M3/L5）：手动、技能、视频的每一帧非停止帧都只经过 submitOutput：
 /// 锁存/设备可能仍在输出时拒绝；停机状态下开始新一次运行要过冷却和 30 分钟额度检查，
 /// 本次最长 min(1200 秒, 剩余额度)，到点自动停止（结构同 legacy limits.py / duty_cycle.py）。
+/// 准入顺序是纯决策 OutputAdmission（ProtocolChecks 覆盖，Brain 审查 M3）。
 final class BLEManager: NSObject, ObservableObject {
 
     static let serviceUUID = CBUUID(string: "0000FFA0-0000-1000-8000-00805F9B34FB")
@@ -108,6 +109,8 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var safety = SafetyStatus()
     /// 断开时停止迟迟未确认：界面显示"强制断开"（修 M5）
     @Published var forceDisconnectOffered = false
+    /// 被动停机代次的主线程镜像（Brain 审查 M5）：AI 执行前读一次，开闸时 bleQueue 上再核对
+    @Published private(set) var gateEpoch = 0
 
     /// 发现未绑定过的设备时弹确认框用
     @Published var pendingDeviceName: String?
@@ -136,6 +139,8 @@ final class BLEManager: NSObject, ObservableObject {
     /// 只有用户主动操作（send / 视频页点"播放"）才能重新打开；停止不开闸（修 C）。
     /// 冷启动时闸门是关的（修 Factory L1）
     private var outputLocked = true
+    /// 被动停机代次（M5，只在 bleQueue 上）：每次被动停机/断链 +1。带代次的开闸请求对不上就不开闸
+    private var queueGateEpoch = 0
     /// 断开流程进行中：除停止帧对外一律拒发（修 N1）
     private var disconnecting = false
     private var disconnectGen = 0
@@ -204,7 +209,9 @@ final class BLEManager: NSObject, ObservableObject {
     private var stopGen = 0
     /// 停止进行中到来的输出帧（最新的覆盖旧的）：停止确认后重新走 submitOutput
     private var deferredFrame: Data?
-    /// 非停止帧最多一笔在途，在途期间只留最新一帧（M2）
+    /// deferredFrame 的升幅上限（M1），和 deferredFrame 一起设置
+    private var deferredMaxRise: Int?
+    /// 非停止帧最多一笔在途，在途期间只留最新一帧（M2）；AI 帧按实际发出的上一帧限升幅（Brain 审查 M1）
     private var outputWrites = OutputWriteCoalescer()
     /// 运行中收到全零输出、已为它发了停止帧对，之后还没有非零帧（见 OutputGate）
     private var zeroHeld = false
@@ -480,6 +487,7 @@ final class BLEManager: NSObject, ObservableObject {
             self.clearMayBeActive()
             self.outputLocked = true
             self.outputWrites.dropPending()
+            self.outputWrites.resetBaseline()
             if self.stopErrorShown {
                 self.stopErrorShown = false
                 DispatchQueue.main.async { [weak self] in self?.lastError = nil }
@@ -561,18 +569,20 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - 输出（全部经过 submitOutput 准入）
 
-    /// 用户主动发送的帧（手动页滑杆前沿帧、技能预设）：会重新开闸。
-    /// 全零帧在运行中会换成停止帧对、运行继续计时（见 OutputGate）；结束运行请用 sendStop
-    func send(frame: Data) {
+    /// 用户主动发送的帧（手动页滑杆前沿帧、技能预设、AI 每条回复的第一帧）：会重新开闸。
+    /// 全零帧在运行中会换成停止帧对、运行继续计时（见 OutputGate）；结束运行请用 sendStop。
+    /// maxRise：AI 帧的每通道升幅上限，按实际发出的上一帧再夹一次（M1）；nil = 不限。
+    /// epoch：AI 执行前读到的 gateEpoch，中间发生过被动停机就不开闸（M5）；nil = 用户直接操作
+    func send(frame: Data, maxRise: Int? = nil, epoch: Int? = nil) {
         bleQueue.async { [weak self] in
-            self?.submitOutput(frame, opensGate: true)
+            self?.submitOutput(frame, opensGate: true, maxRise: maxRise, epoch: epoch)
         }
     }
 
-    /// 节流尾帧：不开闸（修 N2 —— 停机后排队的尾帧必须丢掉）
-    func sendThrottled(frame: Data) {
+    /// 节流尾帧 / AI 后续步骤：不开闸（修 N2 —— 停机后排队的尾帧必须丢掉）
+    func sendThrottled(frame: Data, maxRise: Int? = nil) {
         bleQueue.async { [weak self] in
-            self?.submitOutput(frame, opensGate: false)
+            self?.submitOutput(frame, opensGate: false, maxRise: maxRise)
         }
     }
 
@@ -584,10 +594,13 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// 用户在视频页点了"播放"：显式打开输出闸门（修 C）
-    func userResumeOutput() {
+    /// 用户在视频页点了"播放"、或 AI 开始执行一条回复：显式打开输出闸门（修 C）。
+    /// AI 带 epoch：执行前检查之后发生过被动停机就不开（M5，不再只靠冷却兜底）
+    func userResumeOutput(epoch: Int? = nil) {
         bleQueue.async { [weak self] in
-            self?.outputLocked = false
+            guard let self = self,
+                  OutputGate.mayOpen(requestEpoch: epoch, currentEpoch: self.queueGateEpoch) else { return }
+            self.outputLocked = false
         }
     }
 
@@ -617,62 +630,67 @@ final class BLEManager: NSObject, ObservableObject {
         isActive || stopUnconfirmed || deviceMayBeActive || physicalAckRequired || ledger.hasOpenRun
     }
 
-    /// 唯一的输出准入点（修 M2/M3/L5/N1）：手动、技能、视频的每一帧非停止帧都从这里过
-    private func submitOutput(_ data: Data, opensGate: Bool) {
+    /// 唯一的输出准入点（修 M2/M3/L5/N1）：手动、技能、视频、AI 的每一帧非停止帧都从这里过。
+    /// 准入顺序见 OutputAdmission（纯决策，ProtocolChecks 覆盖）
+    private func submitOutput(_ data: Data, opensGate: Bool, maxRise: Int? = nil, epoch: Int? = nil) {
         // 后台期间（emergencyStop 之后、resumeFromBackground 之前）任何输出都不许开闸，
         // 主线程上迟到的回复/定时器在这里兜底
-        guard canWrite, !disconnecting, !appInBackground else { return }
-        if opensGate { outputLocked = false }
-        guard !outputLocked else { return }
-        // 修 L5 / M4：设备可能仍在输出、或锁存未解除：确认停止前不许新的输出
-        if physicalAckRequired || deviceMayBeActive {
+        let linkWritable = canWrite && !disconnecting && !appInBackground
+        // M5：带代次的开闸请求，中间发生过被动停机就不开
+        if linkWritable, opensGate, OutputGate.mayOpen(requestEpoch: epoch, currentEpoch: queueGateEpoch) {
+            outputLocked = false
+        }
+        let decision = OutputAdmission.decide(OutputAdmission.Inputs(
+            linkWritable: linkWritable,
+            gateOpen: !outputLocked,
+            mayStillBeOutputting: physicalAckRequired || deviceMayBeActive,
+            stopInProgress: stopOp != nil,
+            stopFailed: (stopOp?.failures ?? 0) > 0,
+            allZero: BCProtocol.isAllZeroOutput(data),
+            isActive: isActive,
+            zeroHeld: zeroHeld))
+        switch decision {
+        case .drop, .skipIdleZero, .alreadyZeroed:
+            return
+        case .rejectMayBeActive:
+            // 修 L5 / M4：设备可能仍在输出、或锁存未解除：确认停止前不许新的输出
             rejectOutput("设备可能仍在输出：请先按「停止」并等设备确认，或关闭设备电源后点「已物理关机，解除锁定」")
-            return
-        }
-        if let op = stopOp {
-            if op.failures > 0 {
-                rejectOutput("停止尚未得到设备确认，暂不能输出")
-            } else {
-                // 修 N1/N4：停止帧对还在路上，期间不许插入非停止帧；等它确认后再按这次请求处理
-                deferredFrame = data
-            }
-            return
-        }
-        // H1 / L5：全零输出要么丢掉（设备没在输出），要么换成完整停止帧对、运行继续
-        switch OutputGate.decide(allZero: BCProtocol.isAllZeroOutput(data), isActive: isActive, zeroHeld: zeroHeld) {
-        case .skipIdleZero, .alreadyZeroed:
-            return
+        case .rejectStopUnconfirmed:
+            rejectOutput("停止尚未得到设备确认，暂不能输出")
+        case .deferUntilStopped:
+            // 修 N1/N4：停止帧对还在路上，期间不许插入非停止帧；等它确认后再按这次请求处理
+            deferredFrame = data
+            deferredMaxRise = maxRise
         case .zeroStopPair:
+            // H1 / L5：运行中的全零输出换成完整停止帧对、运行继续
             zeroHeld = true
             requestStop(needed: true, keepRun: true)
-            return
-        case .write:
-            break
-        }
-        if !isActive {
-            // 修 M2/M3：停机状态下开始新一次运行：冷却 + 30 分钟额度，本次最长 min(1200 秒, 剩余额度)
-            if let denial = ledger.checkAdmissible() {
-                rejectOutput(Self.denialText(denial))
-                return
+        case .write(let startsRun):
+            if startsRun {
+                // 修 M2/M3：停机状态下开始新一次运行：冷却 + 30 分钟额度，本次最长 min(1200 秒, 剩余额度)
+                if let denial = ledger.checkAdmissible() {
+                    rejectOutput(Self.denialText(denial))
+                    return
+                }
+                guard let allowed = ledger.begin() else {
+                    rejectOutput("暂时不能输出")
+                    return
+                }
+                armRunDeadline(after: allowed)
+                // 从开始输出算心跳，避免旧心跳让看门狗立刻误判
+                lastHeartbeat = Self.now()
             }
-            guard let allowed = ledger.begin() else {
-                rejectOutput("暂时不能输出")
-                return
-            }
-            armRunDeadline(after: allowed)
-            // 从开始输出算心跳，避免旧心跳让看门狗立刻误判
-            lastHeartbeat = Self.now()
+            zeroHeld = false
+            writeOutput(data, maxRise: maxRise)
+            // 修 F：isActive 只在停止帧对确认后才清零
+            isActive = true
+            publishSafety()
         }
-        zeroHeld = false
-        writeOutput(data)
-        // 修 F：isActive 只在停止帧对确认后才清零
-        isActive = true
-        publishSafety()
     }
 
-    /// 非停止帧经过合并器：没有在途写入就立刻发，否则只记下最新一帧（M2）
-    private func writeOutput(_ data: Data) {
-        guard case .write(let frame) = outputWrites.submit(data) else { return }
+    /// 非停止帧经过合并器：没有在途写入就立刻发，否则只记下最新一帧（M2）；AI 帧按实际发出的上一帧限升幅（M1）
+    private func writeOutput(_ data: Data, maxRise: Int?) {
+        guard case .write(let frame) = outputWrites.submit(data, maxRise: maxRise) else { return }
         if enqueueWrite(frame, kind: .output) < 0 { outputWrites.reset() }
     }
 
@@ -776,6 +794,12 @@ final class BLEManager: NSObject, ObservableObject {
         op.attempts += 1
         op.pair = StopPairAttempt()
         op.stopId = -1
+        // L1：上一轮剩下的全是已超时的停止帧（回执丢了）时清空重新对齐，避免之后的配对永久错位
+        if WriteAckFIFO.canRealign(pendingWrites.map { (isStop: $0.kind != .output, timedOut: $0.timedOut) }) {
+            let dropped = pendingWrites.count
+            Self.log.notice("写入回执队列重新对齐：丢弃 \(dropped) 笔已超时的停止帧")
+            pendingWrites.removeAll()
+        }
         op.zeroId = enqueueWrite(BCProtocol.manualZeroFrame, kind: .stopZero)
         stopOp = op
         let gen = op.gen
@@ -838,10 +862,12 @@ final class BLEManager: NSObject, ObservableObject {
             if op.keepRun { applyZeroStopSuccess() } else { applyStopSuccess() }
         }
         let deferred = deferredFrame
+        let deferredRise = deferredMaxRise
         deferredFrame = nil
+        deferredMaxRise = nil
         op.completions.forEach { $0(result) }
         if result == .confirmed || result == .idleUnconfirmed, let d = deferred, !outputLocked {
-            submitOutput(d, opensGate: false)
+            submitOutput(d, opensGate: false, maxRise: deferredRise)
         }
         publishSafety()
     }
@@ -849,6 +875,8 @@ final class BLEManager: NSObject, ObservableObject {
     /// 全零输出的停止帧对确认：设备停了，运行继续（记账、单次上限、看门狗照旧），闸门保持打开
     private func applyZeroStopSuccess() {
         stopUnconfirmed = false
+        // M1：设备在 0，之后的升幅限速从 0 算
+        outputWrites.resetBaseline()
         if stopErrorShown {
             stopErrorShown = false
             DispatchQueue.main.async { [weak self] in self?.lastError = nil }
@@ -871,6 +899,8 @@ final class BLEManager: NSObject, ObservableObject {
         runGen += 1 // 作废本次运行的到点定时器
         ledger.end() // 修 M3：按实际时长记账并开始冷却
         clearMayBeActive()
+        // M1：设备在 0，之后的升幅限速从 0 算
+        outputWrites.resetBaseline()
         // 停止其实确认成功了，清掉之前"停止未确认"的红字（锁存另有界面，不在这里清）
         if stopErrorShown {
             stopErrorShown = false
@@ -970,7 +1000,12 @@ final class BLEManager: NSObject, ObservableObject {
         disconnecting = false
         disconnectGen += 1
         runGen += 1
-        DispatchQueue.main.async { [weak self] in self?.forceDisconnectOffered = false }
+        // M5：断链也算被动停机，之前读到的代次全部作废
+        let epoch = bumpGateEpoch()
+        DispatchQueue.main.async { [weak self] in
+            self?.forceDisconnectOffered = false
+            self?.gateEpoch = epoch
+        }
         abortStopOp()
         publishSafety()
     }
@@ -1152,9 +1187,18 @@ final class BLEManager: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in self?.safety = s }
     }
 
-    /// 在主线程发送 forceZeroOutputs；调用方保证在 bleQueue 上
+    /// 被动停机代次 +1（M5）；调用方保证在 bleQueue 上，并负责把返回值同步到主线程的 gateEpoch
+    private func bumpGateEpoch() -> Int {
+        queueGateEpoch &+= 1
+        return queueGateEpoch
+    }
+
+    /// 在主线程发送 forceZeroOutputs；调用方保证在 bleQueue 上。
+    /// 所有被动停机都经过这里，所以顺带把被动停机代次 +1（M5），和通知一起同步到主线程
     private func notifyForceZero(_ reason: String?) {
+        let epoch = bumpGateEpoch()
         DispatchQueue.main.async { [weak self] in
+            self?.gateEpoch = epoch
             self?.forceZeroOutputs.send(reason)
         }
     }

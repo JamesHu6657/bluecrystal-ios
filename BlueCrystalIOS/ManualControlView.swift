@@ -26,8 +26,9 @@ final class ManualControlVM: ObservableObject {
     @Published private(set) var idleNotice: String?
 
     static let throttleInterval: TimeInterval = 0.12
-    /// 手动页这么久没有任何操作就自动停止输出（L7）：心跳只证明界面活着，不证明有人在操作
-    static let idleTimeout: TimeInterval = 300
+    /// 手动页这么久没有任何操作就自动停止输出（L7）：心跳只证明界面活着，不证明有人在操作。
+    /// 判断逻辑在 ManualIdle（纯类型，ProtocolChecks 覆盖）
+    static let idleTimeout: TimeInterval = ManualIdle.timeoutSeconds
 
     func attach(ble: BLEManager) {
         // N4：切 Tab 回来会重复 attach，先清掉旧的订阅
@@ -59,8 +60,9 @@ final class ManualControlVM: ObservableObject {
         heartbeatTimer?.invalidate()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            let idle = ProcessInfo.processInfo.systemUptime - self.lastInteraction
-            if self.outputSinceStop, idle >= Self.idleTimeout {
+            if ManualIdle.expired(now: ProcessInfo.processInfo.systemUptime,
+                                  lastInteraction: self.lastInteraction,
+                                  outputSinceStop: self.outputSinceStop) {
                 self.stopAll()
                 self.idleNotice = "\(Int(Self.idleTimeout / 60)) 分钟没有操作，已自动停止输出"
                 return
