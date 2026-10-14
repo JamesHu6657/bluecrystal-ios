@@ -424,6 +424,33 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
+    /// 视频 tick 专用：不开闸（修 C）。
+    /// 看门狗 / emergencyStop 锁住闸后，tick 的自动帧不许再把它打开；
+    /// 只有用户点"播放"（userResumeOutput）才能开闸。
+    func sendTick(channels: [Int]) {
+        bleQueue.async { [weak self] in
+            guard let self = self, !self.outputLocked else { return }
+            self.enqueueFrame(BCProtocol.frame(channels: channels))
+        }
+    }
+
+    /// 用户在视频页点了"播放"：显式打开输出闸门（修 C）
+    func userResumeOutput() {
+        bleQueue.async { [weak self] in
+            self?.outputLocked = false
+        }
+    }
+
+    /// 停止帧不受闸门限制，也不再打开闸门（修 C 备注）：
+    /// 它会被外部暂停/播完等自动路径调用，"只有用户操作才能开闸"必须严格成立。
+    /// 最后一帧是 0x08 手动帧时，enqueueFrame 会先自动补 0x08 归零帧。
+    func sendStop() {
+        bleQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.enqueueFrame(BCProtocol.stopFrame)
+        }
+    }
+
     func sendOfficialStart() {
         send(frame: BCProtocol.officialStartFrame)
     }
