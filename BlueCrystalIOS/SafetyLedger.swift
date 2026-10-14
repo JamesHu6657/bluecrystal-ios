@@ -26,6 +26,20 @@ enum SafetyClock {
         #endif
         return nil
     }
+
+    /// 安全计时用的单调时钟（秒，自本次开机起）：手机睡眠期间继续走（Darwin CLOCK_MONOTONIC = mach_continuous_time）。
+    /// 第二轮审查 M3：之前用 systemUptime，它在睡眠时停走。锁屏睡着、设备却可能还在输出（停止没确认 / 断链 / 进程被杀
+    /// 后同一次开机内重启）时，运行时长少算，确认停止后的冷却和记账跟着变少
+    static func continuousSeconds() -> TimeInterval {
+        #if canImport(Darwin)
+        return TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000_000
+        #else
+        return ProcessInfo.processInfo.systemUptime
+        #endif
+    }
+
+    /// 快照里记录的时钟种类：时间轴不同的旧快照（systemUptime）不能拿来对齐锚点
+    static let continuousClockKind = "continuous"
 }
 
 /// 安全上限（结构沿用 legacy src/safety/limits.py；1.7.4 起按用户要求把单次上限调到 20 分钟，不可在 App 内配置）
@@ -52,7 +66,8 @@ enum SafetyLimits {
 /// 记账条目在结束后保留整整一个窗口（与 legacy 一样偏保守）。
 ///
 /// 不是线程安全的：BLEManager 只在 bleQueue 上用它。
-/// 时间用 systemUptime；持久化墙钟 + 单调锚点 + 启动标识，跨进程也不依赖可变墙钟（F3）。
+/// 时间用 SafetyClock.continuousSeconds（睡眠期间也走，第二轮审查 M3）；持久化墙钟 + 单调锚点 + 启动标识 + 时钟种类，
+/// 跨进程也不依赖可变墙钟（F3）。字段名里的 uptime 沿用旧名，指的就是这个单调时钟
 final class DutyCycleLedger {
 
     enum Denial: Equatable {
@@ -81,11 +96,14 @@ final class DutyCycleLedger {
         var bootIdentity: String?
         var openElapsedUnknown: Bool?
         var openElapsedLowerBound: TimeInterval?
+        /// savedUptime 所在的时钟（M3）；没有 = 旧版 systemUptime 时间轴，不拿来对齐
+        var clockKind: String?
     }
 
     private let clock: () -> TimeInterval
     private let wallClock: () -> TimeInterval
     private let bootIdentity: () -> String?
+    private let clockKind: String
     private var completed: [Entry] = []
     /// 进行中运行的开始时间（单调时钟）；nil = 没有进行中的运行
     private(set) var openStart: TimeInterval?
@@ -102,12 +120,14 @@ final class DutyCycleLedger {
     /// 状态变化回调（BLEManager 用来持久化）
     var onChange: (() -> Void)?
 
-    init(clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+    init(clock: @escaping () -> TimeInterval = { SafetyClock.continuousSeconds() },
          wallClock: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 },
-         bootIdentity: @escaping () -> String? = { SafetyClock.bootIdentity() }) {
+         bootIdentity: @escaping () -> String? = { SafetyClock.bootIdentity() },
+         clockKind: String = SafetyClock.continuousClockKind) {
         self.clock = clock
         self.wallClock = wallClock
         self.bootIdentity = bootIdentity
+        self.clockKind = clockKind
     }
 
     var hasOpenRun: Bool { openStart != nil }
@@ -219,7 +239,8 @@ final class DutyCycleLedger {
             savedUptime: now,
             bootIdentity: bootIdentity(),
             openElapsedUnknown: openElapsedUnknown,
-            openElapsedLowerBound: openStart.map { max(0, now - $0) }
+            openElapsedLowerBound: openStart.map { max(0, now - $0) },
+            clockKind: clockKind
         )
         return try? JSONEncoder().encode(s)
     }
@@ -230,16 +251,18 @@ final class DutyCycleLedger {
         let now = clock()
         let currentBoot = bootIdentity()
         // 同一次启动只用快照中的墙钟/uptime 对应关系，完全忽略当前墙钟跳变。
+        // M3：锚点还必须是同一种时钟；旧版 systemUptime 时间轴的快照走保守恢复
         var anchor: (wall: TimeInterval, uptime: TimeInterval)?
         if let savedWall = s.savedWall, savedWall.isFinite,
            let savedUptime = s.savedUptime, savedUptime.isFinite, savedUptime >= 0,
            let savedBoot = s.bootIdentity, !savedBoot.isEmpty,
-           savedBoot == currentBoot, now >= savedUptime {
+           savedBoot == currentBoot, now >= savedUptime,
+           s.clockKind == clockKind {
             anchor = (savedWall, savedUptime)
         }
         func toUptime(_ w: TimeInterval) -> TimeInterval {
             if let a = anchor { return a.uptime - (a.wall - w) }
-            // 启动标识不明/重启/uptime 倒退：不能让前拨墙钟清掉记账或冷却。
+            // 启动标识不明/重启/uptime 倒退/换了时钟：不能让前拨墙钟清掉记账或冷却。
             return now
         }
         func valid(_ v: TimeInterval) -> Bool { v.isFinite && v >= 0 }
