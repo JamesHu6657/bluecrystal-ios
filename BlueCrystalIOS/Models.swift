@@ -113,3 +113,130 @@ struct ActiveChannels: Equatable {
         lhs.values == rhs.values
     }
 }
+
+// MARK: - 我的收藏（手感页）：纯数据和换算，ProtocolChecks 覆盖。
+// 只是"记住滑杆位置"：召回时走手动页同一条发送路径（ManualControlVM → BLEManager.send / sendThrottled），
+// 准入、冷却、额度、看门狗、单次上限一个不少；这里只负责把存下来的值夹回各自模式的范围。
+
+/// 一条收藏：控制方式（变频 / 手动）+ 三个通道的强度
+struct FavoriteSetting: Codable, Identifiable, Equatable {
+    static let maxCount = 8
+    static let maxNameLength = 12
+    /// 自动起的名字（按顺序取第一个没用过的）
+    static let suggestedNames = ["微醺", "心动", "缠绵", "悸动", "沉溺", "迷离", "余温", "失控边缘"]
+
+    var id: UUID
+    var name: String
+    /// BCProtocol.Mode.rawValue；技能预设本来就是一键，不收藏
+    var modeRaw: Int
+    var levels: [Int]
+
+    /// 只认变频 / 手动；技能或无法识别的值为 nil（这条收藏不能用）
+    var mode: BCProtocol.Mode? {
+        guard let m = BCProtocol.Mode(rawValue: modeRaw), m != .skill else { return nil }
+        return m
+    }
+
+    /// 召回用的强度：补齐 4 个通道、夹到该模式的 0~maxLevel、旋转恒 0；
+    /// 模式无效或全为 0 时为 nil（全零收藏没有意义，也不会被存下来）
+    var clampedLevels: [Int]? {
+        guard let m = mode else { return nil }
+        let out = Self.clamp(levels, maxLevel: m.maxLevel)
+        return out.contains(where: { $0 > 0 }) ? out : nil
+    }
+
+    static func clamp(_ levels: [Int], maxLevel: Int) -> [Int] {
+        (0..<4).map { (i: Int) -> Int in
+            guard BCProtocol.Channel(rawValue: i)?.isUsed == true, i < levels.count else { return 0 }
+            return min(maxLevel, max(0, levels[i]))
+        }
+    }
+
+    /// 名字：去掉首尾空白和换行，最多 maxNameLength 个字；空的用 fallback
+    static func sanitizedName(_ raw: String, fallback: String) -> String {
+        let flat = raw.components(separatedBy: .newlines).joined(separator: " ")
+        let trimmed = flat.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return fallback }
+        return String(trimmed.prefix(maxNameLength))
+    }
+
+    /// 下一个自动名字：建议名都用过了就"我的手感 N"
+    static func nextName(existing: [String]) -> String {
+        if let n = suggestedNames.first(where: { !existing.contains($0) }) { return n }
+        var i = existing.count + 1
+        while existing.contains("我的手感 \(i)") { i += 1 }
+        return "我的手感 \(i)"
+    }
+
+    /// 新建：技能模式或全零时为 nil
+    static func make(name: String, mode: BCProtocol.Mode, levels: [Int]) -> FavoriteSetting? {
+        guard mode != .skill else { return nil }
+        let clamped = clamp(levels, maxLevel: mode.maxLevel)
+        guard clamped.contains(where: { $0 > 0 }) else { return nil }
+        return FavoriteSetting(id: UUID(), name: name, modeRaw: mode.rawValue, levels: clamped)
+    }
+
+    /// 同一模式、同样的强度算重复
+    func sameSetting(as other: FavoriteSetting) -> Bool {
+        modeRaw == other.modeRaw && clampedLevels == other.clampedLevels
+    }
+}
+
+enum FavoriteCodec {
+    /// 解不出来就当没有；无效条目（技能 / 全零 / 未知模式）丢掉，最多 maxCount 条
+    static func decode(_ data: Data?) -> [FavoriteSetting] {
+        guard let d = data, let items = try? JSONDecoder().decode([FavoriteSetting].self, from: d) else { return [] }
+        let valid = items.filter { $0.clampedLevels != nil }
+        return Array(valid.prefix(FavoriteSetting.maxCount))
+    }
+
+    static func encode(_ items: [FavoriteSetting]) -> Data? {
+        try? JSONEncoder().encode(Array(items.prefix(FavoriteSetting.maxCount)))
+    }
+}
+
+/// 召回收藏时的"缓缓推上去"：升高的通道分几步爬到目标，降低的通道第一步就到位（降低永远立即生效）。
+/// 只算每一步的值；发送由 ManualControlVM 做：第一步是用户这次点按（send，开闸），
+/// 后面的步骤走 sendThrottled（不开闸）：中途有任何停止（用户 / 看门狗 / 上限 / 断开），后面的步骤都会被丢掉
+enum FavoriteGlide {
+    static let steps = 6
+    static let stepInterval: TimeInterval = 0.15
+
+    /// 从 from 到 to 的每一步（不含起点，最后一步恰好是 to；相邻重复的步骤合并）。
+    /// from == to 时只有一步（重新发一次目标值）
+    static func plan(from: [Int], to: [Int], steps: Int = steps) -> [[Int]] {
+        let n = max(1, steps)
+        let start = (0..<4).map { $0 < from.count ? max(0, from[$0]) : 0 }
+        let target = (0..<4).map { $0 < to.count ? max(0, to[$0]) : 0 }
+        var out: [[Int]] = []
+        for k in 1...n {
+            let step = (0..<4).map { (i: Int) -> Int in
+                let a = start[i]
+                let b = target[i]
+                guard b > a else { return b }
+                // 向上取整：升高的通道第一步至少 +1，中间步骤不会出现"全零"（全零会被当成停止帧对）
+                let rise = ((b - a) * k + n - 1) / n
+                return a + rise
+            }
+            if out.last != step { out.append(step) }
+        }
+        return out
+    }
+}
+
+/// 热度对应的一个词（手感页中央的"心"下面，纯展示）
+enum HeatMood {
+    static func word(for heat: Double) -> String {
+        if !(heat > 0) { return "静候" }
+        if heat < 0.3 { return "微热" }
+        if heat < 0.6 { return "升温" }
+        if heat < 0.85 { return "炽热" }
+        return "沸点"
+    }
+}
+
+/// 「她」页输入栏上方的快捷话：一点就发，和自己打字发出去完全一样（同一条发送路径）。
+/// 这里的每一句都不能碰到本地停止词（ProtocolChecks 钉住），否则点"再快一点"反而会停
+enum AIQuickReplies {
+    static let phrases = ["开始吧", "温柔一点", "慢一点", "再快一点", "就是这样", "逗逗我"]
+}

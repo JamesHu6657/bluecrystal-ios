@@ -330,6 +330,14 @@ final class VideoSyncPlayer: ObservableObject {
         statusLine = "—"
     }
 
+    /// 打开文件选择器之前（修：选择器是一整页弹出层，会盖住底部停止键）：
+    /// 正在联动就先停下（和 AI 页打开设置前先停止一样）；选完新素材本来也会 stopAll
+    func stopBeforePicker() {
+        guard isPlaying else { return }
+        stopAll()
+        statusLine = "打开文件前已停止"
+    }
+
     /// 被动停机（看门狗/退后台/单次上限/输出被拒）：只归零 UI，不补发停止帧
     /// （需要的停止 BLEManager 已经发出去了）
     private func passiveStop(reason: String?) {
@@ -447,10 +455,16 @@ struct VideoSyncView: View {
     /// 全屏播放中：内嵌预览让出播放器，onDisappear 不把全屏误判成离开页面
     @State private var isFullScreen = false
 
+    /// 选择器弹出前先停（选择器会盖住停止键）
+    private func openPicker(_ kind: PickerKind) {
+        vm.stopBeforePicker()
+        picker = kind
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                PageHeader(title: "一起看", subtitle: "画面起伏，身体跟着一起")
+                PageHeader(title: "一起看", subtitle: "画面起伏，身体也跟着一起")
 
                 DeviceStatusCard(allowDisconnect: false, connectTitle: "连接")
 
@@ -548,18 +562,20 @@ struct VideoSyncView: View {
             .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Velvet.stroke, lineWidth: 1))
             .shadow(color: Velvet.rose.opacity(vm.isPlaying ? 0.35 : 0.1), radius: 24)
         } else {
-            Button { picker = .video } label: {
+            Button { openPicker(.video) } label: {
                 VStack(spacing: 10) {
                     Image(systemName: "play.circle")
                         .font(.system(size: 44, weight: .thin))
                         .foregroundStyle(Velvet.roseGradient)
                     Text("选一段视频，和她一起看")
-                        .font(Velvet.serif(18, .medium))
+                        .font(Velvet.display(.title3, .medium))
                         .foregroundColor(Velvet.text)
                     Text("再载入时间轴脚本，画面和身体就会同步")
                         .font(.caption)
-                        .foregroundColor(Velvet.textMuted)
+                        .foregroundColor(Velvet.textSecondary)
                 }
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
                 .frame(maxWidth: .infinity, minHeight: 200)
                 .background(
                     RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -592,8 +608,8 @@ struct VideoSyncView: View {
                 .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(vm.isPlaying ? "正在一起看" : "播放控制")
-                        .font(Velvet.serif(17, .medium))
+                    Text(vm.isPlaying ? "正在一起看" : (vm.canPlay ? "准备好了" : "播放控制"))
+                        .font(Velvet.display(.headline, .medium))
                         .foregroundColor(Velvet.text)
                     if vm.durationSeconds > 0 {
                         Text("\(formatTime(vm.currentSeconds)) / \(formatTime(vm.durationSeconds))")
@@ -627,6 +643,9 @@ struct VideoSyncView: View {
                 .tint(Velvet.rose)
                 .disabled(!vm.canPlay)
             }
+            if !vm.canPlay {
+                readiness
+            }
             Text(vm.statusLine)
                 .font(.caption)
                 .foregroundColor(Velvet.textSecondary)
@@ -635,13 +654,27 @@ struct VideoSyncView: View {
         .velvetCard()
     }
 
+    /// 还差什么才能播：设备 / 视频 / 脚本，缺哪个点哪个（之前播放键只是灰着，不说为什么）
+    private var readiness: some View {
+        let connected = ble.state == .ready
+        let busy = ble.state == .scanning || ble.state == .connecting || ble.state == .discovering
+            || ble.state == .disconnecting
+        return HStack(spacing: 8) {
+            ReadinessChip(title: busy ? ble.state.rawValue : "设备", done: connected, icon: "dot.radiowaves.left.and.right") {
+                if !connected && !busy { ble.startScan() }
+            }
+            ReadinessChip(title: "视频", done: vm.player != nil, icon: "film") { openPicker(.video) }
+            ReadinessChip(title: "脚本", done: vm.script != nil, icon: "doc.text") { openPicker(.script) }
+        }
+    }
+
     /// 素材（原"素材"区块）
     private var materials: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionLabel(title: "素材", systemImage: "film.stack")
-            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") { picker = .video }
+            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") { openPicker(.video) }
             Divider().overlay(Velvet.stroke)
-            materialRow(icon: "doc.text", title: "脚本", value: vm.scriptName, action: "载入") { picker = .script }
+            materialRow(icon: "doc.text", title: "脚本", value: vm.scriptName, action: "载入") { openPicker(.script) }
             if let s = vm.script {
                 Text("\(s.commands.count) 条命令")
                     .font(.caption).foregroundColor(Velvet.textMuted)
@@ -870,6 +903,35 @@ struct ScriptIntensityChart: View {
     }
 }
 
+/// 播放前的准备项：好了打勾，没好点一下去补
+private struct ReadinessChip: View {
+    let title: String
+    let done: Bool
+    let icon: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: done ? "checkmark.circle.fill" : icon)
+                Text(title)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundColor(done ? Velvet.ok : Velvet.text)
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .background(Capsule().fill(Color.white.opacity(done ? 0.04 : 0.08)))
+            .overlay(Capsule().strokeBorder(done ? Velvet.ok.opacity(0.35) : Velvet.stroke, lineWidth: 1))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(PressableStyle())
+        .accessibilityLabel(title)
+        .accessibilityValue(done ? "已就绪" : "未就绪")
+    }
+}
+
 /// 系统文件选择器（asCopy: true，文件拷进沙盒，不玩 security-scoped 杂技）
 struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
@@ -912,6 +974,20 @@ struct FullScreenVideoView: View {
     @ObservedObject var vm: VideoSyncPlayer
     let onClose: () -> Void
     @State private var showControls = true
+    /// 自动收起控制条的代次：任何一次显示 / 播放状态变化都重新计时
+    @State private var hideGen = 0
+
+    /// 播放中 4 秒没碰屏幕就收起控制条（停止键始终留在右下角）；
+    /// 暂停 / 被自动停止时不收，旁白开着时也不收（找不到控件）
+    private func scheduleAutoHide() {
+        hideGen += 1
+        let gen = hideGen
+        guard vm.isPlaying, !UIAccessibility.isVoiceOverRunning else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            guard gen == hideGen, vm.isPlaying, !UIAccessibility.isVoiceOverRunning else { return }
+            withAnimation(.easeInOut(duration: 0.3)) { showControls = false }
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -924,7 +1000,10 @@ struct FullScreenVideoView: View {
             Color.clear
                 .contentShape(Rectangle())
                 .ignoresSafeArea()
-                .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() } }
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
+                    if showControls { scheduleAutoHide() }
+                }
             if showControls {
                 VStack(spacing: 0) {
                     HStack {
@@ -954,10 +1033,14 @@ struct FullScreenVideoView: View {
                                                  isPlaying: vm.isPlaying, height: 44, compact: true)
                         }
                         if vm.durationSeconds > 0 {
+                            // 拖动期间不许自动收起
                             Slider(
                                 value: Binding(
                                     get: { vm.currentSeconds },
-                                    set: { vm.seek(to: $0) }
+                                    set: { (t: Double) in
+                                        vm.seek(to: t)
+                                        scheduleAutoHide()
+                                    }
                                 ),
                                 in: 0...vm.durationSeconds
                             )
@@ -1017,14 +1100,17 @@ struct FullScreenVideoView: View {
                             Haptics.stop()
                         } label: {
                             Image(systemName: "stop.fill")
-                                .font(.system(size: 18, weight: .bold))
+                                .font(.system(size: 20, weight: .bold))
                                 .foregroundColor(.white)
-                                .frame(width: 48, height: 48)
+                                .frame(width: 56, height: 56)
                                 .background(Circle().fill(Velvet.stopGradient))
-                                .opacity(0.9)
+                                .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
+                                .shadow(color: Velvet.danger.opacity(0.5), radius: 10)
+                                .opacity(0.92)
                         }
                         .buttonStyle(.borderless)
                         .accessibilityLabel("停止")
+                        .accessibilityHint("立即停止所有输出")
                     }
                 }
                 .padding(20)
@@ -1033,6 +1119,16 @@ struct FullScreenVideoView: View {
         }
         .statusBarHidden(!showControls)
         .preferredColorScheme(.dark)
+        .onAppear { scheduleAutoHide() }
+        // 开始播放后开始计时收起；停下（含被动停机）就把控制条和状态说明拿出来
+        .onChange(of: vm.isPlaying) { playing in
+            if playing {
+                scheduleAutoHide()
+            } else {
+                hideGen += 1
+                withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
+            }
+        }
     }
 
     private static func formatTime(_ s: Double) -> String {

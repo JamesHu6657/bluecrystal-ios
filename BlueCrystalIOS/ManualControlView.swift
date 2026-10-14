@@ -24,6 +24,9 @@ final class ManualControlVM: ObservableObject {
     private var lastInteraction = ProcessInfo.processInfo.systemUptime
     /// 空闲停机后的提示；用户再操作时清掉
     @Published private(set) var idleNotice: String?
+    /// 召回收藏时的缓推（FavoriteGlide）：代次 +1 就作废后面的步骤
+    private var glideGen = 0
+    private var glideWork: DispatchWorkItem?
 
     static let throttleInterval: TimeInterval = 0.12
     /// 手动页这么久没有任何操作就自动停止输出（L7）：心跳只证明界面活着，不证明有人在操作。
@@ -51,6 +54,7 @@ final class ManualControlVM: ObservableObject {
 
     /// 离开手动页时调用：停心跳、清订阅（stopAll 另行调用）
     func detach() {
+        cancelGlide()
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         cancellables.removeAll()
@@ -80,6 +84,8 @@ final class ManualControlVM: ObservableObject {
 
     func setChannel(_ index: Int, _ value: Double) {
         guard mode != .skill else { return }
+        // 用户亲手拖滑杆：缓推让位，以手上的为准
+        cancelGlide()
         noteInteraction()
         outputSinceStop = true
         channels[index] = value
@@ -96,6 +102,7 @@ final class ManualControlVM: ObservableObject {
 
     /// 技能 tab：发官方预设（0x06）
     func selectPreset(_ preset: BCProtocol.Preset) {
+        cancelGlide()
         noteInteraction()
         outputSinceStop = true
         pendingWork?.cancel()
@@ -107,6 +114,7 @@ final class ManualControlVM: ObservableObject {
     }
 
     func stopAll() {
+        cancelGlide()
         pendingWork?.cancel()
         pendingWork = nil
         channels = [0, 0, 0, 0]
@@ -119,12 +127,62 @@ final class ManualControlVM: ObservableObject {
     }
 
     func reset() {
+        cancelGlide()
         pendingWork?.cancel()
         pendingWork = nil
         channels = [0, 0, 0, 0]
         selectedPreset = nil
         outputSinceStop = false
         lastSend = -Double.infinity
+    }
+
+    /// 召回收藏：需要时先切模式（和点模式胶囊一样先停机），再从当前值缓缓推到收藏的强度。
+    /// 第一步是这次点按（send：用户操作，会开闸，照常过准入 / 冷却 / 额度）；后面的步骤走 sendThrottled，不开闸：
+    /// 中途任何停止（用户停止、看门狗、上限、输出被拒、断开、退后台）锁了闸，后面的步骤都会被 BLEManager 丢掉，
+    /// 而且 stopAll / reset 会立刻作废缓推。强度已经按模式范围夹过（FavoriteSetting.clampedLevels）
+    func applyFavorite(_ fav: FavoriteSetting) {
+        guard let target = fav.clampedLevels, let favMode = fav.mode else { return }
+        noteInteraction()
+        if favMode != mode {
+            stopAll()
+            mode = favMode
+        }
+        cancelGlide()
+        pendingWork?.cancel()
+        pendingWork = nil
+        outputSinceStop = true
+        let from = channels.map { Int($0) }
+        let plan = FavoriteGlide.plan(from: from, to: target)
+        runGlide(plan, index: 0, gen: glideGen, mode: favMode)
+    }
+
+    private func cancelGlide() {
+        glideGen += 1
+        glideWork?.cancel()
+        glideWork = nil
+    }
+
+    private func runGlide(_ plan: [[Int]], index: Int, gen: Int, mode stepMode: BCProtocol.Mode) {
+        guard gen == glideGen, stepMode == mode, index < plan.count else { return }
+        let lv = plan[index]
+        channels = lv.map(Double.init)
+        lastSend = ProcessInfo.processInfo.systemUptime
+        let frame = stepMode.frame(channels: lv)
+        if index == 0 {
+            ble?.send(frame: frame)
+        } else {
+            ble?.sendThrottled(frame: frame)
+        }
+        ble?.heartbeat()
+        guard index + 1 < plan.count else {
+            glideWork = nil
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.runGlide(plan, index: index + 1, gen: gen, mode: stepMode)
+        }
+        glideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + FavoriteGlide.stepInterval, execute: work)
     }
 
     /// 后缘节流：120ms 内只发一帧，但最后一次的值一定补发（降强度不能丢）
@@ -167,14 +225,28 @@ struct ManualControlView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var privacy: PrivacyLock
     @StateObject private var vm = ManualControlVM()
+    @StateObject private var favorites = FavoriteStore()
+    /// 设备详情（最后一帧 / FFA2 / 版本）默认收起：调试信息不抢主角
+    @State private var showDetails = false
 
     private var modeFooter: String {
         switch vm.mode {
-        case .skill: return "官方 App 的五个固定技能，0x06 帧"
-        case .frequency: return "官方变频：每通道 0~9，0x06 帧"
-        case .manual: return "官方手动：每通道 0~99，0x08 帧"
+        case .skill: return "五种官方节奏，轻点一下就开始"
+        case .frequency: return "九档起伏，一档一档慢慢推上去"
+        case .manual: return "细腻到每一分，0~99 任你拿捏"
         }
     }
+
+    /// 设备详情里的协议说明（原来写在模式下面）
+    private var modeProtocolNote: String {
+        switch vm.mode {
+        case .skill: return "技能：官方五个固定预设，0x06 帧"
+        case .frequency: return "变频：每通道 0~9，0x06 帧"
+        case .manual: return "手动：每通道 0~99，0x08 帧"
+        }
+    }
+
+    private var currentLevels: [Int] { vm.channels.map { Int($0) } }
 
     /// 连上了且现在允许开始/继续输出（冷却、额度、锁存、停止未确认时禁用；停止按钮不受影响）
     private var canOutput: Bool {
@@ -201,7 +273,7 @@ struct ManualControlView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                PageHeader(title: "手感", subtitle: "指尖的每一分力度，都会被温柔地回应")
+                PageHeader(title: "手感", subtitle: Velvet.greeting())
 
                 DeviceStatusCard(allowDisconnect: true, connectTitle: "连接 mizzzee_0032")
 
@@ -209,111 +281,27 @@ struct ManualControlView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 4)
 
-                VStack(alignment: .leading, spacing: 8) {
-                    ModeSelector(selection: vm.mode) { vm.setMode($0) }
-                        .disabled(ble.state != .ready)
-                    Text(modeFooter)
-                        .font(.caption)
-                        .foregroundColor(Velvet.textMuted)
-                        .padding(.horizontal, 6)
-                }
+                modeSection
 
-                if vm.mode == .skill {
-                    VStack(alignment: .leading, spacing: 12) {
-                        SectionLabel(title: "官方技能", systemImage: "sparkles")
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
-                                  spacing: 12) {
-                            ForEach(BCProtocol.presets) { p in
-                                PresetTile(preset: p, selected: vm.selectedPreset == p.key) {
-                                    vm.selectPreset(p)
-                                    Haptics.soft()
-                                }
-                                .disabled(!canOutput)
-                            }
-                        }
-                    }
-                } else {
-                    VStack(alignment: .leading, spacing: 12) {
-                        SectionLabel(title: "通道强度（0~\(vm.mode.maxLevel)）", systemImage: "slider.horizontal.3")
-                        // 修 N5：旋转通道不显示（协议里恒发 0）
-                        ForEach(BCProtocol.Channel.uiChannels, id: \.rawValue) { ch in
-                            ChannelControl(channel: ch,
-                                           value: vm.channels[ch.rawValue],
-                                           maxLevel: vm.mode.maxLevel) { vm.setChannel(ch.rawValue, $0) }
-                                .disabled(!canOutput)
-                        }
-                        Text("旋转通道官方 mizzzee 配置未使用，已隐藏（恒发 0）")
-                            .font(.caption)
-                            .foregroundColor(Velvet.textMuted)
-                            .padding(.horizontal, 6)
-                    }
-                }
+                controlsSection
 
-                // 空闲提示（原停止区块的 footer）：停止键本身常驻在底部
-                HStack(alignment: .top, spacing: 6) {
-                    if let notice = vm.idleNotice {
-                        Image(systemName: "moon.zzz.fill")
-                        Text(notice)
-                    } else {
-                        Image(systemName: "clock")
-                        Text("\(Int(ManualControlVM.idleTimeout / 60)) 分钟没有操作会自动停止")
-                    }
-                }
-                .font(.caption)
-                .foregroundColor(vm.idleNotice != nil ? Velvet.warning : Velvet.textSecondary)
-                .padding(.horizontal, 6)
+                FavoritesPanel(store: favorites, mode: vm.mode, levels: currentLevels,
+                               canOutput: canOutput) { vm.applyFavorite($0) }
 
-                VStack(alignment: .leading, spacing: 10) {
-                    SectionLabel(title: "隐私", systemImage: "eye.slash")
-                    // 已开启时即使生物识别暂不可用也保留开关，随时能关掉
-                    if privacy.biometry != nil || privacy.biometricEnabled {
-                        // 打开开关会弹系统验证框（失败时是全屏密码页），会盖住底部停止键：
-                        // 输出中、断开中或设备需要处理时不许改
-                        Toggle(isOn: Binding(get: { privacy.biometricEnabled },
-                                             set: { privacy.setBiometric($0) })) {
-                            Text("打开 App 时用\(privacy.biometry?.name ?? "面容 ID")解锁").foregroundColor(Velvet.text)
-                        }
-                        .tint(Velvet.rose)
-                        .disabled(ble.privacyCoverBlocked)
-                        if ble.privacyCoverBlocked {
-                            Text("输出中或设备需要处理时不能更改，先停止")
-                                .font(.caption)
-                                .foregroundColor(Velvet.textMuted)
-                        }
-                    }
-                    if let m = privacy.message {
-                        Text(m).font(.caption).foregroundColor(Velvet.warning)
-                    }
-                    Text("切到后台或多任务界面时，画面会自动模糊。")
-                        .font(.caption)
-                        .foregroundColor(Velvet.textMuted)
-                }
-                .velvetCard()
+                idleNote
 
-                VStack(alignment: .leading, spacing: 6) {
-                    SectionLabel(title: "最后一帧", systemImage: "waveform.path.ecg")
-                    Text(ble.lastSentHex)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(Velvet.textSecondary)
-                    Text("仅在收到写入回执后更新（链路层回执，不代表设备已执行）")
-                        .font(.caption2).foregroundColor(Velvet.textMuted)
-                    // 修 L1：FFA2 通知原样显示（含义未知，只记录）
-                    Text("设备通知（FFA2）：\(ble.lastNotifyHex)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundColor(Velvet.textMuted)
-                    Text(versionText)
-                        .font(.caption2).foregroundColor(Velvet.textMuted)
-                }
-                .velvetCard()
+                privacyCard
+
+                deviceDetails
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 16)
         }
         .background(VelvetBackground(glow: heat).ignoresSafeArea())
-        // 停止常驻底部：不随内容滚走，一下就停（连接后可用，和原来一样）
+        // 停止常驻底部：不随内容滚走，一下就停。任何连接状态下都可以点（修：之前未连接 / 断开中时被禁用，
+        // 断开流程里停止正在退避时，点停止本可以立刻整对重发；没有链路时 sendStop 本身什么也不发）
         .safeAreaInset(edge: .bottom) {
             StopDockBar { vm.stopAll() }
-                .disabled(ble.state != .ready)
         }
         // 修 CC r2 L7：attach 挂在整个页面上，与 detach 对称；设备区块滚出屏幕也能重新挂上
         .onAppear { vm.attach(ble: ble) }
@@ -324,6 +312,145 @@ struct ManualControlView: View {
         }
         // 解锁页上的停止：和本页停止键同一个 stopAll
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
+    }
+
+    /// 技能 / 变频 / 手动 的切换和一句说明
+    private var modeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ModeSelector(selection: vm.mode) { vm.setMode($0) }
+                .disabled(ble.state != .ready)
+            Text(modeFooter)
+                .font(.caption)
+                .foregroundColor(Velvet.textSecondary)
+                .padding(.horizontal, 6)
+                .id(vm.mode)
+                .transition(.opacity)
+        }
+        .animation(.easeInOut(duration: 0.25), value: vm.mode)
+    }
+
+    /// 技能卡片，或三个通道的滑杆
+    @ViewBuilder private var controlsSection: some View {
+        if vm.mode == .skill {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionLabel(title: "官方技能", systemImage: "sparkles")
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)],
+                          spacing: 12) {
+                    ForEach(BCProtocol.presets) { p in
+                        PresetTile(preset: p, selected: vm.selectedPreset == p.key) {
+                            vm.selectPreset(p)
+                            Haptics.soft()
+                        }
+                        .disabled(!canOutput)
+                    }
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionLabel(title: "通道强度（0~\(vm.mode.maxLevel)）", systemImage: "slider.horizontal.3")
+                // 修 N5：旋转通道不显示（协议里恒发 0）
+                ForEach(BCProtocol.Channel.uiChannels, id: \.rawValue) { ch in
+                    ChannelControl(channel: ch,
+                                   value: vm.channels[ch.rawValue],
+                                   maxLevel: vm.mode.maxLevel) { vm.setChannel(ch.rawValue, $0) }
+                        .disabled(!canOutput)
+                }
+            }
+        }
+    }
+
+    /// 空闲提示（原停止区块的 footer）：停止键本身常驻在底部
+    private var idleNote: some View {
+        HStack(alignment: .top, spacing: 6) {
+            if let notice = vm.idleNotice {
+                Image(systemName: "moon.zzz.fill")
+                Text(notice)
+            } else {
+                Image(systemName: "clock")
+                Text("\(Int(ManualControlVM.idleTimeout / 60)) 分钟没有操作会自动停止")
+            }
+        }
+        .font(.caption)
+        .foregroundColor(vm.idleNotice != nil ? Velvet.warning : Velvet.textSecondary)
+        .padding(.horizontal, 6)
+    }
+
+    private var privacyCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel(title: "隐私", systemImage: "eye.slash")
+            // 已开启时即使生物识别暂不可用也保留开关，随时能关掉
+            if privacy.biometry != nil || privacy.biometricEnabled {
+                // 打开开关会弹系统验证框（失败时是全屏密码页），会盖住底部停止键：
+                // 输出中、断开中或设备需要处理时不许改
+                Toggle(isOn: Binding(get: { privacy.biometricEnabled },
+                                     set: { privacy.setBiometric($0) })) {
+                    Text("打开 App 时用\(privacy.biometry?.name ?? "面容 ID")解锁").foregroundColor(Velvet.text)
+                }
+                .tint(Velvet.rose)
+                .disabled(ble.privacyCoverBlocked)
+                if ble.privacyCoverBlocked {
+                    Text("输出中或设备需要处理时不能更改，先停止")
+                        .font(.caption)
+                        .foregroundColor(Velvet.textMuted)
+                }
+            }
+            if let m = privacy.message {
+                Text(m).font(.caption).foregroundColor(Velvet.warning)
+            }
+            Text("切到后台或多任务界面时，画面会自动模糊。")
+                .font(.caption)
+                .foregroundColor(Velvet.textMuted)
+        }
+        .velvetCard()
+    }
+
+    /// 设备详情：最后一帧、FFA2 通知、协议说明、版本（点标题展开）
+    private var deviceDetails: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) { showDetails.toggle() }
+                Haptics.select()
+            } label: {
+                HStack {
+                    SectionLabel(title: "设备详情", systemImage: "waveform.path.ecg")
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Velvet.gold.opacity(0.9))
+                        .rotationEffect(.degrees(showDetails ? 180 : 0))
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("设备详情")
+            .accessibilityValue(showDetails ? "已展开" : "已收起")
+            .accessibilityHint("最后一帧、设备通知和版本号")
+            if showDetails {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("最后一帧")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(Velvet.textSecondary)
+                    Text(ble.lastSentHex)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(Velvet.textSecondary)
+                    Text("仅在收到写入回执后更新（链路层回执，不代表设备已执行）")
+                        .font(.caption2).foregroundColor(Velvet.textMuted)
+                    // 修 L1：FFA2 通知原样显示（含义未知，只记录）
+                    Text("设备通知（FFA2）：\(ble.lastNotifyHex)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundColor(Velvet.textMuted)
+                    Text(modeProtocolNote)
+                        .font(.caption2).foregroundColor(Velvet.textMuted)
+                    Text("旋转通道官方 mizzzee 配置未使用，已隐藏（恒发 0）")
+                        .font(.caption2).foregroundColor(Velvet.textMuted)
+                    Text(versionText)
+                        .font(.caption2).foregroundColor(Velvet.textMuted)
+                }
+                .transition(.opacity)
+            }
+        }
+        .velvetCard()
     }
 }
 
@@ -378,18 +505,20 @@ private struct HeatCore: View {
                         .font(Velvet.serif(40, .light))
                         .monospacedDigit()
                         .foregroundColor(.white)
-                    Text("热度")
+                    Text(mood)
                         .font(.caption2.weight(.semibold))
                         .tracking(3)
-                        .foregroundColor(.white.opacity(0.75))
+                        .foregroundColor(.white.opacity(0.8))
                 }
             }
             .frame(height: 220)
             .opacity(active ? 1 : 0.55)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("热度 \(displayedHeat)")
+        .accessibilityLabel("热度 \(displayedHeat)，\(mood)")
     }
+
+    private var mood: String { HeatMood.word(for: heat) }
 }
 
 /// 技能 / 变频 / 手动 的切换胶囊
@@ -468,10 +597,11 @@ private struct ChannelControl: View {
                     .font(.caption)
                     .foregroundColor(Velvet.textMuted)
             }
-            Slider(value: Binding(get: { value }, set: { onChange($0) }),
+            Slider(value: Binding(get: { value }, set: { changed(to: $0) }),
                    in: 0...Double(maxLevel), step: 1)
                 .tint(color)
                 .accessibilityLabel(channel.displayName)
+                .accessibilityValue("\(Int(value))，最高 \(maxLevel)")
             if maxLevel <= 9 {
                 HStack(spacing: 0) {
                     ForEach(0...maxLevel, id: \.self) { i in
@@ -501,6 +631,15 @@ private struct ChannelControl: View {
         )
         .opacity(isEnabled ? 1 : 0.5)
         .animation(.easeOut(duration: 0.2), value: value)
+    }
+
+    /// 档位感：变频每一档、手动每 10 轻轻一下（只在手指拖动时，停止归零不震）
+    private func changed(to newValue: Double) {
+        let old = Int(value)
+        let new = Int(newValue)
+        let bucket = maxLevel <= BCProtocol.maxModeLevel ? 1 : 10
+        if old / bucket != new / bucket { Haptics.detent() }
+        onChange(newValue)
     }
 }
 
@@ -534,7 +673,7 @@ private struct PresetTile: View {
                     }
                 }
                 Text(preset.title)
-                    .font(Velvet.serif(19, .semibold))
+                    .font(Velvet.display(.title3))
                     .foregroundColor(.white)
                 HStack(alignment: .bottom, spacing: 4) {
                     ForEach(BCProtocol.Channel.uiChannels, id: \.rawValue) { ch in

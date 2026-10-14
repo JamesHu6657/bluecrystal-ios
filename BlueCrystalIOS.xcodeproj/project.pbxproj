@@ -19,6 +19,7 @@
 		A1010021 /* AIProgram.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020031 /* AIProgram.swift */; };
 		A1010022 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020032 /* Theme.swift */; };
 		A1010023 /* PrivacyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020033 /* PrivacyGate.swift */; };
+		A1010024 /* Favorites.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020034 /* Favorites.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,6 +35,7 @@
 		A1020031 /* AIProgram.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIProgram.swift; sourceTree = "<group>"; };
 		A1020032 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 		A1020033 /* PrivacyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyGate.swift; sourceTree = "<group>"; };
+		A1020034 /* Favorites.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Favorites.swift; sourceTree = "<group>"; };
 		A1020008 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1020009 /* BlueCrystalIOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BlueCrystalIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -72,6 +74,7 @@
 				A1020031 /* AIProgram.swift */,
 				A1020032 /* Theme.swift */,
 				A1020033 /* PrivacyGate.swift */,
+				A1020034 /* Favorites.swift */,
 				A1020008 /* Info.plist */,
 			);
 			path = BlueCrystalIOS;
@@ -164,6 +167,7 @@
 				A1010021 /* AIProgram.swift in Sources */,
 				A1010022 /* Theme.swift in Sources */,
 				A1010023 /* PrivacyGate.swift in Sources */,
+				A1010024 /* Favorites.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

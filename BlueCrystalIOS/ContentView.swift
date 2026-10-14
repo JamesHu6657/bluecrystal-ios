@@ -27,6 +27,15 @@ struct ContentView: View {
             .tint(Velvet.rose)
         }
         .preferredColorScheme(.dark)
+        // 触感（纯反馈，不改任何状态）：连上了轻轻一下"成功"；连接失败、出现新的红字（自动停机、停止未确认等）
+        // 震一下"警告"，手机不在眼前时也能感觉到发生了什么
+        .onChange(of: ble.state) { s in
+            if s == .ready { Haptics.success() }
+            if s == .failed { Haptics.warning() }
+        }
+        .onChange(of: ble.lastError) { err in
+            if err != nil { Haptics.warning() }
+        }
         // 发现未绑定过的设备时弹确认框（防连到别人的设备）。
         // 直接用 showDeviceConfirm 做 binding：点"连接"和点"取消"走各自的方法，
         // 不会像之前那样在 set(false) 里误调 cancel 把 confirm 的设备抢掉（修 N7）。
@@ -154,6 +163,7 @@ struct DeviceStatusCard: View {
             if !compact {
                 safetySummary
             }
+            runMeter
         }
         .velvetCard(padding: compact ? 10 : 16,
                     tint: ble.lastError != nil || ble.safety.needsPhysicalAck ? Velvet.danger : nil)
@@ -168,6 +178,28 @@ struct DeviceStatusCard: View {
         }
         .font(.caption)
         .foregroundColor(Velvet.danger)
+    }
+
+    /// 正在输出时：本次还剩多少的细条（纯展示；文字说明在 safetySummary 里，旁白读那一行）
+    @ViewBuilder private var runMeter: some View {
+        if let remaining = ble.safety.runRemaining, ble.safety.runAllowed > 0 {
+            let total: Double = Double(ble.safety.runAllowed)
+            let left: Double = Double(max(0, remaining))
+            let frac: CGFloat = CGFloat(min(1.0, left / total))
+            let warn: Bool = remaining <= 60
+            GeometryReader { geo in
+                let width: CGFloat = geo.size.width * frac
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule()
+                        .fill(warn ? AnyShapeStyle(Velvet.warning) : AnyShapeStyle(Velvet.roseGradient))
+                        .frame(width: width)
+                }
+            }
+            .frame(height: 4)
+            .animation(.linear(duration: 1), value: remaining)
+            .accessibilityHidden(true)
+        }
     }
 
     /// 修 M2/M3：单次上限、冷却、30 分钟额度

@@ -1168,6 +1168,55 @@ check(PhysicalAck.shouldResendStop(abandonedStop: true, linkWritable: true), "�
 check(!PhysicalAck.shouldResendStop(abandonedStop: false, linkWritable: true), "没有进行中的停止：不补")
 check(!PhysicalAck.shouldResendStop(abandonedStop: true, linkWritable: false), "链路没了（断开流程已收尾）：不补")
 
+// MARK: - 我的收藏（界面功能，不改任何安全规则）：存下来的值召回时必须夹回各模式的范围
+
+let favManual = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [150, -5, 40, 77])
+check(favManual.clampedLevels == [99, 0, 40, 0], "收藏召回：手动夹到 0~99、负数归 0、旋转恒 0")
+let favFreq = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.frequency.rawValue, levels: [12, 3])
+check(favFreq.clampedLevels == [9, 3, 0, 0], "收藏召回：变频夹到 0~9、缺的通道补 0")
+let favSkill = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.skill.rawValue, levels: [4, 6, 5, 0])
+check(favSkill.mode == nil && favSkill.clampedLevels == nil, "技能不收藏：召回无效")
+let favUnknown = FavoriteSetting(id: UUID(), name: "x", modeRaw: 42, levels: [10, 10, 10, 0])
+check(favUnknown.clampedLevels == nil, "未知模式：召回无效")
+let favZero = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [0, 0, 0, 9])
+check(favZero.clampedLevels == nil, "全零（旋转不算）：召回无效")
+check(FavoriteSetting.make(name: "a", mode: .manual, levels: [0, 0, 0, 0]) == nil, "全零不能存")
+check(FavoriteSetting.make(name: "a", mode: .skill, levels: [4, 6, 5, 0]) == nil, "技能模式不能存")
+check(FavoriteSetting.make(name: "a", mode: .frequency, levels: [20, 1, 0, 5])?.levels == [9, 1, 0, 0], "存的时候就夹好")
+check(FavoriteSetting.sanitizedName("  \n ", fallback: "心动") == "心动", "空名字用默认名")
+check(FavoriteSetting.sanitizedName("一二三四五六七八九十十一十二", fallback: "x").count == FavoriteSetting.maxNameLength, "名字最多 12 个字")
+check(FavoriteSetting.nextName(existing: ["微醺"]) == "心动", "自动起名跳过已用的")
+check(!FavoriteSetting.nextName(existing: FavoriteSetting.suggestedNames).isEmpty, "建议名用完也能起名")
+
+let encodedFavs = FavoriteCodec.encode([favManual, favSkill, favZero, favFreq])
+let decodedFavs = FavoriteCodec.decode(encodedFavs)
+check(decodedFavs.map { $0.id } == [favManual.id, favFreq.id], "读取时丢掉无效收藏")
+check(FavoriteCodec.decode(Data("garbage".utf8)).isEmpty && FavoriteCodec.decode(nil).isEmpty, "坏数据当没有收藏")
+let manyFavs = (0..<20).compactMap { FavoriteSetting.make(name: "\($0)", mode: .manual, levels: [$0 + 1, 0, 0, 0]) }
+check(FavoriteCodec.decode(FavoriteCodec.encode(manyFavs)).count == FavoriteSetting.maxCount, "最多 8 条")
+
+// 召回时缓缓推上去：升高分步、降低第一步就到位、最后一步恰好是目标，每一步都不超过目标
+let glide = FavoriteGlide.plan(from: [0, 50, 9, 0], to: [60, 10, 9, 0])
+check(glide.last == [60, 10, 9, 0], "缓推：最后一步是目标")
+check(glide.allSatisfy { $0[1] == 10 }, "缓推：降低的通道第一步就到位")
+check(glide.first.map { $0[0] > 0 && $0[0] < 60 } ?? false, "缓推：升高的通道从中间值开始")
+let glideTarget: [Int] = [60, 10, 9, 0]
+let glidePairs = Array(zip(glide, glide.dropFirst()))
+check(glidePairs.allSatisfy { (pair: ([Int], [Int])) -> Bool in
+    (0..<4).allSatisfy { pair.1[$0] >= pair.0[$0] }
+}, "缓推：之后只升不降")
+check(glide.allSatisfy { (s: [Int]) -> Bool in
+    (0..<4).allSatisfy { s[$0] <= glideTarget[$0] }
+}, "缓推：不超过目标")
+check(FavoriteGlide.plan(from: [3, 3, 3, 0], to: [3, 3, 3, 0]) == [[3, 3, 3, 0]], "已经在目标：只发一次")
+check(FavoriteGlide.plan(from: [0, 0, 0, 0], to: [2, 0, 0, 0]).count <= FavoriteGlide.steps, "缓推：步数不超过上限、重复合并")
+check(FavoriteGlide.plan(from: [0, 50, 0, 0], to: [3, 0, 0, 0]).allSatisfy { (s: [Int]) -> Bool in s.contains { $0 > 0 } },
+      "缓推：一边降一边升时中间步骤不会全零（全零会变成停止帧对）")
+
+// 快捷话一点就发：不能误中本地停止词（"再快一点"不能变成停）
+check(AIQuickReplies.phrases.allSatisfy { !AIStopWords.matches($0) }, "快捷话都不是停止词")
+check(AIStopWords.matches("停"), "停止词照旧")
+
 if failures > 0 {
     print("\(failures) 项检查失败")
     exit(1)

@@ -284,7 +284,7 @@ final class AIControlVM: ObservableObject {
     @Published var input = ""
     @Published var isThinking = false
     @Published var running = false
-    @Published var statusLine = "未运行"
+    @Published var statusLine = "未运行，她在等你开口"
 
     /// 每次请求带上最近这么多条消息（不是轮数）
     static let historyLimit = 20
@@ -703,13 +703,20 @@ struct AIControlView: View {
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: vm.messages.count) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
+                    // 她回话了：轻轻一下（出错提示不震，红字另有警告触感）
+                    if let last = vm.messages.last, !last.isUser, !last.isError { Haptics.soft() }
                 }
                 .onChange(of: vm.isThinking) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
                 }
             }
+            if showQuickReplies {
+                quickReplies
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             inputBar
         }
+        .animation(.easeInOut(duration: 0.2), value: showQuickReplies)
         .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
         .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) {
             // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，自己也要挂一份
@@ -748,7 +755,7 @@ struct AIControlView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("她")
-                            .font(Velvet.serif(26, .semibold))
+                            .font(Velvet.display(.title))
                             .foregroundColor(Velvet.text)
                         Text("明月栞那")
                             .font(.footnote)
@@ -850,6 +857,43 @@ struct AIControlView: View {
         vm.send()
     }
 
+    /// 输入框空着、没在等回复时才出快捷话（不会盖掉自己打了一半的字）
+    private var showQuickReplies: Bool {
+        vm.input.isEmpty && !vm.isThinking
+    }
+
+    /// 快捷话：一点就发，和自己打字回车完全同一条路径（submit → vm.send）。
+    /// 都不是停止词（ProtocolChecks 钉住）；停止仍然是左下角的红色停止键或说"停"
+    private var quickReplies: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(AIQuickReplies.phrases, id: \.self) { phrase in
+                    Button {
+                        Haptics.select()
+                        vm.input = phrase
+                        submit()
+                    } label: {
+                        Text(phrase)
+                            .font(.footnote.weight(.medium))
+                            .foregroundColor(Velvet.text)
+                            .padding(.horizontal, 14)
+                            .frame(minHeight: 36)
+                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                            .overlay(Capsule().strokeBorder(Velvet.rose.opacity(0.35), lineWidth: 1))
+                            // 看起来 36pt 高，点按区 44pt
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressableStyle())
+                    .accessibilityHint("发送这句话")
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+        .padding(.top, 4)
+        .background(Velvet.ink.opacity(0.35))
+    }
+
     private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: "heart.fill")
@@ -857,15 +901,17 @@ struct AIControlView: View {
                 .foregroundStyle(Velvet.roseGradient)
                 .shadow(color: Velvet.rose.opacity(0.6), radius: 12)
             Text("她在等你开口")
-                .font(Velvet.serif(20, .medium))
+                .font(Velvet.display(.title3, .medium))
                 .foregroundColor(Velvet.text)
-            Text("跟她说句话就开始。随时说“停”或点停止，本地立刻停。")
+            Text("跟她说句话，或点下面的一句就开始。随时说“停”或点红色停止，本地立刻停。")
                 .font(.caption)
                 .foregroundColor(Velvet.textSecondary)
                 .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
+        .velvetAppear()
     }
 
     private var inputBar: some View {
