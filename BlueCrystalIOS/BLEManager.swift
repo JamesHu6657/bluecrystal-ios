@@ -36,15 +36,15 @@ final class BLEManager: NSObject, ObservableObject {
     /// 看门狗 / 安全状态刷新周期
     static let watchdogTickInterval: TimeInterval = 1.0
     /// 单笔写入超时（修 L3：与 legacy device.py write_timeout_seconds 一致）。
-    /// 只标记、不从队列中间删除（修 D）
-    static let writeTimeout: TimeInterval = 5.0
+    /// 只标记、不从队列中间删除（修 D）。数值在 StopTiming（ProtocolChecks 钉住，第二轮审查 L2）
+    static let writeTimeout: TimeInterval = StopTiming.writeTimeout
     /// 停止帧对两帧之间的间隔（修 N4：官方 setTimeout(…, 100)）
-    static let stopPairGap: TimeInterval = 0.1
+    static let stopPairGap: TimeInterval = StopTiming.pairGap
     /// 停止重试退避（修 M4：legacy watchdog.py retry_initial_seconds / retry_max_seconds）
-    static let stopRetryInitial: TimeInterval = 1.0
-    static let stopRetryMax: TimeInterval = 30.0
+    static let stopRetryInitial: TimeInterval = StopTiming.retryInitial
+    static let stopRetryMax: TimeInterval = StopTiming.retryMax
     /// 停止持续这么久仍未确认就拉起操作员锁存（legacy retry_deadline_seconds）
-    static let stopRetryDeadline: TimeInterval = 30.0
+    static let stopRetryDeadline: TimeInterval = StopTiming.deadline
     /// 断开时停止迟迟未确认：过这么久才提供"强制断开"（修 M5 / L3：两轮写超时 + 0.5 秒）
     static let forceDisconnectOfferAfter: TimeInterval = writeTimeout * 2 + 0.5
     /// 退后台时最多持有后台任务这么久等停止确认
@@ -119,6 +119,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 被动停机（看门狗 / 退后台 / 上限 / 写失败 / 输出被拒）后通知 VM：把界面输出归零，附带原因。
     /// VM 收到后只归零 UI，不要再补发停止帧（需要的停止已经由 BLEManager 发出）。
+    /// 只在主线程 send，和 gateEpoch 在同一个 block 里更新（第二轮审查 M1：AI VM 直接订阅、同步作废授权）
     let forceZeroOutputs = PassthroughSubject<String?, Never>()
 
     private static let log = Logger(subsystem: "com.bluecrystal.ios", category: "ble")
@@ -183,7 +184,7 @@ final class BLEManager: NSObject, ObservableObject {
         /// 请求时设备可能在输出（或断开流程要求必须确认）；false 时失败不报警、不重试（修 L4）
         var needed: Bool
         /// 全零输出触发的停止：确认后设备停了，但本次运行不结束（不记账、不冷却、不锁闸）。
-        /// 任何真正的停止请求并入时置为 false
+        /// 任何真正的停止请求并入时置为 false；输出被拒、拉起锁存（被动停机）时同样置为 false（第二轮审查 L1）
         var keepRun: Bool
         var completions: [(StopResult) -> Void]
         var pair = StopPairAttempt()
@@ -211,7 +212,8 @@ final class BLEManager: NSObject, ObservableObject {
     private var deferredFrame: Data?
     /// deferredFrame 的升幅上限（M1），和 deferredFrame 一起设置
     private var deferredMaxRise: Int?
-    /// 非停止帧最多一笔在途，在途期间只留最新一帧（M2）；AI 帧按实际发出的上一帧限升幅（Brain 审查 M1）
+    /// 非停止帧最多一笔在途，在途期间只留最新一帧（M2）；AI 帧按实际发出的上一帧限升幅（Brain 审查 M1）、
+    /// 按距上次实际升高的时间限升幅并压到 70（第二轮审查 M2）
     private var outputWrites = OutputWriteCoalescer()
     /// 运行中收到全零输出、已为它发了停止帧对，之后还没有非零帧（见 OutputGate）
     private var zeroHeld = false
@@ -266,8 +268,9 @@ final class BLEManager: NSObject, ObservableObject {
     /// 用户手动点"连接"重新扫描时会清空。
     private var rejectedUUIDs = Set<String>()
 
-    /// 单调时钟（修 L7：安全计时不受改系统时间影响）
-    private static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+    /// 单调时钟（修 L7：安全计时不受改系统时间影响）。
+    /// 第二轮审查 M3：和账本用同一个睡眠期间也走的时钟（看门狗有用 ledger.openStart 兜底比较，不能混用两种时钟）
+    private static func now() -> TimeInterval { SafetyClock.continuousSeconds() }
 
     override init() {
         super.init()
@@ -554,16 +557,19 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// 回到前台（修 Factory M1）：设备可能还在输出、且没有停止在进行时再补发一对停止帧
+    /// 回到前台（修 Factory M1）：设备可能还在输出时补发一对停止帧。
+    /// 第二轮审查 M4：停止还在进行（退避中、含断开流程的停止）也立刻整对重发——退避定时器在挂起/睡眠期间不走，
+    /// 之前这里 stopOp != nil 就返回，用户回到前台还要等退避最多 30 秒。并入进行中的停止时 requestStop 在退避阶段立即重发
     func resumeFromBackground() {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
             // 修 CC r2 L1：只有真的从后台回来才补发；下拉控制中心等 inactive→active 不发
             let wasBackground = self.appInBackground
             self.appInBackground = false
-            guard wasBackground, self.canWrite, !self.disconnecting,
-                  self.stopOp == nil, self.stopNeeded else { return }
-            self.requestStop(needed: true)
+            guard BackgroundResume.shouldRequestStop(wasBackground: wasBackground, linkWritable: self.canWrite,
+                                                     stopInProgress: self.stopOp != nil,
+                                                     stopNeeded: self.stopNeeded) else { return }
+            self.requestStop(needed: self.stopNeeded)
         }
     }
 
@@ -571,7 +577,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 用户主动发送的帧（手动页滑杆前沿帧、技能预设、AI 每条回复的第一帧）：会重新开闸。
     /// 全零帧在运行中会换成停止帧对、运行继续计时（见 OutputGate）；结束运行请用 sendStop。
-    /// maxRise：AI 帧的每通道升幅上限，按实际发出的上一帧再夹一次（M1）；nil = 不限。
+    /// maxRise：AI 帧的每通道升幅上限，按实际发出的上一帧再夹一次（M1）、按时间限并压到 70（第二轮 M2）；nil = 不限。
     /// epoch：AI 执行前读到的 gateEpoch，中间发生过被动停机就不开闸（M5）；nil = 用户直接操作
     func send(frame: Data, maxRise: Int? = nil, epoch: Int? = nil) {
         bleQueue.async { [weak self] in
@@ -688,9 +694,10 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// 非停止帧经过合并器：没有在途写入就立刻发，否则只记下最新一帧（M2）；AI 帧按实际发出的上一帧限升幅（M1）
+    /// 非停止帧经过合并器：没有在途写入就立刻发，否则只记下最新一帧（M2）；
+    /// AI 帧按实际发出的上一帧限升幅（M1），并按距上次实际升高的时间限幅、压到 70（第二轮审查 M2）
     private func writeOutput(_ data: Data, maxRise: Int?) {
-        guard case .write(let frame) = outputWrites.submit(data, maxRise: maxRise) else { return }
+        guard case .write(let frame) = outputWrites.submit(data, maxRise: maxRise, now: Self.now()) else { return }
         if enqueueWrite(frame, kind: .output) < 0 { outputWrites.reset() }
     }
 
@@ -698,7 +705,7 @@ final class BLEManager: NSObject, ObservableObject {
     private func outputWriteSettled() {
         let canSend = canWrite && !outputLocked && !disconnecting && !appInBackground && stopOp == nil
             && !physicalAckRequired && !deviceMayBeActive && isActive
-        guard let next = outputWrites.writeFinished(canSend: canSend) else { return }
+        guard let next = outputWrites.writeFinished(canSend: canSend, now: Self.now()) else { return }
         if enqueueWrite(next, kind: .output) < 0 { outputWrites.reset() }
     }
 
@@ -713,10 +720,14 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// 输出请求被拒：锁闸、界面归零并说明原因
+    /// 输出请求被拒：锁闸、界面归零并说明原因。
+    /// 第二轮审查 L1：被拒也是被动停机（VM 收到 forceZero 就当已停止）。进行中的全零停止（keepRun）要升级成真正的停止：
+    /// 确认后结束本次运行、记账并冷却，不再留下"设备在 0、运行还开着、闸门锁着"的半截状态
+    /// （之前下一条 AI 回复还能不经冷却接着输出，或者心跳停了之后报一条误导的"看门狗"）
     private func rejectOutput(_ msg: String) {
         outputLocked = true
         deferredFrame = nil
+        stopOp?.keepRun = false
         outputWrites.dropPending()
         notifyForceZero(msg)
         showLimitError(msg)
@@ -773,6 +784,8 @@ final class BLEManager: NSObject, ObservableObject {
             guard let self = self, var op = self.stopOp, op.gen == gen,
                   op.needed, !op.latched else { return }
             op.latched = true
+            // 第二轮审查 L1：锁存是被动停机，全零停止也升级成真正的停止（确认后结束运行）
+            op.keepRun = false
             self.stopOp = op
             self.physicalAckRequired = true
             self.outputLocked = true
@@ -836,7 +849,7 @@ final class BLEManager: NSObject, ObservableObject {
         op.pair.phase = .backoff
         stopUnconfirmed = true
         let delay = op.retryDelay
-        op.retryDelay = min(op.retryDelay * 2, Self.stopRetryMax)
+        op.retryDelay = StopTiming.nextRetryDelay(after: op.retryDelay)
         stopOp = op
         Self.log.error("停止帧对未确认（\(reason, privacy: .public)），第 \(op.failures) 次失败，\(delay) 秒后重试")
         if !op.latched {
@@ -1194,7 +1207,8 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// 在主线程发送 forceZeroOutputs；调用方保证在 bleQueue 上。
-    /// 所有被动停机都经过这里，所以顺带把被动停机代次 +1（M5），和通知一起同步到主线程
+    /// 所有被动停机都经过这里，所以顺带把被动停机代次 +1（M5），和通知一起同步到主线程。
+    /// 代次和通知必须在同一个主线程 block 里：AI VM 直接订阅，在这里同步作废授权（第二轮审查 M1）
     private func notifyForceZero(_ reason: String?) {
         let epoch = bumpGateEpoch()
         DispatchQueue.main.async { [weak self] in
