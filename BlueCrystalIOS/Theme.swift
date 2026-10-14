@@ -76,22 +76,36 @@ struct VelvetBackground: View {
 
     var body: some View {
         GeometryReader { geo in
-            let w = geo.size.width
-            let h = geo.size.height
+            let w: CGFloat = geo.size.width
+            let h: CGFloat = geo.size.height
+            let longestSide: CGFloat = max(w, h)
+            let roseOpacity: Double = 0.30 + 0.35 * glow
+            let roseRadius: CGFloat = longestSide * 0.55
+            let roseSize: CGFloat = w * 1.4
+            let roseX: CGFloat = drift ? w * 0.28 : -w * 0.18
+            let roseY: CGFloat = drift ? -h * 0.30 : -h * 0.18
+            let wineRadius: CGFloat = longestSide * 0.5
+            let wineSize: CGFloat = w * 1.5
+            let wineX: CGFloat = drift ? -w * 0.30 : w * 0.10
+            let wineY: CGFloat = drift ? h * 0.32 : h * 0.20
+            let goldOpacity: Double = 0.08 + 0.10 * glow
+            let goldRadius: CGFloat = w * 0.5
+            let goldX: CGFloat = drift ? w * 0.05 : w * 0.25
+            let goldY: CGFloat = drift ? h * 0.05 : -h * 0.05
             ZStack {
                 LinearGradient(colors: [Velvet.plum, Velvet.ink], startPoint: .top, endPoint: .bottom)
-                RadialGradient(colors: [Velvet.rose.opacity(0.30 + 0.35 * glow), .clear],
-                               center: .center, startRadius: 0, endRadius: max(w, h) * 0.55)
-                    .frame(width: w * 1.4, height: w * 1.4)
-                    .offset(x: drift ? w * 0.28 : -w * 0.18, y: drift ? -h * 0.30 : -h * 0.18)
+                RadialGradient(colors: [Velvet.rose.opacity(roseOpacity), .clear],
+                               center: .center, startRadius: 0, endRadius: roseRadius)
+                    .frame(width: roseSize, height: roseSize)
+                    .offset(x: roseX, y: roseY)
                 RadialGradient(colors: [Velvet.wine.opacity(0.75), .clear],
-                               center: .center, startRadius: 0, endRadius: max(w, h) * 0.5)
-                    .frame(width: w * 1.5, height: w * 1.5)
-                    .offset(x: drift ? -w * 0.30 : w * 0.10, y: drift ? h * 0.32 : h * 0.20)
-                RadialGradient(colors: [Velvet.gold.opacity(0.08 + 0.10 * glow), .clear],
-                               center: .center, startRadius: 0, endRadius: w * 0.5)
+                               center: .center, startRadius: 0, endRadius: wineRadius)
+                    .frame(width: wineSize, height: wineSize)
+                    .offset(x: wineX, y: wineY)
+                RadialGradient(colors: [Velvet.gold.opacity(goldOpacity), .clear],
+                               center: .center, startRadius: 0, endRadius: goldRadius)
                     .frame(width: w, height: w)
-                    .offset(x: drift ? w * 0.05 : w * 0.25, y: drift ? h * 0.05 : -h * 0.05)
+                    .offset(x: goldX, y: goldY)
             }
             .frame(width: w, height: h)
             .clipped()

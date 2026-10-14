@@ -335,29 +335,46 @@ private struct HeatCore: View {
 
     var body: some View {
         // 热度为 0 时停住不画（连着也不空转，省电）；减弱动态效果时一直静止
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || heat == 0)) { ctx in
-            let t = ctx.date.timeIntervalSinceReferenceDate
+        let interval: Double = 1.0 / 30.0
+        let displayedHeat: Int = Int((heat * 100.0).rounded())
+        TimelineView(.animation(minimumInterval: interval, paused: reduceMotion || heat == 0)) { ctx in
+            let t: Double = ctx.date.timeIntervalSinceReferenceDate
             // 空闲时 0.2 Hz 慢呼吸，满热度约 1.6 Hz
-            let freq = 0.2 + 1.4 * heat
-            let wave = reduceMotion ? 0 : sin(t * 2 * .pi * freq)
-            let breathe = 1 + 0.035 * wave * (0.6 + heat)
+            let freq: Double = 0.2 + 1.4 * heat
+            let angle: Double = t * 2.0 * Double.pi * freq
+            let wave: Double = reduceMotion ? 0.0 : sin(angle)
+            let breatheStrength: Double = 0.6 + heat
+            let breatheAmount: Double = 0.035 * wave * breatheStrength
+            let breathe: CGFloat = CGFloat(1.0 + breatheAmount)
+            let ringStrength: Double = 0.5 + heat
+            let ringBaseOpacity: Double = 0.10 + 0.25 * heat
+            let blushOpacity: Double = 0.55 + 0.4 * heat
+            let roseOpacity: Double = 0.55 + 0.35 * heat
+            let shadowOpacity: Double = 0.25 + 0.5 * heat
+            let shadowRadius: Double = 18.0 + 26.0 * heat
+            let shadowSize: CGFloat = CGFloat(shadowRadius)
             ZStack {
                 ForEach(0..<3, id: \.self) { i in
+                    let ringNumber: Double = Double(i + 1)
+                    let ringOpacity: Double = ringBaseOpacity / ringNumber
+                    let ringSize: CGFloat = 150.0 + CGFloat(i) * 34.0
+                    let ringAmount: Double = 0.02 * wave * ringNumber * ringStrength
+                    let ringScale: CGFloat = 1.0 + CGFloat(ringAmount)
                     Circle()
-                        .stroke(Velvet.rose.opacity((0.10 + 0.25 * heat) / Double(i + 1)), lineWidth: 1)
-                        .frame(width: 150 + CGFloat(i) * 34, height: 150 + CGFloat(i) * 34)
-                        .scaleEffect(1 + CGFloat(0.02 * wave * Double(i + 1) * (0.5 + heat)))
+                        .stroke(Velvet.rose.opacity(ringOpacity), lineWidth: 1)
+                        .frame(width: ringSize, height: ringSize)
+                        .scaleEffect(ringScale)
                 }
                 Circle()
-                    .fill(RadialGradient(colors: [Velvet.blush.opacity(0.55 + 0.4 * heat),
-                                                  Velvet.rose.opacity(0.55 + 0.35 * heat),
+                    .fill(RadialGradient(colors: [Velvet.blush.opacity(blushOpacity),
+                                                  Velvet.rose.opacity(roseOpacity),
                                                   Velvet.wine.opacity(0.9)],
                                          center: .center, startRadius: 4, endRadius: 75))
                     .frame(width: 140, height: 140)
-                    .shadow(color: Velvet.rose.opacity(0.25 + 0.5 * heat), radius: 18 + 26 * heat)
-                    .scaleEffect(CGFloat(breathe))
+                    .shadow(color: Velvet.rose.opacity(shadowOpacity), radius: shadowSize)
+                    .scaleEffect(breathe)
                 VStack(spacing: 0) {
-                    Text("\(Int((heat * 100).rounded()))")
+                    Text("\(displayedHeat)")
                         .font(Velvet.serif(40, .light))
                         .monospacedDigit()
                         .foregroundColor(.white)
@@ -371,7 +388,7 @@ private struct HeatCore: View {
             .opacity(active ? 1 : 0.55)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("热度 \(Int((heat * 100).rounded()))")
+        .accessibilityLabel("热度 \(displayedHeat)")
     }
 }
 
@@ -427,13 +444,18 @@ private struct ChannelControl: View {
 
     var body: some View {
         let color = Velvet.channel(channel)
-        let frac = maxLevel > 0 ? min(1, max(0, value / Double(maxLevel))) : 0
+        let normalizedValue: Double = maxLevel > 0 ? value / Double(maxLevel) : 0.0
+        let frac: Double = min(1.0, max(0.0, normalizedValue))
+        let shadowRadius: Double = 2.0 + 6.0 * frac
+        let shadowSize: CGFloat = CGFloat(shadowRadius)
+        let glowOpacity: Double = 0.28 * frac
+        let strokeOpacity: Double = 0.12 + 0.35 * frac
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Circle()
                     .fill(color)
                     .frame(width: 8, height: 8)
-                    .shadow(color: color, radius: 2 + 6 * frac)
+                    .shadow(color: color, radius: shadowSize)
                 Text(channel.displayName)
                     .font(.subheadline.weight(.medium))
                     .foregroundColor(Velvet.text)
@@ -469,13 +491,13 @@ private struct ChannelControl: View {
                 .fill(Velvet.cardFill)
                 .overlay(
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(RadialGradient(colors: [color.opacity(0.28 * frac), .clear],
+                        .fill(RadialGradient(colors: [color.opacity(glowOpacity), .clear],
                                              center: .trailing, startRadius: 0, endRadius: 220))
                 )
         )
         .overlay(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .strokeBorder(color.opacity(0.12 + 0.35 * frac), lineWidth: 1)
+                .strokeBorder(color.opacity(strokeOpacity), lineWidth: 1)
         )
         .opacity(isEnabled ? 1 : 0.5)
         .animation(.easeOut(duration: 0.2), value: value)
@@ -516,10 +538,11 @@ private struct PresetTile: View {
                     .foregroundColor(.white)
                 HStack(alignment: .bottom, spacing: 4) {
                     ForEach(BCProtocol.Channel.uiChannels, id: \.rawValue) { ch in
-                        let v = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0
+                        let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0
+                        let barHeight: CGFloat = 4.0 + CGFloat(v) * 2.4
                         RoundedRectangle(cornerRadius: 2)
                             .fill(Velvet.channel(ch))
-                            .frame(width: 6, height: 4 + CGFloat(v) * 2.4)
+                            .frame(width: 6, height: barHeight)
                     }
                     Spacer()
                     Text(preset.channels.map(String.init).joined(separator: " "))

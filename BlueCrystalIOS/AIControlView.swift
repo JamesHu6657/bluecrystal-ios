@@ -967,16 +967,23 @@ private struct TypingIndicator: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 20, paused: reduceMotion)) { ctx in
-            let t = ctx.date.timeIntervalSinceReferenceDate
+        let interval: Double = 1.0 / 20.0
+        TimelineView(.animation(minimumInterval: interval, paused: reduceMotion)) { ctx in
+            let t: Double = ctx.date.timeIntervalSinceReferenceDate
+            let angle: Double = t * 2.0 * Double.pi / 1.2
             HStack(spacing: 6) {
                 ForEach(0..<3, id: \.self) { i in
-                    let phase = reduceMotion ? 0.6 : sin((t * 2 * .pi / 1.2) - Double(i) * 0.7)
+                    let delay: Double = Double(i) * 0.7
+                    let phase: Double = reduceMotion ? 0.6 : sin(angle - delay)
+                    let positivePhase: Double = max(0.0, phase)
+                    let opacity: Double = 0.35 + 0.65 * positivePhase
+                    let scale: Double = 0.85 + 0.25 * positivePhase
+                    let dotScale: CGFloat = CGFloat(scale)
                     Circle()
                         .fill(Velvet.blush)
                         .frame(width: 7, height: 7)
-                        .opacity(0.35 + 0.65 * max(0, phase))
-                        .scaleEffect(CGFloat(0.85 + 0.25 * max(0, phase)))
+                        .opacity(opacity)
+                        .scaleEffect(dotScale)
                 }
                 Text("她在想…")
                     .font(.caption)
