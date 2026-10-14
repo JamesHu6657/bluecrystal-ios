@@ -2,8 +2,21 @@ import SwiftUI
 import LocalAuthentication
 
 // MARK: - 18+ 入口、面容 ID 解锁、后台隐私遮罩
-// 只是外观和隐私包装：不发帧、不碰 BLEManager 的任何状态。退后台的停止仍由 BlueCrystalIOSApp 的 scenePhase 处理。
-// 设备可能仍在输出 / 停止未确认 / 断开中 / 正在运行时，入口和解锁页一律不显示，停止和警告永远直接可达。
+// 只是外观和隐私包装：不改 BLEManager 的任何状态，唯一发出去的是解锁页上的停止（和各页停止键同一个 sendStop）。
+// 退后台的停止仍由 BlueCrystalIOSApp 的 scenePhase 处理。
+// 设备可能仍在输出 / 停止未确认 / 有红字 / 连接或断开进行中 / 正在运行时，入口页、解锁页和系统验证框一律不出现，
+// 停止和警告永远直接可达。隐私模糊是例外：只在 App 不在前台时出现，不拦点击，回到前台立刻消失。
+
+extension BLEManager {
+    /// 这时绝不盖入口页 / 解锁页、不弹系统验证框（已弹出的会被取消）。
+    /// 红字也算：停止未确认（stopUnconfirmed）不在 SafetyStatus 里，只体现为 lastError；
+    /// 非空闲、非已连接的状态也算（连接中、断开中、连接失败），这时安全状态可能还没刷新
+    var privacyCoverBlocked: Bool {
+        safety.needsPhysicalAck || safety.stopRetrying || safety.runRemaining != nil
+            || forceDisconnectOffered || lastError != nil
+            || (state != .idle && state != .ready)
+    }
+}
 
 final class PrivacyLock: ObservableObject {
     static let consentKey = "bc.ui.adultConsent.v1"
@@ -15,8 +28,8 @@ final class PrivacyLock: ObservableObject {
     @Published private(set) var authenticating = false
     @Published var message: String?
 
-    /// 每次上锁只自动弹一次面容 ID：取消后不反复弹（弹框本身会让 App 短暂离开 active）
-    private var autoPrompted = false
+    /// 正在进行的验证：设备侧需要人处理时 cancelAuthentication 把系统验证框收掉
+    private var context: LAContext?
 
     init() {
         let d = UserDefaults.standard
@@ -59,18 +72,11 @@ final class PrivacyLock: ObservableObject {
         }
     }
 
-    /// 退到后台：下次回来需要解锁
+    /// 退到后台：下次回来需要解锁。回来时不自动弹验证（回到前台的那一刻安全状态可能还没刷新，
+    /// 系统验证框会盖住停止键和警告），由用户在解锁页点「解锁」
     func didEnterBackground() {
         guard consented, biometricEnabled else { return }
         locked = true
-        autoPrompted = false
-    }
-
-    /// 回到前台：自动弹一次验证
-    func autoUnlockIfNeeded() {
-        guard locked, !autoPrompted, !authenticating else { return }
-        autoPrompted = true
-        unlock()
     }
 
     func unlock() {
@@ -79,6 +85,12 @@ final class PrivacyLock: ObservableObject {
             guard let self = self, ok else { return }
             self.locked = false
         }
+    }
+
+    /// 收掉正在显示的系统验证框（回调里是 appCancel，不提示错误，也不解锁）
+    func cancelAuthentication() {
+        context?.invalidate()
+        context = nil
     }
 
     /// 用 deviceOwnerAuthentication：面容 ID 失败可以用锁屏密码，不会把人锁在外面。
@@ -98,10 +110,12 @@ final class PrivacyLock: ObservableObject {
         }
         authenticating = true
         message = nil
+        context = ctx
         ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, error in
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
                 self.authenticating = false
+                if self.context === ctx { self.context = nil }
                 if !ok, let e = error as? LAError, e.code != .userCancel, e.code != .appCancel, e.code != .systemCancel {
                     self.message = "验证没有通过，请再试一次"
                 }
@@ -118,52 +132,68 @@ struct PrivacyShell<Content: View>: View {
     @StateObject private var lock = PrivacyLock()
     @ViewBuilder var content: () -> Content
 
-    /// 设备侧需要人处理的状态：这时绝不盖任何东西
-    private var safetyNeedsAttention: Bool {
-        ble.safety.needsPhysicalAck || ble.safety.stopRetrying || ble.safety.runRemaining != nil
-            || ble.state == .disconnecting || ble.forceDisconnectOffered
-    }
-
     var body: some View {
-        ZStack {
-            content()
-                .environmentObject(lock)
-
-            if !safetyNeedsAttention {
-                if !lock.consented {
-                    AgeGateView(lock: lock)
-                        .transition(.opacity)
-                        .zIndex(2)
-                } else if lock.locked {
-                    LockScreenView(lock: lock)
-                        .transition(.opacity)
-                        .zIndex(2)
-                }
+        content()
+            .privacyCover()
+            .environmentObject(lock)
+            .onChange(of: scenePhase) { phase in
+                if phase == .background { lock.didEnterBackground() }
             }
+            // 验证框弹着时设备侧变成需要处理：立刻收掉，停止键和警告不能被系统弹框挡住
+            .onChange(of: ble.privacyCoverBlocked) { blocked in
+                if blocked { lock.cancelAuthentication() }
+            }
+    }
+}
 
-            if scenePhase != .active {
-                PrivacyVeil()
+/// 入口页 / 解锁页 / 隐私遮罩。根视图和每个弹出层（全屏视频、AI 设置、文件选择器）各挂一份：
+/// 弹出层显示在根视图之上，只挂在根上盖不住它们。需要 BLEManager 和 PrivacyLock 两个环境对象
+struct PrivacyCover: ViewModifier {
+    @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var lock: PrivacyLock
+    @Environment(\.scenePhase) private var scenePhase
+
+    private var showGate: Bool { !ble.privacyCoverBlocked && !lock.consented }
+    private var showLock: Bool { !ble.privacyCoverBlocked && lock.consented && lock.locked }
+
+    func body(content: Content) -> some View {
+        ZStack {
+            // 盖着入口页 / 解锁页时，旁白不能读到、点到下面的内容
+            content
+                .accessibilityHidden(showGate || showLock)
+
+            if showGate {
+                AgeGateView(lock: lock)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityAddTraits(.isModal)
                     .transition(.opacity)
-                    .zIndex(3)
+                    .zIndex(2)
+            } else if showLock {
+                // 解锁页只在设备不需要处理时出现；万一状态还没刷新，底部也有停止键
+                LockScreenView(lock: lock) { ble.sendStop() }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityAddTraits(.isModal)
+                    .transition(.opacity)
+                    .zIndex(2)
             }
         }
         .animation(.easeInOut(duration: 0.25), value: lock.consented)
         .animation(.easeInOut(duration: 0.25), value: lock.locked)
-        .animation(.easeInOut(duration: 0.2), value: scenePhase)
-        .onChange(of: scenePhase) { phase in
-            if phase == .background {
-                lock.didEnterBackground()
-            } else if phase == .active, !safetyNeedsAttention {
-                lock.autoUnlockIfNeeded()
+        // 隐私遮罩在动画作用域之外、不带过渡：多任务截图不会截到半透明的一帧，回到前台立刻消失
+        .overlay {
+            if scenePhase != .active {
+                PrivacyVeil()
+                    .transaction { $0.animation = nil }
             }
-        }
-        .onAppear {
-            if scenePhase == .active, !safetyNeedsAttention { lock.autoUnlockIfNeeded() }
         }
     }
 }
 
-/// 后台 / 多任务界面的遮罩：真正的系统模糊（也能盖住视频播放器），不露出任何内容
+extension View {
+    func privacyCover() -> some View { modifier(PrivacyCover()) }
+}
+
+/// 后台 / 多任务界面的遮罩：真正的系统模糊，不露出任何内容；不拦点击
 struct PrivacyVeil: View {
     var body: some View {
         ZStack {
@@ -179,6 +209,7 @@ struct PrivacyVeil: View {
             }
         }
         .ignoresSafeArea()
+        .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 }
@@ -218,7 +249,7 @@ struct AgeGateView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     VStack(alignment: .leading, spacing: 10) {
-                        Label("任何时候点红色「停止」，或说“停”，都会立刻停下", systemImage: "stop.circle.fill")
+                        Label("点红色「停止」（「她」页面也可以输入“停”）会立刻发送停止，设备确认后才算停下", systemImage: "stop.circle.fill")
                         Label("第一次使用前，先在不接触身体时试一次停止", systemImage: "hand.raised.fill")
                         Label("切到后台时设备自动停止，画面也会被模糊", systemImage: "eye.slash.fill")
                     }
@@ -262,9 +293,10 @@ struct AgeGateView: View {
     }
 }
 
-/// 面容 ID 解锁页
+/// 面容 ID 解锁页：不自动弹验证，点「解锁」才弹；底部常驻停止键
 struct LockScreenView: View {
     @ObservedObject var lock: PrivacyLock
+    let onStop: () -> Void
 
     var body: some View {
         ZStack {
@@ -294,6 +326,9 @@ struct LockScreenView: View {
                 Spacer()
             }
             .padding(.horizontal, 32)
+        }
+        .safeAreaInset(edge: .bottom) {
+            StopDockBar(action: onStop)
         }
     }
 }

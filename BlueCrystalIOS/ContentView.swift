@@ -54,6 +54,9 @@ struct DeviceStatusCard: View {
     @EnvironmentObject var ble: BLEManager
     var allowDisconnect: Bool
     var connectTitle: String
+    /// 紧凑版：钉在 AI 页页头（聊天自动滚到底时红字、解除锁定键和安全状态不会被带走）。
+    /// 省掉设备名，安全状态挪到状态名下面；红字、解除锁定、强制断开和对话框都和完整版一样
+    var compact = false
     @State private var confirmForceDisconnect = false
     @State private var confirmPhysicalAck = false
 
@@ -72,16 +75,20 @@ struct DeviceStatusCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 12) {
+        VStack(alignment: .leading, spacing: compact ? 8 : 12) {
+            HStack(spacing: compact ? 8 : 12) {
                 StatusOrb(color: orbColor, pulsing: isBusy)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(ble.state.rawValue)
-                        .font(.headline)
+                        .font(compact ? .subheadline.weight(.semibold) : .headline)
                         .foregroundColor(ble.state == .ready ? Velvet.ok : Velvet.text)
-                    Text(BLEManager.deviceName)
-                        .font(.caption)
-                        .foregroundColor(Velvet.textMuted)
+                    if compact {
+                        safetySummary
+                    } else {
+                        Text(BLEManager.deviceName)
+                            .font(.caption)
+                            .foregroundColor(Velvet.textMuted)
+                    }
                 }
                 Spacer(minLength: 8)
                 if ble.state == .ready {
@@ -134,14 +141,21 @@ struct DeviceStatusCard: View {
                 }
             }
 
-            // 修 M2/M3：单次上限、冷却、30 分钟额度
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: ble.safety.blockReason == nil ? "hourglass" : "lock.fill")
-                Text(ble.safety.summary).fixedSize(horizontal: false, vertical: true)
+            if !compact {
+                safetySummary
             }
-            .font(.caption)
-            .foregroundColor(ble.safety.blockReason == nil ? Velvet.textSecondary : Velvet.warning)
         }
-        .velvetCard(tint: ble.lastError != nil || ble.safety.needsPhysicalAck ? Velvet.danger : nil)
+        .velvetCard(padding: compact ? 10 : 16,
+                    tint: ble.lastError != nil || ble.safety.needsPhysicalAck ? Velvet.danger : nil)
+    }
+
+    /// 修 M2/M3：单次上限、冷却、30 分钟额度
+    private var safetySummary: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: ble.safety.blockReason == nil ? "hourglass" : "lock.fill")
+            Text(ble.safety.summary).fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.caption)
+        .foregroundColor(ble.safety.blockReason == nil ? Velvet.textSecondary : Velvet.warning)
     }
 }

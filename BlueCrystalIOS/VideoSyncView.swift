@@ -6,7 +6,11 @@ import Combine
 /// 视频联动播放器（ViewModel）
 final class VideoSyncPlayer: ObservableObject {
     @Published var player: AVPlayer?
-    @Published var script: TimelineScript?
+    @Published var script: TimelineScript? {
+        // 曲线用的只读索引，换脚本时建一次（不参与联动发帧）
+        didSet { chartIndex = script.map(ScriptChartIndex.init(script:)) }
+    }
+    @Published private(set) var chartIndex: ScriptChartIndex?
     @Published var scriptName: String = "未载入脚本"
     @Published var videoName: String = "未选择视频"
     @Published var isPlaying = false
@@ -431,6 +435,7 @@ struct NoControlsPlayerView: UIViewControllerRepresentable {
 /// 一起看：播本地视频，按时间轴脚本自动发官方 0x08 帧（强度按官方 video.js 换算）
 struct VideoSyncView: View {
     @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var privacy: PrivacyLock
     @StateObject private var vm = VideoSyncPlayer()
     /// 同一时间只弹一个选择器；用 sheet(item:) 代替两个 sheet(isPresented:)，
     /// 避免第二次点"选择"弹不出来或回调落到错的选择器上
@@ -451,12 +456,13 @@ struct VideoSyncView: View {
 
                 stage
 
-                if let s = vm.script {
+                if let idx = vm.chartIndex {
                     VStack(alignment: .leading, spacing: 10) {
                         SectionLabel(title: "脚本曲线", systemImage: "waveform.path")
-                        // 只读展示：按脚本画出播放头前后的强度，不发帧、不影响联动
-                        ScriptIntensityChart(script: s, player: vm.player,
-                                             fallbackTime: vm.currentSeconds, isPlaying: vm.isPlaying)
+                        // 只读展示：按脚本画出播放头前后的强度，不发帧、不影响联动。
+                        // 全屏时被盖住，停下不画（全屏里有自己的一份）
+                        ScriptIntensityChart(index: idx, player: vm.player, fallbackTime: vm.currentSeconds,
+                                             isPlaying: vm.isPlaying && !isFullScreen)
                     }
                     .velvetCard()
                 }
@@ -475,24 +481,33 @@ struct VideoSyncView: View {
         }
         // 修 CC r3 L4：attach 挂在整个页面上，与 onDisappear 对称（同 ManualControlView）
         .onAppear { vm.attach(ble: ble) }
+        // 弹出层（选择器、全屏）盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
         .sheet(item: $picker) { kind in
-            switch kind {
-            case .video:
-                DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
-                               onCancel: { picker = nil }) { url in
-                    picker = nil
-                    vm.loadVideo(url: url)
-                }
-            case .script:
-                DocumentPicker(contentTypes: [UTType.json], onCancel: { picker = nil }) { url in
-                    picker = nil
-                    vm.loadScript(url: url)
+            Group {
+                switch kind {
+                case .video:
+                    DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
+                                   onCancel: { picker = nil }) { url in
+                        picker = nil
+                        vm.loadVideo(url: url)
+                    }
+                case .script:
+                    DocumentPicker(contentTypes: [UTType.json], onCancel: { picker = nil }) { url in
+                        picker = nil
+                        vm.loadScript(url: url)
+                    }
                 }
             }
+            .privacyCover()
+            .environmentObject(privacy)
+            .environmentObject(ble)
         }
         // 全屏控制同样走 vm（播放/暂停/拖动/停止），设备联动不受影响
         .fullScreenCover(isPresented: $isFullScreen) {
             FullScreenVideoView(vm: vm) { isFullScreen = false }
+                .privacyCover()
+                .environmentObject(privacy)
+                .environmentObject(ble)
         }
         // 弹出全屏时部分系统版本也会触发 onDisappear：全屏中不停机
         .onDisappear { if !isFullScreen { vm.stopAll() } }
@@ -519,9 +534,13 @@ struct VideoSyncView: View {
                         .padding(.vertical, 7)
                         .background(.ultraThinMaterial, in: Capsule())
                         .foregroundColor(.white)
+                        // 点击区域至少 44pt，外观不变
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(PressableStyle())
-                .padding(10)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
             }
             .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Velvet.stroke, lineWidth: 1))
@@ -654,11 +673,72 @@ struct VideoSyncView: View {
     }
 }
 
+/// 曲线用的脚本索引（只读）：每个通道的命令按开始时间排好、强度用 TimelineScript.deviceLevel
+/// （和联动发帧同一个换算，纯函数）预先算好，再配一列"到这条为止最晚的结束时间"二分出可见窗口。
+/// 载入脚本时建一次；每帧只看窗口里的几条命令，不再遍历整份脚本和主线程上的发帧抢时间
+struct ScriptChartIndex {
+    struct Segment {
+        let start: Double
+        let end: Double
+        let level: Int
+    }
+
+    /// 按 Channel.rawValue 存；强度为 0 的命令不画也不影响读数，直接不收
+    private var segments: [[Segment]] = [[], [], [], []]
+    private var prefixMaxEnd: [[Double]] = [[], [], [], []]
+
+    init(script: TimelineScript) {
+        for ch in BCProtocol.Channel.uiChannels {
+            let segs = script.commands
+                .filter { $0.channel == ch }
+                .map { Segment(start: $0.startTimeSeconds, end: $0.endTime, level: script.deviceLevel(for: $0)) }
+                .filter { $0.level > 0 }
+                .sorted { $0.start < $1.start }
+            var latest = -Double.infinity
+            prefixMaxEnd[ch.rawValue] = segs.map { seg -> Double in
+                latest = max(latest, seg.end)
+                return latest
+            }
+            segments[ch.rawValue] = segs
+        }
+    }
+
+    /// 和 [from, to] 有交集的命令（结束 ≥ from 且开始 ≤ to）
+    func visible(_ ch: BCProtocol.Channel, from: Double, to: Double) -> ArraySlice<Segment> {
+        let segs = segments[ch.rawValue]
+        let ends = prefixMaxEnd[ch.rawValue]
+        // 第一条"到这里为止最晚结束 ≥ from"的位置：它之前的命令都在窗口左边结束了
+        var lo = 0, hi = segs.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if ends[mid] >= from { hi = mid } else { lo = mid + 1 }
+        }
+        let first = lo
+        // 第一条开始 > to 的位置
+        hi = segs.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if segs[mid].start > to { hi = mid } else { lo = mid + 1 }
+        }
+        return segs[first..<lo]
+    }
+
+    /// 脚本在某一刻的强度，和 TimelineScript.levels(at: t, previous: nil) 相同（只用于显示）
+    func levels(at t: Double) -> [Int] {
+        var vals = [0, 0, 0, 0]
+        for ch in BCProtocol.Channel.uiChannels {
+            for seg in visible(ch, from: t, to: t) where t >= seg.start && t < seg.end {
+                vals[ch.rawValue] = max(vals[ch.rawValue], seg.level)
+            }
+        }
+        return vals
+    }
+}
+
 /// 脚本强度曲线（只读展示）：播放头前后一段时间里每个通道的强度，随播放滚动。
-/// 强度用 TimelineScript.deviceLevel（和联动发帧同一个换算，纯函数）算出来画图；
-/// 播放头只读 AVPlayer.currentTime()。不发帧、不改任何联动或安全状态
+/// 数据来自 ScriptChartIndex；播放头只读 AVPlayer.currentTime()。不发帧、不改任何联动或安全状态
 struct ScriptIntensityChart: View {
-    let script: TimelineScript
+    let index: ScriptChartIndex
     let player: AVPlayer?
     let fallbackTime: Double
     let isPlaying: Bool
@@ -672,6 +752,7 @@ struct ScriptIntensityChart: View {
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !isPlaying)) { _ in
             let t = playhead()
+            let levels = index.levels(at: t)
             VStack(alignment: .leading, spacing: compact ? 4 : 8) {
                 Canvas { ctx, size in
                     draw(in: &ctx, size: size, at: t)
@@ -688,12 +769,12 @@ struct ScriptIntensityChart: View {
                     .font(.caption2.monospacedDigit())
                     .foregroundColor(Velvet.textMuted)
                 }
-                legend(at: t)
+                legend(levels)
             }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("脚本强度曲线")
-        .accessibilityValue(levelSummary(at: playhead()))
+        .accessibilityValue(levelSummary(index.levels(at: playhead())))
     }
 
     private func playhead() -> Double {
@@ -705,9 +786,8 @@ struct ScriptIntensityChart: View {
     }
 
     /// 图例兼直接读数：通道色点 + 名字 + 脚本此刻的强度（文字用正文色，颜色只在点上）
-    private func legend(at t: Double) -> some View {
-        let levels = script.levels(at: t, previous: nil)
-        return HStack(spacing: compact ? 10 : 14) {
+    private func legend(_ levels: [Int]) -> some View {
+        HStack(spacing: compact ? 10 : 14) {
             ForEach(BCProtocol.Channel.uiChannels, id: \.rawValue) { ch in
                 HStack(spacing: 5) {
                     Circle().fill(Velvet.channel(ch)).frame(width: 8, height: 8)
@@ -723,9 +803,8 @@ struct ScriptIntensityChart: View {
         .font(.caption2)
     }
 
-    private func levelSummary(at t: Double) -> String {
-        let levels = script.levels(at: t, previous: nil)
-        return BCProtocol.Channel.uiChannels
+    private func levelSummary(_ levels: [Int]) -> String {
+        BCProtocol.Channel.uiChannels
             .map { "\($0.displayName) \(levels[$0.rawValue])" }
             .joined(separator: "，")
     }
@@ -758,13 +837,10 @@ struct ScriptIntensityChart: View {
         // 每条命令画成一段：淡填充 + 2px 顶线，端点圆角
         for ch in BCProtocol.Channel.uiChannels {
             let color = Velvet.channel(ch)
-            for cmd in script.commands where cmd.channel == ch {
-                guard cmd.endTime >= start, cmd.startTimeSeconds <= end else { continue }
-                let level = script.deviceLevel(for: cmd)
-                guard level > 0 else { continue }
-                let x0 = max(0, x(cmd.startTimeSeconds))
-                let x1 = min(w, max(x0 + 2, x(cmd.endTime)))
-                let yy = y(level)
+            for seg in index.visible(ch, from: start, to: end) {
+                let x0 = max(0, x(seg.start))
+                let x1 = min(w, max(x0 + 2, x(seg.end)))
+                let yy = y(seg.level)
                 let rect = CGRect(x: x0, y: yy, width: x1 - x0, height: h - yy)
                 ctx.fill(Path(roundedRect: rect, cornerRadius: 3), with: .color(color.opacity(0.18)))
                 var topLine = Path()
@@ -851,7 +927,8 @@ struct FullScreenVideoView: View {
                         Button(action: onClose) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 17, weight: .semibold))
-                                .padding(10)
+                                .foregroundColor(.white)
+                                .frame(width: 44, height: 44)
                                 .background(.ultraThinMaterial, in: Circle())
                         }
                         .accessibilityLabel("退出全屏")
@@ -867,9 +944,9 @@ struct FullScreenVideoView: View {
                     )
                     Spacer()
                     VStack(spacing: 10) {
-                        if let s = vm.script {
+                        if let idx = vm.chartIndex {
                             // 只读展示，同内嵌页
-                            ScriptIntensityChart(script: s, player: vm.player, fallbackTime: vm.currentSeconds,
+                            ScriptIntensityChart(index: idx, player: vm.player, fallbackTime: vm.currentSeconds,
                                                  isPlaying: vm.isPlaying, height: 44, compact: true)
                         }
                         if vm.durationSeconds > 0 {
@@ -884,9 +961,11 @@ struct FullScreenVideoView: View {
                             .disabled(!vm.canPlay)
                         }
                         HStack(spacing: 18) {
+                            // 颜色写在标签上：.borderless 下按钮的 tint / 角色色会盖过外层的白色
                             Button { vm.togglePlay() } label: {
                                 Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill")
                                     .font(.system(size: 22, weight: .bold))
+                                    .foregroundColor(.white)
                                     .frame(width: 50, height: 50)
                                     .background(Circle().fill(Velvet.roseGradient))
                             }
@@ -901,6 +980,7 @@ struct FullScreenVideoView: View {
                                     Text("停止")
                                 }
                                 .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(.white)
                                 .padding(.horizontal, 18)
                                 .frame(height: 50)
                                 .background(Capsule().fill(Velvet.stopGradient))

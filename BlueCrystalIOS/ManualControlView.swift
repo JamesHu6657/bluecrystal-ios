@@ -267,11 +267,19 @@ struct ManualControlView: View {
                     SectionLabel(title: "隐私", systemImage: "eye.slash")
                     // 已开启时即使生物识别暂不可用也保留开关，随时能关掉
                     if PrivacyLock.biometryName != nil || privacy.biometricEnabled {
+                        // 打开开关会弹系统验证框（失败时是全屏密码页），会盖住底部停止键：
+                        // 输出中、断开中或设备需要处理时不许改
                         Toggle(isOn: Binding(get: { privacy.biometricEnabled },
                                              set: { privacy.setBiometric($0) })) {
                             Text("打开 App 时用\(PrivacyLock.biometryName ?? "面容 ID")解锁").foregroundColor(Velvet.text)
                         }
                         .tint(Velvet.rose)
+                        .disabled(ble.privacyCoverBlocked)
+                        if ble.privacyCoverBlocked {
+                            Text("输出中或设备需要处理时不能更改，先停止")
+                                .font(.caption)
+                                .foregroundColor(Velvet.textMuted)
+                        }
                     }
                     if let m = privacy.message {
                         Text(m).font(.caption).foregroundColor(Velvet.warning)
@@ -324,7 +332,9 @@ private struct HeatCore: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { ctx in
+        // 未连接且热度为 0 时停住不画；热度为 0 时慢呼吸用不着 30 帧
+        TimelineView(.animation(minimumInterval: heat > 0 ? 1.0 / 30 : 1.0 / 15,
+                                paused: reduceMotion || (heat == 0 && !active))) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
             // 空闲时 0.2 Hz 慢呼吸，满热度约 1.6 Hz
             let freq = 0.2 + 1.4 * heat

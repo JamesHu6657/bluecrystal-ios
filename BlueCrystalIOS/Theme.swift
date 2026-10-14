@@ -23,8 +23,9 @@ enum Velvet {
     static let gold = Color(hex: 0xE9C08A)
 
     static let text = Color(hex: 0xF8ECF1)
-    static let textSecondary = Color(hex: 0xF8ECF1, alpha: 0.66)
-    static let textMuted = Color(hex: 0xF8ECF1, alpha: 0.42)
+    /// 次要 / 弱化文字：深色底上弱化文字也要 ≥4.5:1（小字号说明、提示都用它）
+    static let textSecondary = Color(hex: 0xF8ECF1, alpha: 0.74)
+    static let textMuted = Color(hex: 0xF8ECF1, alpha: 0.6)
     static let cardFill = Color.white.opacity(0.055)
     static let stroke = Color.white.opacity(0.09)
 
@@ -194,11 +195,15 @@ struct PillButtonStyle: ButtonStyle {
         @Environment(\.isEnabled) private var isEnabled
 
         var body: some View {
+            // 大字号下最多两行再缩小一点，不截断安全相关的按钮文字；高度至少 44pt
             configuration.label
                 .font(.subheadline.weight(.semibold))
-                .lineLimit(1)
+                .lineLimit(2)
+                .minimumScaleFactor(0.8)
+                .multilineTextAlignment(.center)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 9)
+                .frame(minHeight: 44)
                 .foregroundColor(kind == .secondary ? Velvet.text : .white)
                 .background(background)
                 .clipShape(Capsule())

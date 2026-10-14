@@ -657,7 +657,7 @@ final class AIConfigWatcher: ObservableObject {
         if m != model { model = m }
     }
 
-    /// 页头的快捷切换：只改下一次请求用哪家，不影响正在执行的程序和任何安全规则
+    /// 页头的快捷切换：只改下一次请求用哪家，不影响任何安全规则。运行中 / 等回复时菜单禁用（换模型要先停止）
     func select(_ p: AIProvider, _ m: AIModel) {
         AIConfig.provider = p
         AIConfig.model = m
@@ -667,6 +667,7 @@ final class AIConfigWatcher: ObservableObject {
 
 struct AIControlView: View {
     @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var privacy: PrivacyLock
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var vm = AIControlVM()
     @StateObject private var config = AIConfigWatcher()
@@ -679,8 +680,6 @@ struct AIControlView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
-                        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接")
-                            .padding(.bottom, 4)
                         if vm.messages.isEmpty {
                             emptyState
                         }
@@ -712,7 +711,13 @@ struct AIControlView: View {
             inputBar
         }
         .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
-        .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) { AISettingsView() }
+        .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) {
+            // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，自己也要挂一份
+            AISettingsView()
+                .privacyCover()
+                .environmentObject(privacy)
+                .environmentObject(ble)
+        }
         .onAppear {
             config.refresh()
             vm.viewAppeared(ble: ble, scenePhase: scenePhase)
@@ -723,7 +728,8 @@ struct AIControlView: View {
 
     private static let bottomID = "chat-bottom"
 
-    /// 页头：她的名字、当前服务商/模型（可快捷切换）、设置；下面一行是状态和停止（原"当前"区块）
+    /// 页头：她的名字、当前服务商/模型（可快捷切换）、设置；下面一行是状态和停止（原"当前"区块），
+    /// 再下面钉着紧凑的设备卡片：聊天每来一条消息都会自动滚到底，设备卡片放在聊天里会被滚走
     private var header: some View {
         VStack(spacing: 10) {
             HStack(spacing: 12) {
@@ -756,7 +762,7 @@ struct AIControlView: View {
                     Image(systemName: "gearshape")
                         .font(.system(size: 17, weight: .medium))
                         .foregroundColor(Velvet.text)
-                        .frame(width: 40, height: 40)
+                        .frame(width: 44, height: 44)
                         .background(Circle().fill(Color.white.opacity(0.07)))
                 }
                 .buttonStyle(PressableStyle())
@@ -779,6 +785,7 @@ struct AIControlView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.05)))
+            DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true)
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
@@ -789,6 +796,9 @@ struct AIControlView: View {
         )
     }
 
+    /// 运行中或等回复时不许快捷切换：设置页换模型要先停止，这里也一样；页头也不会显示一个还没在用的模型
+    private var modelLocked: Bool { vm.running || vm.isThinking }
+
     /// 当前服务商 · 模型；点开可以快捷切换（只影响下一次请求）
     private var modelMenu: some View {
         Menu {
@@ -796,6 +806,8 @@ struct AIControlView: View {
                 Section(p.title) {
                     ForEach(p.models) { m in
                         Button {
+                            // 菜单打开期间开始运行时也不换
+                            guard !modelLocked else { return }
                             config.select(p, m)
                             Haptics.select()
                         } label: {
@@ -812,13 +824,15 @@ struct AIControlView: View {
             HStack(spacing: 4) {
                 Text("\(config.provider.title) · \(config.model.name)")
                     .lineLimit(1)
-                Image(systemName: "chevron.down")
+                Image(systemName: modelLocked ? "lock.fill" : "chevron.down")
                     .font(.system(size: 9, weight: .bold))
             }
             .font(.caption)
-            .foregroundColor(Velvet.gold)
+            .foregroundColor(Velvet.gold.opacity(modelLocked ? 0.6 : 1))
         }
+        .disabled(modelLocked)
         .accessibilityLabel("当前模型：\(config.provider.title) \(config.model.name)")
+        .accessibilityHint(modelLocked ? "运行中不能切换，先停止" : "切换模型")
     }
 
     private var emptyState: some View {
