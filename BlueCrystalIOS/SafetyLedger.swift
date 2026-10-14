@@ -40,7 +40,7 @@ enum SafetyLimits {
     /// 每次确认停止后的冷却 = max(60 秒, 本次运行时长 × 0.5)（MIN_COOLDOWN_SECONDS / COOLDOWN_RATIO）
     static let minCooldownSeconds: TimeInterval = 60
     static let cooldownRatio: Double = 0.5
-    /// 未知时长恢复：耗尽完整窗口额度，冷却至少按全部 1200 秒额度计算。
+    /// 未知时长恢复：耗尽完整窗口额度，冷却按全部 1200 秒额度计算；也是任何一次冷却的上限（M1）。
     static let unknownElapsedCooldownSeconds = dutyBudgetSeconds * cooldownRatio
     static let checkpointIntervalSeconds: TimeInterval = 5
 }
@@ -166,6 +166,9 @@ final class DutyCycleLedger {
     }
 
     /// 确认停止后记账/冷却；未知时长至少耗尽完整窗口额度，已验证下界更长则保留。
+    /// 冷却最多 unknownElapsedCooldownSeconds（M1）：正常运行不超过 1200 秒，冷却本来就 ≤600 秒；
+    /// 超过的只会是恢复出来的 / 未知的 / 断链期间的时长，被杀 10 小时后再确认停止不能因此锁 5 小时。
+    /// 额度照实际推断时长保守记账，不封顶
     func end() {
         guard let start = openStart else { return }
         let now = clock()
@@ -174,8 +177,9 @@ final class DutyCycleLedger {
         let charge = openElapsedUnknown ? max(SafetyLimits.dutyBudgetSeconds, elapsed) : elapsed
         completed.append(Entry(end: now, charge: charge))
         let cooldown = openElapsedUnknown
-            ? max(SafetyLimits.unknownElapsedCooldownSeconds, elapsed * SafetyLimits.cooldownRatio)
-            : max(SafetyLimits.minCooldownSeconds, elapsed * SafetyLimits.cooldownRatio)
+            ? SafetyLimits.unknownElapsedCooldownSeconds
+            : min(SafetyLimits.unknownElapsedCooldownSeconds,
+                  max(SafetyLimits.minCooldownSeconds, elapsed * SafetyLimits.cooldownRatio))
         openStart = nil
         openAllowed = 0
         openOrphaned = false
@@ -274,7 +278,7 @@ final class DutyCycleLedger {
         }
         if let end = s.lastEnd, end.isFinite, valid(s.appliedCooldown) {
             lastEnd = toUptime(end)
-            appliedCooldown = s.appliedCooldown
+            appliedCooldown = min(s.appliedCooldown, SafetyLimits.unknownElapsedCooldownSeconds)
         }
         prune()
     }

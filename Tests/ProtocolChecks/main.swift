@@ -53,6 +53,47 @@ _ = earlyErrorPair.didSendStopFrame()
 earlyErrorPair.stopAcked = true
 check(earlyErrorPair.confirmed, "新一轮两帧回执才确认停止")
 
+// MARK: - 全零输出（H1/L5）和写入合并（M2）：BLEManager.submitOutput 的纯决策
+
+check(BCProtocol.isAllZeroOutput(BCProtocol.manualFrame(channels: [0, 0, 0, 0])), "0x08 强度 0 帧算全零输出")
+check(BCProtocol.isAllZeroOutput(BCProtocol.manualZeroFrame), "0x08 at(0,255) 算全零输出")
+check(BCProtocol.isAllZeroOutput(BCProtocol.modeFrame(channels: [0, 0, 0, 0])), "0x06 全零帧算全零输出")
+check(!BCProtocol.isAllZeroOutput(BCProtocol.manualFrame(channels: [0, 1, 0, 0])), "有一个通道非零就不算全零")
+check(!BCProtocol.isAllZeroOutput(BCProtocol.officialStartFrame), "技能预设不算全零")
+check(!BCProtocol.isAllZeroOutput(Data([0xAA, 0x08])), "残缺数据不算全零输出")
+check(OutputGate.decide(allZero: false, isActive: false, zeroHeld: false) == .write, "非零帧照常走准入")
+check(OutputGate.decide(allZero: true, isActive: false, zeroHeld: false) == .skipIdleZero,
+      "设备没在输出：全零帧丢掉，不开始运行（L5）")
+check(OutputGate.decide(allZero: true, isActive: true, zeroHeld: false) == .zeroStopPair,
+      "运行中的全零帧换成完整停止帧对（H1）")
+check(OutputGate.decide(allZero: true, isActive: true, zeroHeld: true) == .alreadyZeroed,
+      "已经为全零发过停止帧对：重复的全零帧不再发")
+check(OutputGate.decide(allZero: false, isActive: true, zeroHeld: true) == .write,
+      "全零之后的非零帧照常输出（运行没有结束）")
+
+let frameA = BCProtocol.manualFrame(channels: [10, 0, 0, 0])
+let frameB = BCProtocol.manualFrame(channels: [20, 0, 0, 0])
+let frameC = BCProtocol.manualFrame(channels: [30, 0, 0, 0])
+var coalescer = OutputWriteCoalescer()
+check(coalescer.submit(frameA) == .write(frameA) && coalescer.inFlight, "没有在途写入时立刻发")
+check(coalescer.submit(frameB) == .coalesced, "有在途写入时不发")
+check(coalescer.submit(frameC) == .coalesced, "在途期间继续合并")
+check(coalescer.pending == frameC, "只保留最新一帧")
+check(coalescer.writeFinished(canSend: true) == frameC && coalescer.inFlight, "回执后发最新一帧，仍只有一笔在途")
+check(coalescer.writeFinished(canSend: true) == nil && !coalescer.inFlight, "没有待发帧时回到空闲")
+_ = coalescer.submit(frameA)
+_ = coalescer.submit(frameB)
+coalescer.dropPending()
+check(coalescer.pending == nil && coalescer.inFlight, "停止前丢掉待发输出；已在途的那笔照常等回执")
+check(coalescer.writeFinished(canSend: true) == nil, "停止插队后，回执不会补发旧输出")
+_ = coalescer.submit(frameA)
+_ = coalescer.submit(frameB)
+check(coalescer.writeFinished(canSend: false) == nil && coalescer.pending == nil && !coalescer.inFlight,
+      "锁闸或停止进行中：回执后丢掉待发帧")
+_ = coalescer.submit(frameA)
+coalescer.reset()
+check(!coalescer.inFlight && coalescer.submit(frameB) == .write(frameB), "断链重置后重新开始")
+
 // MARK: - 官方脚本强度换算（video.js executeIntensityCommand → BV(…, 10)）
 
 check(BCProtocol.officialScriptLevel(status: 0) == 0, "status 0 → 0")
@@ -189,6 +230,15 @@ fc.advance(10)
 ledger.end()
 check(near(ledger.cooldownRemaining(), 60), "短运行冷却下限 60 秒")
 
+// M1：断链很久才确认停止（同进程、时长已知）：冷却封顶 600 秒，额度照实际时长记账
+let longLink = makeLedger()
+longLink.begin()
+fc.advance(5000)
+longLink.end()
+check(near(longLink.cooldownRemaining(), 600), "运行 5000 秒后确认停止：冷却封顶 600 秒")
+check(near(longLink.remainingBudget(), 0), "冷却封顶不减少记账：5000 秒仍耗尽额度")
+fc.advance(1800)
+
 // 只剩部分额度时本次上限更短
 let short = makeLedger()
 short.begin()
@@ -226,7 +276,7 @@ check(orphanRestored.hasOpenRun && orphanRestored.openOrphaned, "未结束的运
 check(!orphanRestored.openElapsedUnknown, "同 boot 遗留运行使用可验证的 uptime，不标记未知")
 fc.advance(20)
 orphanRestored.end()
-check(near(orphanRestored.cooldownRemaining(), 760), "遗留运行 1520 秒含确认前等待，冷却 760 秒")
+check(near(orphanRestored.cooldownRemaining(), 600), "遗留运行 1520 秒含确认前等待，冷却封顶 600 秒（M1）")
 check(near(orphanRestored.remainingBudget(), 0), "遗留运行超过 1200 秒耗尽额度，不按单次上限封顶")
 
 // 同 boot 墙钟被往回调：仍按 uptime，冷却不缩短。
@@ -332,7 +382,7 @@ if let d = rebootOpenData { rebootOpenRestored.restore(from: d) }
 check(rebootOpenRestored.openElapsedUnknown, "reboot 后未知区间不能靠已知下界变成可信完整时长")
 fc.advance(20)
 rebootOpenRestored.end()
-check(near(rebootOpenRestored.cooldownRemaining(), 762.5), "reboot 回拨计入已知时长、启动后 5 秒及确认等待")
+check(near(rebootOpenRestored.cooldownRemaining(), 600), "reboot 回拨的未知运行冷却封顶 600 秒（M1）")
 check(near(rebootOpenRestored.remainingBudget(), 0), "reboot 回拨的遗留运行不按软件上限封顶")
 
 // 审查重现：begin 快照后失联 1000 秒，reboot 且墙钟回拨，确认前又等 20 秒。
@@ -424,8 +474,9 @@ if let d = preRebootCheckpointData { checkpointRestored.restore(from: d) }
 check(checkpointRestored.openElapsedUnknown, "checkpoint 不会掩盖 reboot 的未知区间")
 fc.advance(20)
 checkpointRestored.end()
-check(near(checkpointRestored.cooldownRemaining(), 762.5),
-      "reboot 使用 checkpoint 的 1500 秒下界、启动 5 秒和等待 20 秒，不缩短冷却")
+check(near(checkpointRestored.cooldownRemaining(), 600),
+      "reboot 后 checkpoint 下界 1525 秒的未知运行冷却封顶 600 秒（M1）")
+check(near(checkpointRestored.remainingBudget(), 0), "冷却封顶不减少保守记账：额度仍耗尽")
 // 启动标识缺失、uptime 倒退或坏的开始锚点都必须显式未知。
 fc.boot = "anchors-a"
 fc.t = 100
@@ -465,8 +516,8 @@ let persist = AIReply.parse("[CH 40 0 0 0]")
 check(persist.rejection == nil && persist.steps == [AIStep(levels: [40, 0, 0, 0], duration: 0)] && !persist.stop,
       "没有 STOP 时最后一步保持（duration 0）")
 
-let clamped = AIReply.parse("[ch 150 0 0 77]\n[HOLD 100]\n[CH 5 5 5 5]\n[HOLD 999999]")
-check(clamped.steps.first?.levels == [99, 0, 0, 0], "强度夹到 99，c3 恒 0，关键字不分大小写")
+let clamped = AIReply.parse("[ch 99 0 0 77]\n[HOLD 100]\n[CH 5 5 5 5]\n[HOLD 999999]")
+check(clamped.steps.first?.levels == [99, 0, 0, 0], "强度 99 原样保留（上限 70 由 AISafety 处理），c3 恒 0，关键字不分大小写")
 check(clamped.steps.first?.duration == 0.5, "HOLD 夹到最少 500 毫秒")
 check(clamped.steps.last?.levels == [5, 5, 5, 0] && clamped.steps.last?.duration == 60, "HOLD 夹到最多 60000 毫秒")
 
@@ -586,6 +637,79 @@ check(oversized.rejection != nil && oversized.steps.isEmpty && !oversized.stop, 
 check(AIReply.parse("[STOP]").stop && AIReply.parse("[STOP]").steps.isEmpty, "单独 STOP")
 check(AIReply.parse("[笑] 宝宝乖").rejection == nil, "非指令的方括号文字不受影响")
 
+// H3：CH 超过 99 不夹紧，整条回复不执行
+for (raw, name) in [
+    ("[CH 150 0 0 0]", "伸缩 150"),
+    ("[CH 30 0 0 100]", "旋转位 100"),
+    ("宝宝\n[CH 30 0 0 0]\n[CH 100 0 0 0]\n[STOP]", "后面一步 100"),
+] {
+    let r = AIReply.parse(raw)
+    check(r.rejection != nil && !executable(r), "\(name)：超过 99 整条不执行")
+}
+check(AIReply.parse("[CH 150 150 150 0]").rejection?.contains("超过 99") == true, "超过 99 的作废原因写明")
+
+// H3：AI 强度上限 70、每步最多 +20、从空闲开始从 0 爬升（AISafety）
+check(AISafety.maxLevel == 70 && AISafety.maxStepIncrease == 20 && AISafety.rampStepSeconds == 1
+      && AISafety.holdIdleTimeout == 120, "AI 安全常数：上限 70、每步 +20、爬升 1 秒、保持空闲 120 秒")
+let fromIdle = AISafety.enforce([AIStep(levels: [60, 0, 0, 0], duration: 0)], from: [0, 0, 0, 0])
+check(fromIdle.steps == [AIStep(levels: [20, 0, 0, 0], duration: 1), AIStep(levels: [40, 0, 0, 0], duration: 1),
+                         AIStep(levels: [60, 0, 0, 0], duration: 0)],
+      "从空闲开始：第一步每秒 +20 从 0 爬到目标，目标步保持原时长")
+check(fromIdle.rampSteps == 2 && fromIdle.clampedValues == 0, "爬升步计数")
+let overCap = AISafety.enforce([AIStep(levels: [99, 80, 10, 0], duration: 2)], from: [70, 70, 0, 0])
+check(overCap.steps == [AIStep(levels: [70, 70, 10, 0], duration: 2)] && overCap.clampedValues == 2,
+      "超过 70 的值压到 70")
+check(overCap.displaySteps == [AIStep(levels: [70, 70, 10, 0], duration: 2)], "界面显示压低后的值")
+check(AISafety.describe(overCap, stop: false).contains("已压到 70"), "程序说明标出压到 70")
+let fullIdle = AISafety.enforce(AIReply.parse("[CH 99 99 99 0]").steps, from: [0, 0, 0, 0])
+check(fullIdle.steps.first == AIStep(levels: [20, 20, 20, 0], duration: 1)
+      && fullIdle.steps.last == AIStep(levels: [70, 70, 70, 0], duration: 0) && fullIdle.rampSteps == 3,
+      "开场拉满：压到 70，从 0 每秒 +20 爬上去")
+let goingDown = AISafety.enforce([AIStep(levels: [10, 0, 0, 0], duration: 1.5)], from: [70, 60, 0, 0])
+check(goingDown.steps == [AIStep(levels: [10, 0, 0, 0], duration: 1.5)] && goingDown.rampSteps == 0,
+      "降低立刻生效，不插爬升步")
+let mixedMove = AISafety.enforce([AIStep(levels: [50, 0, 0, 0], duration: 1.5)], from: [20, 60, 0, 0])
+check(mixedMove.steps == [AIStep(levels: [40, 0, 0, 0], duration: 1), AIStep(levels: [50, 0, 0, 0], duration: 1.5)],
+      "升的通道爬升，降的通道在第一步就降")
+let chained = AISafety.enforce([AIStep(levels: [20, 0, 0, 0], duration: 1.5), AIStep(levels: nil, duration: 3),
+                                AIStep(levels: [65, 0, 0, 0], duration: 0)], from: [0, 0, 0, 0])
+check(chained.steps == [AIStep(levels: [20, 0, 0, 0], duration: 1.5), AIStep(levels: nil, duration: 3),
+                        AIStep(levels: [40, 0, 0, 0], duration: 1), AIStep(levels: [60, 0, 0, 0], duration: 1),
+                        AIStep(levels: [65, 0, 0, 0], duration: 0)],
+      "每一步都和上一步比，HOLD 不改强度")
+let fromHold = AISafety.enforce([AIStep(levels: [55, 0, 0, 0], duration: 0)], from: [40, 0, 0, 0])
+check(fromHold.steps == [AIStep(levels: [55, 0, 0, 0], duration: 0)], "接着保持的强度继续：差不超过 20 不爬升")
+let zeroEnding = AISafety.enforce(AIReply.parse("[CH 30 0 0 0]\n[CH 0 0 0 0]").steps, from: [0, 0, 0, 0])
+check(zeroEnding.steps.first == AIStep(levels: [20, 0, 0, 0], duration: 1)
+      && ReplyAuthorization.programEndIsTerminal(steps: zeroEnding.steps, endWithStop: false),
+      "爬升不改变全零结尾的停止判断")
+
+// H2：保持最后强度时，120 秒没有新的用户消息就停止
+check(!AISafety.holdIdleExpired(now: 5000, holdStartedAt: nil, lastUserMessageAt: 0), "没在保持时不计时")
+check(!AISafety.holdIdleExpired(now: 1119, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 119 秒未超时")
+check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 120 秒没有新消息就停止")
+check(!AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: 1050), "保持期间的新消息重新计时")
+check(AISafety.holdIdleExpired(now: 1170, holdStartedAt: 1000, lastUserMessageAt: 1050), "新消息之后 120 秒仍没有回应就停止")
+check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: nil), "没有用户消息记录时从保持开始算")
+
+// L2：请求历史不含出错提示，从用户消息开始，同角色相邻合并
+let historyTurns = [
+    AIHistory.Turn(isUser: false, isError: false, content: "a0"),
+    AIHistory.Turn(isUser: true, isError: false, content: "u1"),
+    AIHistory.Turn(isUser: false, isError: true, content: "出错了：超时"),
+    AIHistory.Turn(isUser: true, isError: false, content: "u2"),
+    AIHistory.Turn(isUser: false, isError: false, content: "a2"),
+]
+let fullWindow = AIHistory.window(historyTurns, limit: 20)
+check(fullWindow.first?["role"] == "user", "历史窗口从用户消息开始")
+check(fullWindow.count == 2 && fullWindow[0]["content"] == "u1\nu2" && fullWindow[1]["content"] == "a2",
+      "出错提示不进历史，相邻用户消息合并")
+check(!fullWindow.contains { $0["content"]?.contains("出错了") == true }, "历史里没有出错提示")
+let shortWindow = AIHistory.window(historyTurns, limit: 2)
+check(shortWindow.count == 2 && shortWindow[0]["role"] == "user" && shortWindow[0]["content"] == "u2",
+      "截断后的窗口仍从用户消息开始")
+check(AIHistory.window(historyTurns, limit: 1).isEmpty, "窗口里只剩 assistant 时整段丢掉")
+
 // MARK: - 回复授权（AIControlVM 的 send → 停止 → 执行前验票）
 
 // 发送后程序以 [STOP] / 全零自动结束（AIControlVM.runStep 走 terminalStop）：之后到的回复不执行
@@ -627,10 +751,12 @@ check(multiAuth.block(oldTicket) != nil && multiAuth.block(midTicket) != nil, "�
 // MARK: - 本地停止词
 
 for s in ["停", "停下", "停止", "别动了", "够了", "不要了", "疼", "受不了", "慢点停", "我疼，停止",
-          "宝宝受不了了", "stop", "STOP!", "please stop", "Stop now", "ｓｔｏｐ", "停一下好吗"] {
+          "宝宝受不了了", "stop", "STOP!", "please stop", "Stop now", "ｓｔｏｐ", "停一下好吗",
+          "暂停", "等等", "疼死了", "pause", "Wait!", "wait a sec", "enough", "that's ENOUGH", "ｐａｕｓｅ"] {
     check(AIStopWords.matches(s), "停止词：\(s)")
 }
-for s in ["慢", "慢一点", "再快点", "继续", "stopped", "nonstop", "unstoppable", "好舒服"] {
+for s in ["慢", "慢一点", "再快点", "继续", "stopped", "nonstop", "unstoppable", "好舒服",
+          "waiting", "paused", "awaited"] {
     check(!AIStopWords.matches(s), "不是停止词：\(s)")
 }
 

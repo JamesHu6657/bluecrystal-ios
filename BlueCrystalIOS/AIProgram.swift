@@ -42,7 +42,9 @@ struct AIStep: Equatable {
 /// - 只要出现任何不算数的指令样式文字（行内、引用、代码块里、格式错、STOP 之后还有指令），
 ///   或步数超过 maxSteps，整条回复的程序都作废：只显示文字，一步都不执行
 ///   （调用方此时如果在输出，要安全停止）。
-/// - 合法时 c3（旋转）恒为 0，强度夹到 0~BCProtocol.maxManualLevel，HOLD 夹到 500~60000 毫秒。
+/// - CH 任何一个值超过 BCProtocol.maxManualLevel（99）都算格式错，整条作废（不夹紧）。
+/// - 合法时 c3（旋转）恒为 0，HOLD 夹到 500~60000 毫秒。
+///   AI 强度上限 70、每步最多 +20、从 0 爬升由执行前的 AISafety.enforce 处理。
 struct AIReply {
     /// 去掉合法指令行之后给用户看的文字
     var text: String
@@ -90,8 +92,8 @@ struct AIReply {
             guard args.count == 4, args.allSatisfy(isDecimal) else { return nil }
             var lv: [Int] = []
             for a in args {
-                guard let v = Int(a) else { return nil }
-                lv.append(min(v, BCProtocol.maxManualLevel))
+                guard let v = Int(a), v <= BCProtocol.maxManualLevel else { return nil }
+                lv.append(v)
             }
             // 第 4 通道（旋转）这台设备不用，恒 0
             lv[3] = 0
@@ -105,6 +107,16 @@ struct AIReply {
         default:
             return nil
         }
+    }
+
+    /// 格式对、只是强度超过 99 的 CH（只用来给出更明确的作废原因）
+    private static func chOverLimit(_ line: String) -> Bool {
+        guard line.hasPrefix("["), line.hasSuffix("]"), line.count >= 2 else { return false }
+        let tokens = line.dropFirst().dropLast()
+            .split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\u{3000}" })
+        guard tokens.count == 5, tokens[0].uppercased() == "CH" else { return false }
+        let args = tokens.dropFirst()
+        return args.allSatisfy(isDecimal) && args.contains { (Int($0) ?? Int.max) > BCProtocol.maxManualLevel }
     }
 
     private struct Fence {
@@ -203,7 +215,11 @@ struct AIReply {
                     commands.append(c)
                     continue
                 }
-                if rejection == nil { rejection = "指令格式不对：\(line)" }
+                if rejection == nil {
+                    rejection = chOverLimit(line)
+                        ? "强度超过 \(BCProtocol.maxManualLevel)，整条不执行：\(line)"
+                        : "指令格式不对：\(line)"
+                }
             } else if hasToken, rejection == nil {
                 rejection = "指令没有单独占一行：\(line)"
             }
@@ -278,17 +294,130 @@ struct ReplyAuthorization {
     }
 }
 
+// MARK: - AI 输出安全（在代码里执行，不靠提示词：提示词用户可以改）
+
+/// 模型给的强度在执行前统一经过这里：
+/// - 每通道上限 maxLevel（70）：超过的值压到 70，界面上的程序说明会标出来；
+///   超过 99 的值在 AIReply.parse 里已经整条作废，到不了这里。
+/// - 相邻两步之间每通道最多升高 maxStepIncrease（20）：升得更多时，在目标步前面插入
+///   rampStepSeconds（1 秒）一步的爬升步，每步 +20，直到差距不超过 20 再到目标步。
+///   降低不受限制、立刻生效（降强度是安全方向，用户喊"慢"时不能拖几秒）。
+/// - 起点：从空闲开始的程序从 0 算起（所以第一步也是每秒最多 +20 爬上去）；
+///   接着上一条回复保持的强度继续时，从保持的强度算起。
+enum AISafety {
+    static let maxLevel = 70
+    static let maxStepIncrease = 20
+    static let rampStepSeconds: Double = 1
+    /// 程序走完、保持最后强度时：从开始保持和最近一条用户消息中较晚的那个算起，
+    /// 这么久没有新的用户消息就停止（不在场的人不能被一直保持输出）
+    static let holdIdleTimeout: TimeInterval = 120
+
+    struct Program: Equatable {
+        /// 实际执行的步骤（含插入的爬升步）
+        var steps: [AIStep]
+        /// 压到上限后的原步骤，给界面显示
+        var displaySteps: [AIStep]
+        /// 被压到上限的通道值个数
+        var clampedValues: Int
+        /// 插入的爬升步数
+        var rampSteps: Int
+    }
+
+    static func enforce(_ steps: [AIStep], from start: [Int]) -> Program {
+        var cur = (0..<4).map { i in i < start.count ? max(0, min(maxLevel, start[i])) : 0 }
+        var out: [AIStep] = []
+        var display: [AIStep] = []
+        var clamped = 0
+        var ramps = 0
+        for s in steps {
+            guard let lv = s.levels else {
+                out.append(s)
+                display.append(s)
+                continue
+            }
+            var target = (0..<4).map { i in i < lv.count ? max(0, lv[i]) : 0 }
+            for i in target.indices where target[i] > maxLevel {
+                target[i] = maxLevel
+                clamped += 1
+            }
+            let shaped = AIStep(levels: target, duration: s.duration)
+            display.append(shaped)
+            while true {
+                var next = target
+                var needsRamp = false
+                for i in next.indices where next[i] - cur[i] > maxStepIncrease {
+                    next[i] = cur[i] + maxStepIncrease
+                    needsRamp = true
+                }
+                guard needsRamp else { break }
+                out.append(AIStep(levels: next, duration: rampStepSeconds))
+                ramps += 1
+                cur = next
+            }
+            out.append(shaped)
+            cur = target
+        }
+        return Program(steps: out, displaySteps: display, clampedValues: clamped, rampSteps: ramps)
+    }
+
+    /// 界面上的程序说明：显示压到上限后的强度，并注明压低和爬升
+    static func describe(_ p: Program, stop: Bool) -> String {
+        var text = p.displaySteps.map(\.summary).joined(separator: " → ") + (stop ? " → 停止" : "")
+        if p.clampedValues > 0 {
+            text += "\n（AI 强度上限 \(maxLevel)：\(p.clampedValues) 个超过 \(maxLevel) 的值已压到 \(maxLevel)）"
+        }
+        if p.rampSteps > 0 {
+            text += "\n（自动插入 \(p.rampSteps) 步爬升，每秒每通道最多 +\(maxStepIncrease)）"
+        }
+        return text
+    }
+
+    /// 保持中是否已经超过空闲时限；holdStartedAt 为 nil 表示没在保持
+    static func holdIdleExpired(now: TimeInterval, holdStartedAt: TimeInterval?,
+                                lastUserMessageAt: TimeInterval?) -> Bool {
+        guard let h = holdStartedAt else { return false }
+        return now - max(h, lastUserMessageAt ?? h) >= holdIdleTimeout
+    }
+}
+
+// MARK: - 请求历史
+
+/// 每次请求带的历史：出错提示不进历史；窗口从用户消息开始（严格的接口不接受 assistant 开头）；
+/// 去掉出错提示后相邻同角色的消息合并成一条，保持 user/assistant 交替
+enum AIHistory {
+    struct Turn {
+        var isUser: Bool
+        var isError: Bool
+        var content: String
+    }
+
+    static func window(_ turns: [Turn], limit: Int) -> [[String: String]] {
+        var recent = Array(turns.filter { !$0.isError }.suffix(limit))
+        while let first = recent.first, !first.isUser { recent.removeFirst() }
+        var out: [[String: String]] = []
+        for t in recent {
+            let role = t.isUser ? "user" : "assistant"
+            if let last = out.last, last["role"] == role {
+                out[out.count - 1]["content"] = (last["content"] ?? "") + "\n" + t.content
+            } else {
+                out.append(["role": role, "content": t.content])
+            }
+        }
+        return out
+    }
+}
+
 // MARK: - 本地停止词
 
 /// 本地停止词（不等模型，立刻停）。匹配策略刻意保守，宁可误停：
 /// - 中文安全短语在消息任意位置出现就算（"我疼，停止"、"别停"、"心疼" 都会停）；
-/// - 英文 "stop" 作为独立单词出现就算，不分大小写（"please stop"、"STOP!"、"don't stop" 都会停；
-///   "stopped"、"nonstop" 不算）。全角字母先转半角。
+/// - 英文 stop / pause / wait / enough 作为独立单词出现就算，不分大小写（"please stop"、"STOP!"、
+///   "don't stop"、"wait a sec" 都会停；"stopped"、"nonstop"、"waiting" 不算）。全角字母先转半角。
 /// - "慢"（慢一点）不是停止词，交给模型降档；"慢点停" 含 "停"，仍然本地停。
 enum AIStopWords {
-    static let phrases = ["停", "停下", "停止", "停一下", "慢点停", "别动了", "别弄了", "够了", "不要了",
-                          "疼", "痛", "受不了", "住手"]
-    static let englishWords: Set<String> = ["stop"]
+    static let phrases = ["停", "停下", "停止", "停一下", "慢点停", "暂停", "别动了", "别弄了", "够了", "不要了",
+                          "疼", "疼死", "痛", "受不了", "住手", "等等"]
+    static let englishWords: Set<String> = ["stop", "pause", "wait", "enough"]
 
     static func matches(_ text: String) -> Bool {
         let normalized = (text.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? text).lowercased()

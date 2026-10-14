@@ -9,6 +9,8 @@ struct AIModel: Identifiable, Hashable {
     let id: String
     let name: String
     let wire: WireProtocol
+    /// 支持 reasoning 参数（/responses 的 reasoning.effort）；不支持的模型发了可能被 400 拒绝
+    var reasoning: Bool = false
 }
 
 enum AIProvider: String, CaseIterable, Identifiable {
@@ -39,7 +41,8 @@ enum AIProvider: String, CaseIterable, Identifiable {
             return [
                 AIModel(id: "deepseek/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", wire: .chatCompletions),
                 AIModel(id: "claude-haiku-5-5", name: "Claude Haiku 5.5", wire: .anthropicMessages),
-                AIModel(id: "meta/muse-spark-1.3-contributor", name: "Muse Spark 1.3 Contributor", wire: .responses),
+                AIModel(id: "meta/muse-spark-1.3-contributor", name: "Muse Spark 1.3 Contributor", wire: .responses,
+                        reasoning: true),
             ]
         }
     }
@@ -99,7 +102,7 @@ enum AIConfig {
     2. 节奏：[CH 10 10 0 0] 慢热开场 → 逐步升温 → 小恶魔捉弄
        （突然拉到 60、突然 [HOLD 5000] 停在边缘、快到时降回 15）→ 最后放他释放。
     3. 安全词优先：他说"停"或"受不了"，立刻 [STOP]；说"慢"，立刻降档。
-    4. 单通道不长时间超过 70，全程循序渐进。
+    4. 单通道最高 70（控制器会把更高的值压到 70），每步最多加 20，全程循序渐进。
     5. 坏得温柔，例如："宝宝忍得住吗？忍不住要求我哦。"、"不许自己偷偷动，只能我来。"
     6. 结束发 [STOP]，说句温柔的话让他休息。
 
@@ -109,7 +112,7 @@ enum AIConfig {
     - 指令格式严格遵守，方括号、空格、数字缺一不可。
     """
 
-    /// 读不出来（不论原因）都当空 Key 用于请求；设置页的回滚要区分时用 storedAPIKey
+    /// 只给设置页预填输入框用（读取失败时设置页另外显示错误）；发请求用 storedAPIKey，读取失败要报出来
     static func apiKey(for p: AIProvider) -> String { (try? storedAPIKey(for: p)) ?? "" }
     /// nil = 钥匙串里没有；读取失败时抛错
     static func storedAPIKey(for p: AIProvider) throws -> String? {
@@ -226,8 +229,8 @@ struct LLMClient {
         case .responses:
             path = "/responses"
             // Muse 等推理模型会把预算全烧在思考上，effort 调低、预算给足，否则 steps 出不来（实测 1024 会 incomplete）
-            body = ["model": model.id, "instructions": system, "input": convo,
-                    "max_output_tokens": 3000, "reasoning": ["effort": "low"]]
+            body = ["model": model.id, "instructions": system, "input": convo, "max_output_tokens": 3000]
+            if model.reasoning { body["reasoning"] = ["effort": "low"] }
         }
         guard let url = URL(string: base + path), url.scheme?.hasPrefix("http") == true else {
             throw LLMError.badURL
@@ -237,6 +240,8 @@ struct LLMClient {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         if model.wire == .anthropicMessages {
+            // 原生 Anthropic 接口认 x-api-key，代理可能认 Bearer：两个都带
+            req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
             req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -267,6 +272,8 @@ final class AIControlVM: ObservableObject {
         var program: String?
         /// 模型原始输出（含指令行）：只有程序真的执行了才保存并回传给模型；没执行的回复回传显示文字
         var raw: String?
+        /// 本地出错提示：只显示，不进请求历史
+        var isError = false
     }
 
     @Published var messages: [ChatMessage] = []
@@ -293,6 +300,14 @@ final class AIControlVM: ObservableObject {
     private var requestTask: Task<Void, Never>?
     private var tabActive = false
     private var sceneActive = true
+    /// 程序当前在设备上的强度（爬升的起点）；停止后归零
+    private var currentLevels = [0, 0, 0, 0]
+    /// 程序走完、开始保持最后强度的时间（单调时钟）；nil = 没在保持
+    private var holdStartedAt: TimeInterval?
+    /// 最近一条用户消息的时间（单调时钟）
+    private var lastUserMessageAt: TimeInterval?
+
+    private static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     /// 输入框有字、且（没在等回复，或这句是停止词）时可以发
     var canSubmit: Bool {
@@ -367,18 +382,30 @@ final class AIControlVM: ObservableObject {
             return
         }
         input = ""
+        lastUserMessageAt = Self.now()
         messages.append(ChatMessage(isUser: true, text: text, program: nil, raw: nil))
         // 停止词打断进行中的请求：旧请求作废（授权已撤销，结果也不再处理），带上停止这句重新问
         requestTask?.cancel()
+        requestTask = nil
         requestID &+= 1
         let id = requestID
-        let history = messages.suffix(Self.historyLimit).map { m -> [String: String] in
-            let content = m.raw ?? (m.text.isEmpty ? (m.program ?? "…") : m.text)
-            return ["role": m.isUser ? "user" : "assistant", "content": content]
+        let turns = messages.map { m in
+            AIHistory.Turn(isUser: m.isUser, isError: m.isError,
+                           content: m.raw ?? (m.text.isEmpty ? (m.program ?? "…") : m.text))
         }
+        let history = AIHistory.window(turns, limit: Self.historyLimit)
         let payload = [["role": "system", "content": AIConfig.systemPrompt]] + history
         let provider = AIConfig.provider
-        let client = LLMClient(baseURL: provider.baseURL, model: AIConfig.model, apiKey: AIConfig.apiKey(for: provider))
+        let apiKey: String
+        do {
+            apiKey = try AIConfig.storedAPIKey(for: provider) ?? ""
+        } catch {
+            // 钥匙串读取失败要如实报出来，不能当成"还没填 Key"
+            isThinking = false
+            handleError(error, requestID: id)
+            return
+        }
+        let client = LLMClient(baseURL: provider.baseURL, model: AIConfig.model, apiKey: apiKey)
         isThinking = true
         requestTask = Task { [weak self] in
             do {
@@ -390,14 +417,21 @@ final class AIControlVM: ObservableObject {
         }
     }
 
+    /// 任何请求错误（HTTP、超时、429、断网、回复不完整、钥匙串读取失败）在输出中都停止：
+    /// 用户这句话没有得到回应，不能让设备停在上一条回复的强度上
     private func handleError(_ error: Error, requestID id: Int) {
         guard id == requestID else { return }
         isThinking = false
         requestTask = nil
-        if let e = error as? LLMError, case .incomplete(_) = e, running {
-            stopAll(reason: "回复不完整，已停止")
+        if running {
+            if let e = error as? LLMError, case .incomplete(_) = e {
+                stopAll(reason: "回复不完整，已停止")
+            } else {
+                stopAll(reason: "请求出错，已停止")
+            }
         }
-        messages.append(ChatMessage(isUser: false, text: "出错了：\(error.localizedDescription)", program: nil, raw: nil))
+        messages.append(ChatMessage(isUser: false, text: "出错了：\(error.localizedDescription)", program: nil,
+                                    raw: nil, isError: true))
     }
 
     /// 执行前的最后检查（主线程，紧挨着 start）：返回不能执行的原因
@@ -433,9 +467,11 @@ final class AIControlVM: ObservableObject {
                 programText = "未执行（\(block)）"
                 rejectProgram("已停止")
             } else {
-                start(steps: reply.steps, endWithStop: reply.stop)
+                // 上限 70、每步最多 +20、从空闲开始时从 0 爬升（H3）：在代码里执行，不靠提示词
+                let safe = AISafety.enforce(reply.steps, from: running ? currentLevels : [0, 0, 0, 0])
+                start(steps: safe.steps, endWithStop: reply.stop)
                 executed = true
-                programText = reply.steps.map(\.summary).joined(separator: " → ") + (reply.stop ? " → 停止" : "")
+                programText = AISafety.describe(safe, stop: reply.stop)
             }
         } else if reply.stop {
             stopAll(reason: "已停止")
@@ -453,6 +489,7 @@ final class AIControlVM: ObservableObject {
         stepWork?.cancel()
         self.steps = steps
         self.endWithStop = endWithStop
+        holdStartedAt = nil
         running = true
         // 用户刚发了消息、模型回了指令：显式开闸（和手动/视频页点"播放"一样）
         ble.userResumeOutput()
@@ -467,16 +504,18 @@ final class AIControlVM: ObservableObject {
             // 否则保持最后的强度，等下一条回复
             if ReplyAuthorization.programEndIsTerminal(steps: steps, endWithStop: endWithStop) {
                 terminalStop(reason: "已停止", sendStop: true)
+            } else {
+                beginHold()
             }
             return
         }
         let step = steps[i]
         if let lv = step.levels {
-            // 全零用官方迷姬的 at(0,255)（停止帧对的第一帧）当"暂停"，不锁闸，后面还能接着加
-            let frame = step.isZero
-                ? BCProtocol.manualFrame(channels: lv, tail: 255)
-                : BCProtocol.manualFrame(channels: lv)
+            // 全零步照常发强度 0 帧：BLEManager 在运行中把它换成完整停止帧对（at(0,255) → 100ms → Tt(0)），
+            // 不锁闸、运行继续，后面还能接着加；空闲时直接丢掉
+            let frame = BCProtocol.manualFrame(channels: lv)
             if first { ble.send(frame: frame) } else { ble.sendThrottled(frame: frame) }
+            currentLevels = lv
         }
         ble.heartbeat()
         statusLine = step.duration > 0
@@ -484,7 +523,7 @@ final class AIControlVM: ObservableObject {
             : "保持：\(step.summary)"
         guard step.duration > 0 else {
             // 最后一步保持；如果是全零则走上面的停止分支
-            if step.isZero { runStep(i + 1, gen: gen) }
+            if step.isZero { runStep(i + 1, gen: gen) } else { beginHold() }
             return
         }
         let work = DispatchWorkItem { [weak self] in self?.runStep(i + 1, gen: gen) }
@@ -499,16 +538,28 @@ final class AIControlVM: ObservableObject {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
         steps = []
+        currentLevels = [0, 0, 0, 0]
+        holdStartedAt = nil
         let wasRunning = running
         running = false
         if sendStop { ble?.sendStop() }
         if wasRunning || sendStop { statusLine = reason }
     }
 
+    /// 程序走完、保持最后强度：开始计空闲时限（H2）
+    private func beginHold() {
+        holdStartedAt = Self.now()
+    }
+
     private func startHeartbeat() {
         heartbeatTimer?.invalidate()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self, self.running else { return }
+            if AISafety.holdIdleExpired(now: Self.now(), holdStartedAt: self.holdStartedAt,
+                                        lastUserMessageAt: self.lastUserMessageAt) {
+                self.stopAll(reason: "保持 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息，已停止")
+                return
+            }
             self.ble?.heartbeat()
         }
         RunLoop.main.add(t, forMode: .common)
@@ -545,6 +596,7 @@ struct AIControlView: View {
                         VStack(alignment: m.isUser ? .trailing : .leading, spacing: 4) {
                             if !m.text.isEmpty {
                                 Text(m.text)
+                                    .foregroundColor(m.isError ? .red : .primary)
                                     .padding(8)
                                     .background(m.isUser ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12))
                                     .cornerRadius(10)
@@ -595,10 +647,19 @@ struct AISettingsView: View {
     @State private var keys: [AIProvider: String] = AISettingsView.loadKeys()
     /// 钥匙串里当前的值：只写改过的 Key。读取失败的服务商不在表里（原值未知），回滚时跳过，绝不删除
     @State private var savedKeys: [AIProvider: String] = AISettingsView.loadSavedKeys()
-    @State private var saveError: String?
+    @State private var saveError: String? = AISettingsView.loadReadErrors()
 
     private static func loadKeys() -> [AIProvider: String] {
         Dictionary(uniqueKeysWithValues: AIProvider.allCases.map { ($0, AIConfig.apiKey(for: $0)) })
+    }
+
+    /// 钥匙串读取失败的服务商：输入框会是空的，这里说明真实原因（不是"没填"）
+    private static func loadReadErrors() -> String? {
+        var lines: [String] = []
+        for p in AIProvider.allCases {
+            do { _ = try AIConfig.storedAPIKey(for: p) } catch { lines.append("\(p.title)：\(error.localizedDescription)") }
+        }
+        return lines.isEmpty ? nil : "读取已保存的 API Key 失败（输入框显示为空，不代表没有 Key）：\n" + lines.joined(separator: "\n")
     }
 
     private static func loadSavedKeys() -> [AIProvider: String] {
@@ -642,7 +703,7 @@ struct AISettingsView: View {
                 } header: {
                     Text("提示词")
                 } footer: {
-                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。")
+                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99，超过 99 整条不执行）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)，保持 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息就停止。")
                 }
             }
             .onChange(of: provider) { p in

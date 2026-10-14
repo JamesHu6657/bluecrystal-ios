@@ -192,3 +192,74 @@ struct StopPairAttempt {
         return failureReason
     }
 }
+
+extension BCProtocol {
+    /// 四个通道全为 0 的输出帧（0x08 任意尾部，或 0x06）
+    static func isAllZeroOutput(_ data: Data) -> Bool {
+        let b = [UInt8](data)
+        guard b.count >= 8, b[0] == header, b[1] == manualCmd || b[1] == modeCmd else { return false }
+        return b[3...6].allSatisfy { $0 == 0 }
+    }
+}
+
+/// 输出准入中和停止帧对有关的纯决策（BLEManager.submitOutput 用，ProtocolChecks 覆盖）。
+///
+/// 全零输出不当普通帧发：at([0,0,0,0],0) 在真机上只是"强度 0"，设备不停（见 manualZeroFrame）。
+/// - 设备没在输出：直接丢掉，不开始一次运行（不占额度、不产生冷却）；
+/// - 设备在输出：发完整停止帧对 at(0,255) → 100ms → Tt(0)，运行保持（不结束记账、不锁闸），
+///   之后的非零帧照常经过准入继续输出；
+/// - 已经为这次全零发过停止帧对、之后还没有非零帧：重复的全零帧不再发。
+enum OutputGate {
+    enum Decision: Equatable {
+        case write
+        case skipIdleZero
+        case alreadyZeroed
+        case zeroStopPair
+    }
+
+    static func decide(allZero: Bool, isActive: Bool, zeroHeld: Bool) -> Decision {
+        guard allZero else { return .write }
+        if !isActive { return .skipIdleZero }
+        return zeroHeld ? .alreadyZeroed : .zeroStopPair
+    }
+}
+
+/// 输出写入合并（纯状态，BLEManager 在 bleQueue 上用）：
+/// - 同一时间最多一笔非停止帧在途（写入回执、失败或超时之前不发下一笔）；
+/// - 在途期间到来的帧只保留最新一帧；
+/// - 停止帧对不经过这里，发停止前先 dropPending()，停止帧永远排在待发输出前面。
+struct OutputWriteCoalescer {
+    enum Action: Equatable {
+        case write(Data)
+        case coalesced
+    }
+
+    private(set) var inFlight = false
+    private(set) var pending: Data?
+
+    mutating func submit(_ frame: Data) -> Action {
+        if inFlight {
+            pending = frame
+            return .coalesced
+        }
+        inFlight = true
+        return .write(frame)
+    }
+
+    /// 在途那笔有了结果。canSend 为 false 时丢掉待发帧；返回值是现在要写的下一帧（已标记在途）
+    mutating func writeFinished(canSend: Bool) -> Data? {
+        inFlight = false
+        guard let next = pending else { return nil }
+        pending = nil
+        guard canSend else { return nil }
+        inFlight = true
+        return next
+    }
+
+    mutating func dropPending() { pending = nil }
+
+    mutating func reset() {
+        inFlight = false
+        pending = nil
+    }
+}

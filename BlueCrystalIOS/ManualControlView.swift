@@ -18,8 +18,16 @@ final class ManualControlVM: ObservableObject {
     /// 手动页心跳定时器：滑杆停住不动时也要告诉看门狗"我还活着"，
     /// 否则 5 秒就被误杀（修 N1）
     private var heartbeatTimer: Timer?
+    /// 上次停止以来发过输出（有输出才需要空闲停机）
+    private var outputSinceStop = false
+    /// 最近一次用户操作（单调时钟）
+    private var lastInteraction = ProcessInfo.processInfo.systemUptime
+    /// 空闲停机后的提示；用户再操作时清掉
+    @Published private(set) var idleNotice: String?
 
     static let throttleInterval: TimeInterval = 0.12
+    /// 手动页这么久没有任何操作就自动停止输出（L7）：心跳只证明界面活着，不证明有人在操作
+    static let idleTimeout: TimeInterval = 300
 
     func attach(ble: BLEManager) {
         // N4：切 Tab 回来会重复 attach，先清掉旧的订阅
@@ -50,14 +58,28 @@ final class ManualControlVM: ObservableObject {
     private func startHeartbeatTimer() {
         heartbeatTimer?.invalidate()
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.ble?.heartbeat()
+            guard let self = self else { return }
+            let idle = ProcessInfo.processInfo.systemUptime - self.lastInteraction
+            if self.outputSinceStop, idle >= Self.idleTimeout {
+                self.stopAll()
+                self.idleNotice = "\(Int(Self.idleTimeout / 60)) 分钟没有操作，已自动停止输出"
+                return
+            }
+            self.ble?.heartbeat()
         }
         RunLoop.main.add(t, forMode: .common)
         heartbeatTimer = t
     }
 
+    private func noteInteraction() {
+        lastInteraction = ProcessInfo.processInfo.systemUptime
+        idleNotice = nil
+    }
+
     func setChannel(_ index: Int, _ value: Double) {
         guard mode != .skill else { return }
+        noteInteraction()
+        outputSinceStop = true
         channels[index] = value
         scheduleSend()
     }
@@ -65,12 +87,15 @@ final class ManualControlVM: ObservableObject {
     /// 切换控制方式：先停机归零，避免 0~9 和 0~99 的值串用
     func setMode(_ newMode: BCProtocol.Mode) {
         guard newMode != mode else { return }
+        noteInteraction()
         stopAll()
         mode = newMode
     }
 
     /// 技能 tab：发官方预设（0x06）
     func selectPreset(_ preset: BCProtocol.Preset) {
+        noteInteraction()
+        outputSinceStop = true
         pendingWork?.cancel()
         pendingWork = nil
         selectedPreset = preset.key
@@ -84,6 +109,9 @@ final class ManualControlVM: ObservableObject {
         pendingWork = nil
         channels = [0, 0, 0, 0]
         selectedPreset = nil
+        outputSinceStop = false
+        // 停止会锁闸（M3）：下一次拖动必须是开闸的前沿帧，不能落进节流尾帧
+        lastSend = -Double.infinity
         // 停止帧对：0x08 归零帧 → 100ms → 0x06 停止帧（BLEManager 统一处理）
         ble?.sendStop()
     }
@@ -93,6 +121,7 @@ final class ManualControlVM: ObservableObject {
         pendingWork = nil
         channels = [0, 0, 0, 0]
         selectedPreset = nil
+        outputSinceStop = false
         lastSend = -Double.infinity
     }
 
@@ -230,6 +259,12 @@ struct ManualControlView: View {
                 Button("停止", role: .destructive) { vm.stopAll() }
                     .frame(maxWidth: .infinity)
                     .disabled(ble.state != .ready)
+            } footer: {
+                if let notice = vm.idleNotice {
+                    Text(notice).foregroundColor(.orange)
+                } else {
+                    Text("\(Int(ManualControlVM.idleTimeout / 60)) 分钟没有操作会自动停止")
+                }
             }
 
             Section("最后一帧") {
