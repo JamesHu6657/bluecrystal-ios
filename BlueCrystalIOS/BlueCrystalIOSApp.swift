@@ -13,7 +13,7 @@ struct BlueCrystalIOSApp: App {
         }
         .onChange(of: scenePhase) { phase in
             if phase == .background {
-                // 退后台/锁屏：申请后台时间，一直持有到停止帧整条链出最终结果（最多约 4.5 秒）。
+                // 退后台/锁屏：申请后台时间，一直持有到停止帧对确认（最多 20 秒，没确认会发通知提示关电源）。
                 // 设备不能停在某个强度上等人回来（修 Factory M1：不再阻塞主线程、不再 2 秒就放手）
                 var bgTask: UIBackgroundTaskIdentifier = .invalid
                 bgTask = UIApplication.shared.beginBackgroundTask {

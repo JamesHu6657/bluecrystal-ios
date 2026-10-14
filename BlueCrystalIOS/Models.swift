@@ -1,6 +1,6 @@
 import Foundation
 
-/// 时间轴脚本里的一条命令（兼容官方服务端格式）
+/// 时间轴脚本里的一条命令（字段对应官方 video.js 的 commandType / intensity / duration）
 struct TimelineCommand: Decodable {
     /// Thrust / Vibration / Suction / Rotation（大小写不敏感）
     let commandType: String
@@ -19,16 +19,17 @@ struct TimelineCommand: Decodable {
 /// 时间轴脚本文件
 struct TimelineScript: Decodable {
     let commands: [TimelineCommand]
-    /// 可选：强度刻度声明，"ten"（0~10）或 "percent"（0~100）。
-    /// 不填则自动判断：任一命令 >10 → 百分制；否则按官方十档处理。
-    /// 注意：一份全是小值的百分制脚本（如 3/5/8）会被误判成十档，
-    /// 这种脚本请显式写 "intensityScale": "percent"。
+    /// 强度刻度声明，"ten"（0~10，官方格式）或 "percent"（0~100）。
+    /// 修 L9：不写时只有出现 >10 的值才能确定是百分制；全部 ≤10 时分不清
+    /// （3/5/8 可能是十档，也可能是很小的百分比），按较弱的百分制处理并提示
     let intensityScale: String?
 
     /// 缓存的刻度判断结果，避免每 tick O(n)（修 N10）
     let useTenScale: Bool
-    /// intensityScale 写了但不是 "ten"/"percent"，已回退自动判断（用于界面提示）
+    /// intensityScale 写了但不是 "ten"/"percent"
     let scaleFallback: Bool
+    /// 没有可用的刻度声明且所有值都 ≤10：已按较弱的百分制处理（修 L9）
+    let scaleAmbiguous: Bool
 
     enum CodingKeys: String, CodingKey {
         case commands
@@ -39,36 +40,34 @@ struct TimelineScript: Decodable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         commands = try c.decode([TimelineCommand].self, forKey: .commands)
         intensityScale = try c.decodeIfPresent(String.self, forKey: .intensityScale)
-        // 修 高6：只有 "ten"/"percent" 是合法声明；写成其他值时回退到自动判断，
-        // 不再静默当成百分制
-        if let s = intensityScale?.lowercased() {
-            if s == "ten" {
-                useTenScale = true
-                scaleFallback = false
-            } else if s == "percent" {
-                useTenScale = false
-                scaleFallback = false
-            } else {
-                useTenScale = commands.allSatisfy { $0.intensityLevel <= 10 }
-                scaleFallback = true
-            }
-        } else {
+        let declared = intensityScale?.lowercased()
+        if declared == "ten" {
+            useTenScale = true
             scaleFallback = false
-            // 自动判断：整个脚本统一用一种刻度，避免 10→99、10.5→11 这种断层
-            useTenScale = commands.allSatisfy { $0.intensityLevel <= 10 }
+            scaleAmbiguous = false
+        } else if declared == "percent" {
+            useTenScale = false
+            scaleFallback = false
+            scaleAmbiguous = false
+        } else {
+            // 没写或写错：只认百分制（任一值 >10 时确定是百分制，否则是较弱的那种读法）
+            useTenScale = false
+            scaleFallback = declared != nil
+            scaleAmbiguous = commands.allSatisfy { $0.intensityLevel <= 10 }
         }
     }
 
-    /// 命令强度换算成设备档位 0~BCProtocol.maxLevel
-    /// 十档脚本直接用档位（10 夹到最高档）；百分制按比例换算，非零值至少 1 档
+    /// 命令强度换算成 0x08 帧强度 0~99（修 N2），照官方 video.js executeIntensityCommand：
+    /// 十档值 × 10（百分制直接用）→ 取整 → 非零 +10 → 最高 99
     func deviceLevel(for cmd: TimelineCommand) -> Int {
-        let maxL = Double(BCProtocol.maxLevel)
         let raw = cmd.intensityLevel
-        guard raw.isFinite, raw > 0 else { return 0 }
-        let v = useTenScale ? raw : raw / 100.0 * maxL
-        // 修 高6：先在 Double 域夹紧再转 Int，1e20 这种值不会溢出崩溃
-        let clamped = min(max(v.rounded(), 1), maxL)
-        return Int(clamped)
+        let status = useTenScale ? raw * 10 : raw
+        return BCProtocol.officialScriptLevel(status: status)
+    }
+
+    /// 脚本里旋转通道的命令数（旋转恒为 0，这些命令会被忽略，修 N5）
+    var ignoredRotationCount: Int {
+        commands.filter { $0.channel == .rotation }.count
     }
 
     var scaleDescription: String {
@@ -78,7 +77,7 @@ struct TimelineScript: Decodable {
 
 /// 播放中的激活命令集合（用于判断是否需要重发）
 struct ActiveChannels: Equatable {
-    var values: [Int] // [ch0, ch1, ch2, ch3]，0~BCProtocol.maxLevel
+    var values: [Int] // [ch0, ch1, ch2, ch3]，0x08 帧强度 0~99（ch3 旋转恒为 0）
 
     static var zero: ActiveChannels { ActiveChannels(values: [0, 0, 0, 0]) }
 

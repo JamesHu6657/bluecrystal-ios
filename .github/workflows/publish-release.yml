@@ -1,4 +1,5 @@
 # 手动把某次 Build Unsigned IPA 运行的产物发布成 GitHub Release（tag 不存在时在指定提交上创建）。
+# 发布前核对：运行成功且构建的就是 target 提交、sha256 正确、IPA 内版本号与 tag 一致。
 name: Publish Release
 
 on:
@@ -8,10 +9,10 @@ on:
         description: "Build Unsigned IPA 的运行 ID"
         required: true
       tag:
-        description: "Release 的 tag（如 v1.6.2）"
+        description: "Release 的 tag（如 v1.7.1，必须等于 v + MARKETING_VERSION）"
         required: true
       target:
-        description: "tag 指向的提交 SHA"
+        description: "tag 指向的提交（完整 40 位 SHA，必须是这次运行构建的提交）"
         required: true
       notes:
         description: "Release 说明"
@@ -26,24 +27,53 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 输入一律经 env 传入，不直接拼进 shell（防注入）
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ inputs.run_id }}
+      TAG: ${{ inputs.tag }}
+      TARGET: ${{ inputs.target }}
+      NOTES: ${{ inputs.notes }}
     steps:
-      - name: Download artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Download and verify artifact
         run: |
           set -euo pipefail
-          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n BlueCrystalIOS-unsigned -D out
+          case "$RUN_ID" in (''|*[!0-9]*) echo "::error::run_id 必须是数字"; exit 1;; esac
+          echo "$TARGET" | grep -Eqx '[0-9a-f]{40}' || { echo "::error::target 必须是完整 40 位 SHA"; exit 1; }
+          echo "$TAG" | grep -Eqx 'v[0-9]+(\.[0-9]+)*' || { echo "::error::tag 格式应为 v1.2.3"; exit 1; }
+
+          # 这次运行必须是成功的 Build Unsigned IPA，且构建的正是 target 提交
+          workflow=$(gh run view "$RUN_ID" -R "$REPO" --json workflowName -q .workflowName)
+          conclusion=$(gh run view "$RUN_ID" -R "$REPO" --json conclusion -q .conclusion)
+          head_sha=$(gh run view "$RUN_ID" -R "$REPO" --json headSha -q .headSha)
+          [ "$workflow" = "Build Unsigned IPA" ] || { echo "::error::运行 $RUN_ID 是 $workflow，不是 Build Unsigned IPA"; exit 1; }
+          [ "$conclusion" = "success" ] || { echo "::error::运行 $RUN_ID 结果是 $conclusion"; exit 1; }
+          [ "$head_sha" = "$TARGET" ] || { echo "::error::运行 $RUN_ID 构建的是 $head_sha，不是 $TARGET"; exit 1; }
+
+          gh run download "$RUN_ID" -R "$REPO" -n BlueCrystalIOS-unsigned -D out
           ls -l out
-          cat out/BlueCrystalIOS-unsigned.ipa.sha256
+          (cd out && shasum -a 256 -c BlueCrystalIOS-unsigned.ipa.sha256)
+
+          # IPA 里的版本号和提交号必须和 tag / target 对得上
+          unzip -p out/BlueCrystalIOS-unsigned.ipa Payload/BlueCrystalIOS.app/Info.plist > app-info.plist
+          ver=$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb"))["CFBundleShortVersionString"])' app-info.plist)
+          commit=$(python3 -c 'import plistlib,sys; print(plistlib.load(open(sys.argv[1],"rb")).get("BCGitCommit",""))' app-info.plist)
+          [ "v$ver" = "$TAG" ] || { echo "::error::tag $TAG 与 IPA 版本 $ver 不一致"; exit 1; }
+          [ "$commit" = "$TARGET" ] || { echo "::error::IPA 内的提交号 '$commit' 不是 $TARGET"; exit 1; }
+
+          # tag 已存在时必须指向 target
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            tag_sha=$(gh api "repos/$REPO/commits/$TAG" -q .sha)
+            [ "$tag_sha" = "$TARGET" ] || { echo "::error::已有 tag $TAG 指向 $tag_sha，不是 $TARGET"; exit 1; }
+          fi
+
       - name: Create release and upload
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NOTES: ${{ inputs.notes }}
         run: |
           set -euo pipefail
-          if ! gh release view "${{ inputs.tag }}" -R "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release create "${{ inputs.tag }}" -R "${{ github.repository }}" \
-              --target "${{ inputs.target }}" --title "${{ inputs.tag }}" --notes "$NOTES"
+          if ! gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$REPO" \
+              --target "$TARGET" --title "$TAG" --notes "$NOTES"
           fi
-          gh release upload "${{ inputs.tag }}" out/BlueCrystalIOS-unsigned.ipa out/BlueCrystalIOS-unsigned.ipa.sha256 \
-            -R "${{ github.repository }}" --clobber
+          gh release upload "$TAG" out/BlueCrystalIOS-unsigned.ipa out/BlueCrystalIOS-unsigned.ipa.sha256 \
+            -R "$REPO" --clobber

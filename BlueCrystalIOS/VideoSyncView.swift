@@ -14,9 +14,6 @@ final class VideoSyncPlayer: ObservableObject {
     @Published var currentSeconds: Double = 0
     @Published var durationSeconds: Double = 0
 
-    /// 单次联动最长 30 分钟，超时自动停
-    static let maxSessionSeconds: TimeInterval = 30 * 60
-
     private var timer: Timer?
     private var lastActive = ActiveChannels.zero
     private weak var ble: BLEManager?
@@ -25,7 +22,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// 把还没回来的 duration 订阅一起清掉（修 N4）
     private var stateCancellables = Set<AnyCancellable>()
     private var playerCancellables = Set<AnyCancellable>()
-    private var sessionStart: Date?
+    /// 上一次 tick 采样的播放时间（修 L11：两次采样之间整段结束的短命令也要发一次）
+    private var lastSampleTime: Double?
 
     /// seek 代次：拖进度条会连发多个 seek，只有最新的回调有效（修 #5 的小尾巴）
     private var seekGen = 0
@@ -57,10 +55,10 @@ final class VideoSyncPlayer: ObservableObject {
                 }
             }
             .store(in: &stateCancellables)
-        // 被动停机（看门狗/退后台/30 分钟上限）：只归零 UI，不补发停止帧
+        // 被动停机（看门狗/退后台/单次上限/输出被拒）：只归零 UI，不补发停止帧
         ble.forceZeroOutputs
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in self?.passiveStop() }
+            .sink { [weak self] reason in self?.passiveStop(reason: reason) }
             .store(in: &stateCancellables)
         // 修 M5：timeControlStatus 订阅只在 loadVideo 里挂一次，attach 不再重复添加
     }
@@ -188,8 +186,16 @@ final class VideoSyncPlayer: ObservableObject {
             script = try JSONDecoder().decode(TimelineScript.self, from: data)
             scriptName = url.lastPathComponent
             if let s = script {
-                // 高6 建议：刻度声明写错回退自动判断时明确提示
-                let warn = s.scaleFallback ? "（intensityScale 无法识别，已自动判断）" : ""
+                var notes: [String] = []
+                // 高6 建议：刻度声明写错时明确提示
+                if s.scaleFallback { notes.append("intensityScale 无法识别") }
+                // 修 L9：刻度分不清时按较弱的百分制，提示用户声明
+                if s.scaleAmbiguous {
+                    notes.append("未声明刻度且所有值 ≤10，已按较弱的百分制处理；十档脚本请加 \"intensityScale\": \"ten\"")
+                }
+                // 修 N5：旋转通道恒为 0
+                if s.ignoredRotationCount > 0 { notes.append("\(s.ignoredRotationCount) 条旋转命令已忽略") }
+                let warn = notes.isEmpty ? "" : "（" + notes.joined(separator: "；") + "）"
                 statusLine = "脚本就绪：\(s.commands.count) 条命令，\(s.scaleDescription)刻度\(warn)"
             }
         } catch {
@@ -206,9 +212,14 @@ final class VideoSyncPlayer: ObservableObject {
             stopTimer(sendZero: true)
             statusLine = "已暂停"
         } else {
+            // 修 M2/M3：冷却 / 额度 / 锁存 / 停止未确认时不开播（BLEManager 也会拦截）
+            if let reason = ble?.safety.blockReason {
+                statusLine = reason
+                return
+            }
             let t = p.currentTime().seconds
             let needsRestart = durationSeconds > 0 && t.isFinite && t >= durationSeconds - 0.5
-            sessionStart = Date()
+            lastSampleTime = nil
             isPlaying = true
             // 修 C：用户点"播放"才显式开闸；tick 自己不会开闸
             ble?.userResumeOutput()
@@ -225,8 +236,7 @@ final class VideoSyncPlayer: ObservableObject {
                     guard let self = self, p === self.player else { return }
                     self.seekInFlight = max(0, self.seekInFlight - 1)
                     // 修 B：seek 完成前用户点了暂停/停止/切 Tab，或设备断开，
-                    // 不许把播放复活 —— 否则界面显示已停，设备却继续跟视频走，
-                    // 且 sessionStart 已是 nil，30 分钟上限和看门狗都管不到
+                    // 不许把播放复活 —— 否则界面显示已停，设备却继续跟视频走
                     guard gen == self.seekGen, self.isPlaying else { return }
                     self.lastActive = .zero
                     self.currentSeconds = 0
@@ -274,7 +284,8 @@ final class VideoSyncPlayer: ObservableObject {
                 self.handleExternalPause()
                 return
             }
-            // seek 后强制算一次，避免设备停在旧强度
+            // seek 后强制算一次，避免设备停在旧强度；跳过的那段不算"采样间漏掉的命令"
+            self.lastSampleTime = nil
             self.tick(force: true)
             }
         }
@@ -284,19 +295,19 @@ final class VideoSyncPlayer: ObservableObject {
         player?.pause()
         isPlaying = false
         stopTimer(sendZero: true)
-        sessionStart = nil
+        lastSampleTime = nil
         statusLine = "—"
     }
 
-    /// 被动停机（看门狗/退后台/30 分钟上限）：只归零 UI，不补发停止帧
-    /// （停止帧已经发出去了，再发一次反而可能把闸重新打开）
-    private func passiveStop() {
+    /// 被动停机（看门狗/退后台/单次上限/输出被拒）：只归零 UI，不补发停止帧
+    /// （需要的停止 BLEManager 已经发出去了）
+    private func passiveStop(reason: String?) {
         player?.pause()
         isPlaying = false
         stopTimer(sendZero: false)
         lastActive = .zero
-        sessionStart = nil
-        statusLine = "已自动停止"
+        lastSampleTime = nil
+        statusLine = reason ?? "已自动停止"
     }
 
     var canPlay: Bool {
@@ -338,33 +349,33 @@ final class VideoSyncPlayer: ObservableObject {
         }
         let t = p.currentTime().seconds
         guard t.isFinite else { return }
-
-        // 会话超时保护：先停，再写提示（修 N11：提示不被 stopAll 覆盖）
-        if let start = sessionStart,
-           Date().timeIntervalSince(start) > Self.maxSessionSeconds {
-            sessionStart = nil
-            stopAll()
-            statusLine = "单次联动超过 30 分钟，已自动停止"
-            return
-        }
-
+        // 单次 300 秒上限、30 分钟额度、冷却都由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
 
         currentSeconds = t
+        // 修 L11：连续播放时，上次采样到这次之间整段开始又结束的短命令（<100ms）也发一次
+        let prev: Double? = lastSampleTime.flatMap { (p: Double) -> Double? in
+            (p < t && t - p <= 0.5) ? p : nil
+        }
+        lastSampleTime = t
 
         var vals = [0, 0, 0, 0]
         for cmd in s.commands {
-            guard t >= cmd.startTimeSeconds, t < cmd.endTime,
-                  let ch = cmd.channel else { continue }
+            // 修 N5：旋转通道恒为 0，脚本里的旋转命令忽略
+            guard let ch = cmd.channel, ch.isUsed else { continue }
+            let activeNow = t >= cmd.startTimeSeconds && t < cmd.endTime
+            let skippedBetween = prev.map { cmd.startTimeSeconds > $0 && cmd.endTime <= t } ?? false
+            guard activeNow || skippedBetween else { continue }
             vals[ch.rawValue] = max(vals[ch.rawValue], s.deviceLevel(for: cmd))
         }
         let active = ActiveChannels(values: vals)
         if force || needsResync || active != lastActive {
             needsResync = false
             lastActive = active
-            // 修 C：tick 走不开闸的发送路径，看门狗锁住的闸不会被自动帧打开
-            ble.sendTick(channels: vals)
-            let names = ["伸缩", "震动", "吮吸", "旋转"]
-            let desc = vals.enumerated().map { "\(names[$0.offset]):\($0.element)" }.joined(separator: " ")
+            // 修 N2：官方 0x08 帧；修 C：tick 走不开闸的发送路径，看门狗锁住的闸不会被自动帧打开
+            ble.sendTick(levels: vals)
+            let desc = BCProtocol.Channel.uiChannels
+                .map { "\($0.displayName):\(vals[$0.rawValue])" }
+                .joined(separator: " ")
             statusLine = String(format: "t=%.1fs %@", t, desc)
         }
         if durationSeconds > 0, t >= durationSeconds {
@@ -391,7 +402,7 @@ struct NoControlsPlayerView: UIViewControllerRepresentable {
     }
 }
 
-/// 视频联动：播本地视频，按时间轴脚本自动发 0x06 帧
+/// 视频联动：播本地视频，按时间轴脚本自动发官方 0x08 帧（强度按官方 video.js 换算）
 struct VideoSyncView: View {
     @EnvironmentObject var ble: BLEManager
     @StateObject private var vm = VideoSyncPlayer()
@@ -405,20 +416,7 @@ struct VideoSyncView: View {
 
     var body: some View {
         Form {
-            Section("设备") {
-                HStack {
-                    Text(ble.state.rawValue)
-                        .foregroundColor(ble.state == .ready ? .green : .secondary)
-                    Spacer()
-                    if ble.state != .ready {
-                        Button("连接") { ble.startScan() }
-                            .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .discovering || ble.state == .disconnecting)
-                    }
-                }
-                if let err = ble.lastError {
-                    Text(err).font(.caption).foregroundColor(.red)
-                }
-            }
+            DeviceStatusSection(allowDisconnect: false, connectTitle: "连接")
 
             Section("素材") {
                 HStack {

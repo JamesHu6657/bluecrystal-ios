@@ -19,15 +19,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download artifact and push
+        # 输入一律经 env 传入，不直接拼进 shell（防注入）
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n BlueCrystalIOS-unsigned -D /tmp/out
+          case "$RUN_ID" in (''|*[!0-9]*) echo "::error::run_id 必须是数字"; exit 1;; esac
+          gh run download "$RUN_ID" -R "$REPO" -n BlueCrystalIOS-unsigned -D /tmp/out
+          (cd /tmp/out && shasum -a 256 -c BlueCrystalIOS-unsigned.ipa.sha256)
           git config user.name ci && git config user.email ci@users.noreply.github.com
           git checkout --orphan ipa
           git rm -rf --cached . >/dev/null
           cp /tmp/out/* .
           git add -f BlueCrystalIOS-unsigned.ipa BlueCrystalIOS-unsigned.ipa.sha256
-          git commit -m "IPA from run ${{ inputs.run_id }}"
+          git commit -m "IPA from run $RUN_ID"
           git push -f origin ipa

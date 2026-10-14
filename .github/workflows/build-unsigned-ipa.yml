@@ -8,7 +8,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # 失败时把编译日志推到 ci-logs 分支，便于排查
+  contents: write # 失败时把日志推到 ci-logs 分支，便于排查
+
+# 并行的失败运行会抢着 push -f ci-logs：串行执行
+concurrency:
+  group: build-unsigned-ipa
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -16,11 +21,29 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-
-      - name: Select Xcode (pinned 16.4)
-        uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '16.4'
+          # 写权限 token 不留在 .git/config 里；失败日志推送时显式带上
+          persist-credentials: false
+
+      # 不再用第三方 action：直接选 runner 自带的 Xcode 16.4，并核对版本
+      - name: Select Xcode 16.4
+        run: |
+          set -euo pipefail
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version
+          xcodebuild -version | grep -qx 'Xcode 16\.4'
+
+      # 钉住实抓帧字节、官方换算和安全上限（Tests/ProtocolChecks/main.swift）
+      - name: Protocol and safety checks
+        run: |
+          set -euo pipefail
+          xcrun swiftc \
+            BlueCrystalIOS/Protocol.swift \
+            BlueCrystalIOS/Models.swift \
+            BlueCrystalIOS/SafetyLedger.swift \
+            Tests/ProtocolChecks/main.swift \
+            -o "$RUNNER_TEMP/protocol-checks" 2>&1 | tee tests.log
+          "$RUNNER_TEMP/protocol-checks" 2>&1 | tee -a tests.log
 
       - name: Build (Release, iphoneos, no signing)
         run: |
@@ -33,29 +56,24 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            BC_GIT_COMMIT="$GITHUB_SHA" \
             build 2>&1 | tee build.log
-
-      - name: Push build log on failure
-        if: failure()
-        run: |
-          grep -E "error:|warning: .*BlueCrystal|\*\* BUILD" build.log > build-errors.log || true
-          tail -n 300 build.log > build-tail.log || true
-          git config user.name ci && git config user.email ci@users.noreply.github.com
-          git checkout --orphan ci-logs
-          git rm -rf --cached . >/dev/null
-          git add -f build-errors.log build-tail.log
-          git commit -m "build log for ${GITHUB_SHA}"
-          git push -f origin ci-logs
 
       - name: Package IPA
         run: |
           set -euo pipefail
-          APP="build/Build/Products/Release-iphoneos/BlueCrystalIOS.app"
-          test -d "$APP"
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qry BlueCrystalIOS-unsigned.ipa Payload
-          shasum -a 256 BlueCrystalIOS-unsigned.ipa | tee BlueCrystalIOS-unsigned.ipa.sha256
+          {
+            set -euo pipefail
+            APP="build/Build/Products/Release-iphoneos/BlueCrystalIOS.app"
+            test -d "$APP"
+            # 包里必须带着这次构建的提交号（Publish Release 会核对）
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :BCGitCommit' "$APP/Info.plist")" = "$GITHUB_SHA"
+            mkdir -p Payload
+            cp -R "$APP" Payload/
+            zip -qry BlueCrystalIOS-unsigned.ipa Payload
+            shasum -a 256 BlueCrystalIOS-unsigned.ipa | tee BlueCrystalIOS-unsigned.ipa.sha256
+          } 2>&1 | tee package.log
 
       - uses: actions/upload-artifact@v4
         with:
@@ -64,3 +82,20 @@ jobs:
             BlueCrystalIOS-unsigned.ipa
             BlueCrystalIOS-unsigned.ipa.sha256
           if-no-files-found: error
+
+      # 放在最后：测试、编译、打包任何一步失败都能拿到日志
+      - name: Push logs on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          touch build.log tests.log package.log
+          grep -E "error:|warning: .*BlueCrystal|\*\* BUILD" build.log > build-errors.log || true
+          tail -n 300 build.log > build-tail.log || true
+          git config user.name ci && git config user.email ci@users.noreply.github.com
+          git checkout --orphan ci-logs
+          git rm -rf --cached . >/dev/null
+          git add -f build-errors.log build-tail.log tests.log package.log
+          git commit -m "build log for ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/ci-logs

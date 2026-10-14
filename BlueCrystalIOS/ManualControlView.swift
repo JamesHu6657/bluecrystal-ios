@@ -10,7 +10,8 @@ final class ManualControlVM: ObservableObject {
     @Published private(set) var selectedPreset: String?
 
     private weak var ble: BLEManager?
-    private var lastSend = Date.distantPast
+    /// 上次发送时间（单调时钟，修 L7）
+    private var lastSend = -Double.infinity
     private var pendingWork: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
 
@@ -31,10 +32,10 @@ final class ManualControlVM: ObservableObject {
                 if s != .ready { self?.reset() }
             }
             .store(in: &cancellables)
-        // 被动停机（看门狗/退后台）：滑杆归零（修 高1）
+        // 被动停机（看门狗/退后台/上限/输出被拒）：滑杆归零（修 高1）；原因由 BLEManager 显示在红字里
         ble.forceZeroOutputs
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in self?.reset() }
+            .sink { [weak self] _ in self?.reset() }
             .store(in: &cancellables)
         startHeartbeatTimer()
     }
@@ -83,7 +84,7 @@ final class ManualControlVM: ObservableObject {
         pendingWork = nil
         channels = [0, 0, 0, 0]
         selectedPreset = nil
-        // 0x08 模式下 BLEManager 会自动先补 0x08 归零帧再发停止帧
+        // 停止帧对：0x08 归零帧 → 100ms → 0x06 停止帧（BLEManager 统一处理）
         ble?.sendStop()
     }
 
@@ -92,13 +93,13 @@ final class ManualControlVM: ObservableObject {
         pendingWork = nil
         channels = [0, 0, 0, 0]
         selectedPreset = nil
-        lastSend = .distantPast
+        lastSend = -Double.infinity
     }
 
     /// 后缘节流：120ms 内只发一帧，但最后一次的值一定补发（降强度不能丢）
     private func scheduleSend() {
-        let now = Date()
-        let elapsed = now.timeIntervalSince(lastSend)
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = now - lastSend
         if elapsed >= Self.throttleInterval {
             lastSend = now
             pendingWork?.cancel()
@@ -110,7 +111,7 @@ final class ManualControlVM: ObservableObject {
             let snapMode = mode
             let work = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
-                self.lastSend = Date()
+                self.lastSend = ProcessInfo.processInfo.systemUptime
                 // 延迟帧走 sendThrottled：不断开输出闸门。
                 // 停机/断开后这帧会被丢掉，避免"停止帧之后又来一帧非零"（修 N2）
                 self.ble?.sendThrottled(frame: snapMode.frame(channels: snapshot.map { Int($0) }))
@@ -143,24 +144,23 @@ struct ManualControlView: View {
         }
     }
 
+    /// 连上了且现在允许开始/继续输出（冷却、额度、锁存、停止未确认时禁用；停止按钮不受影响）
+    private var canOutput: Bool {
+        ble.state == .ready && ble.safety.blockReason == nil
+    }
+
+    /// 版本号 + 构建提交（修 L14：CI 构建时写入 BCGitCommit）
+    private var versionText: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let ver = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        let commit = (info["BCGitCommit"] as? String ?? "").prefix(7)
+        return commit.isEmpty ? "版本 \(ver) (\(build))" : "版本 \(ver) (\(build)) · \(commit)"
+    }
+
     var body: some View {
         Form {
-            Section("设备") {
-                HStack {
-                    Text(ble.state.rawValue)
-                        .foregroundColor(ble.state == .ready ? .green : .secondary)
-                    Spacer()
-                    if ble.state == .ready {
-                        Button("断开") { ble.disconnect() }
-                    } else {
-                        Button("连接 mizzzee_0032") { ble.startScan() }
-                            .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .discovering || ble.state == .disconnecting)
-                    }
-                }
-                if let err = ble.lastError {
-                    Text(err).font(.caption).foregroundColor(.red)
-                }
-            }
+            DeviceStatusSection(allowDisconnect: true, connectTitle: "连接 mizzzee_0032")
 
             Section {
                 Picker("控制方式", selection: Binding(
@@ -194,12 +194,13 @@ struct ManualControlView: View {
                                 }
                             }
                         }
-                        .disabled(ble.state != .ready)
+                        .disabled(!canOutput)
                     }
                 }
             } else {
-                Section("四通道强度（0~\(vm.mode.maxLevel)）") {
-                    ForEach(BCProtocol.Channel.allCases, id: \.rawValue) { ch in
+                Section {
+                    // 修 N5：旋转通道不显示（协议里恒发 0）
+                    ForEach(BCProtocol.Channel.uiChannels, id: \.rawValue) { ch in
                         VStack(alignment: .leading) {
                             HStack {
                                 Text(ch.displayName)
@@ -216,8 +217,12 @@ struct ManualControlView: View {
                                 in: 0...Double(vm.mode.maxLevel), step: 1
                             )
                         }
-                        .disabled(ble.state != .ready)
+                        .disabled(!canOutput)
                     }
+                } header: {
+                    Text("通道强度（0~\(vm.mode.maxLevel)）")
+                } footer: {
+                    Text("旋转通道官方 mizzzee 配置未使用，已隐藏（恒发 0）")
                 }
             }
 
@@ -233,7 +238,11 @@ struct ManualControlView: View {
                     .foregroundColor(.secondary)
                 Text("仅在收到写入回执后更新（链路层回执，不代表设备已执行）")
                     .font(.caption2).foregroundColor(.secondary)
-                Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"))")
+                // 修 L1：FFA2 通知原样显示（含义未知，只记录）
+                Text("设备通知（FFA2）：\(ble.lastNotifyHex)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.secondary)
+                Text(versionText)
                     .font(.caption2).foregroundColor(.secondary)
             }
         }

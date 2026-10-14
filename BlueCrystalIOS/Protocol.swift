@@ -8,8 +8,9 @@ import Foundation
 ///
 /// - 0x06 模式帧（官方 Tt()，技能 / 变频 tab）：AA 06 05 <伸缩> <震动> <吮吸> <旋转> 00 <cs>
 ///   变频滑杆官方默认范围 0~9；技能预设最高也是 9
-/// - 0x08 手动帧（官方 at()，手动 tab）：AA 08 06 <伸缩> <震动> <吮吸> <旋转> 00 00 <cs>
-///   手动滑杆官方范围 0~99
+/// - 0x08 帧（官方 at(arr, t)）：AA 08 06 <伸缩> <震动> <吮吸> <旋转> <t 高字节> <t 低字节> <cs>
+///   手动 tab、全屏视频页、video.js 脚本指令都用 t = 0；手动滑杆官方范围 0~99
+/// - 停止：官方全屏视频页退出时先发 0x08 归零帧 at([0,0,0,0],0)，100ms 后再发 0x06 停止帧 Tt([0,0,0,0])
 enum BCProtocol {
 
     static let header: UInt8 = 0xAA
@@ -32,7 +33,14 @@ enum BCProtocol {
             }
         }
 
-        /// 时间轴脚本里的 commandType 映射
+        /// 旋转通道只留在协议里、恒发 0（修 N5）：官方面板默认滑杆只有伸缩/震动/吮吸，
+        /// 内置的 mizzzee 配置和五个技能预设都没用到它，0032 的服务端配置也没拿到
+        var isUsed: Bool { self != .rotation }
+
+        /// 界面上显示的通道
+        static var uiChannels: [Channel] { allCases.filter { $0.isUsed } }
+
+        /// 时间轴脚本里的 commandType 映射（官方 xi 表的键：Thrust / Vibration / Suction / Rotation）
         static func from(commandType: String) -> Channel? {
             switch commandType.lowercased() {
             case "thrust", "stretch": return .thrust
@@ -90,10 +98,10 @@ enum BCProtocol {
 
     /// 0x06 帧每通道上限（官方变频滑杆默认 [0, 9]）
     static let maxModeLevel = 9
-    /// 0x08 帧每通道上限（官方手动滑杆 [0, 99]）
+    /// 0x08 帧每通道上限（官方手动滑杆 [0, 99]，脚本换算也夹到 99）
     static let maxManualLevel = 99
-    /// 视频脚本走 0x06 帧（官方全屏视频页同样用 Tt()），沿用 0x06 上限
-    static let maxLevel = maxModeLevel
+    /// 官方脚本强度加权：BV(…, 10) / VV(…, 10) 的第三个参数，非零值 +10
+    static let scriptWeighting = 10
 
     /// 官方 be(cmd, arr)：AA cmd len payload checksum
     static func frame(cmd: UInt8, payload: [UInt8]) -> Data {
@@ -105,7 +113,9 @@ enum BCProtocol {
     }
 
     private static func clampChannels(_ channels: [Int], max maxV: Int) -> [UInt8] {
-        (0..<4).map { i in
+        (0..<4).map { (i: Int) -> UInt8 in
+            // 修 N5：旋转通道恒为 0
+            guard i != Channel.rotation.rawValue else { return 0 }
             let v = i < channels.count ? channels[i] : 0
             return UInt8(Swift.max(0, Swift.min(maxV, v)))
         }
@@ -116,21 +126,35 @@ enum BCProtocol {
         frame(cmd: modeCmd, payload: clampChannels(channels, max: maxModeLevel) + [0x00])
     }
 
-    /// 0x08 手动帧（官方 at(arr, 0)：[...arr, 0x00, 0x00]）
+    /// 0x08 帧（官方 at(arr, 0)：[...arr, 0x00, 0x00]）
     static func manualFrame(channels: [Int]) -> Data {
         frame(cmd: manualCmd, payload: clampChannels(channels, max: maxManualLevel) + [0x00, 0x00])
     }
 
-    /// 兼容旧调用：0x06 帧
-    static func frame(channels: [Int]) -> Data { modeFrame(channels: channels) }
+    /// 视频联动帧（修 N2）：官方给迷姬（名字含 mizzzee 的设备 devType 2）发脚本/视频强度一律走 0x08：
+    /// video.js executeIntensityCommand 是 at(BV(…), 0)，全屏视频页是 at([a,a,a,a], 0)。
+    /// levels 用 officialScriptLevel 换算过的 0~99
+    static func videoFrame(levels: [Int]) -> Data { manualFrame(channels: levels) }
 
-    /// 停止帧：官方 be("06",[0,0,0,0,0]) = AA 06 05 00 00 00 00 00 B5
+    /// 官方脚本强度换算（video.js executeIntensityCommand → BV 的 directiveType "2" 分支）：
+    /// status = 强度 × 10，u = parseInt(status)，u > 0 时 u += 10，u > 99 时 u = 99。
+    /// 传入的就是 status（十档值 × 10，或百分制原值）
+    static func officialScriptLevel(status: Double) -> Int {
+        // NaN、负数、不到 1（parseInt 后为 0）都按 0，不加权
+        guard status >= 1 else { return 0 }
+        // 先在 Double 域夹紧再转 Int，超大值/无穷大不会溢出崩溃
+        guard status < Double(maxManualLevel) else { return maxManualLevel }
+        return min(Int(status) + scriptWeighting, maxManualLevel)
+    }
+
+    /// 停止帧：官方 be("06",[0,0,0,0,0]) = Tt([0,0,0,0]) = AA 06 05 00 00 00 00 00 B5（与实抓一致）
     static var stopFrame: Data { modeFrame(channels: [0, 0, 0, 0]) }
 
-    /// 手动模式归零帧：官方手动 tab 停止时发 at([0,0,0,0], 0) = AA 08 06 00 00 00 00 00 00 B8
+    /// 0x08 归零帧：官方 at([0,0,0,0], 0) = AA 08 06 00 00 00 00 00 00 B8。
+    /// 每次停止都先发它，100ms 后再发 stopFrame
     static var manualZeroFrame: Data { manualFrame(channels: [0, 0, 0, 0]) }
 
-    /// 官方默认技能"如影随形"：AA 06 05 04 06 05 00 00 C4（与实抓一致）
+    /// 官方默认技能"如影随形"：AA 06 05 04 06 05 00 00 C4（与实抓的官方启动帧一致）
     static var officialStartFrame: Data { modeFrame(channels: presets[0].channels) }
 
     /// 调试用：Data 转 HEX 字符串
