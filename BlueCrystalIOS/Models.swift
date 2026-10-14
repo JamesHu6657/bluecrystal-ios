@@ -14,6 +14,16 @@ struct TimelineCommand: Decodable {
     }
 
     var endTime: Double { startTimeSeconds + durationSeconds }
+
+    /// 连续播放的整个采样间隔都要覆盖；显式 seek 用 previous=nil 重置（L11）。
+    func isCovered(at time: Double, previous: Double?, fromPlaybackStart: Bool = false) -> Bool {
+        let activeNow = time >= startTimeSeconds && time < endTime
+        let crossed = previous.map {
+            $0 < time && durationSeconds > 0 && endTime <= time &&
+                (startTimeSeconds > $0 || (fromPlaybackStart && endTime > $0))
+        } ?? false
+        return activeNow || crossed
+    }
 }
 
 /// 时间轴脚本文件

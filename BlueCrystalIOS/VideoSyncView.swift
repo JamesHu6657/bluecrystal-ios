@@ -24,6 +24,8 @@ final class VideoSyncPlayer: ObservableObject {
     private var playerCancellables = Set<AnyCancellable>()
     /// 上一次 tick 采样的播放时间（修 L11：两次采样之间整段结束的短命令也要发一次）
     private var lastSampleTime: Double?
+    /// 播放起点尚未采样：覆盖当时已经开始的短命令；正常采样不延长已发命令。
+    private var samplingFromPlaybackStart = false
 
     /// seek 代次：拖进度条会连发多个 seek，只有最新的回调有效（修 #5 的小尾巴）
     private var seekGen = 0
@@ -219,7 +221,8 @@ final class VideoSyncPlayer: ObservableObject {
             }
             let t = p.currentTime().seconds
             let needsRestart = durationSeconds > 0 && t.isFinite && t >= durationSeconds - 0.5
-            lastSampleTime = nil
+            lastSampleTime = t.isFinite ? t : nil
+            samplingFromPlaybackStart = true
             isPlaying = true
             // 修 C：用户点"播放"才显式开闸；tick 自己不会开闸
             ble?.userResumeOutput()
@@ -246,6 +249,8 @@ final class VideoSyncPlayer: ObservableObject {
                         self.handleExternalPause()
                         return
                     }
+                    self.lastSampleTime = p.currentTime().seconds
+                    self.samplingFromPlaybackStart = true
                     p.play()
                     self.startTimer()
                     }
@@ -286,6 +291,7 @@ final class VideoSyncPlayer: ObservableObject {
             }
             // seek 后强制算一次，避免设备停在旧强度；跳过的那段不算"采样间漏掉的命令"
             self.lastSampleTime = nil
+            self.samplingFromPlaybackStart = false
             self.tick(force: true)
             }
         }
@@ -352,19 +358,17 @@ final class VideoSyncPlayer: ObservableObject {
         // 单次 300 秒上限、30 分钟额度、冷却都由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
 
         currentSeconds = t
-        // 修 L11：连续播放时，上次采样到这次之间整段开始又结束的短命令（<100ms）也发一次
-        let prev: Double? = lastSampleTime.flatMap { (p: Double) -> Double? in
-            (p < t && t - p <= 0.5) ? p : nil
-        }
+        // 修 L11：从播放起点覆盖整个连续播放区间，包括 >0.5s 的采样延迟；seek 另行重置。
+        let prev = lastSampleTime
+        let fromPlaybackStart = samplingFromPlaybackStart
         lastSampleTime = t
+        samplingFromPlaybackStart = false
 
         var vals = [0, 0, 0, 0]
         for cmd in s.commands {
             // 修 N5：旋转通道恒为 0，脚本里的旋转命令忽略
             guard let ch = cmd.channel, ch.isUsed else { continue }
-            let activeNow = t >= cmd.startTimeSeconds && t < cmd.endTime
-            let skippedBetween = prev.map { cmd.startTimeSeconds > $0 && cmd.endTime <= t } ?? false
-            guard activeNow || skippedBetween else { continue }
+            guard cmd.isCovered(at: t, previous: prev, fromPlaybackStart: fromPlaybackStart) else { continue }
             vals[ch.rawValue] = max(vals[ch.rawValue], s.deviceLevel(for: cmd))
         }
         let active = ActiveChannels(values: vals)

@@ -9,7 +9,7 @@ on:
         description: "Build Unsigned IPA 的运行 ID"
         required: true
       tag:
-        description: "Release 的 tag（如 v1.7.1，必须等于 v + MARKETING_VERSION）"
+        description: "Release 的 tag（如 v1.7.2，必须等于 v + MARKETING_VERSION）"
         required: true
       target:
         description: "tag 指向的提交（完整 40 位 SHA，必须是这次运行构建的提交）"
@@ -22,6 +22,11 @@ on:
 permissions:
   contents: write
   actions: read
+
+# 发布串行执行；发布前仍重新读取 tag，防止验证后 tag 被改动（F5）。
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -62,8 +67,11 @@ jobs:
           [ "v$ver" = "$TAG" ] || { echo "::error::tag $TAG 与 IPA 版本 $ver 不一致"; exit 1; }
           [ "$commit" = "$TARGET" ] || { echo "::error::IPA 内的提交号 '$commit' 不是 $TARGET"; exit 1; }
 
-          # tag 已存在时必须指向 target
-          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+          # 独立检查 git tag（无 release 也要检查）；API 失败不能冒充 tag 不存在。
+          tag_ref=$(gh api "repos/$REPO/git/matching-refs/tags/$TAG" \
+            -q ".[] | select(.ref == \"refs/tags/$TAG\") | .ref")
+          if [ -n "$tag_ref" ]; then
+            # commits API 将轻量/附注 tag 都解析到最终提交。
             tag_sha=$(gh api "repos/$REPO/commits/$TAG" -q .sha)
             [ "$tag_sha" = "$TARGET" ] || { echo "::error::已有 tag $TAG 指向 $tag_sha，不是 $TARGET"; exit 1; }
           fi
@@ -71,9 +79,19 @@ jobs:
       - name: Create release and upload
         run: |
           set -euo pipefail
+          # 验证步骤后可能有人创建/改动 tag，发布前再核对一次。
+          tag_ref=$(gh api "repos/$REPO/git/matching-refs/tags/$TAG" \
+            -q ".[] | select(.ref == \"refs/tags/$TAG\") | .ref")
+          if [ -n "$tag_ref" ]; then
+            tag_sha=$(gh api "repos/$REPO/commits/$TAG" -q .sha)
+            [ "$tag_sha" = "$TARGET" ] || { echo "::error::已有 tag $TAG 指向 $tag_sha，不是 $TARGET"; exit 1; }
+          fi
           if ! gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
             gh release create "$TAG" -R "$REPO" \
               --target "$TARGET" --title "$TAG" --notes "$NOTES"
           fi
+          # 创建后/上传前也核对，不能把 IPA 上传到不匹配的 tag。
+          tag_sha=$(gh api "repos/$REPO/commits/$TAG" -q .sha)
+          [ "$tag_sha" = "$TARGET" ] || { echo "::error::发布 tag $TAG 指向 $tag_sha，不是 $TARGET"; exit 1; }
           gh release upload "$TAG" out/BlueCrystalIOS-unsigned.ipa out/BlueCrystalIOS-unsigned.ipa.sha256 \
             -R "$REPO" --clobber

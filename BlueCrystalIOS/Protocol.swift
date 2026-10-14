@@ -162,3 +162,31 @@ enum BCProtocol {
         data.map { String(format: "%02X", $0) }.joined()
     }
 }
+
+/// 停止帧对的纯状态：首帧失败不能取消 100ms 后的第二帧（F1）。
+/// 调度、写入 ID 和重试仍由 BLEManager 在 bleQueue 上管理。
+struct StopPairAttempt {
+    enum Phase {
+        case gap
+        case awaitingAcks
+        case backoff
+    }
+
+    var phase: Phase = .gap
+    var zeroAcked = false
+    var stopAcked = false
+    private(set) var failureReason: String?
+
+    var confirmed: Bool { failureReason == nil && zeroAcked && stopAcked }
+
+    /// gap 中只记下失败；第二帧发出后才进入整对重试。
+    mutating func recordFailure(_ reason: String) -> Bool {
+        if failureReason == nil { failureReason = reason }
+        return phase != .gap
+    }
+
+    mutating func didSendStopFrame() -> String? {
+        phase = .awaitingAcks
+        return failureReason
+    }
+}

@@ -1,4 +1,32 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
+
+enum SafetyClock {
+    /// 优先使用不随墙钟变化的启动 UUID；旧系统回退到 kern.boottime。
+    /// 回退值改变或读不到时，账本走保守恢复，不信任墙钟流逝（F3）。
+    static func bootIdentity() -> String? {
+        #if canImport(Darwin)
+        var bytes = [CChar](repeating: 0, count: 128)
+        var size = bytes.count
+        let result = bytes.withUnsafeMutableBytes {
+            sysctlbyname("kern.bootsessionuuid", $0.baseAddress, &size, nil, 0)
+        }
+        if result == 0, size > 1, size <= bytes.count {
+            bytes[bytes.count - 1] = 0
+            let uuid = String(cString: bytes)
+            if !uuid.isEmpty { return "uuid:\(uuid)" }
+        }
+        var boot = timeval()
+        size = MemoryLayout<timeval>.size
+        if sysctlbyname("kern.boottime", &boot, &size, nil, 0) == 0 {
+            return "time:\(boot.tv_sec):\(boot.tv_usec)"
+        }
+        #endif
+        return nil
+    }
+}
 
 /// 安全上限（照搬 legacy src/safety/limits.py 的数值，不可配置）
 enum SafetyLimits {
@@ -21,7 +49,7 @@ enum SafetyLimits {
 /// 记账条目在结束后保留整整一个窗口（与 legacy 一样偏保守）。
 ///
 /// 不是线程安全的：BLEManager 只在 bleQueue 上用它。
-/// 时间用单调时钟 systemUptime（修 L7）；持久化时换成墙钟，重启 App 后换回来（修 M3：杀掉 App 不能清零）。
+/// 时间用 systemUptime；持久化墙钟 + 单调锚点 + 启动标识，跨进程也不依赖可变墙钟（F3）。
 final class DutyCycleLedger {
 
     enum Denial: Equatable {
@@ -38,17 +66,21 @@ final class DutyCycleLedger {
         var charge: TimeInterval
     }
 
-    /// 持久化格式：时间点一律存墙钟秒数
+    /// 时间点保留旧版墙钟格式，新增可选锚点以兼容旧账本。
     private struct Snapshot: Codable {
         var completed: [Entry]
         var openStart: TimeInterval?
         var openAllowed: TimeInterval
         var lastEnd: TimeInterval?
         var appliedCooldown: TimeInterval
+        var savedWall: TimeInterval?
+        var savedUptime: TimeInterval?
+        var bootIdentity: String?
     }
 
     private let clock: () -> TimeInterval
     private let wallClock: () -> TimeInterval
+    private let bootIdentity: () -> String?
     private var completed: [Entry] = []
     /// 进行中运行的开始时间（单调时钟）；nil = 没有进行中的运行
     private(set) var openStart: TimeInterval?
@@ -63,9 +95,11 @@ final class DutyCycleLedger {
     var onChange: (() -> Void)?
 
     init(clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-         wallClock: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 }) {
+         wallClock: @escaping () -> TimeInterval = { Date().timeIntervalSince1970 },
+         bootIdentity: @escaping () -> String? = { SafetyClock.bootIdentity() }) {
         self.clock = clock
         self.wallClock = wallClock
+        self.bootIdentity = bootIdentity
     }
 
     var hasOpenRun: Bool { openStart != nil }
@@ -114,10 +148,8 @@ final class DutyCycleLedger {
     func end() {
         guard let start = openStart else { return }
         let now = clock()
-        var elapsed = max(0, now - start)
-        // 上次进程留下的运行：App 被杀/崩溃期间设备跑了多久不可知，
-        // 最多按本次上限记账（App 活着时会在上限处自动停止）
-        if openOrphaned { elapsed = min(elapsed, openAllowed) }
+        // 进程不在时无法执行 300s 截止停机；直到确认/物理确认停止都按实际推断时长记账（F2）。
+        let elapsed = max(0, now - start)
         completed.append(Entry(end: now, charge: elapsed))
         openStart = nil
         openAllowed = 0
@@ -151,7 +183,10 @@ final class DutyCycleLedger {
             openStart: openStart.map(toWall),
             openAllowed: openAllowed,
             lastEnd: lastEnd.map(toWall),
-            appliedCooldown: appliedCooldown
+            appliedCooldown: appliedCooldown,
+            savedWall: wall,
+            savedUptime: now,
+            bootIdentity: bootIdentity()
         )
         return try? JSONEncoder().encode(s)
     }
@@ -161,14 +196,38 @@ final class DutyCycleLedger {
         guard let s = try? JSONDecoder().decode(Snapshot.self, from: data) else { return }
         let now = clock()
         let wall = wallClock()
-        // 墙钟换回单调时钟；墙钟被往回调、看起来在"未来"的时间点按刚刚发生处理（偏保守）
-        func toUptime(_ w: TimeInterval) -> TimeInterval { now - max(0, wall - w) }
+        let currentBoot = bootIdentity()
+        // 同一次启动只用快照中的墙钟/uptime 对应关系，完全忽略当前墙钟跳变。
+        var anchor: (wall: TimeInterval, uptime: TimeInterval)?
+        if let savedWall = s.savedWall, savedWall.isFinite,
+           let savedUptime = s.savedUptime, savedUptime.isFinite, savedUptime >= 0,
+           let savedBoot = s.bootIdentity, !savedBoot.isEmpty,
+           savedBoot == currentBoot, now >= savedUptime {
+            anchor = (savedWall, savedUptime)
+        }
+        func toUptime(_ w: TimeInterval) -> TimeInterval {
+            if let a = anchor { return a.uptime - (a.wall - w) }
+            // 启动标识不明/重启/uptime 倒退：不能让前拨墙钟清掉记账或冷却。
+            return now
+        }
         func valid(_ v: TimeInterval) -> Bool { v.isFinite && v >= 0 }
         completed = s.completed
             .filter { $0.end.isFinite && valid($0.charge) }
             .map { Entry(end: toUptime($0.end), charge: $0.charge) }
         if let start = s.openStart, start.isFinite, valid(s.openAllowed) {
-            openStart = toUptime(start)
+            if anchor != nil {
+                openStart = toUptime(start)
+            } else {
+                let knownElapsed = s.savedWall.map { max(0, $0 - start) } ?? 0
+                let bootChanged = s.bootIdentity != nil && currentBoot != nil && s.bootIdentity != currentBoot
+                let uptimeReset = s.savedUptime.map { now < $0 } ?? false
+                // 跨设备重启时，当前启动以来的 uptime 也属于尚未确认停止的区间。
+                let inferredElapsed = knownElapsed + ((bootChanged || uptimeReset) ? now : 0)
+                // 时钟不可靠时，至少计入预留上限；future openStart 绝不按零秒结束。
+                let elapsed = max(SafetyLimits.maxRunSeconds,
+                                  max(inferredElapsed, max(0, wall - start)))
+                openStart = now - elapsed
+            }
             openAllowed = min(s.openAllowed, SafetyLimits.maxRunSeconds)
             openOrphaned = true
         }

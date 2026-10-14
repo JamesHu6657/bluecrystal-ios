@@ -35,6 +35,23 @@ check(hex(BCProtocol.manualFrame(channels: [99, 50, 0, 7])) == "AA08066332000000
 check(hex(BCProtocol.videoFrame(levels: [60, 0, 0, 0])) == "AA08063C0000000000F4", "视频帧走 0x08")
 check(BCProtocol.Channel.uiChannels == [.thrust, .vibration, .suction], "界面不显示旋转")
 
+// F1：纯状态重现 t=10ms 首帧错误，100ms 仍发第二帧；调度由 BLEManager 执行。
+var earlyErrorPair = StopPairAttempt()
+check(!earlyErrorPair.recordFailure("zero error at 10ms"), "10ms 首帧错误只记录，不进入退避")
+check(earlyErrorPair.phase == .gap, "首帧错误后仍保留 100ms 第二帧发送状态")
+check(earlyErrorPair.didSendStopFrame() == "zero error at 10ms", "100ms 发出 0x06 后才处理首帧错误")
+earlyErrorPair.stopAcked = true
+check(!earlyErrorPair.confirmed, "首帧失败时 0x06 回执不能单独确认停止")
+check(earlyErrorPair.recordFailure("retry pair"), "第二帧发出后允许整对重试")
+earlyErrorPair.phase = .backoff
+earlyErrorPair = StopPairAttempt()
+check(!earlyErrorPair.confirmed && !earlyErrorPair.stopAcked, "整对重试清掉旧回执和错误")
+earlyErrorPair.zeroAcked = true
+check(!earlyErrorPair.confirmed, "只有首帧回执也不能确认停止")
+_ = earlyErrorPair.didSendStopFrame()
+earlyErrorPair.stopAcked = true
+check(earlyErrorPair.confirmed, "新一轮两帧回执才确认停止")
+
 // MARK: - 官方脚本强度换算（video.js executeIntensityCommand → BV(…, 10)）
 
 check(BCProtocol.officialScriptLevel(status: 0) == 0, "status 0 → 0")
@@ -85,16 +102,38 @@ if let s = script("{\"commands\":[\(cmd("Thrust", 50)),\(cmd("Thrust", 5))]}") {
     check(false, "百分制自动判断脚本解析")
 }
 
+// L11：播放起点作为 previous，连续采样不以 0.5s 为界；seek 的 previous=nil 不覆盖跳过部分。
+let firstShort = TimelineCommand(commandType: "Thrust", startTimeSeconds: 0,
+                                 durationSeconds: 0.05, intensityLevel: 5)
+check(firstShort.isCovered(at: 0.1, previous: 0, fromPlaybackStart: true),
+      "第一采样覆盖 [0,0.05) 的短命令")
+check(!firstShort.isCovered(at: 0.1, previous: 0),
+      "正常采样不重发恰好从上个采样点开始且已结束的命令")
+let delayedShort = TimelineCommand(commandType: "Vibration", startTimeSeconds: 0.2,
+                                   durationSeconds: 0.05, intensityLevel: 5)
+check(delayedShort.isCovered(at: 1, previous: 0.1), "连续播放延迟 >0.5s 仍覆盖短命令")
+let overlappingShort = TimelineCommand(commandType: "Suction", startTimeSeconds: 0.05,
+                                       durationSeconds: 0.1, intensityLevel: 5)
+check(overlappingShort.isCovered(at: 0.2, previous: 0.1, fromPlaybackStart: true),
+      "恢复播放后的首个采样覆盖播放起点已经激活的短命令")
+check(!overlappingShort.isCovered(at: 0.2, previous: 0.1),
+      "正常采样不重复已经发过的命令，不延长结束后的输出")
+check(!delayedShort.isCovered(at: 1, previous: nil), "seek 重置后不覆盖跳过的短命令")
+check(!delayedShort.isCovered(at: 0.1, previous: 1), "倒退时间不覆盖跨越区间")
+check(!firstShort.isCovered(at: 0.2, previous: 0.1), "不会重复覆盖已经过去的短命令")
+check(delayedShort.isCovered(at: 0.22, previous: nil), "seek 到当前激活命令仍会同步")
+
 // MARK: - 安全上限（legacy limits.py / duty_cycle.py）
 
 final class FakeClock {
     var t: TimeInterval = 1000
     var wall: TimeInterval = 1_700_000_000
+    var boot: String? = "boot-a"
     func advance(_ s: TimeInterval) { t += s; wall += s }
 }
 let fc = FakeClock()
 func makeLedger() -> DutyCycleLedger {
-    DutyCycleLedger(clock: { fc.t }, wallClock: { fc.wall })
+    DutyCycleLedger(clock: { fc.t }, wallClock: { fc.wall }, bootIdentity: { fc.boot })
 }
 
 check(SafetyLimits.maxRunSeconds == 300, "单次上限 300 秒")
@@ -157,18 +196,20 @@ if let d = data { restored.restore(from: d) }
 check(near(restored.cooldownRemaining(), 30), "重启后冷却继续计时")
 check(near(restored.remainingBudget(), 500), "重启后额度保留")
 
-// 上次进程留下的运行：按本次上限记账
+// F2：进程不在时不能执行软件截止停机，直到确认停止都记账，不限于 300s。
 let orphan = makeLedger()
 orphan.begin()
-fc.advance(1000)
 let orphanData = orphan.snapshotData()
+fc.advance(1000)
 let orphanRestored = makeLedger()
 if let d = orphanData { orphanRestored.restore(from: d) }
 check(orphanRestored.hasOpenRun && orphanRestored.openOrphaned, "未结束的运行跨进程保留")
+fc.advance(20)
 orphanRestored.end()
-check(near(orphanRestored.cooldownRemaining(), 150), "遗留运行最多按 300 秒记账")
+check(near(orphanRestored.cooldownRemaining(), 510), "遗留运行 1020 秒含确认前等待，冷却 510 秒")
+check(near(orphanRestored.remainingBudget(), 0), "遗留运行超过 600 秒耗尽额度，不按 300 秒封顶")
 
-// 墙钟被往回调：按刚刚发生处理（偏保守）
+// 同 boot 墙钟被往回调：仍按 uptime，冷却不缩短。
 let wallBack = makeLedger()
 wallBack.begin()
 fc.advance(100)
@@ -179,6 +220,97 @@ let wallRestored = makeLedger()
 if let d = wallData { wallRestored.restore(from: d) }
 check(near(wallRestored.cooldownRemaining(), 60), "墙钟回拨后冷却不缩短")
 fc.wall += 3600
+
+// F3：同 boot 跨 relaunch 只使用单调时间，前拨墙钟不能清掉预算或冷却。
+let wallForward = makeLedger()
+wallForward.begin()
+fc.advance(300)
+wallForward.end()
+let forwardData = wallForward.snapshotData()
+fc.advance(5)
+fc.wall += 3600
+let forwardRestored = makeLedger()
+if let d = forwardData { forwardRestored.restore(from: d) }
+check(near(forwardRestored.cooldownRemaining(), 145), "同 boot 前拨一小时后冷却只流逝 5 秒")
+check(near(forwardRestored.remainingBudget(), 300), "同 boot 前拨一小时不清掉记账")
+fc.wall -= 7200
+let backwardRestored = makeLedger()
+if let d = forwardData { backwardRestored.restore(from: d) }
+check(near(backwardRestored.cooldownRemaining(), 145), "同 boot 后拨墙钟也只用 uptime")
+fc.wall += 3600
+
+// 同 boot 的 future openStart 墙钟值不会变成零时长。
+let futureOpen = makeLedger()
+futureOpen.begin()
+let futureData = futureOpen.snapshotData()
+fc.advance(1000)
+fc.wall -= 3600
+let futureRestored = makeLedger()
+if let d = futureData { futureRestored.restore(from: d) }
+futureRestored.end()
+check(near(futureRestored.cooldownRemaining(), 500), "墙钟回拨的未结束运行仍按 uptime 计 1000 秒")
+fc.wall += 3600
+
+// 重启/uptime 倒退：不信任前拨墙钟，完整保留记账和冷却。
+fc.boot = "boot-b"
+fc.t = 10
+fc.wall += 86400
+let rebootRestored = makeLedger()
+if let d = forwardData { rebootRestored.restore(from: d) }
+check(near(rebootRestored.remainingBudget(), 300), "reboot 加前拨一天不剪掉记账")
+check(near(rebootRestored.cooldownRemaining(), 150), "reboot 加前拨一天不缩短冷却")
+// 保存保守恢复的新锚点后再次 relaunch，仍只流逝实际 uptime。
+let rebasedData = rebootRestored.snapshotData()
+fc.advance(5)
+fc.wall += 86400
+let rebasedRestored = makeLedger()
+if let d = rebasedData { rebasedRestored.restore(from: d) }
+check(near(rebasedRestored.cooldownRemaining(), 145), "保守恢复后再次 relaunch 不丢掉冷却")
+check(near(rebasedRestored.remainingBudget(), 300), "保守恢复后的记账继续保留")
+
+// 启动 UUID 即使相同，uptime 倒退也必须保守恢复。
+let rollbackData = rebasedRestored.snapshotData()
+fc.t = 1
+let rollbackRestored = makeLedger()
+if let d = rollbackData { rollbackRestored.restore(from: d) }
+check(near(rollbackRestored.cooldownRemaining(), 150), "uptime 倒退不缩短冷却")
+check(near(rollbackRestored.remainingBudget(), 300), "uptime 倒退不清掉记账")
+
+// 兼容旧墙钟账本；没有可验证的启动锚点时 future openStart 至少按上限记账。
+let legacyFuture = Data("""
+{"completed":[],"openStart":\(fc.wall + 3600),"openAllowed":300,
+ "lastEnd":null,"appliedCooldown":0}
+""".utf8)
+let legacyRestored = makeLedger()
+legacyRestored.restore(from: legacyFuture)
+legacyRestored.end()
+check(near(legacyRestored.cooldownRemaining(), 150), "旧账本 future openStart 不能按零秒结束")
+check(near(legacyRestored.remainingBudget(), 300), "旧账本 future openStart 至少记账 300 秒")
+let legacyCompleted = Data("""
+{"completed":[{"end":\(fc.wall - 86400),"charge":600}],"openStart":null,
+ "openAllowed":0,"lastEnd":\(fc.wall - 86400),"appliedCooldown":300}
+""".utf8)
+let legacyCompletedRestored = makeLedger()
+legacyCompletedRestored.restore(from: legacyCompleted)
+check(near(legacyCompletedRestored.remainingBudget(), 0), "旧墙钟账本的前拨不能抹掉 600 秒记账")
+check(near(legacyCompletedRestored.cooldownRemaining(), 300), "旧墙钟账本的前拨不能清掉冷却")
+
+// 重启且墙钟回拨：保留快照前已知 1000 秒，不能把 future openStart 改成现在。
+fc.boot = "boot-c"
+fc.t = 100
+let rebootOpen = makeLedger()
+rebootOpen.begin()
+fc.advance(1000)
+let rebootOpenData = rebootOpen.snapshotData()
+fc.boot = "boot-d"
+fc.t = 5
+fc.wall -= 3600
+let rebootOpenRestored = makeLedger()
+if let d = rebootOpenData { rebootOpenRestored.restore(from: d) }
+fc.advance(20)
+rebootOpenRestored.end()
+check(near(rebootOpenRestored.cooldownRemaining(), 512.5), "reboot 回拨计入已知时长、启动后 5 秒及确认等待")
+check(near(rebootOpenRestored.remainingBudget(), 0), "reboot 回拨的遗留运行不按软件上限封顶")
 
 if failures > 0 {
     print("\(failures) 项检查失败")
