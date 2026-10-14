@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 // CI 检查（修 L15）：swiftc 直接编译 Protocol.swift + Models.swift + SafetyLedger.swift + AIProgram.swift + 本文件后运行。
 // 钉住实抓帧字节、官方换算、legacy 安全上限、AI 指令解析/停止词/回复授权，任何一项不符就以非零退出码失败。
@@ -964,6 +965,153 @@ check(LLMResponse.errorSummary(longMessage, apiKey: "k").count <= 200, "错误�
 // Brain 审查 L5：请求总时长上限
 check(AIRequestPolicy.totalTimeoutSeconds == 45 && AIRequestPolicy.totalTimeoutSeconds < AISafety.holdIdleTimeout,
       "单次请求总时长 45 秒，短于在场时限")
+
+// MARK: - 第二轮审查 M2：出口按时间限升幅 + 绝对上限 70（OutputWriteCoalescer）
+
+check(OutputWriteCoalescer.limitedMaxLevel == AISafety.maxLevel
+      && OutputWriteCoalescer.riseInterval == AISafety.rampStepSeconds,
+      "出口兜底和 VM 同一套常数：AI 帧上限 70、两次升高至少隔 1 秒")
+check(OutputWriteCoalescer.allowedRise(maxRise: 20, sinceLastRise: nil) == 20, "没有上次升高：给满 20")
+check(OutputWriteCoalescer.allowedRise(maxRise: 20, sinceLastRise: 1.0) == 20, "隔 1 秒：给满 20")
+check(OutputWriteCoalescer.allowedRise(maxRise: 20, sinceLastRise: 0.97) == 20, "隔 0.97 秒（调度抖动）：仍给满 20")
+check(OutputWriteCoalescer.allowedRise(maxRise: 20, sinceLastRise: 0.5) == 10, "隔 0.5 秒：最多 +10")
+check(OutputWriteCoalescer.allowedRise(maxRise: 20, sinceLastRise: 0.04) == 0, "隔 40ms：不升")
+check(OutputWriteCoalescer.allowedRise(maxRise: 20, sinceLastRise: -1) == 0
+      && OutputWriteCoalescer.allowedRise(maxRise: 20, sinceLastRise: .nan) == 0, "时间倒退 / NaN：不升")
+
+let t20 = BCProtocol.manualFrame(channels: [20, 0, 0, 0])
+let t40 = BCProtocol.manualFrame(channels: [40, 0, 0, 0])
+let t60 = BCProtocol.manualFrame(channels: [60, 0, 0, 0])
+var slowAck = OutputWriteCoalescer()
+check(slowAck.submit(t20, maxRise: 20, now: 0) == .write(t20), "t=0 升到 20")
+check(slowAck.submit(t40, maxRise: 20, now: 1.0) == .coalesced, "t=1.0 的 40 赶上 20 还在途")
+check(slowAck.writeFinished(canSend: true, now: 1.5) == t40 && slowAck.lastRiseAt == 1.5,
+      "20 的回执拖到 t=1.5，40 这时才发出")
+check(slowAck.writeFinished(canSend: true, now: 1.6) == nil, "40 的回执及时回来")
+check(slowAck.submit(t60, maxRise: 20, now: 2.0) == .write(BCProtocol.manualFrame(channels: [50, 0, 0, 0])),
+      "审查重现：VM 准点 t=2.0 发 60，距设备上次升高只有 0.5 秒：出口只给 +10 到 50（之前直接 60）")
+check(slowAck.lastRiseAt == 2.0 && slowAck.baseline == [50, 0, 0, 0], "上次升高时间和基准跟着实际发出的帧走")
+_ = slowAck.writeFinished(canSend: true, now: 2.05)
+check(slowAck.submit(BCProtocol.manualFrame(channels: [10, 0, 0, 0]), maxRise: 20, now: 2.1)
+      == .write(BCProtocol.manualFrame(channels: [10, 0, 0, 0])), "降低不受时间限制、立即生效")
+check(slowAck.lastRiseAt == 2.0, "只降低不刷新上次升高时间")
+
+var capCo = OutputWriteCoalescer()
+_ = capCo.submit(BCProtocol.manualFrame(channels: [60, 60, 0, 0]))
+_ = capCo.writeFinished(canSend: true, now: 10)
+check(capCo.submit(BCProtocol.manualFrame(channels: [99, 65, 0, 0]), maxRise: 20, now: 20)
+      == .write(BCProtocol.manualFrame(channels: [70, 65, 0, 0])), "AI 帧出口兜底压到 70（VM 漏压也到不了设备）")
+_ = capCo.writeFinished(canSend: true, now: 20.1)
+check(capCo.submit(BCProtocol.manualFrame(channels: [99, 99, 99, 0]), maxRise: 20, now: 40)
+      == .write(BCProtocol.manualFrame(channels: [70, 70, 20, 0])), "已在 70：再要 99 也停在 70")
+_ = capCo.writeFinished(canSend: true, now: 40.1)
+check(capCo.submit(manual99) == .write(manual99), "手动帧（不带 maxRise）不受 70 限制")
+capCo.resetBaseline()
+check(capCo.lastRiseAt == 40, "停止确认只把基准归 0，上次升高时间保留")
+capCo.reset()
+check(capCo.lastRiseAt == nil && capCo.baseline == nil, "断链重置清掉上次升高时间")
+
+// 随机回执延迟下按设备实际收到的帧检查：任意两次升高之间的升幅不超过 20 × 间隔秒数（满间隔给满）、强度 ≤ 70
+let fullGap = OutputWriteCoalescer.riseInterval - OutputWriteCoalescer.riseJitterSlack
+var exitFuzzOK = true
+for _ in 0..<200 {
+    var co = OutputWriteCoalescer()
+    var now = 0.0
+    var device = [0, 0, 0, 0]
+    var lastRise: Double?
+    for _ in 0..<40 {
+        now += [0.01, 0.1, 0.3, 0.5, 1.0, 1.5][nextRand(6)]
+        let target = BCProtocol.manualFrame(channels: [nextRand(100), nextRand(100), nextRand(100), 0])
+        var written: [Data] = []
+        if nextRand(3) == 0, co.inFlight, let next = co.writeFinished(canSend: true, now: now) { written.append(next) }
+        if case .write(let f) = co.submit(target, maxRise: 20, now: now) { written.append(f) }
+        for f in written {
+            guard let lv = BCProtocol.manualLevels(f) else { exitFuzzOK = false; continue }
+            if (0..<4).contains(where: { lv[$0] > device[$0] }) {
+                let gap = lastRise.map { now - $0 } ?? .infinity
+                let allowed = gap >= fullGap ? 20 : Int((20 * gap / OutputWriteCoalescer.riseInterval).rounded(.down))
+                if (0..<4).contains(where: { lv[$0] - device[$0] > allowed }) { exitFuzzOK = false }
+                lastRise = now
+            }
+            if lv.contains(where: { $0 > 70 }) { exitFuzzOK = false }
+            device = lv
+        }
+    }
+}
+check(exitFuzzOK, "随机 200 段 AI 帧 + 随机回执：设备侧每次升高 ≤ 20 × 距上次升高秒数（满 1 秒给满）、强度 ≤ 70")
+
+// MARK: - 第二轮审查 L2：停止时限（StopTiming，BLEManager 直接引用）
+
+check(StopTiming.pairGap == 0.1, "停止帧对间隔 100ms（官方 setTimeout(…, 100)）")
+check(StopTiming.writeTimeout == 5 && StopTiming.deadline == 30, "单笔写超时 5 秒、停止 30 秒未确认拉锁存")
+var retryDelays: [TimeInterval] = []
+var retryStep = StopTiming.retryInitial
+for _ in 0..<7 {
+    retryDelays.append(retryStep)
+    retryStep = StopTiming.nextRetryDelay(after: retryStep)
+}
+check(retryDelays == [1, 2, 4, 8, 16, 30, 30], "停止重试退避 1→2→4→8→16→30→30 秒")
+check(StopTiming.nextRetryDelay(after: 0) == 2, "异常的 0 秒间隔也不会变成连发")
+check(StopTiming.deadline > StopTiming.writeTimeout * 2, "锁存截止晚于两轮写超时（能先完整重试一轮）")
+
+// MARK: - 第二轮审查 M4：回到前台时停止还在退避也立刻重发（BackgroundResume）
+
+check(BackgroundResume.shouldRequestStop(wasBackground: true, linkWritable: true, stopInProgress: true, stopNeeded: true),
+      "回到前台时停止还在退避：立刻整对重发（审查重现：之前要等退避最多 30 秒）")
+check(BackgroundResume.shouldRequestStop(wasBackground: true, linkWritable: true, stopInProgress: false, stopNeeded: true),
+      "回到前台时设备可能还在输出：补发停止")
+check(!BackgroundResume.shouldRequestStop(wasBackground: true, linkWritable: true, stopInProgress: false, stopNeeded: false),
+      "设备已确认停着：不发冗余停止")
+check(!BackgroundResume.shouldRequestStop(wasBackground: false, linkWritable: true, stopInProgress: true, stopNeeded: true),
+      "没进过后台（下拉控制中心）：不发")
+check(!BackgroundResume.shouldRequestStop(wasBackground: true, linkWritable: false, stopInProgress: true, stopNeeded: true),
+      "链路不可写：不发（重连时另发停止）")
+
+// MARK: - 第二轮审查 M3：安全计时用睡眠期间也走的时钟；换时钟的旧快照保守恢复
+
+let uptimeNow = ProcessInfo.processInfo.systemUptime
+let continuousNow = SafetyClock.continuousSeconds()
+check(continuousNow.isFinite && continuousNow + 0.5 >= uptimeNow, "连续时钟不慢于 systemUptime（睡眠时继续走）")
+check(SafetyClock.continuousSeconds() >= continuousNow, "连续时钟单调")
+fc.boot = "clock-a"
+fc.t = 500
+let clockRun = makeLedger()
+clockRun.begin()
+fc.advance(100)
+clockRun.end() // 冷却 60 秒、记账 100 秒
+let taggedData = clockRun.snapshotData()
+var untaggedData: Data?
+if let d0 = taggedData, var obj = (try? JSONSerialization.jsonObject(with: d0)) as? [String: Any] {
+    check(obj["clockKind"] as? String == SafetyClock.continuousClockKind, "快照记下时钟种类")
+    obj.removeValue(forKey: "clockKind")
+    untaggedData = try? JSONSerialization.data(withJSONObject: obj)
+} else {
+    check(false, "快照编码")
+}
+fc.advance(70)
+let taggedRestored = makeLedger()
+if let d0 = taggedData { taggedRestored.restore(from: d0) }
+check(near(taggedRestored.cooldownRemaining(), 0), "同一时钟的快照：照常对齐锚点，冷却已过")
+let untaggedRestored = makeLedger()
+if let d0 = untaggedData { untaggedRestored.restore(from: d0) }
+check(untaggedData != nil && near(untaggedRestored.cooldownRemaining(), 60)
+      && near(untaggedRestored.remainingBudget(), 1100),
+      "旧版（systemUptime 时间轴、没有时钟标记）的快照不按锚点对齐：冷却和记账保守保留")
+
+// MARK: - 第二轮审查 M1：被动停机通知必须在发送的同一个主线程 block 里生效
+// AIControlVM 依赖 UIKit，这里编不到；钉住修法依赖的 Combine 语义：直接订阅在 send 里同步执行，
+// receive(on: DispatchQueue.main) 会再排一次主队列（中间排着的回复能读到新代次、旧授权）
+do {
+    let subject = PassthroughSubject<String?, Never>()
+    var revokedDirect = false
+    var revokedHopped = false
+    var bag = Set<AnyCancellable>()
+    subject.sink { _ in revokedDirect = true }.store(in: &bag)
+    subject.receive(on: DispatchQueue.main).sink { _ in revokedHopped = true }.store(in: &bag)
+    subject.send("看门狗")
+    check(revokedDirect, "直接订阅：send 返回前授权就已作废（AIControlVM 现在的写法）")
+    check(!revokedHopped, "receive(on: main) 还没执行：这就是旧写法留下的窗口（审查重现）")
+}
 
 if failures > 0 {
     print("\(failures) 项检查失败")

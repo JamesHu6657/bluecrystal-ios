@@ -297,11 +297,22 @@ enum OutputAdmission {
 ///   每通道最多升 maxRise。在途合并把中间的爬升步覆盖掉时，设备也不会一步跳过上限；
 ///   夹掉的差距不自动补（偏低是安全方向），由下一步/下一条回复继续爬。降低不受限制。
 ///   基准在启动、reset、停止帧对确认（resetBaseline）后按全 0 算；上一笔是 0x06 帧时也按全 0 算（刻度不同，偏保守）。
+/// - 出口按时间限速 + 绝对上限（第二轮审查 M2）：只按帧限时，回执慢的在途合并会把两次升高压到不足 1 秒
+///   （20 在 t=0、40 因在途拖到 t=1.5 才发、60 准点 t=2.0 → 设备 0.5 秒内升了 20）。带 maxRise 的帧还要满足：
+///   距上次实际升高不到 riseInterval 时升幅按比例缩小（向下取整），每通道不超过 limitedMaxLevel（70）。
+///   时间由调用方传入（BLEManager 一律传单调时钟）；nil 表示不按时间限（纯按帧的检查）。
 struct OutputWriteCoalescer {
     enum Action: Equatable {
         case write(Data)
         case coalesced
     }
+
+    /// AI 帧在出口的绝对上限（VM 的 AISafety 已经压过一次，这里兜底）
+    static let limitedMaxLevel = AISafety.maxLevel
+    /// AI 帧两次升高的最短间隔（和 AISafety 的"每秒每通道最多 +maxStepIncrease"一致）
+    static let riseInterval: TimeInterval = AISafety.rampStepSeconds
+    /// 调度抖动余量：距上次升高 ≥ riseInterval - riseJitterSlack 就给满升幅，几毫秒的抖动不至于少升 1 档
+    static let riseJitterSlack: TimeInterval = 0.05
 
     private(set) var inFlight = false
     private(set) var pending: Data?
@@ -309,25 +320,27 @@ struct OutputWriteCoalescer {
     private var pendingMaxRise: Int?
     /// 最近一笔发出的 0x08 帧的四通道强度（限速基准）；nil 按全 0 算
     private(set) var baseline: [Int]?
+    /// 最近一次实际发出升高的时间（调用方的单调时钟）；nil = 还没升过 / 断链重置后
+    private(set) var lastRiseAt: TimeInterval?
 
-    mutating func submit(_ frame: Data, maxRise: Int? = nil) -> Action {
+    mutating func submit(_ frame: Data, maxRise: Int? = nil, now: TimeInterval? = nil) -> Action {
         if inFlight {
             pending = frame
             pendingMaxRise = maxRise
             return .coalesced
         }
-        return .write(markWritten(frame, maxRise: maxRise))
+        return .write(markWritten(frame, maxRise: maxRise, now: now))
     }
 
     /// 在途那笔有了结果。canSend 为 false 时丢掉待发帧；返回值是现在要写的下一帧（已标记在途、已限速）
-    mutating func writeFinished(canSend: Bool) -> Data? {
+    mutating func writeFinished(canSend: Bool, now: TimeInterval? = nil) -> Data? {
         inFlight = false
         guard let next = pending else { return nil }
         let rise = pendingMaxRise
         pending = nil
         pendingMaxRise = nil
         guard canSend else { return nil }
-        return markWritten(next, maxRise: rise)
+        return markWritten(next, maxRise: rise, now: now)
     }
 
     mutating func dropPending() {
@@ -335,30 +348,56 @@ struct OutputWriteCoalescer {
         pendingMaxRise = nil
     }
 
-    /// 停止帧对确认后设备在 0：之后的限速从 0 算
+    /// 停止帧对确认后设备在 0：之后的限速从 0 算（上次升高的时间保留：停了马上再升也要隔够）
     mutating func resetBaseline() { baseline = nil }
 
     mutating func reset() {
         inFlight = false
         dropPending()
         baseline = nil
+        lastRiseAt = nil
     }
 
-    private mutating func markWritten(_ frame: Data, maxRise: Int?) -> Data {
+    private mutating func markWritten(_ frame: Data, maxRise: Int?, now: TimeInterval?) -> Data {
+        let base = baseline ?? [0, 0, 0, 0]
         var out = frame
         if let rise = maxRise {
-            out = Self.limitRise(frame, from: baseline ?? [0, 0, 0, 0], maxRise: rise)
+            var since: TimeInterval?
+            if let n = now, let last = lastRiseAt { since = n - last }
+            out = Self.limitRise(frame, from: base,
+                                 maxRise: Self.allowedRise(maxRise: rise, sinceLastRise: since),
+                                 maxLevel: Self.limitedMaxLevel)
         }
         inFlight = true
-        baseline = BCProtocol.manualLevels(out)
+        let levels = BCProtocol.manualLevels(out)
+        if let n = now, let lv = levels, (0..<4).contains(where: { lv[$0] > base[$0] }) {
+            lastRiseAt = n
+        }
+        baseline = levels
         return out
     }
 
-    /// 0x08 帧每通道最多比 base 高 maxRise（降低不受限）；不是 0x08 帧原样返回（AI 只发 0x08）
-    static func limitRise(_ frame: Data, from base: [Int], maxRise: Int) -> Data {
+    /// 距上次实际升高 elapsed 秒时每通道最多还能升多少（第二轮审查 M2）：
+    /// 满 riseInterval（扣抖动余量）给满 maxRise，不到就按比例向下取整，
+    /// 所以任意一段时间里的总升幅不超过 maxRise × 秒数（加抖动余量）。
+    /// elapsed 为 nil（没有时间信息，或还没升过）时不按时间限；倒退/NaN 按 0
+    static func allowedRise(maxRise: Int, sinceLastRise elapsed: TimeInterval?) -> Int {
+        let step = max(0, maxRise)
+        guard let e = elapsed else { return step }
+        if e >= riseInterval - riseJitterSlack { return step }
+        guard e > 0 else { return 0 }
+        return min(step, Int((Double(step) * e / riseInterval).rounded(.down)))
+    }
+
+    /// 0x08 帧每通道最多比 base 高 maxRise、且不超过 maxLevel（降低不受限）；不是 0x08 帧原样返回（AI 只发 0x08）
+    static func limitRise(_ frame: Data, from base: [Int], maxRise: Int, maxLevel: Int? = nil) -> Data {
         guard let target = BCProtocol.manualLevels(frame) else { return frame }
         let step = max(0, maxRise)
-        let limited = (0..<4).map { i in min(target[i], (i < base.count ? base[i] : 0) + step) }
+        let cap = max(0, maxLevel ?? BCProtocol.maxManualLevel)
+        let limited = (0..<4).map { (i: Int) -> Int in
+            let from = i < base.count ? base[i] : 0
+            return min(target[i], from + step, cap)
+        }
         guard limited != target else { return frame }
         let b = [UInt8](frame)
         let tail = UInt16(b[7]) << 8 | UInt16(b[8])
@@ -384,5 +423,35 @@ enum ManualIdle {
 
     static func expired(now: TimeInterval, lastInteraction: TimeInterval, outputSinceStop: Bool) -> Bool {
         outputSinceStop && now - lastInteraction >= timeoutSeconds
+    }
+}
+
+/// 停止相关的时限（第二轮审查 L2：原来散在 BLEManager 里，CI 编不到、没有检查钉住）。
+/// BLEManager 直接引用这里的值；ProtocolChecks 钉住数值和退避序列
+enum StopTiming {
+    /// 停止帧对两帧之间的间隔（官方 handleSlide：onWriteOrder(0) 后 setTimeout(Tt([0,0,0,0]), 100)）
+    static let pairGap: TimeInterval = 0.1
+    /// 单笔写入超时（legacy device.py write_timeout_seconds）
+    static let writeTimeout: TimeInterval = 5.0
+    /// 停止重试退避（legacy watchdog.py retry_initial_seconds / retry_max_seconds）
+    static let retryInitial: TimeInterval = 1.0
+    static let retryMax: TimeInterval = 30.0
+    /// 停止持续这么久仍未确认就拉起操作员锁存（legacy retry_deadline_seconds）
+    static let deadline: TimeInterval = 30.0
+
+    /// 退避：1 → 2 → 4 → 8 → 16 → 30 → 30…
+    static func nextRetryDelay(after delay: TimeInterval) -> TimeInterval {
+        min(max(delay, retryInitial) * 2, retryMax)
+    }
+}
+
+/// 回到前台时要不要（再）发停止（第二轮审查 M4）。
+/// 退避定时器和 30 秒截止在 App 挂起 / 手机睡眠时不走：停止正在退避时回到前台，下一次重发可能还要等最多 30 秒。
+/// 所以只要停止还在进行（含退避中、含断开流程的停止），或设备可能仍在输出，就立刻整对重发。
+/// 下拉控制中心等 inactive→active（没进过后台）不发（修 CC r2 L1）
+enum BackgroundResume {
+    static func shouldRequestStop(wasBackground: Bool, linkWritable: Bool,
+                                  stopInProgress: Bool, stopNeeded: Bool) -> Bool {
+        wasBackground && linkWritable && (stopInProgress || stopNeeded)
     }
 }
