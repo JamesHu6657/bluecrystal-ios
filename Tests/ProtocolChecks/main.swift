@@ -1113,6 +1113,61 @@ do {
     check(!revokedHopped, "receive(on: main) 还没执行：这就是旧写法留下的窗口（审查重现）")
 }
 
+// MARK: - 第三轮审查
+
+// M3：本地停止词补上常见的拒绝 / 求救说法和繁体写法（宁可误停）
+for s in ["不要", "不要！", "不行了", "好难受", "救命", "关掉", "结束吧", "要不要再快点",
+          "夠了", "別動了", "難受", "關掉", "no", "No!", "oh no", "ouch", "it hurts", "pain"] {
+    check(AIStopWords.matches(s), "第三轮停止词：\(s)")
+}
+for s in ["know", "nothing", "nobody", "painful", "hurting", "再来", "好舒服"] {
+    check(!AIStopWords.matches(s), "第三轮不是停止词：\(s)")
+}
+
+// L1：运行到点后不再写任何帧，直接按上限停机。到点定时器 / 看门狗在停止进行中会跳过检查，
+// 之前全零停止帧对确认后重放挂起的非零帧会让设备越过上限一直输出到下一次 tick
+check(OutputAdmission.decide(.init(isActive: true, runExpired: true)) == .stopForLimit,
+      "运行到点：非零帧不写，按上限停机")
+check(OutputAdmission.decide(.init(allZero: true, isActive: true, runExpired: true)) == .stopForLimit,
+      "运行到点：全零帧也直接结束运行，不再走保持运行的停止帧对")
+check(OutputAdmission.decide(.init(allZero: true, isActive: true, zeroHeld: true, runExpired: true)) == .stopForLimit,
+      "运行到点：保持在 0 的运行同样结束")
+check(OutputAdmission.decide(.init(runExpired: true)) == .write(startsRun: true), "没在运行时到点标记不起作用")
+check(OutputAdmission.decide(.init(stopInProgress: true, isActive: true, runExpired: true)) == .deferUntilStopped,
+      "停止帧对在路上：照旧挂起，确认后重放时再按到点处理")
+check(OutputAdmission.decide(.init(gateOpen: false, isActive: true, runExpired: true)) == .drop,
+      "闸门关着：照旧丢掉")
+check(OutputAdmission.decide(.init(mayStillBeOutputting: true, isActive: true, runExpired: true)) == .rejectMayBeActive,
+      "锁存优先于到点")
+
+// L2：开闸前提和 submitOutput 一致，链路不可写时开闸请求也不开
+check(!OutputGate.mayResume(linkWritable: false, requestEpoch: nil, currentEpoch: 3),
+      "链路不可写（断链 / 断开中 / 后台）：用户的开闸请求不开，闸门不会一直开到重连 / 回前台")
+check(!OutputGate.mayResume(linkWritable: false, requestEpoch: 3, currentEpoch: 3), "代次对得上也不行")
+check(OutputGate.mayResume(linkWritable: true, requestEpoch: nil, currentEpoch: 3), "链路可写的用户操作：开闸")
+check(OutputGate.mayResume(linkWritable: true, requestEpoch: 3, currentEpoch: 3)
+      && !OutputGate.mayResume(linkWritable: true, requestEpoch: 2, currentEpoch: 3), "代次核对照旧（M5）")
+
+// M1：意外断链 / 蓝牙重新打开 / 重启后设备可能仍在输出：自动重连已绑定设备去发停止
+func reconnect(mayBeActive: Bool = true, poweredOn: Bool = true, linkIdle: Bool = true,
+               hasPeripheral: Bool = false, disconnecting: Bool = false, hasBondedDevice: Bool = true) -> Bool {
+    AutoReconnect.shouldReconnect(mayBeActive: mayBeActive, poweredOn: poweredOn, linkIdle: linkIdle,
+                                  hasPeripheral: hasPeripheral, disconnecting: disconnecting,
+                                  hasBondedDevice: hasBondedDevice)
+}
+check(reconnect(), "设备可能仍在输出、链路空闲、有绑定设备：自动重连去发停止（之前只提示关电源、等用户点连接）")
+check(!reconnect(mayBeActive: false), "设备已确认停着：不自动重连")
+check(!reconnect(hasBondedDevice: false), "没有绑定过的设备：不自动连（陌生设备必须弹框确认）")
+check(!reconnect(linkIdle: false, hasPeripheral: true), "已经在连 / 已连接：不打断")
+check(!reconnect(hasPeripheral: true), "有待确认的外设：不抢")
+check(!reconnect(poweredOn: false), "蓝牙没开：不连")
+check(!reconnect(disconnecting: true), "断开流程中：不连")
+
+// L3：解除锁定放弃了进行中的停止帧对（可能停在两帧之间）：链路还在就补一对冗余停止
+check(PhysicalAck.shouldResendStop(abandonedStop: true, linkWritable: true), "放弃了进行中的停止、链路还在：补一对")
+check(!PhysicalAck.shouldResendStop(abandonedStop: false, linkWritable: true), "没有进行中的停止：不补")
+check(!PhysicalAck.shouldResendStop(abandonedStop: true, linkWritable: false), "链路没了（断开流程已收尾）：不补")
+
 if failures > 0 {
     print("\(failures) 项检查失败")
     exit(1)
