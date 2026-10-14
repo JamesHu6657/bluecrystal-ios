@@ -109,7 +109,12 @@ enum AIConfig {
     - 指令格式严格遵守，方括号、空格、数字缺一不可。
     """
 
-    static func apiKey(for p: AIProvider) -> String { Keychain.read(account: p.keychainAccount) ?? "" }
+    /// 读不出来（不论原因）都当空 Key 用于请求；设置页的回滚要区分时用 storedAPIKey
+    static func apiKey(for p: AIProvider) -> String { (try? storedAPIKey(for: p)) ?? "" }
+    /// nil = 钥匙串里没有；读取失败时抛错
+    static func storedAPIKey(for p: AIProvider) throws -> String? {
+        try Keychain.read(account: p.keychainAccount)
+    }
     static func setAPIKey(_ key: String, for p: AIProvider) throws {
         try Keychain.write(account: p.keychainAccount, value: key)
     }
@@ -137,14 +142,19 @@ enum Keychain {
         ]
     }
 
-    static func read(account: String) -> String? {
+    /// nil 只表示条目不存在；其他失败（含读到的数据解不出来）都抛错，调用方不能把它当成"没有 Key"
+    static func read(account: String) throws -> String? {
         var q = base(account)
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
-              let d = out as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
+        let s = SecItemCopyMatching(q as CFDictionary, &out)
+        if s == errSecItemNotFound { return nil }
+        guard s == errSecSuccess else { throw KeychainError.status("读取", s) }
+        guard let d = out as? Data, let v = String(data: d, encoding: .utf8) else {
+            throw KeychainError.status("读取", errSecDecode)
+        }
+        return v
     }
 
     /// 已有条目用 SecItemUpdate 原地替换，没有才 SecItemAdd；失败时原条目保持不变。空值表示删除
@@ -276,10 +286,8 @@ final class AIControlVM: ObservableObject {
     private var heartbeatTimer: Timer?
     private var stepWork: DispatchWorkItem?
     private var endWithStop = false
-    /// 授权代次（只在主线程读写）：用户停止、本地停止词、被动停机（看门狗/上限/冷却/输出被拒/退后台）、
-    /// 连接离开 ready（不论是否在运行）、离开 AI 页面都会 +1。发消息时记下，执行前在主线程再比一次，
-    /// 不一致的回复只显示文字，绝不启动设备
-    private var authGen = 0
+    /// 回复授权（只在主线程读写，规则见 ReplyAuthorization）：所有停止都经 terminalStop 作废
+    private var auth = ReplyAuthorization()
     /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断）结果直接丢弃
     private var requestID = 0
     private var requestTask: Task<Void, Never>?
@@ -341,20 +349,16 @@ final class AIControlVM: ObservableObject {
     /// 所有真正的停止都走这里：先作废停止前发出的请求，再停程序。
     /// sendStop 为 false 表示 BLEManager 已经发过停止帧对（被动停机/断开/退后台）
     private func terminalStop(reason: String, sendStop: Bool) {
-        revokeAuthorization()
+        auth.revoke()
         haltProgram(reason: reason, sendStop: sendStop)
-    }
-
-    private func revokeAuthorization() {
-        authGen &+= 1
     }
 
     func send() {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let isStop = AIStopWords.matches(text)
-        // 在本地停止之前取代次：说了停止词，模型这次回什么强度都不执行，只显示文字
-        let authAtSend = authGen
+        // 在本地停止之前领授权票：说了停止词，模型这次回什么强度都不执行，只显示文字
+        let ticket = auth.issue()
         // 停止词先于"等待回复"检查：请求进行中也必须立刻本地停
         if isStop {
             stopAll(reason: "已停止（本地停止词）")
@@ -379,7 +383,7 @@ final class AIControlVM: ObservableObject {
         requestTask = Task { [weak self] in
             do {
                 let result = try await client.chat(payload)
-                await MainActor.run { self?.handle(result, requestID: id, authAtSend: authAtSend) }
+                await MainActor.run { self?.handle(result, requestID: id, ticket: ticket) }
             } catch {
                 await MainActor.run { self?.handleError(error, requestID: id) }
             }
@@ -397,8 +401,8 @@ final class AIControlVM: ObservableObject {
     }
 
     /// 执行前的最后检查（主线程，紧挨着 start）：返回不能执行的原因
-    private func executionBlock(authAtSend: Int) -> String? {
-        if authGen != authAtSend { return "发送后已停止或连接/页面状态变化" }
+    private func executionBlock(ticket: ReplyAuthorization.Ticket) -> String? {
+        if let reason = auth.block(ticket) { return reason }
         if !tabActive { return "已离开 AI 页面" }
         if !sceneActive || UIApplication.shared.applicationState != .active { return "App 不在前台" }
         guard let ble = ble, ble.state == .ready else { return "设备未连接" }
@@ -411,7 +415,7 @@ final class AIControlVM: ObservableObject {
         if running { stopAll(reason: reason) }
     }
 
-    private func handle(_ result: LLMResult, requestID id: Int, authAtSend: Int) {
+    private func handle(_ result: LLMResult, requestID id: Int, ticket: ReplyAuthorization.Ticket) {
         guard id == requestID else { return }
         isThinking = false
         requestTask = nil
@@ -425,7 +429,7 @@ final class AIControlVM: ObservableObject {
             programText = "未执行：\(why)"
             rejectProgram("回复指令无效，已停止")
         } else if !reply.steps.isEmpty {
-            if let block = executionBlock(authAtSend: authAtSend) {
+            if let block = executionBlock(ticket: ticket) {
                 programText = "未执行（\(block)）"
                 rejectProgram("已停止")
             } else {
@@ -461,7 +465,7 @@ final class AIControlVM: ObservableObject {
         guard i < steps.count else {
             // 序列走完：带 [STOP] 或最后是全零 → 真正停止（和用户停止一样作废期间发出的请求）；
             // 否则保持最后的强度，等下一条回复
-            if endWithStop || steps.last(where: { $0.levels != nil })?.isZero == true {
+            if ReplyAuthorization.programEndIsTerminal(steps: steps, endWithStop: endWithStop) {
                 terminalStop(reason: "已停止", sendStop: true)
             }
             return
@@ -589,12 +593,20 @@ struct AISettingsView: View {
     @State private var modelID = AIConfig.model.id
     @State private var prompt = AIConfig.systemPrompt
     @State private var keys: [AIProvider: String] = AISettingsView.loadKeys()
-    /// 钥匙串里当前的值：只写改过的 Key
-    @State private var savedKeys: [AIProvider: String] = AISettingsView.loadKeys()
+    /// 钥匙串里当前的值：只写改过的 Key。读取失败的服务商不在表里（原值未知），回滚时跳过，绝不删除
+    @State private var savedKeys: [AIProvider: String] = AISettingsView.loadSavedKeys()
     @State private var saveError: String?
 
     private static func loadKeys() -> [AIProvider: String] {
         Dictionary(uniqueKeysWithValues: AIProvider.allCases.map { ($0, AIConfig.apiKey(for: $0)) })
+    }
+
+    private static func loadSavedKeys() -> [AIProvider: String] {
+        var out: [AIProvider: String] = [:]
+        for p in AIProvider.allCases {
+            do { out[p] = try AIConfig.storedAPIKey(for: p) ?? "" } catch { continue }
+        }
+        return out
     }
 
     var body: some View {
@@ -647,7 +659,8 @@ struct AISettingsView: View {
         }
     }
 
-    /// 先写钥匙串；任何一个 Key 写失败就把这次已写入的 Key 改回原值，服务商/模型/提示词也不保存
+    /// 先写钥匙串；任何一个 Key 写失败就把这次已写入的 Key 改回原值，服务商/模型/提示词也不保存。
+    /// 原值读取失败（未知）的 Key 不回滚：写回空值会删掉原条目
     private func save() {
         var written: [AIProvider] = []
         for p in AIProvider.allCases {
@@ -657,18 +670,24 @@ struct AISettingsView: View {
                 try AIConfig.setAPIKey(key, for: p)
                 written.append(p)
             } catch {
-                var rollbackFailures: [String] = []
+                var notRestored: [String] = []
                 for w in written {
+                    let newKey = (keys[w] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard let old = savedKeys[w] else {
+                        notRestored.append(w.title)
+                        savedKeys[w] = newKey
+                        continue
+                    }
                     do {
-                        try AIConfig.setAPIKey(savedKeys[w] ?? "", for: w)
+                        try AIConfig.setAPIKey(old, for: w)
                     } catch {
-                        rollbackFailures.append(w.title)
-                        savedKeys[w] = (keys[w] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        notRestored.append(w.title)
+                        savedKeys[w] = newKey
                     }
                 }
                 var msg = "\(p.title) 的 API Key 保存失败：\(error.localizedDescription)\n设置都没有保存。"
-                if !rollbackFailures.isEmpty {
-                    msg += "\n注意：\(rollbackFailures.joined(separator: "、")) 的新 Key 已写入且无法改回。"
+                if !notRestored.isEmpty {
+                    msg += "\n注意：\(notRestored.joined(separator: "、")) 的新 Key 已写入且无法改回（原 Key 读取失败或改回失败）。"
                 }
                 saveError = msg
                 return

@@ -514,6 +514,36 @@ check(tildeFence.rejection == nil && tildeFence.steps == [AIStep(levels: [15, 0,
       "波浪线块只被更长或等长的波浪线闭合")
 check(AIReply.parse("用 ``` 包代码就行").rejection == nil, "没有指令时含糊围栏不影响")
 
+// 代码块外的指令行：制表符或 4 格以上缩进可能是缩进代码块，整条作废；0~3 个空格照常
+// 渲染时可能藏住指令的 HTML、围栏字符后的组合符号：有指令就整条作废
+for (raw, name) in [
+    ("x\n\n    [CH 99 0 0 0]", "空行后缩进 4 格的指令（缩进代码块）"),
+    ("\t[CH 99 0 0 0]", "制表符缩进的指令"),
+    ("宝宝\n     [STOP]", "缩进 5 格的 STOP"),
+    ("<pre>\n[CH 99 0 0 0]\n</pre>", "<pre> 里的指令"),
+    ("<PRE class=\"x\">\n[CH 99 0 0 0]\n</PRE>", "大写 <PRE>"),
+    ("<Code>\n[CH 99 0 0 0]\n</Code>", "<code> 里的指令"),
+    ("<!--\n[CH 99 0 0 0]\n-->", "HTML 注释里的指令"),
+    ("[CH 30 0 0 0]\n<!-- 注释 -->", "合法指令 + HTML 注释"),
+    ("```\u{301}\n[CH 99 0 0 0]", "反引号后紧跟组合符号的围栏"),
+    ("~~~\u{300}\n[CH 99 0 0 0]\n~~~", "波浪线后紧跟组合符号的围栏"),
+    ("说明 ``\u{301}` 示例\n[CH 99 0 0 0]", "行内反引号中间夹组合符号"),
+    ("```\n```\u{301}\n[CH 99 0 0 0]", "带组合符号的行不能闭合围栏"),
+] {
+    let r = AIReply.parse(raw)
+    check(r.rejection != nil && !executable(r), "\(name)：整条不执行")
+}
+for (raw, name) in [
+    (" [CH 20 0 0 0]", "缩进 1 格"),
+    ("  [CH 20 0 0 0]", "缩进 2 格"),
+    ("宝宝\n\n   [CH 20 0 0 0]", "空行后缩进 3 格"),
+] {
+    let r = AIReply.parse(raw)
+    check(r.rejection == nil && r.steps == [AIStep(levels: [20, 0, 0, 0], duration: 0)], "\(name)的指令照常执行")
+}
+check(AIReply.parse("宝宝\n    继续缩进的文字").rejection == nil, "没有指令时缩进文字不影响")
+check(AIReply.parse("<pre>乖</pre>\n<!-- 嘘 -->").rejection == nil, "没有指令时 HTML 不影响")
+
 // 参数必须精确
 for (raw, name) in [
     ("[CH bad 99 0 0]", "坏参数不挪通道"),
@@ -546,6 +576,44 @@ let oversized = AIReply.parse(fortyCH + "\n[CH 0 0 0 0]\n[STOP]")
 check(oversized.rejection != nil && oversized.steps.isEmpty && !oversized.stop, "41 步：整条作废，不执行前缀")
 check(AIReply.parse("[STOP]").stop && AIReply.parse("[STOP]").steps.isEmpty, "单独 STOP")
 check(AIReply.parse("[笑] 宝宝乖").rejection == nil, "非指令的方括号文字不受影响")
+
+// MARK: - 回复授权（AIControlVM 的 send → 停止 → 执行前验票）
+
+// 发送后程序以 [STOP] / 全零自动结束（AIControlVM.runStep 走 terminalStop）：之后到的回复不执行
+for (raw, name) in [("[CH 30 0 0 0]\n[HOLD 2000]\n[STOP]", "[STOP] 结尾"), ("[CH 30 0 0 0]\n[CH 0 0 0 0]", "全零结尾")] {
+    var auth = ReplyAuthorization()
+    let running = AIReply.parse(raw)
+    let pending = auth.issue()
+    let terminal = ReplyAuthorization.programEndIsTerminal(steps: running.steps, endWithStop: running.stop)
+    check(terminal, "\(name)的程序走完算真正停止")
+    if terminal { auth.revoke() }
+    check(auth.block(pending) != nil, "\(name)自动停止后，停止前发出的请求的回复不执行")
+    check(auth.block(auth.issue()) == nil, "\(name)自动停止后再发的新消息可以执行")
+}
+// 用户点停止 / 本地停止词（票在本地停止之前领）：之后到的回复不执行
+var userStopAuth = ReplyAuthorization()
+let beforeUserStop = userStopAuth.issue()
+userStopAuth.revoke()
+check(userStopAuth.block(beforeUserStop) != nil, "用户停止后，停止前发出的请求的回复不执行")
+var stopWordAuth = ReplyAuthorization()
+let stopWordTicket = stopWordAuth.issue()
+stopWordAuth.revoke()
+check(stopWordAuth.block(stopWordTicket) != nil, "停止词那句的回复也不执行")
+// 发送后没有任何停止：回复可以执行；保持最后强度的程序走完不算停止，不作废授权
+let openAuth = ReplyAuthorization()
+let openTicket = openAuth.issue()
+check(openAuth.block(openTicket) == nil, "发送后没有停止：回复可以执行")
+let holding = AIReply.parse("[CH 30 0 0 0]\n[HOLD 2000]\n[CH 40 0 0 0]")
+check(!ReplyAuthorization.programEndIsTerminal(steps: holding.steps, endWithStop: holding.stop),
+      "保持最后强度的程序走完不算停止")
+check(openAuth.block(openTicket) == nil, "保持中的程序不作废待执行的回复")
+// 多次停止后，任何旧票都不会重新生效
+var multiAuth = ReplyAuthorization()
+let oldTicket = multiAuth.issue()
+multiAuth.revoke()
+let midTicket = multiAuth.issue()
+multiAuth.revoke()
+check(multiAuth.block(oldTicket) != nil && multiAuth.block(midTicket) != nil, "连续停止后旧票都失效")
 
 // MARK: - 本地停止词
 

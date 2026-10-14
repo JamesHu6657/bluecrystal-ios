@@ -1,6 +1,6 @@
 import Foundation
 
-// 纯逻辑（只依赖 Foundation + BCProtocol）：指令解析、本地停止词、接口完整性检查。
+// 纯逻辑（只依赖 Foundation + BCProtocol）：指令解析、回复授权、本地停止词、接口完整性检查。
 // CI 的 ProtocolChecks 直接编译本文件做单元检查。
 
 enum WireProtocol {
@@ -33,8 +33,10 @@ struct AIStep: Equatable {
 /// 解析规则（宁可不执行，也不猜）：
 /// - 指令必须单独占一行（前后只允许空白），且不在 ``` / ~~~ 代码块里。
 ///   代码块按 CommonMark 围栏判断：记住开头的字符和长度，只有同一种字符、长度不短于开头、
-///   后面只剩空白的行才闭合；没闭合就算到回复结尾。围栏样式含糊（缩进 4 格以上/制表符、
-///   引用或列表里的围栏、行内 ```）时，只要有指令就整条作废。
+///   后面只剩空白的行才闭合；没闭合就算到回复结尾。围栏长度按 Unicode 标量数（和 CommonMark 一致）。
+///   围栏样式含糊（缩进 4 格以上/制表符、引用或列表里的围栏、行内 ```、` / ~ 后紧跟组合符号）
+///   或出现 <pre / <code / <!--（HTML 可能把指令藏起来）时，只要有指令就整条作废。
+/// - 代码块外的指令行只允许 0~3 个空格缩进；制表符或 4 格以上可能是缩进代码块，整条作废。
 /// - 参数个数精确：CH 恰好 4 个非负十进制整数，HOLD 恰好 1 个正十进制整数，STOP 没有参数。
 ///   不接受小数、负号、科学计数法、逗号分隔，不补齐、不跳过坏参数、不挪通道。
 /// - 只要出现任何不算数的指令样式文字（行内、引用、代码块里、格式错、STOP 之后还有指令），
@@ -106,16 +108,43 @@ struct AIReply {
     }
 
     private struct Fence {
-        var char: Character
+        var char: Unicode.Scalar
         var count: Int
     }
 
-    /// 去掉行首空白后以 3 个以上 ` 或 ~ 开头：返回围栏字符、长度和后面剩下的部分
+    /// 去掉行首空白后以 3 个以上 ` 或 ~ 开头：返回围栏字符、长度和后面剩下的部分。
+    /// 按标量数：Character 会把紧跟的组合符号并进最后一个 `，少数一个
     private static func fenceRun(_ body: Substring) -> (fence: Fence, rest: Substring)? {
-        guard let c = body.first, c == "`" || c == "~" else { return nil }
-        let n = body.prefix(while: { $0 == c }).count
+        let scalars = body.unicodeScalars
+        guard let c = scalars.first, c == "`" || c == "~" else { return nil }
+        let n = scalars.prefix(while: { $0 == c }).count
         guard n >= 3 else { return nil }
-        return (Fence(char: c, count: n), body.dropFirst(n))
+        return (Fence(char: c, count: n), Substring(scalars.dropFirst(n)))
+    }
+
+    /// 渲染时可能藏住指令、但这里不解析的写法：<pre、<code、<!--（不分大小写），
+    /// 或 ` / ~ 后紧跟组合符号（U+0300~U+036F，各家渲染器对围栏的判断可能不同）
+    private static func hasHidingMarkup(_ line: Substring) -> Bool {
+        let lower = line.lowercased()
+        if lower.contains("<pre") || lower.contains("<code") || lower.contains("<!--") { return true }
+        var prev: Unicode.Scalar?
+        for u in line.unicodeScalars {
+            if let p = prev, p == "`" || p == "~", (0x300...0x36F).contains(u.value) { return true }
+            prev = u
+        }
+        return false
+    }
+
+    /// 行内任何位置有连续 3 个以上 ` 或 ~（按标量数）
+    private static func hasFenceLikeRun(_ line: Substring) -> Bool {
+        var prev: Unicode.Scalar?
+        var run = 0
+        for u in line.unicodeScalars {
+            run = (u == "`" || u == "~") ? (u == prev ? run + 1 : 1) : 0
+            if run >= 3 { return true }
+            prev = u
+        }
+        return false
     }
 
     static func parse(_ raw: String) -> AIReply {
@@ -124,8 +153,9 @@ struct AIReply {
         var rejection: String?
         // 当前所在代码块的开头围栏；没闭合就一直算在代码块里，直到回复结束
         var fence: Fence?
-        // 出现了无法和 Markdown 渲染结果对齐的围栏样式（缩进 4 格/制表符、引用或列表里的围栏、行内 ```）
-        var fenceAmbiguous = false
+        // 出现了无法和 Markdown 渲染结果对齐的写法（缩进 4 格/制表符、引用或列表里的围栏、行内 ```、
+        // HTML 的 <pre / <code / <!--、围栏字符后的组合符号）
+        var markupAmbiguous = false
 
         let lines = raw.replacingOccurrences(of: "\r\n", with: "\n")
             .split(separator: "\n", omittingEmptySubsequences: false)
@@ -135,12 +165,13 @@ struct AIReply {
             let indent = rawLine.prefix(while: { $0.isWhitespace })
             let plainIndent = indent.count <= 3 && indent.allSatisfy { $0 == " " }
             let run = fenceRun(rawLine.dropFirst(indent.count))
+            if hasHidingMarkup(rawLine) { markupAmbiguous = true }
 
             if let open = fence {
                 // CommonMark 闭合围栏：同一种字符、长度不短于开头、后面只有空格/制表符
                 if let r = run, r.fence.char == open.char, r.fence.count >= open.count,
                    r.rest.allSatisfy({ $0 == " " || $0 == "\t" }) {
-                    if plainIndent { fence = nil } else { fenceAmbiguous = true }
+                    if plainIndent { fence = nil } else { markupAmbiguous = true }
                     textLines.append(line)
                     continue
                 }
@@ -149,14 +180,18 @@ struct AIReply {
                 continue
             }
             // 反引号围栏的信息串里不能再有反引号（否则是行内代码，不是代码块）
-            if let r = run, r.fence.char == "~" || !r.rest.contains("`") {
-                if !plainIndent { fenceAmbiguous = true }
+            if let r = run, r.fence.char == "~" || !r.rest.unicodeScalars.contains("`") {
+                if !plainIndent { markupAmbiguous = true }
                 fence = r.fence
                 if hasToken, rejection == nil { rejection = "代码块里出现了指令" }
                 textLines.append(line)
                 continue
             }
-            if line.contains("```") || line.contains("~~~") { fenceAmbiguous = true }
+            if hasFenceLikeRun(rawLine) { markupAmbiguous = true }
+            // 制表符或 4 格以上缩进的行可能在缩进代码块里（渲染成代码，不是指令）
+            if hasToken, !plainIndent, rejection == nil {
+                rejection = "指令有缩进（制表符或 4 格以上），可能在代码块里：\(line)"
+            }
             if hasToken, line.hasPrefix("[") {
                 if let c = parseCommandLine(line) {
                     if commands.last == .stop, rejection == nil {
@@ -171,9 +206,9 @@ struct AIReply {
             }
             if !line.isEmpty { textLines.append(line) }
         }
-        // 围栏样式含糊时无法确定指令在不在代码块里：只要有指令就整条作废
-        if rejection == nil, fenceAmbiguous, !commands.isEmpty {
-            rejection = "代码块格式不明确，无法确认指令是否在代码块里"
+        // 写法含糊时无法确定指令在渲染后是不是代码/被隐藏：只要有指令就整条作废
+        if rejection == nil, markupAmbiguous, !commands.isEmpty {
+            rejection = "代码块或 HTML 格式不明确，无法确认指令是否在代码块里或被隐藏"
         }
         let text = textLines.joined(separator: "\n")
 
@@ -207,6 +242,36 @@ struct AIReply {
         // 最后一步保持到下一条回复：持续时间置 0，表示"不再推进"
         if !stop, let i = steps.indices.last, !lastHeld { steps[i].duration = 0 }
         return AIReply(text: text, steps: steps, stop: stop, rejection: nil)
+    }
+}
+
+// MARK: - 回复授权
+
+/// 回复授权的生命周期（纯状态，只在主线程用）：
+/// - 发消息时 issue() 领一张票（停止词那句在本地停止之前领，所以它的回复也会被作废）；
+/// - 任何真正的停止都 revoke()：用户停止、本地停止词、程序以 [STOP] / 全零自动结束、被动停机
+///   （看门狗/上限/冷却/输出被拒）、退后台、连接离开 ready、离开 AI 页面。之前领的票全部失效；
+/// - 执行前在主线程用 block(_:) 验票：票失效的回复只显示文字，绝不启动设备。
+struct ReplyAuthorization {
+    struct Ticket: Equatable {
+        fileprivate let generation: Int
+    }
+
+    private var generation = 0
+
+    func issue() -> Ticket { Ticket(generation: generation) }
+
+    mutating func revoke() { generation &+= 1 }
+
+    /// nil 表示授权仍有效
+    func block(_ ticket: Ticket) -> String? {
+        ticket.generation == generation ? nil : "发送后已停止或连接/页面状态变化"
+    }
+
+    /// 序列走完时是否算真正停止（带 [STOP]，或最后一个强度步是全零）：是就要走停止并 revoke()；
+    /// 否则保持最后的强度，等下一条回复，授权不变
+    static func programEndIsTerminal(steps: [AIStep], endWithStop: Bool) -> Bool {
+        endWithStop || steps.last(where: { $0.levels != nil })?.isZero == true
     }
 }
 
