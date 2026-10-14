@@ -335,8 +335,12 @@ final class AIControlVM: ObservableObject {
         // 授权却还没作废，照样开闸（M5 的代次核对被绕过）。万一不在主线程就退回主队列
         ble.forceZeroOutputs
             .sink { [weak self] reason in
-                let stop = { self?.terminalStop(reason: reason ?? "已自动停止", sendStop: false) }
-                if Thread.isMainThread { stop() } else { DispatchQueue.main.async(execute: stop) }
+                let why = reason ?? "已自动停止"
+                guard Thread.isMainThread else {
+                    DispatchQueue.main.async { self?.terminalStop(reason: why, sendStop: false) }
+                    return
+                }
+                self?.terminalStop(reason: why, sendStop: false)
             }
             .store(in: &cancellables)
         ble.$state
