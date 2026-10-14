@@ -461,13 +461,19 @@ enum AIHistory {
 
 /// 本地停止词（不等模型，立刻停）。匹配策略刻意保守，宁可误停：
 /// - 中文安全短语在消息任意位置出现就算（"我疼，停止"、"别停"、"心疼" 都会停）；
-/// - 英文 stop / pause / wait / enough 作为独立单词出现就算，不分大小写（"please stop"、"STOP!"、
-///   "don't stop"、"wait a sec" 都会停；"stopped"、"nonstop"、"waiting" 不算）。全角字母先转半角。
+///   第三轮 M3：补上常见的拒绝 / 求救说法（不要、不行、难受、救命、关掉、结束）和繁体写法，
+///   之前"不要！""不行了""好难受""救命""夠了"都要等模型自己理解。"要不要再快点"这类也会停（宁可误停）；
+/// - 英文 stop / pause / wait / enough / no / ouch / hurt / hurts / pain 作为独立单词出现就算，不分大小写
+///   （"please stop"、"STOP!"、"don't stop"、"wait a sec"、"oh no" 都会停；
+///   "stopped"、"nonstop"、"waiting"、"nothing"、"painful" 不算）。全角字母先转半角。
 /// - "慢"（慢一点）不是停止词，交给模型降档；"慢点停" 含 "停"，仍然本地停。
 enum AIStopWords {
     static let phrases = ["停", "停下", "停止", "停一下", "慢点停", "暂停", "别动了", "别弄了", "够了", "不要了",
-                          "疼", "疼死", "痛", "受不了", "住手", "等等"]
-    static let englishWords: Set<String> = ["stop", "pause", "wait", "enough"]
+                          "疼", "疼死", "痛", "受不了", "住手", "等等",
+                          // 第三轮 M3：拒绝 / 求救说法和繁体写法
+                          "不要", "不行", "难受", "救命", "关掉", "结束",
+                          "夠了", "別動了", "別弄了", "難受", "關掉", "結束"]
+    static let englishWords: Set<String> = ["stop", "pause", "wait", "enough", "no", "ouch", "hurt", "hurts", "pain"]
 
     static func matches(_ text: String) -> Bool {
         let normalized = (text.applyingTransform(.fullwidthToHalfwidth, reverse: false) ?? text).lowercased()
