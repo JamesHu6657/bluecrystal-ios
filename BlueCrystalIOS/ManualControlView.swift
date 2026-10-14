@@ -142,6 +142,9 @@ final class ManualControlVM: ObservableObject {
     /// 而且 stopAll / reset 会立刻作废缓推。强度已经按模式范围夹过（FavoriteSetting.clampedLevels）
     func applyFavorite(_ fav: FavoriteSetting) {
         guard let target = fav.clampedLevels, let favMode = fav.mode else { return }
+        // 正在输出时召回别的模式：切模式要先停机，停机后的冷却会让这次召回被拒（只剩一条红字）。
+        // 界面上这类收藏已锁住，这里再兜一次底：什么也不做（不发任何帧，也不停机）
+        if favMode != mode, ble?.safety.runRemaining != nil { return }
         noteInteraction()
         if favMode != mode {
             stopAll()
@@ -248,6 +251,12 @@ struct ManualControlView: View {
 
     private var currentLevels: [Int] { vm.channels.map { Int($0) } }
 
+    /// 收藏为什么现在点不了（和 canOutput 同一组条件，只是把原因说出来）
+    private var favoritesBlockReason: String? {
+        if ble.state != .ready { return "连上设备后，点一下就回到收藏的手感" }
+        return ble.safety.blockReason
+    }
+
     /// 连上了且现在允许开始/继续输出（冷却、额度、锁存、停止未确认时禁用；停止按钮不受影响）
     private var canOutput: Bool {
         ble.state == .ready && ble.safety.blockReason == nil
@@ -285,10 +294,12 @@ struct ManualControlView: View {
 
                 controlsSection
 
-                FavoritesPanel(store: favorites, mode: vm.mode, levels: currentLevels,
-                               canOutput: canOutput) { vm.applyFavorite($0) }
-
+                // 空闲停机说明紧跟在滑杆下面：它说的就是这几根滑杆
                 idleNote
+
+                FavoritesPanel(store: favorites, mode: vm.mode, levels: currentLevels,
+                               canOutput: canOutput, blockReason: favoritesBlockReason,
+                               running: ble.safety.runRemaining != nil) { vm.applyFavorite($0) }
 
                 privacyCard
 

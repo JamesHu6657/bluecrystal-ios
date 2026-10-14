@@ -93,7 +93,14 @@ enum Haptics {
     /// 滑杆跨过一个档位（变频每一档、手动每 10）
     static func detent() { selection.selectionChanged() }
     static func success() { notification.notificationOccurred(.success) }
-    static func warning() { notification.notificationOccurred(.warning) }
+    /// 同一件事常常同时改好几个状态（连接失败 + 红字）：0.8 秒内只震一次
+    static func warning() {
+        let now: TimeInterval = ProcessInfo.processInfo.systemUptime
+        guard now - lastWarningAt >= 0.8 else { return }
+        lastWarningAt = now
+        notification.notificationOccurred(.warning)
+    }
+    private static var lastWarningAt: TimeInterval = -.infinity
 }
 
 // MARK: - 入场：轻轻浮上来（减弱动态效果时只淡入、不位移）

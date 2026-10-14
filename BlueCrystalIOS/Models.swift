@@ -238,5 +238,14 @@ enum HeatMood {
 /// 「她」页输入栏上方的快捷话：一点就发，和自己打字发出去完全一样（同一条发送路径）。
 /// 这里的每一句都不能碰到本地停止词（ProtocolChecks 钉住），否则点"再快一点"反而会停
 enum AIQuickReplies {
-    static let phrases = ["开始吧", "温柔一点", "慢一点", "再快一点", "就是这样", "逗逗我"]
+    /// 还没开始时：邀请她开始
+    static let idle = ["开始吧", "温柔一点", "慢慢来", "逗逗我"]
+    /// 她正在带节奏时：调快慢、换花样
+    static let running = ["慢一点", "再快一点", "就是这样", "换个节奏", "温柔一点"]
+    /// 全部（ProtocolChecks 逐条检查不是停止词）
+    static var phrases: [String] { idle + running }
+
+    static func current(running isRunning: Bool) -> [String] {
+        isRunning ? Self.running : Self.idle
+    }
 }

@@ -710,11 +710,16 @@ struct AIControlView: View {
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
                 }
             }
-            if showQuickReplies {
-                quickReplies
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            // 快捷话和输入栏共用一层底色（之前两层深浅不同，中间有一道接缝）
+            VStack(spacing: 0) {
+                if showQuickReplies {
+                    quickReplies
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                inputBar
             }
-            inputBar
+            .background(.ultraThinMaterial)
+            .background(Velvet.ink.opacity(0.5))
         }
         .animation(.easeInOut(duration: 0.2), value: showQuickReplies)
         .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
@@ -863,15 +868,15 @@ struct AIControlView: View {
     }
 
     /// 快捷话：一点就发，和自己打字回车完全同一条路径（submit → vm.send）。
-    /// 都不是停止词（ProtocolChecks 钉住）；停止仍然是左下角的红色停止键或说"停"
+    /// 都不是停止词（ProtocolChecks 钉住）；停止仍然是左下角的红色停止键或说"停"。
+    /// 没开始时是邀请的话，她在带节奏时换成调快慢的话
     private var quickReplies: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        let phrases: [String] = AIQuickReplies.current(running: vm.running)
+        return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(AIQuickReplies.phrases, id: \.self) { phrase in
+                ForEach(phrases, id: \.self) { phrase in
                     Button {
-                        Haptics.select()
-                        vm.input = phrase
-                        submit()
+                        sendQuickReply(phrase)
                     } label: {
                         Text(phrase)
                             .font(.footnote.weight(.medium))
@@ -891,7 +896,17 @@ struct AIControlView: View {
             .padding(.horizontal, 12)
         }
         .padding(.top, 4)
-        .background(Velvet.ink.opacity(0.35))
+    }
+
+    /// 隐私遮挡期间不发，也不把这句留在输入框里
+    private func sendQuickReply(_ phrase: String) {
+        guard !privacy.isCovering(ble) else {
+            PrivacyLock.dismissKeyboard()
+            return
+        }
+        Haptics.select()
+        vm.input = phrase
+        submit()
     }
 
     private var emptyState: some View {
@@ -931,6 +946,7 @@ struct AIControlView: View {
             }
             .buttonStyle(PressableStyle())
             .accessibilityLabel("停止")
+            .accessibilityHint("立即停止所有输出")
             // 等回复期间输入框也保持可用：停止词随时能发
             TextField(vm.isThinking ? "她在回复…说“停”随时停" : "说点什么…", text: $vm.input)
                 .focused($inputFocused)
@@ -954,8 +970,6 @@ struct AIControlView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
-        .background(Velvet.ink.opacity(0.5))
     }
 }
 

@@ -455,10 +455,35 @@ struct VideoSyncView: View {
     /// 全屏播放中：内嵌预览让出播放器，onDisappear 不把全屏误判成离开页面
     @State private var isFullScreen = false
 
-    /// 选择器弹出前先停（选择器会盖住停止键）
+    /// 设备需要用户处理（停止重试中、需要确认物理关机、提供强制断开）时不弹选择器：
+    /// 选择器是整页弹出层，会盖住红字和「解除锁定 / 强制断开」这些只在设备卡片上的按钮
+    private var pickerBlocked: Bool {
+        ble.safety.needsPhysicalAck || ble.safety.stopRetrying || ble.forceDisconnectOffered
+    }
+
+    /// 选择器弹出前先停（选择器会盖住页面底部的停止键；选择器里另有一个停止键）
     private func openPicker(_ kind: PickerKind) {
+        guard !pickerBlocked else {
+            Haptics.warning()
+            UIAccessibility.post(notification: .announcement, argument: "先处理设备卡片上的提示，再选文件")
+            return
+        }
         vm.stopBeforePicker()
         picker = kind
+    }
+
+    /// 选择器底部：停止键（停止帧对可能还在路上）；有红字或锁存时连设备卡片一起带上
+    private var pickerStopBar: some View {
+        let showCard: Bool = ble.lastError != nil || ble.safety.needsPhysicalAck || ble.safety.stopRetrying
+        return VStack(spacing: 0) {
+            if showCard {
+                DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+            }
+            StopDockBar { vm.stopAll() }
+        }
+        .background(Velvet.ink.ignoresSafeArea())
     }
 
     var body: some View {
@@ -512,6 +537,7 @@ struct VideoSyncView: View {
                     }
                 }
             }
+            .safeAreaInset(edge: .bottom) { pickerStopBar }
             .privacyCover()
             .environmentObject(privacy)
             .environmentObject(ble)
@@ -630,6 +656,7 @@ struct VideoSyncView: View {
                 }
                 .buttonStyle(PressableStyle())
                 .accessibilityLabel("停止")
+                .accessibilityHint("立即停止所有输出")
             }
             // 自建进度条：拖动走 vm.seek，设备状态同步跟上
             if vm.durationSeconds > 0 {
@@ -645,6 +672,12 @@ struct VideoSyncView: View {
             }
             if !vm.canPlay {
                 readiness
+            } else if !vm.isPlaying, let reason = ble.safety.blockReason {
+                // 三样都齐了但安全规则暂时不许输出（冷却 / 额度 / 锁存）：就在播放键旁边说清楚
+                Label(reason, systemImage: "lock.fill")
+                    .font(.caption)
+                    .foregroundColor(Velvet.warning)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Text(vm.statusLine)
                 .font(.caption)
@@ -656,15 +689,22 @@ struct VideoSyncView: View {
 
     /// 还差什么才能播：设备 / 视频 / 脚本，缺哪个点哪个（之前播放键只是灰着，不说为什么）
     private var readiness: some View {
-        let connected = ble.state == .ready
-        let busy = ble.state == .scanning || ble.state == .connecting || ble.state == .discovering
-            || ble.state == .disconnecting
+        let state: BLEManager.State = ble.state
+        let connected: Bool = state == .ready
+        let connecting: Bool = state == .scanning || state == .connecting || state == .discovering
+        let busy: Bool = connecting || state == .disconnecting
+        let deviceTitle: String = busy ? state.rawValue : "设备"
+        let hasVideo: Bool = vm.player != nil
+        let hasScript: Bool = vm.script != nil
         return HStack(spacing: 8) {
-            ReadinessChip(title: busy ? ble.state.rawValue : "设备", done: connected, icon: "dot.radiowaves.left.and.right") {
+            ReadinessChip(title: deviceTitle, done: connected, icon: "dot.radiowaves.left.and.right",
+                          hint: busy ? "" : "连接设备", enabled: !busy) {
                 if !connected && !busy { ble.startScan() }
             }
-            ReadinessChip(title: "视频", done: vm.player != nil, icon: "film") { openPicker(.video) }
-            ReadinessChip(title: "脚本", done: vm.script != nil, icon: "doc.text") { openPicker(.script) }
+            ReadinessChip(title: "视频", done: hasVideo, icon: "film",
+                          hint: "选择视频", enabled: !pickerBlocked) { openPicker(.video) }
+            ReadinessChip(title: "脚本", done: hasScript, icon: "doc.text",
+                          hint: "载入时间轴脚本", enabled: !pickerBlocked) { openPicker(.script) }
         }
     }
 
@@ -698,6 +738,7 @@ struct VideoSyncView: View {
             Spacer(minLength: 8)
             Button(action, action: perform)
                 .buttonStyle(PillButtonStyle(kind: .secondary))
+                .disabled(pickerBlocked)
         }
     }
 
@@ -908,6 +949,10 @@ private struct ReadinessChip: View {
     let title: String
     let done: Bool
     let icon: String
+    /// 没就绪时点一下会做什么（旁白读）
+    let hint: String
+    /// 已就绪的不变灰（勾要看得清），只有"现在点了也没用"的才禁用
+    var enabled = true
     let action: () -> Void
 
     var body: some View {
@@ -927,8 +972,10 @@ private struct ReadinessChip: View {
             .contentShape(Capsule())
         }
         .buttonStyle(PressableStyle())
+        .disabled(!done && !enabled)
         .accessibilityLabel(title)
         .accessibilityValue(done ? "已就绪" : "未就绪")
+        .accessibilityHint(done ? "" : hint)
     }
 }
 
@@ -969,22 +1016,35 @@ struct DocumentPicker: UIViewControllerRepresentable {
 }
 
 /// 全屏播放：黑底铺满，点画面显示/隐藏控制条；所有控制都走 VideoSyncPlayer，
-/// 不用系统播放控件（会绕过联动和安全逻辑）。控制条隐藏时右下角仍留一个停止键
+/// 不用系统播放控件（会绕过联动和安全逻辑）。
+/// 停止键只有一个、永远在右下角同一个位置：控制条显示或收起（含 4 秒自动收起）都不挪地方，
+/// 伸手去点的那一下不会因为控制条刚好收起而落空
 struct FullScreenVideoView: View {
     @ObservedObject var vm: VideoSyncPlayer
     let onClose: () -> Void
     @State private var showControls = true
     /// 自动收起控制条的代次：任何一次显示 / 播放状态变化都重新计时
     @State private var hideGen = 0
+    /// 正在拖进度条：拖动期间不收起
+    @State private var scrubbing = false
 
-    /// 播放中 4 秒没碰屏幕就收起控制条（停止键始终留在右下角）；
-    /// 暂停 / 被自动停止时不收，旁白开着时也不收（找不到控件）
+    /// 停止键直径、离边缘的距离；控制条右侧给它让出的宽度（控制条的内容不压到停止键下面）
+    private static let stopSize: CGFloat = 60
+    private static let stopInset: CGFloat = 20
+    private static let stopReserve: CGFloat = stopSize + stopInset + 8
+
+    /// 旁白、切换控制、全键盘控制开着时不自动收起（找不到控件）
+    private static var assistiveTechRunning: Bool {
+        UIAccessibility.isVoiceOverRunning || UIAccessibility.isSwitchControlRunning
+    }
+
+    /// 播放中 4 秒没碰屏幕就收起控制条（停止键不受影响）；暂停 / 被自动停止 / 拖动中不收
     private func scheduleAutoHide() {
         hideGen += 1
         let gen = hideGen
-        guard vm.isPlaying, !UIAccessibility.isVoiceOverRunning else { return }
+        guard vm.isPlaying, !scrubbing, !Self.assistiveTechRunning else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            guard gen == hideGen, vm.isPlaying, !UIAccessibility.isVoiceOverRunning else { return }
+            guard gen == hideGen, vm.isPlaying, !scrubbing, !Self.assistiveTechRunning else { return }
             withAnimation(.easeInOut(duration: 0.3)) { showControls = false }
         }
     }
@@ -1005,117 +1065,11 @@ struct FullScreenVideoView: View {
                     if showControls { scheduleAutoHide() }
                 }
             if showControls {
-                VStack(spacing: 0) {
-                    HStack {
-                        Button(action: onClose) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 17, weight: .semibold))
-                                .foregroundColor(.white)
-                                .frame(width: 44, height: 44)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                        .accessibilityLabel("退出全屏")
-                        Spacer()
-                        Text(vm.videoName).font(.footnote).lineLimit(1)
-                    }
-                    .padding(.horizontal)
-                    .padding(.top, 8)
-                    .padding(.bottom, 24)
-                    .background(
-                        LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
-                            .ignoresSafeArea()
-                    )
-                    Spacer()
-                    VStack(spacing: 10) {
-                        if let idx = vm.chartIndex {
-                            // 只读展示，同内嵌页
-                            ScriptIntensityChart(index: idx, player: vm.player, fallbackTime: vm.currentSeconds,
-                                                 isPlaying: vm.isPlaying, height: 44, compact: true)
-                        }
-                        if vm.durationSeconds > 0 {
-                            // 拖动期间不许自动收起
-                            Slider(
-                                value: Binding(
-                                    get: { vm.currentSeconds },
-                                    set: { (t: Double) in
-                                        vm.seek(to: t)
-                                        scheduleAutoHide()
-                                    }
-                                ),
-                                in: 0...vm.durationSeconds
-                            )
-                            .tint(Velvet.rose)
-                            .disabled(!vm.canPlay)
-                        }
-                        HStack(spacing: 18) {
-                            // 颜色写在标签上：.borderless 下按钮的 tint / 角色色会盖过外层的白色
-                            Button { vm.togglePlay() } label: {
-                                Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill")
-                                    .font(.system(size: 22, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(width: 50, height: 50)
-                                    .background(Circle().fill(Velvet.roseGradient))
-                            }
-                            .disabled(!vm.canPlay)
-                            .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
-                            Button(role: .destructive) {
-                                vm.stopAll()
-                                Haptics.stop()
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "stop.fill")
-                                    Text("停止")
-                                }
-                                .font(.system(size: 16, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 18)
-                                .frame(height: 50)
-                                .background(Capsule().fill(Velvet.stopGradient))
-                            }
-                            .accessibilityLabel("停止")
-                            Spacer()
-                            Text("\(Self.formatTime(vm.currentSeconds)) / \(Self.formatTime(vm.durationSeconds))")
-                                .font(.caption.monospacedDigit())
-                        }
-                        Text(vm.statusLine)
-                            .font(.caption2)
-                            .lineLimit(2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .padding()
-                    .background(.ultraThinMaterial)
-                    .background(Color.black.opacity(0.35))
-                }
-                .foregroundColor(.white)
-                .buttonStyle(.borderless)
-                .transition(.opacity)
-            } else {
-                // 控制条藏起来时停止键也不消失
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        Button(role: .destructive) {
-                            vm.stopAll()
-                            Haptics.stop()
-                        } label: {
-                            Image(systemName: "stop.fill")
-                                .font(.system(size: 20, weight: .bold))
-                                .foregroundColor(.white)
-                                .frame(width: 56, height: 56)
-                                .background(Circle().fill(Velvet.stopGradient))
-                                .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
-                                .shadow(color: Velvet.danger.opacity(0.5), radius: 10)
-                                .opacity(0.92)
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel("停止")
-                        .accessibilityHint("立即停止所有输出")
-                    }
-                }
-                .padding(20)
-                .transition(.opacity)
+                controls
+                    .transition(.opacity)
             }
+            // 最后画：永远在最上层、永远在同一个位置
+            stopButton
         }
         .statusBarHidden(!showControls)
         .preferredColorScheme(.dark)
@@ -1129,6 +1083,116 @@ struct FullScreenVideoView: View {
                 withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
             }
         }
+    }
+
+    private var controls: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 44, height: 44)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .accessibilityLabel("退出全屏")
+                Spacer()
+                Text(vm.videoName).font(.footnote).lineLimit(1)
+            }
+            .padding(.horizontal)
+            .padding(.top, 8)
+            .padding(.bottom, 24)
+            .background(
+                LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
+                    .ignoresSafeArea()
+            )
+            Spacer()
+            bottomPanel
+        }
+        .foregroundColor(.white)
+        .buttonStyle(.borderless)
+    }
+
+    private var bottomPanel: some View {
+        VStack(spacing: 10) {
+            if let idx = vm.chartIndex {
+                // 只读展示，同内嵌页
+                ScriptIntensityChart(index: idx, player: vm.player, fallbackTime: vm.currentSeconds,
+                                     isPlaying: vm.isPlaying, height: 44, compact: true)
+            }
+            if vm.durationSeconds > 0 {
+                Slider(
+                    value: Binding(
+                        get: { vm.currentSeconds },
+                        set: { (t: Double) in vm.seek(to: t) }
+                    ),
+                    in: 0...vm.durationSeconds,
+                    onEditingChanged: { (editing: Bool) in
+                        // 拖动期间不许自动收起；松手后重新计时
+                        scrubbing = editing
+                        if !editing { scheduleAutoHide() }
+                    }
+                )
+                .tint(Velvet.rose)
+                .disabled(!vm.canPlay)
+            }
+            HStack(spacing: 18) {
+                // 颜色写在标签上：.borderless 下按钮的 tint / 角色色会盖过外层的白色
+                Button { vm.togglePlay() } label: {
+                    Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundColor(.white)
+                        .frame(width: 50, height: 50)
+                        .background(Circle().fill(Velvet.roseGradient))
+                }
+                .disabled(!vm.canPlay)
+                .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
+                Text("\(Self.formatTime(vm.currentSeconds)) / \(Self.formatTime(vm.durationSeconds))")
+                    .font(.caption.monospacedDigit())
+                Spacer()
+            }
+            Text(vm.statusLine)
+                .font(.caption2)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.leading)
+        .padding(.vertical)
+        // 右边让给常驻的停止键
+        .padding(.trailing, Self.stopReserve)
+        .background(.ultraThinMaterial)
+        .background(Color.black.opacity(0.35))
+    }
+
+    /// 常驻停止键：带"停止"两个字，控制条收起时也一眼认得出
+    private var stopButton: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                Button(role: .destructive) {
+                    vm.stopAll()
+                    Haptics.stop()
+                } label: {
+                    VStack(spacing: 1) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 18, weight: .bold))
+                        Text("停止")
+                            .font(.system(size: 11, weight: .bold))
+                    }
+                    .foregroundColor(.white)
+                    .frame(width: Self.stopSize, height: Self.stopSize)
+                    .background(Circle().fill(Velvet.stopGradient))
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
+                    .shadow(color: Velvet.danger.opacity(0.5), radius: 10)
+                    .contentShape(Circle())
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("停止")
+                .accessibilityHint("立即停止所有输出")
+            }
+        }
+        .padding(Self.stopInset)
     }
 
     private static func formatTime(_ s: Double) -> String {

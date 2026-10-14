@@ -1215,6 +1215,10 @@ check(FavoriteGlide.plan(from: [0, 50, 0, 0], to: [3, 0, 0, 0]).allSatisfy { (s:
 
 // 快捷话一点就发：不能误中本地停止词（"再快一点"不能变成停）
 check(AIQuickReplies.phrases.allSatisfy { !AIStopWords.matches($0) }, "快捷话都不是停止词")
+check(AIQuickReplies.current(running: false) == AIQuickReplies.idle
+      && AIQuickReplies.current(running: true) == AIQuickReplies.running
+      && !AIQuickReplies.idle.isEmpty && !AIQuickReplies.running.isEmpty,
+      "快捷话：没开始 / 运行中各一组")
 check(AIStopWords.matches("停"), "停止词照旧")
 
 if failures > 0 {
