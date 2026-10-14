@@ -266,12 +266,12 @@ struct ManualControlView: View {
                 VStack(alignment: .leading, spacing: 10) {
                     SectionLabel(title: "隐私", systemImage: "eye.slash")
                     // 已开启时即使生物识别暂不可用也保留开关，随时能关掉
-                    if PrivacyLock.biometryName != nil || privacy.biometricEnabled {
+                    if privacy.biometry != nil || privacy.biometricEnabled {
                         // 打开开关会弹系统验证框（失败时是全屏密码页），会盖住底部停止键：
                         // 输出中、断开中或设备需要处理时不许改
                         Toggle(isOn: Binding(get: { privacy.biometricEnabled },
                                              set: { privacy.setBiometric($0) })) {
-                            Text("打开 App 时用\(PrivacyLock.biometryName ?? "面容 ID")解锁").foregroundColor(Velvet.text)
+                            Text("打开 App 时用\(privacy.biometry?.name ?? "面容 ID")解锁").foregroundColor(Velvet.text)
                         }
                         .tint(Velvet.rose)
                         .disabled(ble.privacyCoverBlocked)
@@ -322,6 +322,8 @@ struct ManualControlView: View {
             vm.stopAll()
             vm.detach()
         }
+        // 解锁页上的停止：和本页停止键同一个 stopAll
+        .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
 }
 
@@ -332,9 +334,8 @@ private struct HeatCore: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        // 未连接且热度为 0 时停住不画；热度为 0 时慢呼吸用不着 30 帧
-        TimelineView(.animation(minimumInterval: heat > 0 ? 1.0 / 30 : 1.0 / 15,
-                                paused: reduceMotion || (heat == 0 && !active))) { ctx in
+        // 热度为 0 时停住不画（连着也不空转，省电）；减弱动态效果时一直静止
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion || heat == 0)) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
             // 空闲时 0.2 Hz 慢呼吸，满热度约 1.6 Hz
             let freq = 0.2 + 1.4 * heat
@@ -391,8 +392,8 @@ private struct ModeSelector: View {
                 } label: {
                     Text(m.title)
                         .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, minHeight: 44)
                         .foregroundColor(selection == m ? Color.white : Velvet.textSecondary)
                         .background {
                             if selection == m {

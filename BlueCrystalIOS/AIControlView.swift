@@ -724,6 +724,8 @@ struct AIControlView: View {
         }
         .onDisappear { if !showSettings { vm.viewDisappeared() } }
         .onChange(of: scenePhase) { phase in vm.scenePhaseChanged(phase) }
+        // 解锁页上的停止：和本页停止键同一个 stopAll（停程序、作废授权）
+        .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
 
     private static let bottomID = "chat-bottom"
@@ -742,7 +744,8 @@ struct AIControlView: View {
                         .font(Velvet.serif(20, .semibold))
                         .foregroundColor(.white)
                 }
-                VStack(alignment: .leading, spacing: 3) {
+                // 模型菜单的点按区高 44pt，自带上下留白，这里不再加间距
+                VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("她")
                             .font(Velvet.serif(26, .semibold))
@@ -785,7 +788,8 @@ struct AIControlView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.05)))
-            DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true)
+            // 打字时键盘占了半屏：红字和安全状态先收成两行，点一下收起键盘就完整显示（解除锁定键始终在）
+            DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, collapsed: inputFocused)
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
@@ -829,10 +833,21 @@ struct AIControlView: View {
             }
             .font(.caption)
             .foregroundColor(Velvet.gold.opacity(modelLocked ? 0.6 : 1))
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
         .disabled(modelLocked)
         .accessibilityLabel("当前模型：\(config.provider.title) \(config.model.name)")
         .accessibilityHint(modelLocked ? "运行中不能切换，先停止" : "切换模型")
+    }
+
+    /// 盖着入口页 / 解锁页时不发送：系统键盘浮在解锁页上面时，回车也不能把消息发出去
+    private func submit() {
+        guard !privacy.isCovering(ble) else {
+            PrivacyLock.dismissKeyboard()
+            return
+        }
+        vm.send()
     }
 
     private var emptyState: some View {
@@ -874,13 +889,13 @@ struct AIControlView: View {
             TextField(vm.isThinking ? "她在回复…说“停”随时停" : "说点什么…", text: $vm.input)
                 .focused($inputFocused)
                 .submitLabel(.send)
-                .onSubmit { vm.send() }
+                .onSubmit { submit() }
                 .foregroundColor(Velvet.text)
                 .padding(.horizontal, 16)
                 .frame(minHeight: 44)
                 .background(Capsule().fill(Color.white.opacity(0.08)))
                 .overlay(Capsule().strokeBorder(inputFocused ? Velvet.rose.opacity(0.6) : Velvet.stroke, lineWidth: 1))
-            Button { vm.send() } label: {
+            Button { submit() } label: {
                 Image(systemName: "arrow.up")
                     .font(.system(size: 17, weight: .bold))
                     .foregroundColor(.white)
@@ -947,14 +962,16 @@ private struct ChatBubble: View {
     }
 }
 
-/// 她在打字：三个依次亮起的点
+/// 她在打字：三个依次亮起的点（减弱动态效果时静止）
 private struct TypingIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 20, paused: false)) { ctx in
+        TimelineView(.animation(minimumInterval: 1.0 / 20, paused: reduceMotion)) { ctx in
             let t = ctx.date.timeIntervalSinceReferenceDate
             HStack(spacing: 6) {
                 ForEach(0..<3, id: \.self) { i in
-                    let phase = sin((t * 2 * .pi / 1.2) - Double(i) * 0.7)
+                    let phase = reduceMotion ? 0.6 : sin((t * 2 * .pi / 1.2) - Double(i) * 0.7)
                     Circle()
                         .fill(Velvet.blush)
                         .frame(width: 7, height: 7)

@@ -34,9 +34,11 @@ enum Velvet {
     static let warning = Color(hex: 0xFFB04A)
     static let ok = Color(hex: 0x7BE3B6)
 
-    static let roseGradient = LinearGradient(colors: [Color(hex: 0xFF6F98), Color(hex: 0xC2306A)],
+    /// 上面压白字（进入 / 解锁 / 连接 / 用户气泡）：浅端白字约 3.7:1、深端约 5.4:1，配粗体
+    static let roseGradient = LinearGradient(colors: [Color(hex: 0xE8487A), Color(hex: 0xC2306A)],
                                              startPoint: .topLeading, endPoint: .bottomTrailing)
-    static let stopGradient = LinearGradient(colors: [Color(hex: 0xFF4A5A), Color(hex: 0xD3172C)],
+    /// 停止键底色：浅端白字约 4.2:1、深端约 5.4:1
+    static let stopGradient = LinearGradient(colors: [Color(hex: 0xE8344A), Color(hex: 0xD3172C)],
                                              startPoint: .top, endPoint: .bottom)
 
     /// 通道颜色（伸缩 玫瑰 / 震动 琥珀 / 吮吸 紫罗兰）：深色底上做过色觉辨识校验，各处统一
@@ -195,9 +197,10 @@ struct PillButtonStyle: ButtonStyle {
         @Environment(\.isEnabled) private var isEnabled
 
         var body: some View {
-            // 大字号下最多两行再缩小一点，不截断安全相关的按钮文字；高度至少 44pt
+            // 大字号下最多两行再缩小一点，不截断安全相关的按钮文字；高度至少 44pt。
+            // 彩色底（主按钮 / 停止类）上的白字用粗体，渐变浅端的对比度也够
             configuration.label
-                .font(.subheadline.weight(.semibold))
+                .font(.subheadline.weight(kind == .secondary ? .semibold : .bold))
                 .lineLimit(2)
                 .minimumScaleFactor(0.8)
                 .multilineTextAlignment(.center)

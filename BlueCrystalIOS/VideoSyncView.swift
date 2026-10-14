@@ -511,6 +511,8 @@ struct VideoSyncView: View {
         }
         // 弹出全屏时部分系统版本也会触发 onDisappear：全屏中不停机
         .onDisappear { if !isFullScreen { vm.stopAll() } }
+        // 解锁页上的停止：和本页停止键同一个 stopAll
+        .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
 
     /// 预览画面（原"预览"区块）：没有视频时是一块邀请选择的幕布
@@ -838,6 +840,8 @@ struct ScriptIntensityChart: View {
         for ch in BCProtocol.Channel.uiChannels {
             let color = Velvet.channel(ch)
             for seg in index.visible(ch, from: start, to: end) {
+                // visible() 按"到这里为止最晚结束"查找，会带出窗口左边已经结束的段：跳过，不画 2px 残条
+                guard seg.end > start else { continue }
                 let x0 = max(0, x(seg.start))
                 let x1 = min(w, max(x0 + 2, x(seg.end)))
                 let yy = y(seg.level)

@@ -57,6 +57,11 @@ struct DeviceStatusCard: View {
     /// 紧凑版：钉在 AI 页页头（聊天自动滚到底时红字、解除锁定键和安全状态不会被带走）。
     /// 省掉设备名，安全状态挪到状态名下面；红字、解除锁定、强制断开和对话框都和完整版一样
     var compact = false
+    /// 解锁页上不给连接键：一点连接，"连接中"就会撤掉解锁页
+    var showsConnect = true
+    /// 收起版（AI 页打字、键盘弹起时）：红字和安全状态最多两行，点红字收起键盘看全文；
+    /// 解除锁定、强制断开照常显示
+    var collapsed = false
     @State private var confirmForceDisconnect = false
     @State private var confirmPhysicalAck = false
 
@@ -102,7 +107,7 @@ struct DeviceStatusCard: View {
                         Button("强制断开", role: .destructive) { confirmForceDisconnect = true }
                             .buttonStyle(PillButtonStyle(kind: .danger))
                     }
-                } else {
+                } else if showsConnect {
                     Button(connectTitle) { ble.startScan() }
                         .buttonStyle(PillButtonStyle(kind: .primary))
                         .disabled(ble.state == .scanning || ble.state == .connecting || ble.state == .discovering)
@@ -116,12 +121,17 @@ struct DeviceStatusCard: View {
             }
 
             if let err = ble.lastError {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                    Text(err).fixedSize(horizontal: false, vertical: true)
+                if collapsed {
+                    Button {
+                        PrivacyLock.dismissKeyboard()
+                    } label: {
+                        errorText(err)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("收起键盘，显示完整提示")
+                } else {
+                    errorText(err)
                 }
-                .font(.caption)
-                .foregroundColor(Velvet.danger)
             }
 
             // 修 M4 / L5：锁存期间拒绝输出，只有用户确认已物理关机才解除
@@ -149,11 +159,24 @@ struct DeviceStatusCard: View {
                     tint: ble.lastError != nil || ble.safety.needsPhysicalAck ? Velvet.danger : nil)
     }
 
+    private func errorText(_ err: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+            Text(err)
+                .lineLimit(collapsed ? 2 : nil)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .font(.caption)
+        .foregroundColor(Velvet.danger)
+    }
+
     /// 修 M2/M3：单次上限、冷却、30 分钟额度
     private var safetySummary: some View {
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: ble.safety.blockReason == nil ? "hourglass" : "lock.fill")
-            Text(ble.safety.summary).fixedSize(horizontal: false, vertical: true)
+            Text(ble.safety.summary)
+                .lineLimit(collapsed ? 2 : nil)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .font(.caption)
         .foregroundColor(ble.safety.blockReason == nil ? Velvet.textSecondary : Velvet.warning)
