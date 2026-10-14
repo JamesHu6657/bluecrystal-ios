@@ -12,7 +12,7 @@ import os
 /// Notify:  0000FFA2-0000-1000-8000-00805F9B34FB
 ///
 /// 停止（修 N1/N3/N4）：任何停止（用户停止、看门狗、上限、退后台、进程退出、重连确认、断开）
-/// 都是"0x08 归零帧 → 100ms → 0x06 停止帧"一对，照官方全屏视频页 onUnload
+/// 都是"0x08 停止帧 at(0,255) → 100ms → 0x06 停止帧"一对，照官方迷姬 video.js handleSlide
 /// （onWriteOrder(0) 后 setTimeout(Tt([0,0,0,0]), 100)）。两帧都拿到写入回执才算停；
 /// 任何一帧失败/超时就整对重发，按 1→2→4→8→16→30 秒退避一直重试到确认；
 /// 30 秒仍未确认时拉起操作员锁存，只有用户确认已物理关机才解除（修 M4，legacy watchdog.py）。
@@ -20,7 +20,7 @@ import os
 ///
 /// 输出准入（修 M2/M3/L5）：手动、技能、视频的每一帧非停止帧都只经过 submitOutput：
 /// 锁存/设备可能仍在输出时拒绝；停机状态下开始新一次运行要过冷却和 30 分钟额度检查，
-/// 本次最长 min(300 秒, 剩余额度)，到点自动停止（legacy limits.py / duty_cycle.py 原值）。
+/// 本次最长 min(1200 秒, 剩余额度)，到点自动停止（结构同 legacy limits.py / duty_cycle.py）。
 final class BLEManager: NSObject, ObservableObject {
 
     static let serviceUUID = CBUUID(string: "0000FFA0-0000-1000-8000-00805F9B34FB")
@@ -65,7 +65,7 @@ final class BLEManager: NSObject, ObservableObject {
     struct SafetyStatus: Equatable {
         /// 正在输出时本次剩余秒数；没在输出时为 nil
         var runRemaining: Int?
-        /// 本次运行上限（≤300 秒，30 分钟额度不够时更短）
+        /// 本次运行上限（≤1200 秒，30 分钟额度不够时更短）
         var runAllowed = 0
         /// 冷却剩余秒数
         var cooldownRemaining = 0
@@ -620,7 +620,7 @@ final class BLEManager: NSObject, ObservableObject {
             return
         }
         if !isActive {
-            // 修 M2/M3：停机状态下开始新一次运行：冷却 + 30 分钟额度，本次最长 min(300 秒, 剩余额度)
+            // 修 M2/M3：停机状态下开始新一次运行：冷却 + 30 分钟额度，本次最长 min(1200 秒, 剩余额度)
             if let denial = ledger.checkAdmissible() {
                 rejectOutput(Self.denialText(denial))
                 return
@@ -1035,7 +1035,7 @@ final class BLEManager: NSObject, ObservableObject {
         }
     }
 
-    /// 本次运行到点（单次 300 秒，或 30 分钟额度用完）时准时停止；看门狗每秒再兜底检查一次
+    /// 本次运行到点（单次 1200 秒，或 30 分钟额度用完）时准时停止；看门狗每秒再兜底检查一次
     private func armRunDeadline(after allowed: TimeInterval) {
         runGen += 1
         let gen = runGen

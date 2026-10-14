@@ -10,7 +10,7 @@ import Foundation
 ///   变频滑杆官方默认范围 0~9；技能预设最高也是 9
 /// - 0x08 帧（官方 at(arr, t)）：AA 08 06 <伸缩> <震动> <吮吸> <旋转> <t 高字节> <t 低字节> <cs>
 ///   手动 tab、全屏视频页、video.js 脚本指令都用 t = 0；手动滑杆官方范围 0~99
-/// - 停止：官方全屏视频页退出时先发 0x08 归零帧 at([0,0,0,0],0)，100ms 后再发 0x06 停止帧 Tt([0,0,0,0])
+/// - 停止：照官方迷姬专用停止（video.js handleSlide）先发 0x08 停止帧 at([0,0,0,0],255)，100ms 后再发 0x06 停止帧 Tt([0,0,0,0])
 enum BCProtocol {
 
     static let header: UInt8 = 0xAA
@@ -126,9 +126,10 @@ enum BCProtocol {
         frame(cmd: modeCmd, payload: clampChannels(channels, max: maxModeLevel) + [0x00])
     }
 
-    /// 0x08 帧（官方 at(arr, 0)：[...arr, 0x00, 0x00]）
-    static func manualFrame(channels: [Int]) -> Data {
-        frame(cmd: manualCmd, payload: clampChannels(channels, max: maxManualLevel) + [0x00, 0x00])
+    /// 0x08 帧（官方 at(arr, t)：[...arr, t 高字节, t 低字节]；普通输出 t = 0）
+    static func manualFrame(channels: [Int], tail: UInt16 = 0) -> Data {
+        frame(cmd: manualCmd,
+              payload: clampChannels(channels, max: maxManualLevel) + [UInt8(tail >> 8), UInt8(tail & 0xFF)])
     }
 
     /// 视频联动帧（修 N2）：官方给迷姬（名字含 mizzzee 的设备 devType 2）发脚本/视频强度一律走 0x08：
@@ -150,9 +151,10 @@ enum BCProtocol {
     /// 停止帧：官方 be("06",[0,0,0,0,0]) = Tt([0,0,0,0]) = AA 06 05 00 00 00 00 00 B5（与实抓一致）
     static var stopFrame: Data { modeFrame(channels: [0, 0, 0, 0]) }
 
-    /// 0x08 归零帧：官方 at([0,0,0,0], 0) = AA 08 06 00 00 00 00 00 00 B8。
-    /// 每次停止都先发它，100ms 后再发 stopFrame
-    static var manualZeroFrame: Data { manualFrame(channels: [0, 0, 0, 0]) }
+    /// 0x08 停止帧：官方迷姬（devType 2）专用停止 video.js handleSlide：
+    /// at([0,0,0,0], 255) = AA 08 06 00 00 00 00 00 FF B7，100ms 后再发 Tt([0,0,0,0])。
+    /// 1.7.4 起改用它：at([0,0,0,0], 0) 只是"强度 0"，真机上点停止后设备不停。
+    static var manualZeroFrame: Data { manualFrame(channels: [0, 0, 0, 0], tail: 0x00FF) }
 
     /// 官方默认技能"如影随形"：AA 06 05 04 06 05 00 00 C4（与实抓的官方启动帧一致）
     static var officialStartFrame: Data { modeFrame(channels: presets[0].channels) }

@@ -27,7 +27,8 @@ func hex(_ d: Data) -> String { BCProtocol.hex(d) }
 check(hex(BCProtocol.stopFrame) == "AA06050000000000B5", "停止帧 = 实抓暂停帧")
 check(hex(BCProtocol.officialStartFrame) == "AA06050406050000C4", "如影随形 = 实抓启动帧")
 // 官方源码 at([0,0,0,0], 0)
-check(hex(BCProtocol.manualZeroFrame) == "AA0806000000000000B8", "0x08 归零帧")
+check(hex(BCProtocol.manualZeroFrame) == "AA08060000000000FFB7", "0x08 停止帧 at([0,0,0,0],255)")
+check(hex(BCProtocol.manualFrame(channels: [0, 0, 0, 0])) == "AA0806000000000000B8", "0x08 强度 0 帧")
 // 旋转通道恒为 0（N5），0x06 夹到 9，0x08 夹到 99
 check(hex(BCProtocol.modeFrame(channels: [1, 2, 3, 9])) == "AA06050102030000BB", "0x06 帧旋转恒 0")
 check(hex(BCProtocol.modeFrame(channels: [12, -3, 0, 0])) == "AA06050900000000BE", "0x06 帧夹到 0~9")
@@ -156,38 +157,34 @@ func makeLedger() -> DutyCycleLedger {
     DutyCycleLedger(clock: { fc.t }, wallClock: { fc.wall }, bootIdentity: { fc.boot })
 }
 
-check(SafetyLimits.maxRunSeconds == 300, "单次上限 300 秒")
-check(SafetyLimits.dutyWindowSeconds == 1800 && SafetyLimits.dutyBudgetSeconds == 600, "30 分钟 600 秒")
+check(SafetyLimits.maxRunSeconds == 1200, "单次上限 20 分钟")
+check(SafetyLimits.dutyWindowSeconds == 1800 && SafetyLimits.dutyBudgetSeconds == 1200, "30 分钟 1200 秒")
 check(SafetyLimits.minCooldownSeconds == 60 && SafetyLimits.cooldownRatio == 0.5, "冷却 max(60, 0.5×时长)")
-check(SafetyLimits.unknownElapsedCooldownSeconds == 300 && SafetyLimits.checkpointIntervalSeconds == 5,
-      "未知时长最大额度冷却 300 秒，每 5 秒保存下界")
+check(SafetyLimits.unknownElapsedCooldownSeconds == 600 && SafetyLimits.checkpointIntervalSeconds == 5,
+      "未知时长最大额度冷却 600 秒，每 5 秒保存下界")
 
 let ledger = makeLedger()
 check(ledger.checkAdmissible() == nil, "初始可以开始")
-check(near(ledger.begin(), 300), "第一次最长 300 秒")
+check(near(ledger.begin(), 1200), "第一次最长 1200 秒")
 check(ledger.checkAdmissible() == .openRun, "运行中不能再开一次")
-fc.advance(300)
-check((ledger.runRemaining() ?? 1) <= 0, "300 秒到点")
+fc.advance(1200)
+check((ledger.runRemaining() ?? 1) <= 0, "1200 秒到点")
 ledger.end()
-check(near(ledger.cooldownRemaining(), 150), "跑满 300 秒后冷却 150 秒")
+check(near(ledger.cooldownRemaining(), 600), "跑满 1200 秒后冷却 600 秒")
 if case .cooldown(let s)? = ledger.checkAdmissible() {
-    check(near(s, 150), "冷却中拒绝开始")
+    check(near(s, 600), "冷却中拒绝开始")
 } else {
     check(false, "冷却中拒绝开始")
 }
-fc.advance(150)
-check(ledger.checkAdmissible() == nil, "冷却结束可以开始")
-check(near(ledger.begin(), 300), "第二次 300 秒（额度还剩 300）")
-fc.advance(300)
-ledger.end()
-fc.advance(150)
+fc.advance(600)
 if case .budget(let wait)? = ledger.checkAdmissible() {
-    check(near(wait, 1200), "600 秒额度用完，等最早一笔滑出窗口（1200 秒）")
+    check(near(wait, 1200), "1200 秒额度用完，等这一笔滑出窗口（1200 秒）")
 } else {
-    check(false, "600 秒额度用完应拒绝")
+    check(false, "1200 秒额度用完应拒绝")
 }
 fc.advance(1200)
-check(near(ledger.begin(), 300), "最早一笔滑出窗口后可再跑 300 秒")
+check(ledger.checkAdmissible() == nil, "滑出窗口后可以开始")
+check(near(ledger.begin(), 1200), "滑出窗口后可再跑 1200 秒")
 fc.advance(10)
 ledger.end()
 check(near(ledger.cooldownRemaining(), 60), "短运行冷却下限 60 秒")
@@ -195,13 +192,13 @@ check(near(ledger.cooldownRemaining(), 60), "短运行冷却下限 60 秒")
 // 只剩部分额度时本次上限更短
 let short = makeLedger()
 short.begin()
+fc.advance(600)
+short.end()
 fc.advance(300)
-short.end()
-fc.advance(150)
 short.begin()
-fc.advance(290)
+fc.advance(590)
 short.end()
-fc.advance(145)
+fc.advance(295)
 check(near(short.remainingBudget(), 10) && near(short.begin(), 10), "额度只剩 10 秒时本次上限 10 秒")
 fc.advance(10)
 short.end()
@@ -216,21 +213,21 @@ fc.advance(30)
 let restored = makeLedger()
 if let d = data { restored.restore(from: d) }
 check(near(restored.cooldownRemaining(), 30), "重启后冷却继续计时")
-check(near(restored.remainingBudget(), 500), "重启后额度保留")
+check(near(restored.remainingBudget(), 1100), "重启后额度保留")
 
-// F2：进程不在时不能执行软件截止停机，直到确认停止都记账，不限于 300s。
+// F2：进程不在时不能执行软件截止停机，直到确认停止都记账，不限于单次上限。
 let orphan = makeLedger()
 orphan.begin()
 let orphanData = orphan.snapshotData()
-fc.advance(1000)
+fc.advance(1500)
 let orphanRestored = makeLedger()
 if let d = orphanData { orphanRestored.restore(from: d) }
 check(orphanRestored.hasOpenRun && orphanRestored.openOrphaned, "未结束的运行跨进程保留")
 check(!orphanRestored.openElapsedUnknown, "同 boot 遗留运行使用可验证的 uptime，不标记未知")
 fc.advance(20)
 orphanRestored.end()
-check(near(orphanRestored.cooldownRemaining(), 510), "遗留运行 1020 秒含确认前等待，冷却 510 秒")
-check(near(orphanRestored.remainingBudget(), 0), "遗留运行超过 600 秒耗尽额度，不按 300 秒封顶")
+check(near(orphanRestored.cooldownRemaining(), 760), "遗留运行 1520 秒含确认前等待，冷却 760 秒")
+check(near(orphanRestored.remainingBudget(), 0), "遗留运行超过 1200 秒耗尽额度，不按单次上限封顶")
 
 // 同 boot 墙钟被往回调：仍按 uptime，冷却不缩短。
 let wallBack = makeLedger()
@@ -255,7 +252,7 @@ fc.wall += 3600
 let forwardRestored = makeLedger()
 if let d = forwardData { forwardRestored.restore(from: d) }
 check(near(forwardRestored.cooldownRemaining(), 145), "同 boot 前拨一小时后冷却只流逝 5 秒")
-check(near(forwardRestored.remainingBudget(), 300), "同 boot 前拨一小时不清掉记账")
+check(near(forwardRestored.remainingBudget(), 900), "同 boot 前拨一小时不清掉记账")
 fc.wall -= 7200
 let backwardRestored = makeLedger()
 if let d = forwardData { backwardRestored.restore(from: d) }
@@ -280,7 +277,7 @@ fc.t = 10
 fc.wall += 86400
 let rebootRestored = makeLedger()
 if let d = forwardData { rebootRestored.restore(from: d) }
-check(near(rebootRestored.remainingBudget(), 300), "reboot 加前拨一天不剪掉记账")
+check(near(rebootRestored.remainingBudget(), 900), "reboot 加前拨一天不剪掉记账")
 check(near(rebootRestored.cooldownRemaining(), 150), "reboot 加前拨一天不缩短冷却")
 // 保存保守恢复的新锚点后再次 relaunch，仍只流逝实际 uptime。
 let rebasedData = rebootRestored.snapshotData()
@@ -289,7 +286,7 @@ fc.wall += 86400
 let rebasedRestored = makeLedger()
 if let d = rebasedData { rebasedRestored.restore(from: d) }
 check(near(rebasedRestored.cooldownRemaining(), 145), "保守恢复后再次 relaunch 不丢掉冷却")
-check(near(rebasedRestored.remainingBudget(), 300), "保守恢复后的记账继续保留")
+check(near(rebasedRestored.remainingBudget(), 900), "保守恢复后的记账继续保留")
 
 // 启动 UUID 即使相同，uptime 倒退也必须保守恢复。
 let rollbackData = rebasedRestored.snapshotData()
@@ -297,7 +294,7 @@ fc.t = 1
 let rollbackRestored = makeLedger()
 if let d = rollbackData { rollbackRestored.restore(from: d) }
 check(near(rollbackRestored.cooldownRemaining(), 150), "uptime 倒退不缩短冷却")
-check(near(rollbackRestored.remainingBudget(), 300), "uptime 倒退不清掉记账")
+check(near(rollbackRestored.remainingBudget(), 900), "uptime 倒退不清掉记账")
 
 // 兼容旧墙钟账本；缺少启动锚点时必须保持未知，而非估成 300 秒。
 let legacyFuture = Data("""
@@ -309,23 +306,23 @@ legacyRestored.restore(from: legacyFuture)
 check(legacyRestored.openElapsedUnknown && legacyRestored.checkAdmissible() == .openRun,
       "旧账本缺锚点保持未知、拒绝新运行")
 legacyRestored.end()
-check(near(legacyRestored.cooldownRemaining(), 300), "旧账本未知运行按全部额度应用最大冷却")
-check(near(legacyRestored.remainingBudget(), 0), "旧账本未知运行停止后耗尽全部 600 秒额度")
+check(near(legacyRestored.cooldownRemaining(), 600), "旧账本未知运行按全部额度应用最大冷却")
+check(near(legacyRestored.remainingBudget(), 0), "旧账本未知运行停止后耗尽全部 1200 秒额度")
 let legacyCompleted = Data("""
-{"completed":[{"end":\(fc.wall - 86400),"charge":600}],"openStart":null,
- "openAllowed":0,"lastEnd":\(fc.wall - 86400),"appliedCooldown":300}
+{"completed":[{"end":\(fc.wall - 86400),"charge":1200}],"openStart":null,
+ "openAllowed":0,"lastEnd":\(fc.wall - 86400),"appliedCooldown":600}
 """.utf8)
 let legacyCompletedRestored = makeLedger()
 legacyCompletedRestored.restore(from: legacyCompleted)
-check(near(legacyCompletedRestored.remainingBudget(), 0), "旧墙钟账本的前拨不能抹掉 600 秒记账")
-check(near(legacyCompletedRestored.cooldownRemaining(), 300), "旧墙钟账本的前拨不能清掉冷却")
+check(near(legacyCompletedRestored.remainingBudget(), 0), "旧墙钟账本的前拨不能抹掉 1200 秒记账")
+check(near(legacyCompletedRestored.cooldownRemaining(), 600), "旧墙钟账本的前拨不能清掉冷却")
 
-// 重启且墙钟回拨：保留快照前已知 1000 秒，不能把 future openStart 改成现在。
+// 重启且墙钟回拨：保留快照前已知 1500 秒，不能把 future openStart 改成现在。
 fc.boot = "boot-c"
 fc.t = 100
 let rebootOpen = makeLedger()
 rebootOpen.begin()
-fc.advance(1000)
+fc.advance(1500)
 let rebootOpenData = rebootOpen.snapshotData()
 fc.boot = "boot-d"
 fc.t = 5
@@ -335,7 +332,7 @@ if let d = rebootOpenData { rebootOpenRestored.restore(from: d) }
 check(rebootOpenRestored.openElapsedUnknown, "reboot 后未知区间不能靠已知下界变成可信完整时长")
 fc.advance(20)
 rebootOpenRestored.end()
-check(near(rebootOpenRestored.cooldownRemaining(), 512.5), "reboot 回拨计入已知时长、启动后 5 秒及确认等待")
+check(near(rebootOpenRestored.cooldownRemaining(), 762.5), "reboot 回拨计入已知时长、启动后 5 秒及确认等待")
 check(near(rebootOpenRestored.remainingBudget(), 0), "reboot 回拨的遗留运行不按软件上限封顶")
 
 // 审查重现：begin 快照后失联 1000 秒，reboot 且墙钟回拨，确认前又等 20 秒。
@@ -370,16 +367,16 @@ check(unknownRelaunched.openElapsedUnknown, "重存同 boot 锚点再 relaunch �
 fc.advance(15)
 unknownRelaunched.end() // BLEManager 的确认停止/物理停机路径；物理锁存由 BLEManager 保留。
 check(!unknownRelaunched.hasOpenRun && !unknownRelaunched.openElapsedUnknown, "确认停止结束未知运行")
-check(near(unknownRelaunched.cooldownRemaining(), 300), "未知运行停止后至少冷却 300 秒")
+check(near(unknownRelaunched.cooldownRemaining(), 600), "未知运行停止后至少冷却 600 秒")
 check(near(unknownRelaunched.remainingBudget(), 0) && near(unknownRelaunched.secondsUntilBudget(), 1800),
       "未知运行恢复后完整 30 分钟没有新额度")
 let unknownStoppedData = unknownRelaunched.snapshotData()
-fc.advance(300)
+fc.advance(600)
 let unknownStoppedRestored = makeLedger()
 if let d = unknownStoppedData { unknownStoppedRestored.restore(from: d) }
 check(near(unknownStoppedRestored.cooldownRemaining(), 0), "未知运行最大额度冷却计时跨进程保留")
-check(unknownStoppedRestored.checkAdmissible() == .budget(1500), "冷却后仍须等满额度窗口")
-fc.advance(1499)
+check(unknownStoppedRestored.checkAdmissible() == .budget(1200), "冷却后仍须等满额度窗口")
+fc.advance(1199)
 check(near(unknownStoppedRestored.remainingBudget(), 0), "确认停止后 1799 秒仍无额度")
 fc.advance(1)
 check(unknownStoppedRestored.checkAdmissible() == nil, "确认停止后完整窗口才恢复额度")
@@ -388,7 +385,7 @@ fc.t = 5
 fc.wall += 86400
 let unknownStopRebootRestored = makeLedger()
 if let d = unknownStoppedData { unknownStopRebootRestored.restore(from: d) }
-check(near(unknownStopRebootRestored.cooldownRemaining(), 300)
+check(near(unknownStopRebootRestored.cooldownRemaining(), 600)
       && near(unknownStopRebootRestored.remainingBudget(), 0)
       && near(unknownStopRebootRestored.secondsUntilBudget(), 1800),
       "恢复后的完整预算禁用和最大冷却跨 reboot/前拨继续保守保留")
@@ -410,7 +407,7 @@ check(checkpointWrites == 1, "checkpoint 不在每次看门狗 tick 写入")
 fc.advance(1)
 checkpointRun.checkpoint()
 check(checkpointWrites == 2, "开放运行每 5 秒写入已验证时长")
-fc.advance(995)
+fc.advance(1495)
 checkpointRun.checkpoint()
 check(checkpointWrites == 3, "停止未确认的长运行仍持续保存 checkpoint")
 let preRebootCheckpointData = checkpointData
@@ -427,8 +424,8 @@ if let d = preRebootCheckpointData { checkpointRestored.restore(from: d) }
 check(checkpointRestored.openElapsedUnknown, "checkpoint 不会掩盖 reboot 的未知区间")
 fc.advance(20)
 checkpointRestored.end()
-check(near(checkpointRestored.cooldownRemaining(), 512.5),
-      "reboot 使用 checkpoint 的 1000 秒下界、启动 5 秒和等待 20 秒，不缩短冷却")
+check(near(checkpointRestored.cooldownRemaining(), 762.5),
+      "reboot 使用 checkpoint 的 1500 秒下界、启动 5 秒和等待 20 秒，不缩短冷却")
 // 启动标识缺失、uptime 倒退或坏的开始锚点都必须显式未知。
 fc.boot = "anchors-a"
 fc.t = 100

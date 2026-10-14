@@ -439,6 +439,8 @@ struct VideoSyncView: View {
         var id: Int { rawValue }
     }
     @State private var picker: PickerKind?
+    /// 全屏播放中：内嵌预览让出播放器，onDisappear 不把全屏误判成离开页面
+    @State private var isFullScreen = false
 
     var body: some View {
         Form {
@@ -492,8 +494,16 @@ struct VideoSyncView: View {
 
             if let p = vm.player {
                 Section("预览") {
-                    NoControlsPlayerView(player: p)
-                        .frame(height: 220)
+                    if !isFullScreen {
+                        NoControlsPlayerView(player: p)
+                            .frame(height: 220)
+                    }
+                    Button {
+                        isFullScreen = true
+                    } label: {
+                        Label("全屏播放", systemImage: "arrow.up.left.and.arrow.down.right")
+                    }
+                    .buttonStyle(.borderless)
                 }
             }
         }
@@ -515,7 +525,12 @@ struct VideoSyncView: View {
                 }
             }
         }
-        .onDisappear { vm.stopAll() }
+        // 全屏控制同样走 vm（播放/暂停/拖动/停止），设备联动不受影响
+        .fullScreenCover(isPresented: $isFullScreen) {
+            FullScreenVideoView(vm: vm) { isFullScreen = false }
+        }
+        // 弹出全屏时部分系统版本也会触发 onDisappear：全屏中不停机
+        .onDisappear { if !isFullScreen { vm.stopAll() } }
     }
 
     private func formatTime(_ s: Double) -> String {
@@ -558,5 +573,90 @@ struct DocumentPicker: UIViewControllerRepresentable {
             guard let url = urls.first else { return }
             onPick(url)
         }
+    }
+}
+
+/// 全屏播放：黑底铺满，点画面显示/隐藏控制条；所有控制都走 VideoSyncPlayer，
+/// 不用系统播放控件（会绕过联动和安全逻辑）
+struct FullScreenVideoView: View {
+    @ObservedObject var vm: VideoSyncPlayer
+    let onClose: () -> Void
+    @State private var showControls = true
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if let p = vm.player {
+                NoControlsPlayerView(player: p)
+                    .ignoresSafeArea()
+            }
+            // 透明点击层：切换控制条
+            Color.clear
+                .contentShape(Rectangle())
+                .ignoresSafeArea()
+                .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() } }
+            if showControls {
+                VStack(spacing: 0) {
+                    HStack {
+                        Button(action: onClose) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 17, weight: .semibold))
+                                .padding(10)
+                                .background(.black.opacity(0.45), in: Circle())
+                        }
+                        .accessibilityLabel("退出全屏")
+                        Spacer()
+                        Text(vm.videoName).font(.footnote).lineLimit(1)
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 8)
+                    Spacer()
+                    VStack(spacing: 8) {
+                        if vm.durationSeconds > 0 {
+                            Slider(
+                                value: Binding(
+                                    get: { vm.currentSeconds },
+                                    set: { vm.seek(to: $0) }
+                                ),
+                                in: 0...vm.durationSeconds
+                            )
+                            .disabled(!vm.canPlay)
+                        }
+                        HStack(spacing: 24) {
+                            Button { vm.togglePlay() } label: {
+                                Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill")
+                                    .font(.system(size: 26))
+                            }
+                            .disabled(!vm.canPlay)
+                            .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
+                            Button(role: .destructive) { vm.stopAll() } label: {
+                                Image(systemName: "stop.fill").font(.system(size: 22))
+                            }
+                            .accessibilityLabel("停止")
+                            Spacer()
+                            Text("\(Self.formatTime(vm.currentSeconds)) / \(Self.formatTime(vm.durationSeconds))")
+                                .font(.caption.monospacedDigit())
+                        }
+                        Text(vm.statusLine)
+                            .font(.caption2)
+                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding()
+                    .background(.black.opacity(0.45))
+                }
+                .foregroundColor(.white)
+                .buttonStyle(.borderless)
+                .transition(.opacity)
+            }
+        }
+        .statusBarHidden(!showControls)
+        .preferredColorScheme(.dark)
+    }
+
+    private static func formatTime(_ s: Double) -> String {
+        guard s.isFinite else { return "--:--" }
+        let m = Int(s) / 60, sec = Int(s) % 60
+        return String(format: "%d:%02d", m, sec)
     }
 }

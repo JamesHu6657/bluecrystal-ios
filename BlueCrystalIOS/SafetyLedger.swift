@@ -28,19 +28,19 @@ enum SafetyClock {
     }
 }
 
-/// 安全上限（照搬 legacy src/safety/limits.py 的数值，不可配置）
+/// 安全上限（结构沿用 legacy src/safety/limits.py；1.7.4 起按用户要求把单次上限调到 20 分钟，不可在 App 内配置）
 enum SafetyLimits {
-    /// 单次连续输出上限（MAX_DURATION_SECONDS = 300）
-    static let maxRunSeconds: TimeInterval = 300
+    /// 单次连续输出上限：20 分钟（legacy 原值 300 秒）
+    static let maxRunSeconds: TimeInterval = 20 * 60
     /// 一次运行至少要能跑 1 秒才允许开始（validate_duration 下限 1）
     static let minRunSeconds: TimeInterval = 1
-    /// 滚动 30 分钟内最多输出 600 秒（DUTY_CYCLE_WINDOW_SECONDS / DUTY_CYCLE_BUDGET_SECONDS）
+    /// 滚动 30 分钟内最多输出 1200 秒（与单次上限相同，保证能跑满一次 20 分钟；legacy 原值 600 秒）
     static let dutyWindowSeconds: TimeInterval = 30 * 60
-    static let dutyBudgetSeconds: TimeInterval = 600
+    static let dutyBudgetSeconds: TimeInterval = 20 * 60
     /// 每次确认停止后的冷却 = max(60 秒, 本次运行时长 × 0.5)（MIN_COOLDOWN_SECONDS / COOLDOWN_RATIO）
     static let minCooldownSeconds: TimeInterval = 60
     static let cooldownRatio: Double = 0.5
-    /// 未知时长恢复：耗尽完整窗口额度，冷却至少按全部 600 秒额度计算。
+    /// 未知时长恢复：耗尽完整窗口额度，冷却至少按全部 1200 秒额度计算。
     static let unknownElapsedCooldownSeconds = dutyBudgetSeconds * cooldownRatio
     static let checkpointIntervalSeconds: TimeInterval = 5
 }
@@ -48,7 +48,7 @@ enum SafetyLimits {
 /// 滚动窗口占空比账本（移植 legacy src/safety/duty_cycle.py 的 DutyCycleLedger）。
 ///
 /// iOS 的一次"运行"：从停机状态下第一帧输出开始，到停止帧对确认（或用户确认已物理关机）为止。
-/// 开始时预留 min(300 秒, 剩余额度) 作为本次上限；结束时按实际时长记账，并开始冷却。
+/// 开始时预留 min(1200 秒, 剩余额度) 作为本次上限；结束时按实际时长记账，并开始冷却。
 /// 记账条目在结束后保留整整一个窗口（与 legacy 一样偏保守）。
 ///
 /// 不是线程安全的：BLEManager 只在 bleQueue 上用它。
@@ -169,7 +169,7 @@ final class DutyCycleLedger {
     func end() {
         guard let start = openStart else { return }
         let now = clock()
-        // 进程不在时无法执行 300s 截止停机；直到确认/物理确认停止都按实际推断时长记账（F2）。
+        // 进程不在时无法执行单次上限截止停机；直到确认/物理确认停止都按实际推断时长记账（F2）。
         let elapsed = max(0, now - start)
         let charge = openElapsedUnknown ? max(SafetyLimits.dutyBudgetSeconds, elapsed) : elapsed
         completed.append(Entry(end: now, charge: charge))
