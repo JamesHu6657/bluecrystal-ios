@@ -718,7 +718,7 @@ struct VideoSyncView: View {
         let hasScript: Bool = vm.script != nil
         return HStack(spacing: 8) {
             ReadinessChip(title: deviceTitle, done: connected, icon: "dot.radiowaves.left.and.right",
-                          hint: busy ? "" : "连接设备", enabled: !busy) {
+                          hint: busy ? "" : "连接设备", enabled: !busy, tappableWhenDone: false) {
                 if !connected && !busy { ble.startScan() }
             }
             ReadinessChip(title: "视频", done: hasVideo, icon: "film",
@@ -973,29 +973,44 @@ private struct ReadinessChip: View {
     let hint: String
     /// 已就绪的不变灰（勾要看得清），只有"现在点了也没用"的才禁用
     var enabled = true
+    /// 就绪后再点还有没有意义（视频 / 脚本可以换；设备连上了再点什么也不做，就不当按钮）
+    var tappableWhenDone = true
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: done ? "checkmark.circle.fill" : icon)
-                Text(title)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
+        if done && !tappableWhenDone {
+            chipLabel
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(title)
+                .accessibilityValue("已就绪")
+        } else {
+            Button(action: action) {
+                chipLabel
             }
-            .font(.caption.weight(.semibold))
-            .foregroundColor(done ? Velvet.ok : Velvet.text)
-            .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity, minHeight: 44)
-            .background(Capsule().fill(Color.white.opacity(done ? 0.04 : 0.08)))
-            .overlay(Capsule().strokeBorder(done ? Velvet.ok.opacity(0.35) : Velvet.stroke, lineWidth: 1))
-            .contentShape(Capsule())
+            .buttonStyle(PressableStyle())
+            .disabled(!done && !enabled)
+            .accessibilityLabel(title)
+            .accessibilityValue(done ? "已就绪" : "未就绪")
+            .accessibilityHint(done ? "点一下更换" : hint)
         }
-        .buttonStyle(PressableStyle())
-        .disabled(!done && !enabled)
-        .accessibilityLabel(title)
-        .accessibilityValue(done ? "已就绪" : "未就绪")
-        .accessibilityHint(done ? "" : hint)
+    }
+
+    private var chipLabel: some View {
+        let fill: Color = Color.white.opacity(done ? 0.04 : 0.08)
+        let stroke: Color = done ? Velvet.ok.opacity(0.35) : Velvet.stroke
+        return HStack(spacing: 5) {
+            Image(systemName: done ? "checkmark.circle.fill" : icon)
+            Text(title)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundColor(done ? Velvet.ok : Velvet.text)
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .background(Capsule().fill(fill))
+        .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
+        .contentShape(Capsule())
     }
 }
 
@@ -1211,6 +1226,8 @@ struct FullScreenVideoView: View {
                 .buttonStyle(.borderless)
                 .accessibilityLabel("停止")
                 .accessibilityHint("立即停止所有输出")
+                // 字号固定（圆里放不下更大的字）：大字号用户长按能看到放大的"停止"（点按照常立刻停）
+                .accessibilityShowsLargeContentViewer()
             }
         }
         .padding(Self.stopInset)

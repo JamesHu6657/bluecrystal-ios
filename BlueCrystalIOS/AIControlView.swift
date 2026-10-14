@@ -669,6 +669,7 @@ struct AIControlView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var privacy: PrivacyLock
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var vm = AIControlVM()
     @StateObject private var config = AIConfigWatcher()
     @State private var showSettings = false
@@ -713,13 +714,14 @@ struct AIControlView: View {
             // 快捷话和输入栏共用一层底色（之前两层深浅不同，中间有一道接缝）
             VStack(spacing: 0) {
                 if showQuickReplies {
+                    // 减弱动态效果时只淡入淡出，不位移
                     quickReplies
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .transition(quickReplyTransition)
                 }
                 inputBar
             }
             // 只给快捷话这一层做动画，不把聊天记录一起带着动
-            .animation(.easeInOut(duration: 0.2), value: showQuickReplies)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: showQuickReplies)
             .background(.ultraThinMaterial)
             .background(Velvet.ink.opacity(0.5))
         }
@@ -861,6 +863,13 @@ struct AIControlView: View {
             return
         }
         vm.send()
+    }
+
+    /// 快捷话出现 / 收起：减弱动态效果时只淡入淡出（写成明确类型，避开 iOS 17 Transition 重载的推断）
+    private var quickReplyTransition: AnyTransition {
+        if reduceMotion { return AnyTransition.opacity }
+        let move: AnyTransition = AnyTransition.move(edge: .bottom)
+        return move.combined(with: AnyTransition.opacity)
     }
 
     /// 输入框空着时才出快捷话（不会盖掉自己打了一半的字）。

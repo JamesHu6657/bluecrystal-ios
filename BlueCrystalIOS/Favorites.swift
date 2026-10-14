@@ -5,7 +5,7 @@ import UIKit
 // 只存 UserDefaults 里的几组数字；召回交给 ManualControlVM.applyFavorite，走手动页同一条发送路径，
 // 不新增任何发帧方式，也不碰准入 / 冷却 / 额度 / 看门狗。存取时都按各模式范围夹紧（FavoriteSetting.clamp）。
 // 收藏区不弹任何 alert / sheet：重命名是卡片里的输入框、删除可撤销，底部停止键始终在键盘上面可点。
-// 界面分两块：模式下面的「一键回到」横排（召回，不用滚过滑杆）；滑杆下面的「我的收藏」（收藏此刻、整理）。
+// 界面只有一块：滑杆下面的「我的收藏」——一排卡片点了就回去，行尾「收藏此刻」，「整理」就地重命名 / 删除。
 
 final class FavoriteStore: ObservableObject {
     static let storageKey = "bc.ui.favorites.v1"
@@ -52,10 +52,10 @@ final class FavoriteStore: ObservableObject {
         return removed
     }
 
-    /// 撤销删除：放回原位；满了或已经在了就不放
+    /// 撤销删除：放回原位；满了、已经在了、或同样的手感又收藏过一次就不放
     @discardableResult
     func restore(_ r: Removed) -> Bool {
-        guard !isFull, !items.contains(where: { $0.id == r.item.id }) else { return false }
+        guard !isFull, !items.contains(where: { $0.id == r.item.id || $0.sameSetting(as: r.item) }) else { return false }
         let at: Int = min(max(0, r.index), items.count)
         items.insert(r.item, at: at)
         persist()
@@ -100,78 +100,48 @@ final class FavoriteStore: ObservableObject {
     }
 }
 
-// MARK: - 一键回到（模式选择下面）
+// MARK: - 我的收藏（滑杆下面）：一排卡片 + 行尾「收藏此刻」，整理就地展开
 
-/// 收藏的横排卡片：不用滚过三根滑杆就能一点回到那一下。能不能点由 FavoriteRecallRules 决定
-struct FavoriteQuickRow: View {
+/// 手感页唯一的收藏区：点卡片召回、点行尾的加号卡片收藏此刻、「整理」就地重命名 / 删除（可撤销）。
+/// 卡片能不能点由 FavoriteRecallRules 决定；最下面最多一行字：撤销 > 刚做完的事 > 为什么点不了
+struct FavoritesSection: View {
     @ObservedObject var store: FavoriteStore
     let rules: FavoriteRecallRules
     let onRecall: (FavoriteSetting) -> Void
-    /// 卡片宽度跟着字号放大
-    @ScaledMetric(relativeTo: .headline) private var chipWidth: CGFloat = 138
-
-    private var activeID: UUID? { store.match(mode: rules.mode, levels: rules.levels)?.id }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SectionLabel(title: "一键回到", systemImage: "heart.fill")
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
-                    ForEach(store.items) { fav in
-                        let usable: Bool = rules.usable(fav)
-                        let active: Bool = activeID == fav.id
-                        FavoriteTile(fav: fav, active: active, hint: rules.hint(for: fav)) {
-                            onRecall(fav)
-                            Haptics.light()
-                        }
-                        .frame(width: chipWidth)
-                        .disabled(!usable)
-                    }
-                }
-                // 给选中卡片的光晕留出地方，不被滚动区裁掉
-                .padding(.vertical, 8)
-                .padding(.horizontal, 2)
-            }
-            if let status = rules.status(for: store.items) {
-                Label(status, systemImage: "lock.fill")
-                    .font(.caption)
-                    .foregroundColor(Velvet.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: store.items.map { $0.id })
-    }
-}
-
-// MARK: - 我的收藏（滑杆下面）：收藏此刻、整理
-
-/// 手感页的收藏区：收藏此刻、整理（重命名 / 删除 / 撤销删除）。召回在上面的 FavoriteQuickRow
-struct FavoritesPanel: View {
-    @ObservedObject var store: FavoriteStore
-    let mode: BCProtocol.Mode
-    let levels: [Int]
 
     @State private var editing = false
     @State private var notice: String?
     @State private var undo: FavoriteStore.Removed?
     @State private var noticeGen = 0
     @FocusState private var focusedName: UUID?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// 卡片宽度跟着字号放大
+    @ScaledMetric(relativeTo: .headline) private var chipWidth: CGFloat = 150
+    @ScaledMetric(relativeTo: .headline) private var addWidth: CGFloat = 112
+
+    private var mode: BCProtocol.Mode { rules.mode }
 
     private var hasOutputToSave: Bool {
-        mode != .skill && FavoriteSetting.clamp(levels, maxLevel: mode.maxLevel).contains { $0 > 0 }
+        guard mode != .skill else { return false }
+        let clamped: [Int] = FavoriteSetting.clamp(rules.levels, maxLevel: mode.maxLevel)
+        return clamped.contains { $0 > 0 }
     }
 
-    /// 收藏键下面的一句说明（不能收藏时说清楚为什么）
+    private var canSave: Bool { hasOutputToSave && !store.isFull && !editing }
+
+    private var activeID: UUID? { store.match(mode: mode, levels: rules.levels)?.id }
+
+    /// 加号卡片上的小字：能收藏时说收什么，不能时说为什么
+    private var saveCaption: String {
+        if store.isFull { return "已满 \(FavoriteSetting.maxCount) 组" }
+        if !hasOutputToSave { return "先推滑杆" }
+        return "存下这一刻"
+    }
+
     private var saveHint: String {
-        if mode == .skill { return "技能本身就是一键；切到变频或手动，调出喜欢的感觉再收藏" }
         if store.isFull { return "最多收藏 \(FavoriteSetting.maxCount) 组，先整理掉不常用的" }
         if !hasOutputToSave { return "先把滑杆推到喜欢的位置，再收藏" }
-        return "收藏后一点就回来：强度会在一秒内缓缓推上去"
-    }
-
-    /// 空列表时上面已经有一句引导，和"先把滑杆推上去"重复，就不再说一遍
-    private var showsSaveHint: Bool {
-        mode == .skill || !store.items.isEmpty || hasOutputToSave
+        return "收藏后点一下就回来：强度会缓缓推上去"
     }
 
     /// 撤销条停留多久：旁白用户要先找到"撤销"键，给得宽一些
@@ -179,40 +149,41 @@ struct FavoritesPanel: View {
         UIAccessibility.isVoiceOverRunning ? 15 : 6
     }
 
+    private var listAnimation: Animation? {
+        reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.85)
+    }
+
+    private var editAnimation: Animation? {
+        reduceMotion ? nil : .easeInOut(duration: 0.2)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             header
             if editing && !store.items.isEmpty {
                 editList
             } else if store.items.isEmpty {
-                if mode != .skill {
-                    Text("调到最喜欢的那一下，收藏起来，下次在上面一点就回到那里。")
-                        .font(.caption)
-                        .foregroundColor(Velvet.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                emptyCard
             } else {
-                Text("已收藏 \(store.items.count)/\(FavoriteSetting.maxCount) 组，在上方「一键回到」点一下就回来")
-                    .font(.caption)
-                    .foregroundColor(Velvet.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            // 技能模式下收藏键永远不能用，不摆一个灰按钮，只留一句说明
-            if mode != .skill {
-                saveButton
+                tileRow
             }
             footnote
         }
-        .velvetCard()
-        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: store.items.map { $0.id })
-        .animation(.easeInOut(duration: 0.2), value: editing)
+        .animation(listAnimation, value: store.items.map { $0.id })
+        .animation(editAnimation, value: editing)
         // 整理到一半切走：名字照样收好（不留空名字）
         .onDisappear { endEditing() }
     }
 
     private var header: some View {
-        HStack {
-            SectionLabel(title: "我的收藏", systemImage: "heart")
+        HStack(alignment: .center, spacing: 8) {
+            SectionLabel(title: "我的收藏", systemImage: "heart.fill")
+            if !store.items.isEmpty {
+                Text("\(store.items.count)/\(FavoriteSetting.maxCount)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundColor(Velvet.textMuted)
+                    .accessibilityLabel("已收藏 \(store.items.count) 组，最多 \(FavoriteSetting.maxCount) 组")
+            }
             Spacer()
             if !store.items.isEmpty {
                 Button {
@@ -230,6 +201,130 @@ struct FavoritesPanel: View {
         }
     }
 
+    /// 一排收藏卡片，行尾是「收藏此刻」；新收藏的那张会滚到眼前
+    private var tileRow: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 10) {
+                    ForEach(store.items) { fav in
+                        let usable: Bool = rules.usable(fav)
+                        let active: Bool = activeID == fav.id
+                        let hint: String = rules.hint(for: fav)
+                        FavoriteTile(fav: fav, active: active, hint: hint) {
+                            onRecall(fav)
+                            Haptics.light()
+                        }
+                        .frame(width: chipWidth)
+                        .disabled(!usable)
+                        .id(fav.id)
+                    }
+                    // 技能模式不能收藏：不摆一个永远灰着的加号
+                    if mode != .skill {
+                        addTile
+                            .frame(width: addWidth)
+                    }
+                }
+                // 卡片等高（名字两行的那张不会把别的比下去）；给选中卡片的光晕留出地方
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 2)
+            }
+            .onChange(of: store.items.last?.id) { newID in
+                guard let id = newID else { return }
+                if reduceMotion {
+                    proxy.scrollTo(id, anchor: .trailing)
+                } else {
+                    withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(id, anchor: .trailing) }
+                }
+            }
+        }
+    }
+
+    private var addTile: some View {
+        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+        return Button {
+            save()
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                Image(systemName: "plus")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(Velvet.gold)
+                    .frame(width: 30, height: 30)
+                    .overlay(Circle().strokeBorder(Velvet.gold.opacity(0.6), lineWidth: 1))
+                Text("收藏此刻")
+                    .font(Velvet.display(.subheadline))
+                    .foregroundColor(Velvet.text)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                Text(saveCaption)
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textSecondary)
+                    .lineLimit(2)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(shape.fill(Color.white.opacity(0.03)))
+            .overlay(shape.strokeBorder(Velvet.gold.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
+            .contentShape(shape)
+        }
+        .buttonStyle(SoftPressStyle())
+        .disabled(!canSave)
+        .accessibilityLabel("收藏此刻的手感")
+        .accessibilityHint(saveHint)
+    }
+
+    /// 还没有收藏：一张邀请卡片（技能模式下只说明为什么不能收藏）
+    @ViewBuilder private var emptyCard: some View {
+        let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
+        if mode == .skill {
+            Label("技能本身就是一键。切到变频或手动，调出喜欢的感觉再收藏", systemImage: "sparkles")
+                .font(.caption)
+                .foregroundColor(Velvet.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(shape.fill(Color.white.opacity(0.03)))
+                .overlay(shape.strokeBorder(Velvet.stroke, lineWidth: 1))
+        } else {
+            Button {
+                save()
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "heart.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 40, height: 40)
+                        .background(Circle().fill(Velvet.roseGradient))
+                        .shadow(color: Velvet.rose.opacity(0.45), radius: 8)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("收藏此刻的手感")
+                            .font(Velvet.display(.headline))
+                            .foregroundColor(Velvet.text)
+                        Text("下次点一下，就缓缓回到这里")
+                            .font(.caption)
+                            .foregroundColor(Velvet.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundColor(Velvet.gold)
+                        .accessibilityHidden(true)
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .background(shape.fill(Color.white.opacity(0.03)))
+                .overlay(shape.strokeBorder(Velvet.gold.opacity(0.45), style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
+                .contentShape(shape)
+            }
+            .buttonStyle(SoftPressStyle())
+            .disabled(!canSave)
+            .accessibilityLabel("收藏此刻的手感")
+            .accessibilityHint(saveHint)
+        }
+    }
+
     private var editList: some View {
         VStack(spacing: 10) {
             ForEach(store.items) { fav in
@@ -242,18 +337,7 @@ struct FavoritesPanel: View {
         }
     }
 
-    private var saveButton: some View {
-        Button {
-            save()
-        } label: {
-            Label("收藏此刻的手感", systemImage: "heart.fill")
-                .frame(maxWidth: .infinity)
-        }
-        .buttonStyle(PillButtonStyle(kind: .secondary))
-        .disabled(editing || !hasOutputToSave || store.isFull)
-        .accessibilityHint(saveHint)
-    }
-
+    /// 最多一行：撤销 > 刚做完的事 > 为什么点不了 > 空列表时怎么开始
     @ViewBuilder private var footnote: some View {
         if let u = undo {
             HStack(spacing: 8) {
@@ -278,12 +362,17 @@ struct FavoritesPanel: View {
             Label(n, systemImage: "checkmark.seal.fill")
                 .font(.caption)
                 .foregroundColor(Velvet.blush)
+                .fixedSize(horizontal: false, vertical: true)
                 .transition(.opacity)
-        } else if showsSaveHint {
-            Text(saveHint)
+        } else if !editing, let status = rules.status(for: store.items) {
+            Label(status, systemImage: "lock.fill")
+                .font(.caption)
+                .foregroundColor(Velvet.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if store.items.isEmpty && mode != .skill && !hasOutputToSave {
+            Text("先把滑杆推到喜欢的位置，再收藏")
                 .font(.caption)
                 .foregroundColor(Velvet.textMuted)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -333,16 +422,18 @@ struct FavoritesPanel: View {
         if ok {
             Haptics.select()
             flash("已放回「\(r.item.name)」")
-        } else {
+        } else if store.isFull {
             flash("收藏已满 \(FavoriteSetting.maxCount) 组，放不回去了")
+        } else {
+            flash("同样的手感已经在收藏里了")
         }
     }
 
     private func save() {
-        switch store.add(mode: mode, levels: levels) {
+        switch store.add(mode: mode, levels: rules.levels) {
         case .added(let fav):
             Haptics.success()
-            flash("已收藏「\(fav.name)」，在上方一点就回来")
+            flash("已收藏「\(fav.name)」，点一下就回来")
         case .duplicate(let fav):
             Haptics.select()
             flash("这组已经在收藏里了：「\(fav.name)」")
@@ -366,6 +457,27 @@ struct FavoritesPanel: View {
     }
 }
 
+/// 收藏区的按下效果：不能点时只淡一点（0.55），卡片上的说明字还看得清
+private struct SoftPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        SoftPressBody(configuration: configuration)
+    }
+
+    private struct SoftPressBody: View {
+        let configuration: ButtonStyleConfiguration
+        @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+        var body: some View {
+            let pressedScale: CGFloat = (configuration.isPressed && !reduceMotion) ? 0.97 : 1
+            configuration.label
+                .opacity(isEnabled ? 1 : 0.55)
+                .scaleEffect(pressedScale)
+                .animation(.spring(response: 0.22, dampingFraction: 0.7), value: configuration.isPressed)
+        }
+    }
+}
+
 /// 一组收藏：名字、模式、三个通道的小柱和数值
 private struct FavoriteTile: View {
     let fav: FavoriteSetting
@@ -385,20 +497,23 @@ private struct FavoriteTile: View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
+                    // 名字最多 12 个字：两行放得下，不截成"…"
                     Text(fav.name)
                         .font(Velvet.display(.headline))
                         .foregroundColor(.white)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
                     Text(fav.mode?.title ?? "")
                         .font(.caption2.weight(.semibold))
                         .foregroundColor(active ? Color.white : Velvet.gold)
                 }
+                Spacer(minLength: 0)
                 FavoriteBars(levels: levels, maxLevel: maxLevel, active: active)
             }
             .padding(12)
-            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(tileBackground)
             .overlay(
                 RoundedRectangle(cornerRadius: 18, style: .continuous)

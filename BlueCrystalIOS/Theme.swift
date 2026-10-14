@@ -228,7 +228,9 @@ struct SectionLabel: View {
     var body: some View {
         HStack(spacing: 6) {
             if let s = systemImage {
+                // 图标只是装饰：旁白只读标题，不读符号名
                 Image(systemName: s).font(.system(size: 11, weight: .semibold))
+                    .accessibilityHidden(true)
             }
             Text(title).font(.footnote.weight(.semibold)).tracking(1.5)
         }

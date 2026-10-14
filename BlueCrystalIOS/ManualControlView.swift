@@ -155,7 +155,7 @@ final class ManualControlVM: ObservableObject {
         pendingWork = nil
         outputSinceStop = true
         let from = channels.map { Int($0) }
-        let plan = FavoriteGlide.plan(from: from, to: target)
+        let plan = FavoriteGlide.plan(from: from, to: target, maxLevel: favMode.maxLevel)
         runGlide(plan, index: 0, gen: glideGen, mode: favMode)
     }
 
@@ -231,6 +231,7 @@ struct ManualControlView: View {
     @StateObject private var favorites = FavoriteStore()
     /// 「隐私与设备」默认收起：面容 ID 开关、最后一帧、FFA2、版本都不抢主角
     @State private var showDetails = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var modeFooter: String {
         switch vm.mode {
@@ -268,6 +269,8 @@ struct ManualControlView: View {
         vm.idleNotice != nil || ble.safety.runRemaining != nil
     }
 
+    private var isConnected: Bool { ble.state == .ready }
+
     /// 连上了且现在允许开始/继续输出（冷却、额度、锁存、停止未确认时禁用；停止按钮不受影响）
     private var canOutput: Bool {
         ble.state == .ready && ble.safety.blockReason == nil
@@ -295,37 +298,25 @@ struct ManualControlView: View {
             VStack(alignment: .leading, spacing: 18) {
                 PageHeader(title: "手感", subtitle: Velvet.greeting())
 
-                // 型号写在卡片里的设备名上，按钮只说要做什么
-                DeviceStatusCard(allowDisconnect: true, connectTitle: "连接设备")
+                // 连接键在下面的邀请卡片上（未连接时）；设备卡片只管状态、红字、解除锁定和断开
+                DeviceStatusCard(allowDisconnect: true, connectTitle: "连接设备", showsConnect: false)
 
-                HeatCore(heat: heat, active: ble.state == .ready)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
-
-                modeSection
-
-                // 收藏放在滑杆上面：一点就回到那一下，不用先滚过三根滑杆
-                if !favorites.items.isEmpty {
-                    FavoriteQuickRow(store: favorites, rules: recallRules) { vm.applyFavorite($0) }
-                        .transition(.opacity)
+                // 连上之前不摆一墙灰掉的控件：一张邀请卡片 + 一个大大的连接键；连上后才是心、模式、滑杆和收藏
+                VStack(alignment: .leading, spacing: 18) {
+                    if isConnected {
+                        connectedContent
+                            .transition(.opacity)
+                    } else {
+                        ConnectHero(favoriteCount: favorites.items.count)
+                            .transition(.opacity)
+                    }
                 }
-
-                controlsSection
-
-                // 空闲停机说明紧跟在滑杆下面：它说的就是这几根滑杆
-                if showsIdleNote {
-                    idleNote
-                        .transition(.opacity)
-                }
-
-                FavoritesPanel(store: favorites, mode: vm.mode, levels: currentLevels)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: isConnected)
 
                 settingsCard
             }
             .padding(.horizontal, 20)
             .padding(.bottom, 16)
-            .animation(.easeInOut(duration: 0.25), value: favorites.items.isEmpty)
-            .animation(.easeInOut(duration: 0.25), value: showsIdleNote)
         }
         .background(VelvetBackground(glow: heat).ignoresSafeArea())
         // 停止常驻底部：不随内容滚走，一下就停。任何连接状态下都可以点（修：之前未连接 / 断开中时被禁用，
@@ -344,6 +335,29 @@ struct ManualControlView: View {
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
 
+    /// 连上之后：心、模式、滑杆（主角，尽量不用滚动就够得着）、空闲说明、收藏
+    private var connectedContent: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HeatCore(heat: heat, active: true)
+                .frame(maxWidth: .infinity)
+
+            modeSection
+
+            // 空闲停机说明紧跟在滑杆下面：它说的就是这几根滑杆。动画只挂在这一小块上
+            VStack(alignment: .leading, spacing: 12) {
+                controlsSection
+                if showsIdleNote {
+                    idleNote
+                        .transition(.opacity)
+                }
+            }
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: showsIdleNote)
+
+            // 收藏在滑杆下面：滑杆是主角，先够得着；收藏一排卡片，点一下缓缓回到那里
+            FavoritesSection(store: favorites, rules: recallRules) { vm.applyFavorite($0) }
+        }
+    }
+
     /// 技能 / 变频 / 手动 的切换和一句说明
     private var modeSection: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -356,7 +370,7 @@ struct ManualControlView: View {
                 .id(vm.mode)
                 .transition(.opacity)
         }
-        .animation(.easeInOut(duration: 0.25), value: vm.mode)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: vm.mode)
     }
 
     /// 技能卡片，或三个通道的滑杆
@@ -508,6 +522,114 @@ struct ManualControlView: View {
     }
 }
 
+/// 未连接时的主角：一团慢慢呼吸的光、一句话、一个大大的连接键（连接中 / 没连上 / 断开中各有各的说法）。
+/// 只调 ble.startScan()，和设备卡片上原来的连接键是同一个入口
+private struct ConnectHero: View {
+    @EnvironmentObject var ble: BLEManager
+    let favoriteCount: Int
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var glow = false
+
+    private var busy: Bool {
+        ble.state == .scanning || ble.state == .connecting || ble.state == .discovering
+    }
+
+    private var title: String {
+        switch ble.state {
+        case .scanning, .connecting, .discovering: return "正在找你的它…"
+        case .failed: return "这次没连上"
+        case .disconnecting: return "正在断开…"
+        case .idle, .ready: return "今晚，从连接开始"
+        }
+    }
+
+    private var message: String {
+        switch ble.state {
+        case .scanning, .connecting, .discovering: return "让设备开着机、靠近手机，马上就好"
+        case .failed: return "确认设备已开机、电量充足、就在手机旁边，再试一次"
+        case .disconnecting: return "等设备确认停下；需要你处理时，上面的设备卡片会说明"
+        case .idle, .ready: return "打开设备电源，放在手机旁边，轻点下面就好"
+        }
+    }
+
+    private var buttonTitle: String {
+        if busy { return ble.state.rawValue }
+        return ble.state == .failed ? "再试一次" : "连接设备"
+    }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            orb
+            VStack(spacing: 6) {
+                Text(title)
+                    .font(Velvet.display(.title2))
+                    .foregroundColor(Velvet.text)
+                    .multilineTextAlignment(.center)
+                    .accessibilityAddTraits(.isHeader)
+                Text(message)
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // 断开中不给连接键：断开流程（含停止确认）走完之前不开始新的连接
+            if ble.state != .disconnecting {
+                Button {
+                    ble.startScan()
+                } label: {
+                    HStack(spacing: 8) {
+                        if busy {
+                            ProgressView()
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "dot.radiowaves.left.and.right")
+                        }
+                        Text(buttonTitle)
+                    }
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                }
+                .buttonStyle(PillButtonStyle(kind: .primary))
+                .disabled(busy)
+            }
+            if favoriteCount > 0 {
+                Label("你收藏的 \(favoriteCount) 组手感，连上就能一点回到", systemImage: "heart.fill")
+                    .font(.caption)
+                    .foregroundColor(Velvet.blush)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .velvetCard(padding: 20)
+        .onAppear {
+            guard !reduceMotion else { return }
+            withAnimation(.easeInOut(duration: 2.8).repeatForever(autoreverses: true)) { glow = true }
+        }
+    }
+
+    private var orb: some View {
+        let scale: CGFloat = glow ? 1.06 : 0.94
+        return ZStack {
+            Circle()
+                .fill(RadialGradient(colors: [Velvet.rose.opacity(0.5), .clear],
+                                     center: .center, startRadius: 0, endRadius: 70))
+                .frame(width: 140, height: 140)
+                .scaleEffect(scale)
+            Circle()
+                .fill(RadialGradient(colors: [Velvet.blush.opacity(0.85), Velvet.rose.opacity(0.8), Velvet.wine.opacity(0.9)],
+                                     center: .center, startRadius: 2, endRadius: 40))
+                .frame(width: 76, height: 76)
+                .shadow(color: Velvet.rose.opacity(0.5), radius: 18)
+            Image(systemName: "heart.fill")
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundColor(.white)
+        }
+        .frame(height: 140)
+        .accessibilityHidden(true)
+    }
+}
+
 /// 中央的"心"：随热度呼吸，热度越高越快越亮（纯展示）
 private struct HeatCore: View {
     let heat: Double
@@ -538,7 +660,7 @@ private struct HeatCore: View {
                 ForEach(0..<3, id: \.self) { i in
                     let ringNumber: Double = Double(i + 1)
                     let ringOpacity: Double = ringBaseOpacity / ringNumber
-                    let ringSize: CGFloat = 150.0 + CGFloat(i) * 34.0
+                    let ringSize: CGFloat = 118.0 + CGFloat(i) * 26.0
                     let ringAmount: Double = 0.02 * wave * ringNumber * ringStrength
                     let ringScale: CGFloat = 1.0 + CGFloat(ringAmount)
                     Circle()
@@ -550,13 +672,13 @@ private struct HeatCore: View {
                     .fill(RadialGradient(colors: [Velvet.blush.opacity(blushOpacity),
                                                   Velvet.rose.opacity(roseOpacity),
                                                   Velvet.wine.opacity(0.9)],
-                                         center: .center, startRadius: 4, endRadius: 75))
-                    .frame(width: 140, height: 140)
+                                         center: .center, startRadius: 4, endRadius: 60))
+                    .frame(width: 112, height: 112)
                     .shadow(color: Velvet.rose.opacity(shadowOpacity), radius: shadowSize)
                     .scaleEffect(breathe)
                 VStack(spacing: 0) {
                     Text("\(displayedHeat)")
-                        .font(Velvet.serif(40, .light))
+                        .font(Velvet.serif(34, .light))
                         .monospacedDigit()
                         .foregroundColor(.white)
                     Text(mood)
@@ -565,7 +687,8 @@ private struct HeatCore: View {
                         .foregroundColor(.white.opacity(0.8))
                 }
             }
-            .frame(height: 220)
+            // 比原来矮一截（220 → 176）：小屏上第一根滑杆不用滚动就够得着
+            .frame(height: 176)
             .opacity(active ? 1 : 0.55)
         }
         .accessibilityElement(children: .ignore)

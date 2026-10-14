@@ -199,14 +199,38 @@ enum FavoriteCodec {
 
 /// 召回收藏时的"缓缓推上去"：升高的通道分几步爬到目标，降低的通道第一步就到位（降低永远立即生效）。
 /// 只算每一步的值；发送由 ManualControlVM 做：第一步是用户这次点按（send，开闸），
-/// 后面的步骤走 sendThrottled（不开闸）：中途有任何停止（用户 / 看门狗 / 上限 / 断开），后面的步骤都会被丢掉
+/// 后面的步骤走 sendThrottled（不开闸）：中途有任何停止（用户 / 看门狗 / 上限 / 断开），后面的步骤都会被丢掉。
+/// 用时跟着升幅走：小幅调整约 0.75 秒，从 0 推到满档约 3 秒（一下点到满强度也不会"猛地一下"）
 enum FavoriteGlide {
-    static let steps = 6
+    /// 最少步数：(6 - 1) × 0.15 = 0.75 秒
+    static let minSteps = 6
+    /// 最多步数：(21 - 1) × 0.15 = 3 秒（升幅等于整个量程时）
+    static let maxSteps = 21
     static let stepInterval: TimeInterval = 0.15
+
+    /// 按最大升幅占量程的比例决定步数（只升不降、或不变时取 minSteps）
+    static func stepCount(from: [Int], to: [Int], maxLevel: Int) -> Int {
+        let rises: [Int] = (0..<4).map { (i: Int) -> Int in
+            let a: Int = i < from.count ? max(0, from[i]) : 0
+            let b: Int = i < to.count ? max(0, to[i]) : 0
+            return max(0, b - a)
+        }
+        let maxRise: Int = rises.max() ?? 0
+        guard maxLevel > 0, maxRise > 0 else { return minSteps }
+        let fraction: Double = min(1.0, Double(maxRise) / Double(maxLevel))
+        let extraSpan: Double = Double(maxSteps - minSteps)
+        let extra: Int = Int((extraSpan * fraction).rounded(.up))
+        return min(maxSteps, minSteps + extra)
+    }
+
+    /// 按该模式量程自动定步数的缓推
+    static func plan(from: [Int], to: [Int], maxLevel: Int) -> [[Int]] {
+        plan(from: from, to: to, steps: stepCount(from: from, to: to, maxLevel: maxLevel))
+    }
 
     /// 从 from 到 to 的每一步（不含起点，最后一步恰好是 to；相邻重复的步骤合并）。
     /// from == to 时只有一步（重新发一次目标值）
-    static func plan(from: [Int], to: [Int], steps: Int = steps) -> [[Int]] {
+    static func plan(from: [Int], to: [Int], steps: Int) -> [[Int]] {
         let n = max(1, steps)
         let start = (0..<4).map { $0 < from.count ? max(0, from[$0]) : 0 }
         let target = (0..<4).map { $0 < to.count ? max(0, to[$0]) : 0 }
@@ -252,6 +276,7 @@ struct FavoriteRecallRules {
     func hint(for fav: FavoriteSetting) -> String {
         if let r = blockReason { return r }
         if locked(fav) { return "正在输出，切换模式要先停止并冷却" }
+        if let m = fav.mode, m != mode { return "切到\(m.title)，再缓缓推到这组强度" }
         return "缓缓推到这组强度"
     }
 
