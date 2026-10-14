@@ -9,7 +9,7 @@ struct ContentView: View {
                 ManualControlView()
             }
             .tabItem {
-                Label("手动控制", systemImage: "sliders.horizontal.3")
+                Label("手动控制", systemImage: "slider.horizontal.3")
             }
 
             NavigationView {

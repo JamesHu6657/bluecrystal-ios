@@ -1,17 +1,22 @@
 import Foundation
 
-/// 醉清风 aa 协议 0x06 模式命令（mizzzee_0032 实抓验证）
+/// 醉清风 aa 协议（参数全部取自官方 App 3.5.1 源码，app-service.js）
 ///
-/// 帧格式：AA 06 05 <ch0> <ch1> <ch2> <ch3> <flag=00> <checksum>
-/// 共 9 字节，checksum = 前 8 字节相加取低 8 位
-/// 写特征值 FFA1，需 Write With Response
+/// 通用帧（官方 be(cmd, arr)）：AA <cmd> <len> <payload...> <checksum>
+/// checksum = 前面所有字节相加取低 8 位
+/// 写特征值 FFA1，Write With Response
+///
+/// - 0x06 模式帧（官方 Tt()，技能 / 变频 tab）：AA 06 05 <伸缩> <震动> <吮吸> <旋转> 00 <cs>
+///   变频滑杆官方默认范围 0~9；技能预设最高也是 9
+/// - 0x08 手动帧（官方 at()，手动 tab）：AA 08 06 <伸缩> <震动> <吮吸> <旋转> 00 00 <cs>
+///   手动滑杆官方范围 0~99
 enum BCProtocol {
 
     static let header: UInt8 = 0xAA
-    static let cmd: UInt8 = 0x06
-    static let len: UInt8 = 0x05
+    static let modeCmd: UInt8 = 0x06
+    static let manualCmd: UInt8 = 0x08
 
-    /// 四通道索引
+    /// 四通道索引（官方 getSlideProtocolIndex：伸缩 0 / 震动 1 / 吮吸 2 / 旋转 3）
     enum Channel: Int, CaseIterable {
         case thrust = 0    // 伸缩
         case vibration = 1 // 震动
@@ -39,32 +44,94 @@ enum BCProtocol {
         }
     }
 
-    /// 设备每通道最高档位。官方 App 实抓启动帧为 04 06 05 00（个位数档位），
-    /// 设备按 0~9 档解释：之前按 0~99 发，1% 以上就会被设备当成高档（用户实测"一档跑到九档"）
-    static let maxLevel = 9
+    /// 控制方式，对应官方 PlayPanel 的三个 tab
+    enum Mode: Int, CaseIterable, Identifiable {
+        case skill = 1    // 技能：固定预设，0x06
+        case frequency = 2 // 变频：滑杆 0~9，0x06
+        case manual = 3   // 手动：滑杆 0~99，0x08
 
-    /// 构造 0x06 控制帧，每通道档位 0~maxLevel
-    static func frame(channels: [Int]) -> Data {
-        var bytes: [UInt8] = [header, cmd, len]
-        for i in 0..<4 {
-            let v = i < channels.count ? channels[i] : 0
-            bytes.append(UInt8(max(0, min(maxLevel, v))))
+        var id: Int { rawValue }
+        var title: String {
+            switch self {
+            case .skill: return "技能"
+            case .frequency: return "变频"
+            case .manual: return "手动"
+            }
         }
-        bytes.append(0x00) // flag，恒 0
+        var maxLevel: Int {
+            switch self {
+            case .skill, .frequency: return BCProtocol.maxModeLevel
+            case .manual: return BCProtocol.maxManualLevel
+            }
+        }
+        func frame(channels: [Int]) -> Data {
+            switch self {
+            case .skill, .frequency: return BCProtocol.modeFrame(channels: channels)
+            case .manual: return BCProtocol.manualFrame(channels: channels)
+            }
+        }
+    }
+
+    /// 官方技能预设（ts / n_ 表，原值）
+    struct Preset: Identifiable {
+        let key: String
+        let title: String
+        let channels: [Int]
+        var id: String { key }
+    }
+
+    static let presets: [Preset] = [
+        Preset(key: "shadow_follow", title: "如影随形", channels: [4, 6, 5, 0]),
+        Preset(key: "wind_spin", title: "疾风旋舞", channels: [8, 9, 9, 0]),
+        Preset(key: "phantom_follow", title: "幻影随行", channels: [6, 6, 8, 0]),
+        Preset(key: "water_ring", title: "水光环绕", channels: [2, 2, 3, 0]),
+        Preset(key: "dragon_tail", title: "神龙摆尾", channels: [3, 9, 3, 0]),
+    ]
+
+    /// 0x06 帧每通道上限（官方变频滑杆默认 [0, 9]）
+    static let maxModeLevel = 9
+    /// 0x08 帧每通道上限（官方手动滑杆 [0, 99]）
+    static let maxManualLevel = 99
+    /// 视频脚本走 0x06 帧（官方全屏视频页同样用 Tt()），沿用 0x06 上限
+    static let maxLevel = maxModeLevel
+
+    /// 官方 be(cmd, arr)：AA cmd len payload checksum
+    static func frame(cmd: UInt8, payload: [UInt8]) -> Data {
+        var bytes: [UInt8] = [header, cmd, UInt8(payload.count)]
+        bytes.append(contentsOf: payload)
         let checksum = bytes.reduce(0) { ($0 + Int($1)) & 0xFF }
         bytes.append(UInt8(checksum))
         return Data(bytes)
     }
 
-    /// 停止帧：AA 06 05 00 00 00 00 00 B5（实抓验证）
-    static var stopFrame: Data {
-        frame(channels: [0, 0, 0, 0])
+    private static func clampChannels(_ channels: [Int], max maxV: Int) -> [UInt8] {
+        (0..<4).map { i in
+            let v = i < channels.count ? channels[i] : 0
+            return UInt8(Swift.max(0, Swift.min(maxV, v)))
+        }
     }
 
-    /// 官方 UI 启动帧：AA 06 05 04 06 05 00 00 C4（实抓验证）
-    static var officialStartFrame: Data {
-        Data([0xAA, 0x06, 0x05, 0x04, 0x06, 0x05, 0x00, 0x00, 0xC4])
+    /// 0x06 模式帧（官方 Tt(arr)：[...arr, 0]，末位标志官方恒为 0）
+    static func modeFrame(channels: [Int]) -> Data {
+        frame(cmd: modeCmd, payload: clampChannels(channels, max: maxModeLevel) + [0x00])
     }
+
+    /// 0x08 手动帧（官方 at(arr, 0)：[...arr, 0x00, 0x00]）
+    static func manualFrame(channels: [Int]) -> Data {
+        frame(cmd: manualCmd, payload: clampChannels(channels, max: maxManualLevel) + [0x00, 0x00])
+    }
+
+    /// 兼容旧调用：0x06 帧
+    static func frame(channels: [Int]) -> Data { modeFrame(channels: channels) }
+
+    /// 停止帧：官方 be("06",[0,0,0,0,0]) = AA 06 05 00 00 00 00 00 B5
+    static var stopFrame: Data { modeFrame(channels: [0, 0, 0, 0]) }
+
+    /// 手动模式归零帧：官方手动 tab 停止时发 at([0,0,0,0], 0) = AA 08 06 00 00 00 00 00 00 B8
+    static var manualZeroFrame: Data { manualFrame(channels: [0, 0, 0, 0]) }
+
+    /// 官方默认技能"如影随形"：AA 06 05 04 06 05 00 00 C4（与实抓一致）
+    static var officialStartFrame: Data { modeFrame(channels: presets[0].channels) }
 
     /// 调试用：Data 转 HEX 字符串
     static func hex(_ data: Data) -> String {

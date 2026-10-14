@@ -66,6 +66,8 @@ final class BLEManager: NSObject, ObservableObject {
     /// 视频 tick 走 sendTick，不开闸（修 C）。
     /// 修 Factory L1：冷启动时闸门是关的，必须等用户第一次主动操作才开
     private var outputLocked = true
+    /// 最后一帧非零控制帧是不是 0x08 手动帧（bleQueue 上读写）
+    private var lastFrameWasManual = false
     /// 断开流程进行中：除停止帧外一律拒发，避免断开期间被重新开闸（修 N1）
     private var disconnecting = false
 
@@ -398,65 +400,52 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 发送 0x06 控制帧（四通道档位 0~BCProtocol.maxLevel）
     func send(channels: [Int]) {
+        send(frame: BCProtocol.frame(channels: channels))
+    }
+
+    /// 用户主动发送任意控制帧（0x06 / 0x08），会重新开闸
+    func send(frame: Data) {
         bleQueue.async { [weak self] in
             guard let self = self else { return }
             self.outputLocked = false
-            self.enqueueFrame(BCProtocol.frame(channels: channels))
+            self.enqueueFrame(frame)
         }
     }
 
     /// 节流延迟帧专用：不重新开闸（修 N2 —— 停机后排队的尾帧必须丢掉）
     func sendThrottled(channels: [Int]) {
+        sendThrottled(frame: BCProtocol.frame(channels: channels))
+    }
+
+    func sendThrottled(frame: Data) {
         bleQueue.async { [weak self] in
             guard let self = self, !self.outputLocked else { return }
-            self.enqueueFrame(BCProtocol.frame(channels: channels))
-        }
-    }
-
-    /// 视频 tick 专用：不开闸（修 C）。
-    /// 看门狗 / emergencyStop 锁住闸后，tick 的自动帧不许再把它打开；
-    /// 只有用户点"播放"（userResumeOutput）才能开闸。
-    func sendTick(channels: [Int]) {
-        bleQueue.async { [weak self] in
-            guard let self = self, !self.outputLocked else { return }
-            self.enqueueFrame(BCProtocol.frame(channels: channels))
-        }
-    }
-
-    /// 用户在视频页点了"播放"：显式打开输出闸门（修 C）
-    func userResumeOutput() {
-        bleQueue.async { [weak self] in
-            self?.outputLocked = false
-        }
-    }
-
-    /// 停止帧不受闸门限制，也不再打开闸门（修 C 备注）：
-    /// 它会被外部暂停/播完等自动路径调用，"只有用户操作才能开闸"必须严格成立
-    func sendStop() {
-        bleQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.enqueueFrame(BCProtocol.stopFrame)
+            self.enqueueFrame(frame)
         }
     }
 
     func sendOfficialStart() {
-        bleQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.outputLocked = false
-            self.enqueueFrame(BCProtocol.officialStartFrame)
-        }
+        send(frame: BCProtocol.officialStartFrame)
     }
 
     // MARK: - 内部（bleQueue 上）
 
     /// 入队并发送一帧，返回该笔写入的 id（发不出去返回 -1）；调用方保证在 bleQueue 上
     @discardableResult
-    private func enqueueFrame(_ data: Data, onAck: (() -> Void)? = nil) -> Int {
+    private func enqueueFrame(_ data: Data, onAck: (() -> Void)? = nil, internalZero: Bool = false) -> Int {
         guard let p = peripheral,
               let c = writeChar,
               queueState == .ready else { return -1 }
-        // 修 N1：断开流程中只放行停止帧
-        if disconnecting, data != BCProtocol.stopFrame { return -1 }
+        // 修 N1：断开流程中只放行停止帧（以及停止帧前自动补的 0x08 归零帧）
+        if disconnecting, data != BCProtocol.stopFrame, !internalZero { return -1 }
+        if data == BCProtocol.stopFrame, lastFrameWasManual {
+            // 官方手动 tab 停止时发的是 0x08 归零帧：设备处在 0x08 手动模式时，
+            // 先补一帧 0x08 归零，再发 0x06 停止帧（停止帧仍排在最后）
+            lastFrameWasManual = false
+            enqueueFrame(BCProtocol.manualZeroFrame, internalZero: true)
+        } else if data.count > 1 {
+            lastFrameWasManual = data[1] == BCProtocol.manualCmd && data != BCProtocol.manualZeroFrame
+        }
         writeSeq += 1
         let id = writeSeq
         pendingWrites.append(PendingWrite(

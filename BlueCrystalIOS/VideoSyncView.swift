@@ -181,6 +181,8 @@ final class VideoSyncPlayer: ObservableObject {
     func loadScript(url: URL) {
         // N3：换脚本前先停
         stopAll()
+        // 修 M6：解析失败时不能留着旧脚本继续可播
+        script = nil
         do {
             let data = try Data(contentsOf: url)
             script = try JSONDecoder().decode(TimelineScript.self, from: data)
@@ -192,6 +194,7 @@ final class VideoSyncPlayer: ObservableObject {
             }
         } catch {
             scriptName = "解析失败：\(error.localizedDescription)"
+            statusLine = "脚本解析失败，请重新选择"
         }
     }
 

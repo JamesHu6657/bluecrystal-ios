@@ -4,6 +4,10 @@ import Combine
 /// 手动控制的 ViewModel：带后缘节流的强度发送
 final class ManualControlVM: ObservableObject {
     @Published var channels: [Double] = [0, 0, 0, 0]
+    /// 当前控制方式（官方三个 tab：技能 / 变频 / 手动）
+    @Published private(set) var mode: BCProtocol.Mode = .frequency
+    /// 技能 tab 当前选中的预设
+    @Published private(set) var selectedPreset: String?
 
     private weak var ble: BLEManager?
     private var lastSend = Date.distantPast
@@ -52,14 +56,34 @@ final class ManualControlVM: ObservableObject {
     }
 
     func setChannel(_ index: Int, _ value: Double) {
+        guard mode != .skill else { return }
         channels[index] = value
         scheduleSend()
+    }
+
+    /// 切换控制方式：先停机归零，避免 0~9 和 0~99 的值串用
+    func setMode(_ newMode: BCProtocol.Mode) {
+        guard newMode != mode else { return }
+        stopAll()
+        mode = newMode
+    }
+
+    /// 技能 tab：发官方预设（0x06）
+    func selectPreset(_ preset: BCProtocol.Preset) {
+        pendingWork?.cancel()
+        pendingWork = nil
+        selectedPreset = preset.key
+        channels = preset.channels.map(Double.init)
+        ble?.send(frame: BCProtocol.modeFrame(channels: preset.channels))
+        ble?.heartbeat()
     }
 
     func stopAll() {
         pendingWork?.cancel()
         pendingWork = nil
         channels = [0, 0, 0, 0]
+        selectedPreset = nil
+        // 0x08 模式下 BLEManager 会自动先补 0x08 归零帧再发停止帧
         ble?.sendStop()
     }
 
@@ -67,6 +91,7 @@ final class ManualControlVM: ObservableObject {
         pendingWork?.cancel()
         pendingWork = nil
         channels = [0, 0, 0, 0]
+        selectedPreset = nil
         lastSend = .distantPast
     }
 
@@ -82,12 +107,13 @@ final class ManualControlVM: ObservableObject {
         } else {
             pendingWork?.cancel()
             let snapshot = channels
+            let snapMode = mode
             let work = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
                 self.lastSend = Date()
                 // 延迟帧走 sendThrottled：不断开输出闸门。
                 // 停机/断开后这帧会被丢掉，避免"停止帧之后又来一帧非零"（修 N2）
-                self.ble?.sendThrottled(channels: snapshot.map { Int($0) })
+                self.ble?.sendThrottled(frame: snapMode.frame(channels: snapshot.map { Int($0) }))
                 self.ble?.heartbeat()
             }
             pendingWork = work
@@ -99,7 +125,7 @@ final class ManualControlVM: ObservableObject {
     }
 
     private func sendNow() {
-        ble?.send(channels: channels.map { Int($0) })
+        ble?.send(frame: mode.frame(channels: channels.map { Int($0) }))
         ble?.heartbeat()
     }
 }
@@ -108,6 +134,14 @@ final class ManualControlVM: ObservableObject {
 struct ManualControlView: View {
     @EnvironmentObject var ble: BLEManager
     @StateObject private var vm = ManualControlVM()
+
+    private var modeFooter: String {
+        switch vm.mode {
+        case .skill: return "官方 App 的五个固定技能，0x06 帧"
+        case .frequency: return "官方变频：每通道 0~9，0x06 帧"
+        case .manual: return "官方手动：每通道 0~99，0x08 帧"
+        }
+    }
 
     var body: some View {
         Form {
@@ -128,47 +162,78 @@ struct ManualControlView: View {
                 }
             }
 
-            Section("四通道强度") {
-                ForEach(BCProtocol.Channel.allCases, id: \.rawValue) { ch in
-                    VStack(alignment: .leading) {
-                        HStack {
-                            Text(ch.displayName)
-                            Spacer()
-                            Text("\(Int(vm.channels[ch.rawValue]))")
-                                .monospacedDigit()
-                                .foregroundColor(.secondary)
-                        }
-                        Slider(
-                            value: Binding(
-                                get: { vm.channels[ch.rawValue] },
-                                set: { vm.setChannel(ch.rawValue, $0) }
-                            ),
-                            in: 0...Double(BCProtocol.maxLevel), step: 1
-                        )
+            Section {
+                Picker("控制方式", selection: Binding(
+                    get: { vm.mode },
+                    set: { vm.setMode($0) }
+                )) {
+                    ForEach(BCProtocol.Mode.allCases) { m in
+                        Text(m.title).tag(m)
                     }
-                    .disabled(ble.state != .ready)
+                }
+                .pickerStyle(.segmented)
+                .disabled(ble.state != .ready)
+            } footer: {
+                Text(modeFooter)
+            }
+
+            if vm.mode == .skill {
+                Section("官方技能") {
+                    ForEach(BCProtocol.presets) { p in
+                        Button {
+                            vm.selectPreset(p)
+                        } label: {
+                            HStack {
+                                Text(p.title)
+                                Spacer()
+                                Text(p.channels.map(String.init).joined(separator: " "))
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundColor(.secondary)
+                                if vm.selectedPreset == p.key {
+                                    Image(systemName: "checkmark").foregroundColor(.accentColor)
+                                }
+                            }
+                        }
+                        .disabled(ble.state != .ready)
+                    }
+                }
+            } else {
+                Section("四通道强度（0~\(vm.mode.maxLevel)）") {
+                    ForEach(BCProtocol.Channel.allCases, id: \.rawValue) { ch in
+                        VStack(alignment: .leading) {
+                            HStack {
+                                Text(ch.displayName)
+                                Spacer()
+                                Text("\(Int(vm.channels[ch.rawValue]))")
+                                    .monospacedDigit()
+                                    .foregroundColor(.secondary)
+                            }
+                            Slider(
+                                value: Binding(
+                                    get: { vm.channels[ch.rawValue] },
+                                    set: { vm.setChannel(ch.rawValue, $0) }
+                                ),
+                                in: 0...Double(vm.mode.maxLevel), step: 1
+                            )
+                        }
+                        .disabled(ble.state != .ready)
+                    }
                 }
             }
 
-            Section("快捷") {
-                HStack {
-                    Button("官方启动帧") {
-                        ble.sendOfficialStart()
-                        ble.heartbeat()
-                    }
-                    Spacer()
-                    Button("停止", role: .destructive) { vm.stopAll() }
-                }
-                // 一行两个按钮：Form 里默认整行只算一个点击区域，点"官方启动帧"会连"停止"一起触发
-                .buttonStyle(.borderless)
-                .disabled(ble.state != .ready)
+            Section {
+                Button("停止", role: .destructive) { vm.stopAll() }
+                    .frame(maxWidth: .infinity)
+                    .disabled(ble.state != .ready)
             }
 
             Section("最后一帧") {
                 Text(ble.lastSentHex)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(.secondary)
-                Text("仅在设备确认收到后更新")
+                Text("仅在收到写入回执后更新（链路层回执，不代表设备已执行）")
+                    .font(.caption2).foregroundColor(.secondary)
+                Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"))")
                     .font(.caption2).foregroundColor(.secondary)
             }
         }
