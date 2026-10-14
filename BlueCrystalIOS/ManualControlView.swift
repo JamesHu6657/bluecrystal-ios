@@ -143,7 +143,7 @@ struct ManualControlView: View {
                                 get: { vm.channels[ch.rawValue] },
                                 set: { vm.setChannel(ch.rawValue, $0) }
                             ),
-                            in: 0...99, step: 1
+                            in: 0...Double(BCProtocol.maxLevel), step: 1
                         )
                     }
                     .disabled(ble.state != .ready)
@@ -159,6 +159,8 @@ struct ManualControlView: View {
                     Spacer()
                     Button("停止", role: .destructive) { vm.stopAll() }
                 }
+                // 一行两个按钮：Form 里默认整行只算一个点击区域，点"官方启动帧"会连"停止"一起触发
+                .buttonStyle(.borderless)
                 .disabled(ble.state != .ready)
             }
 

@@ -396,7 +396,7 @@ final class BLEManager: NSObject, ObservableObject {
 
     // MARK: - 用户主动发送（会重新打开输出闸门）
 
-    /// 发送 0x06 控制帧（四通道强度 0~99）
+    /// 发送 0x06 控制帧（四通道档位 0~BCProtocol.maxLevel）
     func send(channels: [Int]) {
         bleQueue.async { [weak self] in
             guard let self = self else { return }

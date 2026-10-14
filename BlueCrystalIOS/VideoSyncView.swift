@@ -104,21 +104,70 @@ final class VideoSyncPlayer: ObservableObject {
         // 修 CC r2 L4：旧播放器未完成的 seek 回调作废
         seekGen += 1
         seekInFlight = 0
-        videoName = url.lastPathComponent
-        let p = AVPlayer(url: url)
+        // 换视频：先把上一个视频的时长/进度清掉，新时长回来前不显示旧值
+        durationSeconds = 0
+        currentSeconds = 0
+        lastActive = .zero
+        let displayName = url.lastPathComponent
+        // 拷到 App 自己的目录、文件名加唯一前缀：选择器给的临时副本可能被系统清掉，
+        // 同名文件也不会互相覆盖
+        guard let local = Self.importVideo(from: url) else {
+            player = nil
+            videoName = "导入失败：\(displayName)"
+            statusLine = "视频文件无法读取，请重新选择"
+            return
+        }
+        if let old = currentVideoFile, old != local {
+            try? FileManager.default.removeItem(at: old)
+        }
+        currentVideoFile = local
+        videoName = displayName
+        let item = AVPlayerItem(asset: AVURLAsset(url: local))
+        let p = AVPlayer(playerItem: item)
         player = p
         observeTimeControlStatus(p)
-        if let dur = p.currentItem?.duration.seconds, dur.isFinite {
-            durationSeconds = dur
-        } else {
-            p.currentItem?.publisher(for: \.duration)
-                .receive(on: DispatchQueue.main)
-                .sink { [weak self] d in
-                    if d.seconds.isFinite { self?.durationSeconds = d.seconds }
+        item.publisher(for: \.duration)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak p] d in
+                guard let self = self, let p = p, p === self.player else { return }
+                if d.seconds.isFinite, d.seconds > 0 { self.durationSeconds = d.seconds }
+            }
+            .store(in: &playerCancellables)
+        item.publisher(for: \.status)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak p] st in
+                guard let self = self, let p = p, p === self.player else { return }
+                switch st {
+                case .failed:
+                    self.stopAll()
+                    let reason = p.currentItem?.error?.localizedDescription ?? "未知错误"
+                    self.statusLine = "视频无法播放：\(reason)"
+                case .readyToPlay:
+                    if self.statusLine == "—" { self.statusLine = "视频就绪" }
+                default:
+                    break
                 }
-                .store(in: &playerCancellables)
+            }
+            .store(in: &playerCancellables)
+    }
+
+    /// 当前视频在 App 目录里的副本（换视频时删旧的，避免占空间）
+    private var currentVideoFile: URL?
+
+    private static func importVideo(from url: URL) -> URL? {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("SyncVideos", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent(UUID().uuidString + "-" + url.lastPathComponent)
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            // 选择器 asCopy 已经给了一份临时副本，优先移动，失败再拷贝
+            do { try fm.moveItem(at: url, to: dest) } catch { try fm.copyItem(at: url, to: dest) }
+            return dest
+        } catch {
+            return nil
         }
-        currentSeconds = 0
     }
 
     func loadScript(url: URL) {
@@ -295,7 +344,7 @@ final class VideoSyncPlayer: ObservableObject {
         for cmd in s.commands {
             guard t >= cmd.startTimeSeconds, t < cmd.endTime,
                   let ch = cmd.channel else { continue }
-            vals[ch.rawValue] = max(vals[ch.rawValue], s.intensity99(for: cmd))
+            vals[ch.rawValue] = max(vals[ch.rawValue], s.deviceLevel(for: cmd))
         }
         let active = ActiveChannels(values: vals)
         if force || needsResync || active != lastActive {
@@ -335,8 +384,13 @@ struct NoControlsPlayerView: UIViewControllerRepresentable {
 struct VideoSyncView: View {
     @EnvironmentObject var ble: BLEManager
     @StateObject private var vm = VideoSyncPlayer()
-    @State private var showVideoPicker = false
-    @State private var showScriptPicker = false
+    /// 同一时间只弹一个选择器；用 sheet(item:) 代替两个 sheet(isPresented:)，
+    /// 避免第二次点"选择"弹不出来或回调落到错的选择器上
+    private enum PickerKind: Int, Identifiable {
+        case video, script
+        var id: Int { rawValue }
+    }
+    @State private var picker: PickerKind?
 
     var body: some View {
         Form {
@@ -359,13 +413,15 @@ struct VideoSyncView: View {
                 HStack {
                     Text("视频"); Spacer()
                     Text(vm.videoName).foregroundColor(.secondary).lineLimit(1)
-                    Button("选择") { showVideoPicker = true }
+                    Button("选择") { picker = .video }
                 }
+                .buttonStyle(.borderless)
                 HStack {
                     Text("脚本"); Spacer()
                     Text(vm.scriptName).foregroundColor(.secondary).lineLimit(1)
-                    Button("载入") { showScriptPicker = true }
+                    Button("载入") { picker = .script }
                 }
+                .buttonStyle(.borderless)
                 if let s = vm.script {
                     Text("\(s.commands.count) 条命令")
                         .font(.caption).foregroundColor(.secondary)
@@ -379,6 +435,9 @@ struct VideoSyncView: View {
                     Spacer()
                     Button("停止", role: .destructive) { vm.stopAll() }
                 }
+                // 一行两个按钮：Form 默认把整行当一个点击区域，点"播放"会连"停止"一起触发，
+                // 表现就是播放键点了没反应
+                .buttonStyle(.borderless)
                 // 自建进度条：拖动走 vm.seek，设备状态同步跟上
                 if vm.durationSeconds > 0 {
                     Slider(
@@ -406,14 +465,18 @@ struct VideoSyncView: View {
         .navigationTitle("视频联动")
         // 修 CC r3 L4：attach 挂在整个 Form 上，与 onDisappear 对称（同 ManualControlView）
         .onAppear { vm.attach(ble: ble) }
-        .sheet(isPresented: $showVideoPicker) {
-            DocumentPicker(contentTypes: [UTType.movie, UTType.video]) { url in
-                vm.loadVideo(url: url)
-            }
-        }
-        .sheet(isPresented: $showScriptPicker) {
-            DocumentPicker(contentTypes: [UTType.json]) { url in
-                vm.loadScript(url: url)
+        .sheet(item: $picker) { kind in
+            switch kind {
+            case .video:
+                DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie]) { url in
+                    picker = nil
+                    vm.loadVideo(url: url)
+                }
+            case .script:
+                DocumentPicker(contentTypes: [UTType.json]) { url in
+                    picker = nil
+                    vm.loadScript(url: url)
+                }
             }
         }
         .onDisappear { vm.stopAll() }

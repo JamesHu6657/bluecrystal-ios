@@ -39,12 +39,16 @@ enum BCProtocol {
         }
     }
 
-    /// 构造 0x06 控制帧，强度 0~99
+    /// 设备每通道最高档位。官方 App 实抓启动帧为 04 06 05 00（个位数档位），
+    /// 设备按 0~9 档解释：之前按 0~99 发，1% 以上就会被设备当成高档（用户实测"一档跑到九档"）
+    static let maxLevel = 9
+
+    /// 构造 0x06 控制帧，每通道档位 0~maxLevel
     static func frame(channels: [Int]) -> Data {
         var bytes: [UInt8] = [header, cmd, len]
         for i in 0..<4 {
             let v = i < channels.count ? channels[i] : 0
-            bytes.append(UInt8(max(0, min(99, v))))
+            bytes.append(UInt8(max(0, min(maxLevel, v))))
         }
         bytes.append(0x00) // flag，恒 0
         let checksum = bytes.reduce(0) { ($0 + Int($1)) & 0xFF }

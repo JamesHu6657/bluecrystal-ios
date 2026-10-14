@@ -59,13 +59,16 @@ struct TimelineScript: Decodable {
         }
     }
 
-    /// 命令强度归一化到 0~99
-    func intensity99(for cmd: TimelineCommand) -> Int {
-        let v = useTenScale ? cmd.intensityLevel * 10 : cmd.intensityLevel
+    /// 命令强度换算成设备档位 0~BCProtocol.maxLevel
+    /// 十档脚本直接用档位（10 夹到最高档）；百分制按比例换算，非零值至少 1 档
+    func deviceLevel(for cmd: TimelineCommand) -> Int {
+        let maxL = Double(BCProtocol.maxLevel)
+        let raw = cmd.intensityLevel
+        guard raw.isFinite, raw > 0 else { return 0 }
+        let v = useTenScale ? raw : raw / 100.0 * maxL
         // 修 高6：先在 Double 域夹紧再转 Int，1e20 这种值不会溢出崩溃
-        // （播放中崩溃 = 设备停在非零强度上没人管）
-        let clamped = min(max(v, 0), 99)
-        return Int(clamped.rounded())
+        let clamped = min(max(v.rounded(), 1), maxL)
+        return Int(clamped)
     }
 
     var scaleDescription: String {
@@ -75,7 +78,7 @@ struct TimelineScript: Decodable {
 
 /// 播放中的激活命令集合（用于判断是否需要重发）
 struct ActiveChannels: Equatable {
-    var values: [Int] // [ch0, ch1, ch2, ch3]，0~99
+    var values: [Int] // [ch0, ch1, ch2, ch3]，0~BCProtocol.maxLevel
 
     static var zero: ActiveChannels { ActiveChannels(values: [0, 0, 0, 0]) }
 
