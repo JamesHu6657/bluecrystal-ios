@@ -300,9 +300,7 @@ final class AIControlVM: ObservableObject {
         ble.forceZeroOutputs
             .receive(on: DispatchQueue.main)
             .sink { [weak self] reason in
-                guard let self = self else { return }
-                self.revokeAuthorization()
-                self.haltProgram(reason: reason ?? "已自动停止", sendStop: false)
+                self?.terminalStop(reason: reason ?? "已自动停止", sendStop: false)
             }
             .store(in: &cancellables)
         ble.$state
@@ -310,8 +308,7 @@ final class AIControlVM: ObservableObject {
             .sink { [weak self] s in
                 guard let self = self, s != .ready else { return }
                 // 没在运行也作废：断开期间发出的请求，重连后回来也不许执行
-                self.revokeAuthorization()
-                if self.running { self.haltProgram(reason: "设备已断开，AI 控制已停止", sendStop: false) }
+                self.terminalStop(reason: "设备已断开，AI 控制已停止", sendStop: false)
             }
             .store(in: &cancellables)
     }
@@ -332,15 +329,20 @@ final class AIControlVM: ObservableObject {
         sceneActive = phase == .active
         if phase == .background {
             // 停止帧对由 BLEManager.emergencyStop 发，这里只停程序并作废回复
-            revokeAuthorization()
-            haltProgram(reason: "App 已退到后台，已停止", sendStop: false)
+            terminalStop(reason: "App 已退到后台，已停止", sendStop: false)
         }
     }
 
     /// 用户点停止 / 说了停止词 / 离开页面
     func stopAll(reason: String = "已停止") {
+        terminalStop(reason: reason, sendStop: true)
+    }
+
+    /// 所有真正的停止都走这里：先作废停止前发出的请求，再停程序。
+    /// sendStop 为 false 表示 BLEManager 已经发过停止帧对（被动停机/断开/退后台）
+    private func terminalStop(reason: String, sendStop: Bool) {
         revokeAuthorization()
-        haltProgram(reason: reason, sendStop: true)
+        haltProgram(reason: reason, sendStop: sendStop)
     }
 
     private func revokeAuthorization() {
@@ -457,9 +459,10 @@ final class AIControlVM: ObservableObject {
     private func runStep(_ i: Int, gen: Int, first: Bool = false) {
         guard gen == programGen, running, let ble = ble else { return }
         guard i < steps.count else {
-            // 序列走完：带 [STOP] 或最后是全零 → 真正停止；否则保持最后的强度，等下一条回复
+            // 序列走完：带 [STOP] 或最后是全零 → 真正停止（和用户停止一样作废期间发出的请求）；
+            // 否则保持最后的强度，等下一条回复
             if endWithStop || steps.last(where: { $0.levels != nil })?.isZero == true {
-                haltProgram(reason: "已停止", sendStop: true)
+                terminalStop(reason: "已停止", sendStop: true)
             }
             return
         }
@@ -644,25 +647,36 @@ struct AISettingsView: View {
         }
     }
 
+    /// 先写钥匙串；任何一个 Key 写失败就把这次已写入的 Key 改回原值，服务商/模型/提示词也不保存
     private func save() {
-        AIConfig.provider = provider
-        AIConfig.systemPrompt = prompt
-        if let m = provider.models.first(where: { $0.id == modelID }) { AIConfig.model = m }
-        var failures: [String] = []
+        var written: [AIProvider] = []
         for p in AIProvider.allCases {
             let key = (keys[p] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard key != (savedKeys[p] ?? "") else { continue }
             do {
                 try AIConfig.setAPIKey(key, for: p)
-                savedKeys[p] = key
+                written.append(p)
             } catch {
-                failures.append("\(p.title)：\(error.localizedDescription)")
+                var rollbackFailures: [String] = []
+                for w in written {
+                    do {
+                        try AIConfig.setAPIKey(savedKeys[w] ?? "", for: w)
+                    } catch {
+                        rollbackFailures.append(w.title)
+                        savedKeys[w] = (keys[w] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                }
+                var msg = "\(p.title) 的 API Key 保存失败：\(error.localizedDescription)\n设置都没有保存。"
+                if !rollbackFailures.isEmpty {
+                    msg += "\n注意：\(rollbackFailures.joined(separator: "、")) 的新 Key 已写入且无法改回。"
+                }
+                saveError = msg
+                return
             }
         }
-        guard failures.isEmpty else {
-            saveError = "API Key 保存失败，钥匙串里原来的 Key 保持不变：\n" + failures.joined(separator: "\n")
-            return
-        }
+        AIConfig.provider = provider
+        AIConfig.systemPrompt = prompt
+        if let m = provider.models.first(where: { $0.id == modelID }) { AIConfig.model = m }
         dismiss()
     }
 }

@@ -483,6 +483,37 @@ for (raw, name) in [
     check(r.rejection != nil && !executable(r), "\(name)：整条不执行")
 }
 
+// 代码块按 CommonMark 围栏：同字符、长度不短于开头、后面只剩空白才闭合；没闭合算到结尾
+for (raw, name) in [
+    ("````\n```\n[CH 99 0 0 0]\n````", "4 反引号块里的 3 反引号行之后"),
+    ("````\n```\n[CH 99 0 0 0]", "短围栏不能闭合长围栏"),
+    ("~~~\n```\n[CH 99 0 0 0]\n```\n~~~", "波浪线块里的反引号围栏"),
+    ("```\n~~~\n[CH 99 0 0 0]\n~~~\n```", "反引号块里的波浪线围栏"),
+    ("```\n``` 还没完\n[CH 99 0 0 0]\n```", "围栏后面有文字不算闭合"),
+    ("```\n```\u{3000}\n[CH 99 0 0 0]", "全角空格不算闭合围栏后的空白"),
+    ("例子：\n```\n[CH 99 0 0 0]", "没闭合的代码块"),
+    ("```python\nprint(1)\n\n[STOP]", "没闭合的代码块里的 STOP"),
+    ("``` [CH 99 0 0 0]", "围栏信息串里的指令"),
+    ("```\n    ```\n[CH 99 0 0 0]", "缩进 4 格的闭合围栏（含糊）"),
+    ("- ```\n  [CH 99 0 0 0]\n  ```", "列表里的围栏（含糊）"),
+    ("> ```\n[CH 99 0 0 0]", "引用里的围栏（含糊）"),
+    ("```a`b\n[CH 99 0 0 0]\n```", "信息串带反引号不是围栏（含糊）"),
+] {
+    let r = AIReply.parse(raw)
+    check(r.rejection != nil && !executable(r), "\(name)：整条不执行")
+}
+
+let afterFence = AIReply.parse("示例：\n```\n[笑]\n```\n[CH 30 0 0 0]\n[HOLD 2000]\n[STOP]")
+check(afterFence.rejection == nil && afterFence.stop
+      && afterFence.steps == [AIStep(levels: [30, 0, 0, 0], duration: 2)], "闭合代码块之后的指令正常执行")
+let longFence = AIReply.parse("````\n```\n````  \n[CH 25 0 0 0]")
+check(longFence.rejection == nil && longFence.steps == [AIStep(levels: [25, 0, 0, 0], duration: 0)],
+      "4 反引号块用 4 反引号闭合（后面允许空格），之后的指令正常执行")
+let tildeFence = AIReply.parse("~~~~\n~~~\n```\n~~~~~\n[CH 15 0 0 0]")
+check(tildeFence.rejection == nil && tildeFence.steps == [AIStep(levels: [15, 0, 0, 0], duration: 0)],
+      "波浪线块只被更长或等长的波浪线闭合")
+check(AIReply.parse("用 ``` 包代码就行").rejection == nil, "没有指令时含糊围栏不影响")
+
 // 参数必须精确
 for (raw, name) in [
     ("[CH bad 99 0 0]", "坏参数不挪通道"),

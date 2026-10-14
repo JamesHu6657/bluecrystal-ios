@@ -32,6 +32,9 @@ struct AIStep: Equatable {
 ///
 /// 解析规则（宁可不执行，也不猜）：
 /// - 指令必须单独占一行（前后只允许空白），且不在 ``` / ~~~ 代码块里。
+///   代码块按 CommonMark 围栏判断：记住开头的字符和长度，只有同一种字符、长度不短于开头、
+///   后面只剩空白的行才闭合；没闭合就算到回复结尾。围栏样式含糊（缩进 4 格以上/制表符、
+///   引用或列表里的围栏、行内 ```）时，只要有指令就整条作废。
 /// - 参数个数精确：CH 恰好 4 个非负十进制整数，HOLD 恰好 1 个正十进制整数，STOP 没有参数。
 ///   不接受小数、负号、科学计数法、逗号分隔，不补齐、不跳过坏参数、不挪通道。
 /// - 只要出现任何不算数的指令样式文字（行内、引用、代码块里、格式错、STOP 之后还有指令），
@@ -102,23 +105,59 @@ struct AIReply {
         }
     }
 
+    private struct Fence {
+        var char: Character
+        var count: Int
+    }
+
+    /// 去掉行首空白后以 3 个以上 ` 或 ~ 开头：返回围栏字符、长度和后面剩下的部分
+    private static func fenceRun(_ body: Substring) -> (fence: Fence, rest: Substring)? {
+        guard let c = body.first, c == "`" || c == "~" else { return nil }
+        let n = body.prefix(while: { $0 == c }).count
+        guard n >= 3 else { return nil }
+        return (Fence(char: c, count: n), body.dropFirst(n))
+    }
+
     static func parse(_ raw: String) -> AIReply {
         var commands: [Command] = []
         var textLines: [String] = []
         var rejection: String?
-        var inFence = false
+        // 当前所在代码块的开头围栏；没闭合就一直算在代码块里，直到回复结束
+        var fence: Fence?
+        // 出现了无法和 Markdown 渲染结果对齐的围栏样式（缩进 4 格/制表符、引用或列表里的围栏、行内 ```）
+        var fenceAmbiguous = false
 
         let lines = raw.replacingOccurrences(of: "\r\n", with: "\n")
             .split(separator: "\n", omittingEmptySubsequences: false)
         for rawLine in lines {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix("```") || line.hasPrefix("~~~") {
-                inFence.toggle()
+            let hasToken = containsCommandToken(line)
+            let indent = rawLine.prefix(while: { $0.isWhitespace })
+            let plainIndent = indent.count <= 3 && indent.allSatisfy { $0 == " " }
+            let run = fenceRun(rawLine.dropFirst(indent.count))
+
+            if let open = fence {
+                // CommonMark 闭合围栏：同一种字符、长度不短于开头、后面只有空格/制表符
+                if let r = run, r.fence.char == open.char, r.fence.count >= open.count,
+                   r.rest.allSatisfy({ $0 == " " || $0 == "\t" }) {
+                    if plainIndent { fence = nil } else { fenceAmbiguous = true }
+                    textLines.append(line)
+                    continue
+                }
+                if hasToken, rejection == nil { rejection = "代码块里出现了指令" }
+                if !line.isEmpty { textLines.append(line) }
+                continue
+            }
+            // 反引号围栏的信息串里不能再有反引号（否则是行内代码，不是代码块）
+            if let r = run, r.fence.char == "~" || !r.rest.contains("`") {
+                if !plainIndent { fenceAmbiguous = true }
+                fence = r.fence
+                if hasToken, rejection == nil { rejection = "代码块里出现了指令" }
                 textLines.append(line)
                 continue
             }
-            let hasToken = containsCommandToken(line)
-            if !inFence, hasToken, line.hasPrefix("[") {
+            if line.contains("```") || line.contains("~~~") { fenceAmbiguous = true }
+            if hasToken, line.hasPrefix("[") {
                 if let c = parseCommandLine(line) {
                     if commands.last == .stop, rejection == nil {
                         rejection = "[STOP] 之后还有指令"
@@ -128,11 +167,13 @@ struct AIReply {
                 }
                 if rejection == nil { rejection = "指令格式不对：\(line)" }
             } else if hasToken, rejection == nil {
-                rejection = inFence
-                    ? "代码块里出现了指令"
-                    : "指令没有单独占一行：\(line)"
+                rejection = "指令没有单独占一行：\(line)"
             }
             if !line.isEmpty { textLines.append(line) }
+        }
+        // 围栏样式含糊时无法确定指令在不在代码块里：只要有指令就整条作废
+        if rejection == nil, fenceAmbiguous, !commands.isEmpty {
+            rejection = "代码块格式不明确，无法确认指令是否在代码块里"
         }
         let text = textLines.joined(separator: "\n")
 
