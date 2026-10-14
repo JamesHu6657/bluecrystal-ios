@@ -676,6 +676,14 @@ struct AIControlView: View {
                 }
             }
             HStack {
+                // 第三轮 M2：停止键常驻输入栏。"当前"区块里的停止键在 Form 里，聊天记录一长就会滚出屏幕，
+                // 输入栏始终在底部，不用滚动、不用打字也能一下停
+                Button(role: .destructive) { vm.stopAll() } label: {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.red)
+                }
+                .accessibilityLabel("停止")
                 // 等回复期间输入框也保持可用：停止词随时能发
                 TextField(vm.isThinking ? "她在回复…说“停”随时停" : "说点什么…", text: $vm.input)
                     .textFieldStyle(.roundedBorder)
