@@ -194,7 +194,9 @@ struct DeviceStatusCard: View {
             let total: Double = Double(ble.safety.runAllowed)
             let left: Double = Double(max(0, remaining))
             let frac: CGFloat = CGFloat(min(1.0, left / total))
-            let warn: Bool = remaining <= 60
+            // 只剩不到（上限的 1/3，封顶 60 秒）才转警示色：额度只剩一小段的运行不至于从头到尾都是警示色
+            let warnThreshold: Int = min(60, max(1, ble.safety.runAllowed / 3))
+            let warn: Bool = remaining <= warnThreshold
             GeometryReader { geo in
                 let width: CGFloat = geo.size.width * frac
                 ZStack(alignment: .leading) {
