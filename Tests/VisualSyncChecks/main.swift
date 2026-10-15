@@ -116,20 +116,20 @@ vcheck(vsDownscale(flatSource, width: 1280, height: 720, bytesPerRow: 100) == ni
 // MARK: - 帧差
 
 // 镜头平移 / 手持晃动：整幅有纹理的画面平移 2 像素 → 补偿后几乎没有能量；不补偿（小物体）照旧
-func vsTexture(_ x: Int, _ y: Int) -> UInt8 {
+func vsPanTex(_ x: Int, _ y: Int) -> UInt8 {
     let h = (x &* 73_856_093) ^ (y &* 19_349_663)
     return UInt8(40 + (h & 0x7fff_ffff) % 160)
 }
 
 do {
     var an = MotionAnalyzer()
-    _ = an.analyze(vsFrame { x, y in vsTexture(x, y) }, time: 0)
-    let panned = an.analyze(vsFrame { x, y in vsTexture(x - 2, y + 1) }, time: vsDt)
+    _ = an.analyze(vsFrame { x, y in vsPanTex(x, y) }, time: 0)
+    let panned = an.analyze(vsFrame { x, y in vsPanTex(x - 2, y + 1) }, time: vsDt)
     let e = panned?.energy ?? 99
     vcheck(e < 0.5, "平移补偿：整幅画面平移 (2, −1) 像素 → 能量 < 0.5（得到 \(e)）")
     var raw = MotionAnalyzer()
-    _ = raw.analyze(vsFrame { x, y in vsTexture(x, y) }, time: 0)
-    let changed = raw.analyze(vsFrame { x, y in vsTexture(x + 37, y + 11) }, time: vsDt)
+    _ = raw.analyze(vsFrame { x, y in vsPanTex(x, y) }, time: 0)
+    let changed = raw.analyze(vsFrame { x, y in vsPanTex(x + 37, y + 11) }, time: vsDt)
     vcheck((changed?.energy ?? 0) > 10, "平移补偿：画面整个换掉（对不齐）→ 能量照样大（\(changed?.energy ?? 0)）")
 }
 
