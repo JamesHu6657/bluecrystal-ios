@@ -409,9 +409,11 @@ struct AgeGateView: View {
 }
 
 /// 面容 ID 解锁页：不自动弹验证，点「解锁」才弹；底部常驻停止键。
-/// 设备需要处理时（同 needsAttentionCard），上面钉一张紧凑设备卡片（没有连接键）。
+/// 设备需要处理时（同 needsAttentionCard），上面钉一张紧凑设备卡片（平常没有连接键）。
 /// 第四轮 M3：设备可能在输出 / 连接或断开进行中（privacyCoverBlocked）时解锁页照样盖着内容，
-/// 只是一直显示设备卡片、写明原因，不给解锁（系统验证框会盖住停止键）；设备处理好了解锁键自己回来
+/// 只是一直显示设备卡片、写明原因，不给解锁（系统验证框会盖住停止键）；设备处理好了解锁键自己回来。
+/// 这时卡片带上「断开」（已连接）/「连接」（未连接）：连接中残留红字、或断开后设备可能仍在输出时，
+/// 锁着的 App 要有出路——断开后就能解锁，连上去能把停止帧对发出去（两个都是各页本来就有的停止方向操作）
 struct LockScreenView: View {
     @EnvironmentObject var ble: BLEManager
     @ObservedObject var lock: PrivacyLock
@@ -423,7 +425,7 @@ struct LockScreenView: View {
             VelvetBackground(glow: 0.2).ignoresSafeArea()
             VStack(spacing: 22) {
                 if blocked || ble.needsAttentionCard {
-                    DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
+                    DeviceStatusCard(allowDisconnect: blocked, connectTitle: "连接", compact: true, showsConnect: blocked)
                         .padding(.top, 8)
                 }
                 Spacer()
@@ -438,7 +440,7 @@ struct LockScreenView: View {
                     .foregroundColor(Velvet.text)
                     .accessibilityAddTraits(.isHeader)
                 if blocked {
-                    Text("设备这边还需要处理（可能仍在输出、停止未确认，或正在连接 / 断开）。下面的停止随时可以点；处理好之后才能解锁")
+                    Text("设备这边还需要处理（可能仍在输出、停止未确认，或正在连接 / 断开）。下面的停止随时可以点；处理好或断开设备之后就能解锁")
                         .font(.subheadline)
                         .foregroundColor(Velvet.warning)
                         .multilineTextAlignment(.center)
