@@ -41,6 +41,17 @@ final class VideoSyncPlayer: ObservableObject {
     /// 重连后强制重发首帧（修 N6：避免被"没有变化"吞掉）
     private var needsResync = false
 
+    /// 第四轮 M4：播放中播放头超过这么久没前进（缓冲 / 解码卡住 / waitingToPlayAtSpecifiedRate）就停机。
+    /// 之前只认 .paused，卡住时 Timer 照发心跳、看门狗不会触发，设备停在当前强度只受 1200 秒单次上限约束
+    static let stallLimit: TimeInterval = 1.5
+    /// 播放头最近一次前进的位置（nan = 还没采到）和时刻（单调时钟）
+    private var progressPosition: Double = .nan
+    private var progressAt: TimeInterval = 0
+    /// 脚本载入代次：后台解析还没回来就又选了新脚本时，旧结果作废
+    private var scriptLoadGen = 0
+
+    private static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
     func attach(ble: BLEManager) {
         // N4：切 Tab 回来会重复 attach，只清状态订阅；
         // 播放器订阅在 playerCancellables 里，不受影响
@@ -82,6 +93,8 @@ final class VideoSyncPlayer: ObservableObject {
                     // 修 CC r3 L3：seek 期间先记下，由 seek 回调处理
                     self.pausedDuringSeek = true
                 }
+                // 第四轮 M4：waitingToPlayAtSpecifiedRate（缓冲）不在这里单独处理：
+                // tick 看播放头有没有前进，卡住超过 stallLimit 就停机（缓冲很短时不误停）
             }
             .store(in: &playerCancellables)
     }
@@ -101,6 +114,32 @@ final class VideoSyncPlayer: ObservableObject {
         isPlaying = false
         stopTimer(sendZero: true)
         statusLine = "外部暂停，设备已停止"
+    }
+
+    /// 第四轮 M4：播放中播放头卡住：画面不动时设备不能停在当前强度上。
+    /// 暂停播放器（之后的 .paused KVO 看到 isPlaying 已是 false，不会再处理）、发停止帧对；要继续得用户再点播放
+    private func handleStall() {
+        player?.pause()
+        isPlaying = false
+        stopTimer(sendZero: true)
+        statusLine = "视频卡住了（缓冲或读取变慢），设备已停止；准备好后再点播放"
+    }
+
+    /// 播放头前进监视从头开始算（开始播放、seek 完成时）
+    private func resetProgressWatch() {
+        progressPosition = .nan
+        progressAt = Self.now()
+    }
+
+    /// 播放头在走就记下时刻；超过 stallLimit 没动（含时间读不出来）返回 true
+    private func playheadStalled(at t: Double) -> Bool {
+        let now = Self.now()
+        if t.isFinite, progressPosition.isNaN || abs(t - progressPosition) > 0.01 {
+            progressPosition = t
+            progressAt = now
+            return false
+        }
+        return now - progressAt > Self.stallLimit
     }
 
     private func handleNaturalCompletion(_ p: AVPlayer) {
@@ -202,29 +241,62 @@ final class VideoSyncPlayer: ObservableObject {
         }
     }
 
+    /// 第四轮：先查文件大小，读文件和解析放到后台队列（大脚本不再卡住主线程——主线程卡住会触发看门狗、点不动停止键）；
+    /// 解析中没有脚本，播放键是灰的；结果回主线程时代次对不上（已经又选了别的）就丢掉
     func loadScript(url: URL) {
         // N3：换脚本前先停
         stopAll()
         // 修 M6：解析失败时不能留着旧脚本继续可播
         script = nil
-        do {
-            let data = try Data(contentsOf: url)
-            script = try JSONDecoder().decode(TimelineScript.self, from: data)
-            scriptName = url.lastPathComponent
-            if let s = script {
-                var notes: [String] = []
-                // 高6 建议：刻度声明写错时明确提示
-                if s.scaleFallback { notes.append("intensityScale 无法识别") }
-                // 修 L9：刻度分不清时按较弱的百分制，提示用户声明
-                if s.scaleAmbiguous {
-                    notes.append("未声明刻度且所有值 ≤10，已按较弱的百分制处理；十档脚本请加 \"intensityScale\": \"ten\"")
-                }
-                // 修 N5：旋转通道恒为 0
-                if s.ignoredRotationCount > 0 { notes.append("\(s.ignoredRotationCount) 条旋转命令已忽略") }
-                let warn = notes.isEmpty ? "" : "（" + notes.joined(separator: "；") + "）"
-                statusLine = "脚本就绪：\(s.commands.count) 条命令，\(s.scaleDescription)刻度\(warn)"
+        scriptLoadGen += 1
+        let gen = scriptLoadGen
+        let name = url.lastPathComponent
+        scriptName = "正在读取：\(name)"
+        statusLine = "正在解析脚本…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Self.readScript(url: url)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, gen == self.scriptLoadGen else { return }
+                self.applyLoadedScript(result, name: name)
             }
+        }
+    }
+
+    /// 后台队列上：大小检查 + 读文件 + 解析（TimelineScript 自己校验时间和命令数）
+    private static func readScript(url: URL) -> Result<TimelineScript, Error> {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let limit = TimelineLimits.maxFileBytes
+        let tooBig = TimelineScriptError(message: "脚本文件太大（最多 \(limit / 1024 / 1024) MB）")
+        do {
+            let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+            guard size <= limit else { return .failure(tooBig) }
+            let data = try Data(contentsOf: url)
+            guard data.count <= limit else { return .failure(tooBig) }
+            return .success(try JSONDecoder().decode(TimelineScript.self, from: data))
         } catch {
+            return .failure(error)
+        }
+    }
+
+    private func applyLoadedScript(_ result: Result<TimelineScript, Error>, name: String) {
+        switch result {
+        case .success(let s):
+            script = s
+            scriptName = name
+            var notes: [String] = []
+            // 高6 建议：刻度声明写错时明确提示
+            if s.scaleFallback { notes.append("intensityScale 无法识别") }
+            // 修 L9：刻度分不清时按较弱的百分制，提示用户声明
+            if s.scaleAmbiguous {
+                notes.append("未声明刻度且所有值 ≤10，已按较弱的百分制处理；十档脚本请加 \"intensityScale\": \"ten\"")
+            }
+            // 修 N5：旋转通道恒为 0
+            if s.ignoredRotationCount > 0 { notes.append("\(s.ignoredRotationCount) 条旋转命令已忽略") }
+            let warn = notes.isEmpty ? "" : "（" + notes.joined(separator: "；") + "）"
+            statusLine = "脚本就绪：\(s.commands.count) 条命令，\(s.scaleDescription)刻度\(warn)"
+        case .failure(let error):
+            script = nil
             scriptName = "解析失败：\(error.localizedDescription)"
             statusLine = "脚本解析失败，请重新选择"
         }
@@ -318,6 +390,8 @@ final class VideoSyncPlayer: ObservableObject {
             // seek 后强制算一次，避免设备停在旧强度；跳过的那段不算"采样间漏掉的命令"
             self.lastSampleTime = nil
             self.samplingFromPlaybackStart = false
+            // 第四轮 M4：seek 完成后播放头前进监视重新计时
+            self.resetProgressWatch()
             self.tick(force: true)
             }
         }
@@ -358,6 +432,8 @@ final class VideoSyncPlayer: ObservableObject {
 
     private func startTimer() {
         stopTimer(sendZero: false)
+        // 第四轮 M4：开始播放时播放头前进监视从头计时
+        resetProgressWatch()
         // N5：用 common modes，滚动 Form 时 tick 不暂停
         let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.tick()
@@ -388,12 +464,17 @@ final class VideoSyncPlayer: ObservableObject {
             return
         }
         let t = p.currentTime().seconds
-        guard t.isFinite else { return }
         let duration = p.currentItem?.duration.seconds ?? durationSeconds
         if PlaybackCompletion.reachedEnd(position: t, duration: duration) {
             handleNaturalCompletion(p)
             return
         }
+        // 第四轮 M4：播放器没停、播放头却不走（缓冲 / 解码卡住 / 时间读不出来）：超过 stallLimit 就停机
+        if isPlaying, playheadStalled(at: t) {
+            handleStall()
+            return
+        }
+        guard t.isFinite else { return }
         sample(at: t, force: force)
     }
 
