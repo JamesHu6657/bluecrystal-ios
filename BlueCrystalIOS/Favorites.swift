@@ -122,6 +122,9 @@ struct FavoritesSection: View {
     @State private var noticeGen = 0
     /// 撤销条整组收起的代次（和提示分开计时：显示提示不再清空撤销栈）
     @State private var undoGen = 0
+    /// 因为收藏已满没能放回的那条：用户删掉一组腾出位置后，它要排到撤销条最上面，
+    /// 下一次"撤销"放回的是它，而不是刚为它腾位置删掉的那组
+    @State private var blockedRestore: FavoriteStore.Removed?
     /// 缓推中点亮的是召回的那张（缓推会路过别的收藏的档位，别让高亮中途跳到别人身上）
     @State private var glidingTarget: UUID?
     @FocusState private var focusedName: UUID?
@@ -155,7 +158,8 @@ struct FavoritesSection: View {
         if store.isFull { return "已满 \(FavoriteSetting.maxCount) 组" }
         if !isConnected { return "连上设备后可收藏" }
         if isGliding { return "缓推完成后再收藏" }
-        if !hasOutputToSave { return "先推滑杆" }
+        // 冷却 / 锁存等暂时不许输出时滑杆是灰的：不叫人去推一根推不动的滑杆
+        if !hasOutputToSave { return rules.canOutput ? "先推滑杆" : "安全限制解除后再收藏" }
         return "存下这一刻"
     }
 
@@ -163,9 +167,15 @@ struct FavoritesSection: View {
         if store.isFull { return "最多收藏 \(FavoriteSetting.maxCount) 组，先整理掉不常用的" }
         if !isConnected { return "先连接设备，调出喜欢的手感再收藏" }
         if isGliding { return "等强度缓缓推到目标后，再收藏" }
-        if !hasOutputToSave { return "先把滑杆推到喜欢的位置，再收藏" }
+        if !hasOutputToSave {
+            if rules.canOutput { return "先把滑杆推到喜欢的位置，再收藏" }
+            return rules.blockReason ?? "暂时不能输出，安全限制解除后再收藏"
+        }
         return "收藏后点一下就回来：强度会缓缓推上去"
     }
+
+    /// 收不了时旁白也要听到原因（提示可能被用户关掉，原因放在值里）
+    private var saveA11yValue: String { canSave ? "" : saveCaption }
 
     /// 撤销条停留多久：旁白用户要先找到"撤销"键，给得宽一些
     private var undoSeconds: Double {
@@ -296,6 +306,7 @@ struct FavoritesSection: View {
         .buttonStyle(SoftPressStyle())
         .disabled(!canSave)
         .accessibilityLabel("收藏此刻的手感")
+        .accessibilityValue(saveA11yValue)
         .accessibilityHint(saveHint)
     }
 
@@ -348,6 +359,7 @@ struct FavoritesSection: View {
             .buttonStyle(SoftPressStyle())
             .disabled(!canSave)
             .accessibilityLabel("收藏此刻的手感")
+            .accessibilityValue(saveA11yValue)
             .accessibilityHint(saveHint)
         }
     }
@@ -374,8 +386,11 @@ struct FavoritesSection: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .transition(.opacity)
         } else if let u = undo {
+            // 为放回它腾出了位置：直接说现在点撤销会发生什么
+            let readyToReturn: Bool = u == blockedRestore && !store.isFull
             HStack(spacing: 8) {
-                Label("已删除「\(u.item.name)」", systemImage: "trash")
+                Label(readyToReturn ? "空出一格了，放回「\(u.item.name)」" : "已删除「\(u.item.name)」",
+                      systemImage: readyToReturn ? "arrow.uturn.backward" : "trash")
                     .font(.caption)
                     .foregroundColor(Velvet.textSecondary)
                 Spacer(minLength: 4)
@@ -392,16 +407,13 @@ struct FavoritesSection: View {
                 .accessibilityHint("把\(u.item.name)放回收藏")
             }
             .transition(.opacity)
-        } else if !editing, let status = rules.status(for: store.items) {
+        } else if !editing, !store.items.isEmpty, let status = rules.status(for: store.items) {
+            // 说的是"卡片为什么点不了"：还没有收藏时不说（空卡片上已经写了为什么现在收不了，不再重复一遍）。
             // 真被安全规则挡住才用锁；没连上只是还没开始，用连接的图标
             Label(status, systemImage: isConnected ? "lock.fill" : "dot.radiowaves.left.and.right")
                 .font(.caption)
                 .foregroundColor(Velvet.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
-        } else if store.items.isEmpty && mode != .skill && !hasOutputToSave {
-            Text("先把滑杆推到喜欢的位置，再收藏")
-                .font(.caption)
-                .foregroundColor(Velvet.textMuted)
         }
     }
 
@@ -434,13 +446,24 @@ struct FavoritesSection: View {
         }
         // 新的撤销条顶掉可能还在显示的提示（提示的定时器一并作废）
         noticeGen += 1
+        // 之前因为已满没放回的那条（用户正是为它腾的位置）排回最上面：下一次"撤销"放回它
+        let waiting: FavoriteStore.Removed? = blockedRestore.flatMap { b in undoStack.contains(b) ? b : nil }
         withAnimation(settleAnimation()) {
             notice = nil
             undoStack.append(removed)
+            if let b = waiting, let i = undoStack.firstIndex(of: b) {
+                undoStack.remove(at: i)
+                undoStack.append(b)
+            }
             // 撤销条只有一行：栈太深也摆不下，留最近 3 条
             if undoStack.count > 3 { undoStack.removeFirst(undoStack.count - 3) }
         }
-        UIAccessibility.post(notification: .announcement, argument: "已删除\(removed.item.name)，可以撤销")
+        if let b = waiting {
+            UIAccessibility.post(notification: .announcement,
+                                 argument: "已删除\(removed.item.name)，空出一格了，点撤销就能放回\(b.item.name)")
+        } else {
+            UIAccessibility.post(notification: .announcement, argument: "已删除\(removed.item.name)，可以撤销")
+        }
         armUndoDismissal()
     }
 
@@ -454,6 +477,7 @@ struct FavoritesSection: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay + undoSeconds) {
             guard gen == undoGen else { return }
             withAnimation(settle) { undoStack = [] }
+            blockedRestore = nil
         }
     }
 
@@ -462,17 +486,21 @@ struct FavoritesSection: View {
         if ok {
             // 放回成功才消费这条撤销；还有别的可撤销的：窗口重新计（提示会顶掉撤销条几秒，从提示收走后再算）
             undoStack.removeAll { $0 == r }
+            if blockedRestore == r { blockedRestore = nil }
             if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
             Haptics.select()
             flash("已放回「\(r.item.name)」")
         } else if store.isFull {
-            // 满了放不回去：撤销条留着（先整理出一格，再点撤销还能放回）。
-            // "整理出一格再点撤销"是个多步动作：提示这几秒盖着"撤销"键，窗口从提示收走后才开始，才走得完
+            // 满了放不回去：撤销条留着，记下这条。用户删掉一组腾出位置时，delete() 把它排回撤销条最上面，
+            // 下一次"撤销"放回的就是它（不是刚删掉的那组）。
+            // 提示这几秒盖着"撤销"键：窗口从提示收走后才开始，多一步也走得完
+            blockedRestore = r
             armUndoDismissal(after: Self.noticeSeconds)
-            flash("收藏已满 \(FavoriteSetting.maxCount) 组，先整理出一格，再点撤销")
+            flash("收藏已满 \(FavoriteSetting.maxCount) 组：删掉一组空出位置，再点撤销就能放回「\(r.item.name)」")
         } else {
             // 同样的手感已经在收藏里：这条撤销没有意义了，别让用户再点进同一个失败
             undoStack.removeAll { $0 == r }
+            if blockedRestore == r { blockedRestore = nil }
             if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
             flash("同样的手感已经在收藏里了")
         }

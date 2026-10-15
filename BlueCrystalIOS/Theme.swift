@@ -64,15 +64,46 @@ enum Velvet {
         Font.system(style, design: .serif).weight(weight)
     }
 
+    /// 一天里的时段：页头的问候和连接卡片的邀请用同一套划分（一个出处，不会各走各的）
+    enum Daypart {
+        case lateNight, morning, afternoon, evening, night
+
+        init(hour: Int = Calendar.current.component(.hour, from: Date())) {
+            switch hour {
+            case 0..<5: self = .lateNight
+            case 5..<11: self = .morning
+            case 11..<17: self = .afternoon
+            case 17..<21: self = .evening
+            default: self = .night
+            }
+        }
+
+        /// 手感页页头的一句
+        var greeting: String {
+            switch self {
+            case .lateNight: return "夜深了，只剩你和指尖的温度"
+            case .morning: return "清晨的慵懒，适合慢慢醒来"
+            case .afternoon: return "偷得半日闲，给自己一点甜"
+            case .evening: return "夜色刚好，把节奏交给指尖"
+            case .night: return "夜色正浓，每一分力度都被温柔回应"
+            }
+        }
+
+        /// 连接卡片的标题：紧挨着页头，和问候互相接话，不重复它的开头
+        var connectInvite: String {
+            switch self {
+            case .lateNight: return "轻轻唤醒它，就从连接开始"
+            case .morning: return "晨光正好，先把它连上"
+            case .afternoon: return "午后时光，先把它连上"
+            case .evening: return "灯光调暗，先把它连上"
+            case .night: return "一切就绪，只差连上它"
+            }
+        }
+    }
+
     /// 按时间说一句话（手感页页头）：深夜、清晨、午后、傍晚各一句
     static func greeting(hour: Int = Calendar.current.component(.hour, from: Date())) -> String {
-        switch hour {
-        case 0..<5: return "夜深了，只剩你和指尖的温度"
-        case 5..<11: return "清晨的慵懒，适合慢慢醒来"
-        case 11..<17: return "偷得半日闲，给自己一点甜"
-        case 17..<21: return "夜色刚好，把节奏交给指尖"
-        default: return "夜色正浓，每一分力度都被温柔回应"
-        }
+        Daypart(hour: hour).greeting
     }
 }
 
@@ -177,11 +208,23 @@ struct VelvetBackground: View {
             .clipped()
         }
         .animation(.easeInOut(duration: 1.2), value: glow)
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 14).repeatForever(autoreverses: true)) { drift = true }
+        .onAppear { startDrift() }
+        // 中途打开减弱动态效果：正在循环的漂移立刻停下；关掉时再慢慢漂起来
+        .onChange(of: reduceMotion) { rm in
+            if rm {
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) { drift = false }
+            } else {
+                startDrift()
+            }
         }
         .accessibilityHidden(true)
+    }
+
+    private func startDrift() {
+        guard !reduceMotion, !drift else { return }
+        withAnimation(.easeInOut(duration: 14).repeatForever(autoreverses: true)) { drift = true }
     }
 }
 

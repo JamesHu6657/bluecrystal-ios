@@ -774,9 +774,7 @@ struct AIControlView: View {
                 }
                 Spacer(minLength: 4)
                 Button {
-                    // L2：设置页会盖住停止键，打开前先停止
-                    vm.willOpenSettings()
-                    showSettings = true
+                    openSettings()
                 } label: {
                     Image(systemName: "gearshape")
                         .font(.system(size: 17, weight: .medium))
@@ -786,6 +784,7 @@ struct AIControlView: View {
                 }
                 .buttonStyle(PressableStyle())
                 .accessibilityLabel("AI 设置")
+                .accessibilityHint(settingsBlocked ? "先处理下方设备卡片的提示" : "服务商、模型、API Key 和提示词")
             }
             HStack(spacing: 10) {
                 StatusOrb(color: vm.running ? Velvet.rose : (vm.isThinking ? Velvet.gold : Velvet.textMuted),
@@ -814,6 +813,23 @@ struct AIControlView: View {
             LinearGradient(colors: [Velvet.ink.opacity(0.95), Velvet.ink.opacity(0.6)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .top)
         )
+    }
+
+    /// 设备需要用户处理（停止重试中、需要确认物理关机、提供强制断开）时不弹设置页：
+    /// 设置页是整页弹出层，会盖住页头设备卡片上的红字和「解除锁定 / 强制断开」（同一起看的选择器）
+    private var settingsBlocked: Bool {
+        ble.safety.needsPhysicalAck || ble.safety.stopRetrying || ble.forceDisconnectOffered
+    }
+
+    /// L2：设置页会盖住页面上的停止键，打开前先停止；设备需要处理时不打开，震一下并说明
+    private func openSettings() {
+        guard !settingsBlocked else {
+            Haptics.warning()
+            UIAccessibility.post(notification: .announcement, argument: "先处理设备卡片上的提示，再打开设置")
+            return
+        }
+        vm.willOpenSettings()
+        showSettings = true
     }
 
     /// 运行中或等回复时不许快捷切换：设置页换模型要先停止，这里也一样；页头也不会显示一个还没在用的模型
@@ -1096,6 +1112,8 @@ private struct TypingIndicator: View {
 
 struct AISettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var privacy: PrivacyLock
     @State private var provider = AIConfig.provider
     @State private var modelID = AIConfig.model.id
     @State private var prompt = AIConfig.systemPrompt
@@ -1164,6 +1182,8 @@ struct AISettingsView: View {
             .onChange(of: provider) { p in
                 if !p.models.contains(where: { $0.id == modelID }) { modelID = p.models[0].id }
             }
+            // 设置页盖住了 AI 页的停止键：这里常驻一个（同一起看的选择器），停止帧对万一还在路上也一下就能再发
+            .safeAreaInset(edge: .bottom) { stopBar }
             .scrollContentBackground(.hidden)
             .background(VelvetBackground(glow: 0.1).ignoresSafeArea())
             .tint(Velvet.rose)
@@ -1176,6 +1196,25 @@ struct AISettingsView: View {
                 }
             }
         }
+    }
+
+    /// 底部停止条：和解锁页的停止同一条路径（sendStop + 各页 VM 的 stopAll）；
+    /// 有红字、需要确认物理关机或停止重试中时，连紧凑设备卡片（解除锁定 / 强制断开）一起带上
+    private var stopBar: some View {
+        let showCard: Bool = ble.lastError != nil || ble.safety.needsPhysicalAck || ble.safety.stopRetrying
+            || ble.forceDisconnectOffered
+        return VStack(spacing: 0) {
+            if showCard {
+                DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+            }
+            StopDockBar {
+                ble.sendStop()
+                privacy.requestStopAll()
+            }
+        }
+        .background(Velvet.ink.opacity(0.92).ignoresSafeArea())
     }
 
     /// 先写钥匙串；任何一个 Key 写失败就把这次已写入的 Key 改回原值，服务商/模型/提示词也不保存。

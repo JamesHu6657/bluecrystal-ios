@@ -399,7 +399,7 @@ final class VideoSyncPlayer: ObservableObject {
 
     private func sample(at t: Double, force: Bool = false) {
         guard let s = script, let ble = ble else { return }
-        // 单次 300 秒上限、30 分钟额度、冷却都由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
+        // 单次上限（SafetyLimits.maxRunSeconds）、30 分钟额度、冷却都由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
 
         currentSeconds = t
         // 修 L11：从播放起点覆盖整个连续播放区间，包括 >0.5s 的采样延迟；seek 另行重置。
@@ -478,9 +478,14 @@ struct VideoSyncView: View {
     }
 
     /// 选择器被拦下时的那句话：先处理什么、再选什么，一个出处
-    /// （旁白播的、钉在停止键上显示的、幕布上写的都是同一句）
-    private func pickerBlockedMessage(_ kind: PickerKind) -> String {
-        let what: String = kind == .video ? "视频" : "脚本"
+    /// （旁白播的、钉在停止键上显示的、幕布和素材区写的都是同一句）。kind 为 nil：视频和脚本一起说
+    private func pickerBlockedMessage(_ kind: PickerKind?) -> String {
+        let what: String
+        switch kind {
+        case .video?: what = "视频"
+        case .script?: what = "脚本"
+        case nil: what = "视频或脚本"
+        }
         return "先处理上方设备卡片的提示，再选\(what)"
     }
 
@@ -581,6 +586,13 @@ struct VideoSyncView: View {
         }
         // 修 CC r3 L4：attach 挂在整个页面上，与 onDisappear 对称（同 ManualControlView）
         .onAppear { vm.attach(ble: ble) }
+        // 设备那边处理好了：钉着的"先处理设备卡片"立刻收掉，不再指向一张已经不在的卡片
+        .onChange(of: pickerBlocked) { blocked in
+            guard !blocked, pickerNotice != nil else { return }
+            pickerNoticeGen += 1
+            let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+            withAnimation(settle) { pickerNotice = nil }
+        }
         // 弹出层（选择器、全屏）盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
         .sheet(item: $picker) { kind in
             // 选择器和底部停止条上下排（不用 safeAreaInset：系统选择器是远程界面，未必让出底部的
@@ -799,9 +811,14 @@ struct VideoSyncView: View {
     private var materials: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionLabel(title: "素材", systemImage: "film.stack")
-            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") { openPicker(.video) }
+            // 被拦下的原因常驻写在本卡片底部（blockedReasonShown）：点这两行时不再往停止键上钉第二份
+            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") {
+                openPicker(.video, blockedReasonShown: true)
+            }
             Divider().overlay(Velvet.stroke)
-            materialRow(icon: "doc.text", title: "脚本", value: vm.scriptName, action: "载入") { openPicker(.script) }
+            materialRow(icon: "doc.text", title: "脚本", value: vm.scriptName, action: "载入") {
+                openPicker(.script, blockedReasonShown: true)
+            }
             if let s = vm.script {
                 Text("\(s.commands.count) 条命令")
                     .font(.caption).foregroundColor(Velvet.textMuted)
@@ -809,7 +826,7 @@ struct VideoSyncView: View {
             if pickerBlocked {
                 // 已选过视频后幕布不在了，素材行是唯一入口：被拦的原因常驻写在这里（和幕布上那句同一个意思），
                 // 不只靠停止键上方那 3 秒的提示
-                Label("先处理上方设备卡片的提示，再选视频或脚本", systemImage: "exclamationmark.triangle.fill")
+                Label(pickerBlockedMessage(nil), systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundColor(Velvet.warning)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1199,14 +1216,14 @@ struct FullScreenVideoView: View {
                 }
                 // 独立于控制条的淡入淡出：警告不动画、不自动收起。长红字 / 大字号可滚动，
                 // 上方留出退出键，下方的固定停止键仍最后绘制、始终可点。
+                // 卡片多高就占多高（横屏时不再整块盖住下面的进度条和曲线）；放不下才滚动，最多 warningHeight
                 if needsDeviceAttention {
                     VStack {
-                        ScrollView {
-                            DeviceStatusCard(allowDisconnect: false, connectTitle: "连接",
-                                             compact: true, showsConnect: false)
-                                .padding(.horizontal, 16)
+                        ViewThatFits(in: .vertical) {
+                            warningCard
+                            ScrollView { warningCard }
                         }
-                        .frame(height: warningHeight)
+                        .frame(maxHeight: warningHeight)
                         Spacer(minLength: 0)
                     }
                     .padding(.top, 60)
@@ -1235,6 +1252,11 @@ struct FullScreenVideoView: View {
                 }
             }
         }
+    }
+
+    private var warningCard: some View {
+        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
+            .padding(.horizontal, 16)
     }
 
     private var controls: some View {

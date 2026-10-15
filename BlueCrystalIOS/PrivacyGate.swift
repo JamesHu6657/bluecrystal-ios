@@ -365,10 +365,22 @@ struct AgeGateView: View {
                 .padding(.horizontal, 24)
             }
         }
-        .onAppear {
-            guard !reduceMotion else { return }
-            withAnimation(.easeInOut(duration: 2.6).repeatForever(autoreverses: true)) { glow = true }
+        .onAppear { startGlow() }
+        // 中途打开减弱动态效果：正在循环的光晕立刻停下；关掉时再亮起来
+        .onChange(of: reduceMotion) { rm in
+            if rm {
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) { glow = false }
+            } else {
+                startGlow()
+            }
         }
+    }
+
+    private func startGlow() {
+        guard !reduceMotion, !glow else { return }
+        withAnimation(.easeInOut(duration: 2.6).repeatForever(autoreverses: true)) { glow = true }
     }
 }
 
@@ -398,7 +410,8 @@ struct LockScreenView: View {
                     .font(Velvet.display(.title))
                     .foregroundColor(Velvet.text)
                     .accessibilityAddTraits(.isHeader)
-                Text("验证一下，再继续今晚")
+                // 不写"今晚"：白天打开也说得通
+                Text("验证一下，再回到只属于你的时光")
                     .font(.subheadline)
                     .foregroundColor(Velvet.textSecondary)
                 if let m = lock.message {
