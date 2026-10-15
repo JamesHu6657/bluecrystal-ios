@@ -627,6 +627,8 @@ struct AudioSyncSettings: Equatable {
         static let sensitivityDb = "bcAudioSyncSensitivityDb"
         static let maxPercent = "bcAudioSyncMaxPercent"
         static let channels = "bcAudioSyncChannels"
+        static let minPercent = "bcAudioSyncMinPercent"
+        static let autoGain = "bcAudioSyncAutoGain"
     }
 
     static let defaultEnabled = true
@@ -637,18 +639,30 @@ struct AudioSyncSettings: Equatable {
     static let maxPercentRange: ClosedRange<Double> = 10...100
     static let defaultMaxPercent: Double = 60
     static let defaultChannels = AudioSyncChannels.both
+    /// 最低强度（%）：播放中安静片段也不归零，保持在这里（用户要求"不归零"）；0 = 允许归零
+    static let minPercentRange: ClosedRange<Double> = 0...50
+    /// App 里没存过时的默认值（init 参数默认 0，纯逻辑测试沿用原行为）
+    static let defaultMinPercent: Double = 10
+    /// 自动灵敏度：跟踪当前视频最近的响度，自动把它的响段映射到接近上限，安静的视频和响的视频都用满范围
+    static let defaultAutoGain = true
 
     var enabled: Bool
     var sensitivityDb: Double
     var maxPercent: Double
     var channels: AudioSyncChannels
+    var minPercent: Double
+    var autoGain: Bool
 
     init(enabled: Bool = defaultEnabled, sensitivityDb: Double = defaultSensitivityDb,
-         maxPercent: Double = defaultMaxPercent, channels: AudioSyncChannels = defaultChannels) {
+         maxPercent: Double = defaultMaxPercent, channels: AudioSyncChannels = defaultChannels,
+         minPercent: Double = 0, autoGain: Bool = false) {
         self.enabled = enabled
         self.sensitivityDb = Self.clamp(sensitivityDb, to: Self.sensitivityRange, fallback: Self.defaultSensitivityDb)
         self.maxPercent = Self.clamp(maxPercent, to: Self.maxPercentRange, fallback: Self.defaultMaxPercent)
         self.channels = channels
+        // 最低强度不超过上限
+        self.minPercent = min(self.maxPercent, Self.clamp(minPercent, to: Self.minPercentRange, fallback: 0))
+        self.autoGain = autoGain
     }
 
     static func load(from defaults: UserDefaults) -> AudioSyncSettings {
@@ -657,7 +671,9 @@ struct AudioSyncSettings: Equatable {
             enabled: defaults.object(forKey: Keys.enabled) as? Bool ?? defaultEnabled,
             sensitivityDb: defaults.object(forKey: Keys.sensitivityDb) as? Double ?? defaultSensitivityDb,
             maxPercent: defaults.object(forKey: Keys.maxPercent) as? Double ?? defaultMaxPercent,
-            channels: channels ?? defaultChannels)
+            channels: channels ?? defaultChannels,
+            minPercent: defaults.object(forKey: Keys.minPercent) as? Double ?? defaultMinPercent,
+            autoGain: defaults.object(forKey: Keys.autoGain) as? Bool ?? defaultAutoGain)
     }
 
     /// 灵敏度的倍数写法（界面显示）
@@ -688,6 +704,14 @@ struct AudioReactiveShaper {
     static let releaseSeconds: TimeInterval = 0.8
     /// dB 加权里 RMS 的比重（其余给峰值）
     static let rmsWeight: Double = 0.7
+    /// 自动灵敏度：参考响度（视频最近的"响段"电平）的起始值、上升 / 下降时间常数，
+    /// 以及参考响度要映射到的位置（0~100）
+    static let autoInitialRefDb: Double = -20
+    static let autoRiseSeconds: TimeInterval = 1.5
+    static let autoFallSeconds: TimeInterval = 20
+    static let autoTargetPercent: Double = 85
+    /// 自动增益的范围（dB）：再安静的视频也最多放大这么多，避免把纯底噪放大成强输出
+    static let autoGainRange: ClosedRange<Double> = -12...24
 
     struct Output: Equatable {
         /// 灵敏度之后、噪声门之前的电平（0~100），界面电平条用
@@ -698,10 +722,34 @@ struct AudioReactiveShaper {
 
     private(set) var smoothed: Double = 0
     private(set) var gateOpen = false
+    /// 自动灵敏度跟踪的参考响度（dB）；暂停 / 跳转不清零，换视频时 resetAdaptation()
+    private(set) var refDb: Double = autoInitialRefDb
 
     mutating func reset() {
         smoothed = 0
         gateOpen = false
+    }
+
+    /// 换视频：重新学习响度
+    mutating func resetAdaptation() {
+        reset()
+        refDb = Self.autoInitialRefDb
+    }
+
+    /// 当前自动增益（dB）：把参考响度放到 autoTargetPercent
+    var autoGainDb: Double {
+        let targetDb = Self.floorDb + Self.autoTargetPercent / 100 * (Self.ceilingDb - Self.floorDb)
+        let g = targetDb - refDb
+        guard g.isFinite else { return 0 }
+        return min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, g))
+    }
+
+    /// 跟踪参考响度：变响较快跟上，变轻很慢地落（一段安静不会立刻把增益拉满）
+    private mutating func adapt(loudnessDb db: Double, dt: TimeInterval) {
+        guard db.isFinite, db > Self.absoluteGateDb else { return }
+        let tau = db > refDb ? Self.autoRiseSeconds : Self.autoFallSeconds
+        refDb += (db - refDb) * (1 - exp(-dt / tau))
+        if !refDb.isFinite { refDb = Self.autoInitialRefDb }
     }
 
     /// 增益前的电平（dBFS 量级）。满幅正弦 ≈ 0 dB；没有音频或全静音返回 -inf
@@ -720,22 +768,41 @@ struct AudioReactiveShaper {
         return min(100, max(0, frac * 100))
     }
 
-    mutating func step(_ w: AudioWindow, settings: AudioSyncSettings, dt: TimeInterval) -> Output {
-        let level = Self.targetPercent(loudnessDb: Self.loudnessDb(w), sensitivityDb: settings.sensitivityDb)
+    /// hasAudio = false（没有音轨 / 分析失败 / 还没就绪）时不加最低强度：没有信号就不输出
+    mutating func step(_ w: AudioWindow, settings: AudioSyncSettings, dt: TimeInterval,
+                       hasAudio: Bool = true) -> Output {
+        // 计时抖动 / 主线程卡顿：步长夹在 10 ms ~ 1 s
+        let step = dt.isFinite ? min(1, max(0.01, dt)) : Self.interval
+        let db = Self.loudnessDb(w)
+        var gain = settings.sensitivityDb
+        if settings.autoGain {
+            adapt(loudnessDb: db, dt: step)
+            // 自动增益 + 手动灵敏度作微调
+            gain = min(Self.autoGainRange.upperBound + AudioSyncSettings.sensitivityRange.upperBound,
+                       max(Self.autoGainRange.lowerBound + AudioSyncSettings.sensitivityRange.lowerBound,
+                           autoGainDb + settings.sensitivityDb))
+        }
+        let level = Self.targetPercent(loudnessDb: db, sensitivityDb: gain)
         if gateOpen {
             if level < Self.gateClosePercent { gateOpen = false }
         } else if level >= Self.gateOpenPercent {
             gateOpen = true
         }
         let target = gateOpen ? level : 0
-        // 计时抖动 / 主线程卡顿：步长夹在 10 ms ~ 1 s
-        let step = dt.isFinite ? min(1, max(0.01, dt)) : Self.interval
         let tau = target > smoothed ? Self.attackSeconds : Self.releaseSeconds
         smoothed += (target - smoothed) * (1 - exp(-step / tau))
         smoothed = smoothed.isFinite ? min(100, max(0, smoothed)) : 0
         let cap = settings.maxPercent
-        let scaled = smoothed * cap / 100
-        let percent = scaled < 1 ? 0 : min(Int(cap.rounded(.down)), Int(scaled.rounded()))
+        let floor = hasAudio ? min(cap, settings.minPercent) : 0
+        let percent: Int
+        if floor >= 1 {
+            // 不归零：0~100 映射到 最低强度 ~ 上限
+            let scaled = floor + smoothed * (cap - floor) / 100
+            percent = min(Int(cap.rounded(.down)), max(Int(floor.rounded()), Int(scaled.rounded())))
+        } else {
+            let scaled = smoothed * cap / 100
+            percent = scaled < 1 ? 0 : min(Int(cap.rounded(.down)), Int(scaled.rounded()))
+        }
         return Output(level: level, percent: max(0, min(100, percent)))
     }
 }

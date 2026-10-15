@@ -168,6 +168,7 @@ final class VideoSyncPlayer: ObservableObject {
         seekGen += 1
         isSeeking = false
         meterGen += 1
+        shaper.resetAdaptation()
         progressWatch.reset(now: Self.now())
         cancelScrubbing()
         durationSeconds = 0
@@ -451,7 +452,7 @@ final class VideoSyncPlayer: ObservableObject {
         let dt = lastTickAt.map { now - $0 } ?? AudioReactiveShaper.interval
         lastTickAt = now
         let window = meter?.drain() ?? .silent
-        let out = shaper.step(window, settings: settings, dt: dt)
+        let out = shaper.step(window, settings: settings, dt: dt, hasAudio: audioStatus == .ready)
         level = out.level
         intensity = out.percent
         guard settings.enabled else { return }
@@ -542,11 +543,14 @@ struct VideoSyncView: View {
     @AppStorage(AudioSyncSettings.Keys.sensitivityDb) private var sensitivityDb = AudioSyncSettings.defaultSensitivityDb
     @AppStorage(AudioSyncSettings.Keys.maxPercent) private var maxPercent = AudioSyncSettings.defaultMaxPercent
     @AppStorage(AudioSyncSettings.Keys.channels) private var channelsRaw = AudioSyncSettings.defaultChannels.rawValue
+    @AppStorage(AudioSyncSettings.Keys.minPercent) private var minPercent = AudioSyncSettings.defaultMinPercent
+    @AppStorage(AudioSyncSettings.Keys.autoGain) private var autoGain = AudioSyncSettings.defaultAutoGain
 
     private var audioSettings: AudioSyncSettings {
         AudioSyncSettings(enabled: syncEnabled, sensitivityDb: sensitivityDb,
                           maxPercent: maxPercent,
-                          channels: AudioSyncChannels(rawValue: channelsRaw) ?? .both)
+                          channels: AudioSyncChannels(rawValue: channelsRaw) ?? .both,
+                          minPercent: minPercent, autoGain: autoGain)
     }
 
     /// 设备需要用户处理（停止重试中、需要确认物理关机、提供强制断开）时不弹选择器：
@@ -667,6 +671,8 @@ struct VideoSyncView: View {
         .onChange(of: sensitivityDb) { _ in vm.applySettings(audioSettings) }
         .onChange(of: maxPercent) { _ in vm.applySettings(audioSettings) }
         .onChange(of: channelsRaw) { _ in vm.applySettings(audioSettings) }
+        .onChange(of: minPercent) { _ in vm.applySettings(audioSettings) }
+        .onChange(of: autoGain) { _ in vm.applySettings(audioSettings) }
         // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
         .sheet(isPresented: $showPicker) {
             // 选择器和底部停止条上下排：系统选择器是远程界面，未必让出底部标签栏
@@ -822,6 +828,35 @@ struct VideoSyncView: View {
                     .accessibilityLabel("强度上限")
                     .accessibilityValue("\(Int(maxPercent))%")
             }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("最低强度（安静时不归零）")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Spacer()
+                    Text("\(Int(min(minPercent, maxPercent)))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(Velvet.textSecondary)
+                }
+                Slider(value: $minPercent,
+                       in: AudioSyncSettings.minPercentRange, step: 1)
+                    .tint(Velvet.gold)
+                    .accessibilityLabel("最低强度")
+                    .accessibilityValue("\(Int(min(minPercent, maxPercent)))%")
+            }
+
+            Toggle(isOn: $autoGain) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动灵敏度")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Text("按这个视频自己的音量自动调整，灵敏度滑块变成微调")
+                        .font(.caption2)
+                        .foregroundColor(Velvet.textMuted)
+                }
+            }
+            .tint(Velvet.gold)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("输出到")

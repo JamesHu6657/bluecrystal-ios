@@ -318,10 +318,63 @@ r4check(clampedLow.sensitivityDb == -12 && clampedLow.maxPercent == 10, "声音�
 let nanSettings = AudioSyncSettings(sensitivityDb: .nan, maxPercent: .infinity)
 r4check(nanSettings.sensitivityDb == 0 && nanSettings.maxPercent == 60, "声音设置：NaN / 无穷按默认")
 r4check(abs(AudioSyncSettings(sensitivityDb: 6).gainMultiplier - 1.9953) < 1e-3, "声音设置：+6 dB ≈ ×2")
+// 不归零：播放中有音轨时安静片段保持最低强度；没有音轨不输出
+do {
+    let floorSettings = AudioSyncSettings(maxPercent: 60, minPercent: 10)
+    var fs = AudioReactiveShaper()
+    var o = fs.step(.silent, settings: floorSettings, dt: 0.3)
+    r4check(o.percent == 10, "不归零：一开始安静也保持 10%")
+    for _ in 0..<5 { o = fs.step(sineWindow(0), settings: floorSettings, dt: 0.3) }
+    r4check(o.percent == 60, "不归零：最响仍到上限 60")
+    for _ in 0..<40 { o = fs.step(.silent, settings: floorSettings, dt: 0.3) }
+    r4check(o.percent == 10, "不归零：持续安静落回 10%，不到 0")
+    fs.reset()
+    r4check(fs.step(.silent, settings: floorSettings, dt: 0.3, hasAudio: false).percent == 0, "不归零：没有音轨时输出 0")
+    r4check(AudioSyncSettings(maxPercent: 20, minPercent: 50).minPercent == 20, "最低强度不超过上限")
+    r4check(AudioSyncSettings(minPercent: .nan).minPercent == 0 && AudioSyncSettings(minPercent: 99).minPercent == 50,
+            "最低强度夹回 0~50")
+    var withinFloorCap = true
+    var rs = AudioReactiveShaper()
+    for _ in 0..<2_000 {
+        let s = AudioSyncSettings(sensitivityDb: -20 + nextRandom() * 50, maxPercent: nextRandom() * 120,
+                                  minPercent: nextRandom() * 60, autoGain: nextRandom() < 0.5)
+        let w = AudioWindow(peakToPeak: nextRandom() * 2.5, rms: nextRandom(), frames: Int(nextRandom() * 3) * 1_000)
+        let out = rs.step(w, settings: s, dt: nextRandom() * 1.5)
+        let lowest = s.minPercent >= 1 ? min(Int(s.minPercent.rounded()), Int(s.maxPercent.rounded(.down))) : 0
+        if out.percent < lowest || out.percent > Int(s.maxPercent) { withinFloorCap = false }
+    }
+    r4check(withinFloorCap, "不归零：随机输入始终在 最低强度 ~ 上限 之间")
+}
+
+// 自动灵敏度：安静的视频和响的视频都能用满范围
+do {
+    let auto = AudioSyncSettings(maxPercent: 100, autoGain: true)
+    var quietVideo = AudioReactiveShaper()
+    var q = quietVideo.step(sineWindow(-35), settings: auto, dt: 0.3)
+    for _ in 0..<120 { q = quietVideo.step(sineWindow(-35), settings: auto, dt: 0.3) }
+    var manual = AudioReactiveShaper()
+    var m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3)
+    for _ in 0..<120 { m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3) }
+    r4check(q.percent >= 70 && q.percent > m.percent, "自动灵敏度：小声视频的响段也能到 70% 以上（手动只有 \(m.percent)）")
+    var loudVideo = AudioReactiveShaper()
+    var l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3)
+    for _ in 0..<60 { l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3) }
+    r4check(l.percent >= 70 && l.percent <= 95, "自动灵敏度：大声视频不长期顶死在 100%")
+    r4check(quietVideo.autoGainDb <= AudioReactiveShaper.autoGainRange.upperBound, "自动增益有上限")
+    var silentAuto = AudioReactiveShaper()
+    var sOut = silentAuto.step(.silent, settings: auto, dt: 0.3)
+    for _ in 0..<100 { sOut = silentAuto.step(AudioWindow(peakToPeak: 0.0004, rms: 0.0001, frames: 1000), settings: auto, dt: 0.3) }
+    r4check(sOut.percent == 0, "自动灵敏度：纯底噪（低于 -60 dB）不会被放大")
+    quietVideo.resetAdaptation()
+    r4check(quietVideo.refDb == AudioReactiveShaper.autoInitialRefDb, "换视频重新学习响度")
+}
+
 let suite = "bc.round4.audiosync"
 if let defaults = UserDefaults(suiteName: suite) {
     defaults.removePersistentDomain(forName: suite)
-    r4check(AudioSyncSettings.load(from: defaults) == AudioSyncSettings(), "声音设置：没存过用默认")
+    r4check(AudioSyncSettings.load(from: defaults) == AudioSyncSettings(minPercent: AudioSyncSettings.defaultMinPercent,
+                                                                         autoGain: AudioSyncSettings.defaultAutoGain),
+            "声音设置：没存过用默认（最低强度 10%、自动灵敏度开）")
     defaults.set("abc", forKey: AudioSyncSettings.Keys.maxPercent)
     defaults.set(9, forKey: AudioSyncSettings.Keys.channels)
     defaults.set(400.0, forKey: AudioSyncSettings.Keys.sensitivityDb)
