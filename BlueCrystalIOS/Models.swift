@@ -813,9 +813,11 @@ struct AudioReactiveShaper {
     static let autoInitialRefDb: Double = -20
     static let autoRiseSeconds: TimeInterval = 1.5
     static let autoFallSeconds: TimeInterval = 20
-    static let autoTargetPercent: Double = 85
+    static let autoTargetPercent: Double = 75
+    /// 自动增益只补一半差距：小声的视频仍然偏轻，不把轻微的声音顶成强输出（真机反馈 2026-10-15）
+    static let autoCompensation: Double = 0.5
     /// 自动增益的范围（dB）：再安静的视频也最多放大这么多，避免把纯底噪放大成强输出
-    static let autoGainRange: ClosedRange<Double> = -12...24
+    static let autoGainRange: ClosedRange<Double> = -12...12
     /// 自动模式下手动灵敏度只做微调（±6 dB），总增益仍夹在 autoGainRange 内
     static let autoTrimRange: ClosedRange<Double> = -6...6
     /// 自动模式的相对噪声门：比参考响度低这么多以上算底噪，不放大成输出
@@ -854,7 +856,7 @@ struct AudioReactiveShaper {
     /// 当前自动增益（dB）：把参考响度放到 autoTargetPercent
     var autoGainDb: Double {
         let targetDb = Self.floorDb + Self.autoTargetPercent / 100 * (Self.ceilingDb - Self.floorDb)
-        let g = targetDb - refDb
+        let g = (targetDb - refDb) * Self.autoCompensation
         guard g.isFinite else { return 0 }
         return min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, g))
     }
