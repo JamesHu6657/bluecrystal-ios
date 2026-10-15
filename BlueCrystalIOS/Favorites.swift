@@ -513,6 +513,13 @@ struct FavoritesSection: View {
     private func toggleEditing() {
         if editing {
             endEditing()
+        } else if store.isFull, waiting == nil, let u = undo {
+            // 满着、撤销条上那条（"已满：删掉一组，就能放回"）还没等空位时点了标题的「整理」：
+            // 和撤销条上的「去整理」走同一条路，让它改为等空位（常驻、撤销条放到列表上面）。
+            // 不然删掉一组后它被压在新删的那组下面，撤销新删的那组又占满位置，consumeUndo 清栈时它就丢了。
+            // makeRoom 会再回到这里开始整理（那时已经有等空位的那条，不会再进这个分支）；震动在那一次里给
+            makeRoom(for: u)
+            return
         } else {
             barAboveList = waiting != nil
             editing = true
@@ -530,7 +537,8 @@ struct FavoritesSection: View {
         if wasEditing, !undoStack.isEmpty { armUndoDismissal() }
     }
 
-    /// 满着时点「去整理」：这条改为等空位（常驻，删掉一组后先给它「撤销」），栈里别的几组满着放不回、一并收起
+    /// 满着时点「去整理」（或满着、栈顶还有一条时点标题的「整理」，见 toggleEditing）：
+    /// 这条改为等空位（常驻，删掉一组后先给它「撤销」），栈里别的几组满着放不回、一并收起
     private func makeRoom(for r: FavoriteStore.Removed) {
         withAnimation(settleAnimation()) {
             undoStack = []

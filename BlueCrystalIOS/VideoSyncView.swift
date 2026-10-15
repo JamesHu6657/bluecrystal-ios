@@ -811,13 +811,15 @@ struct VideoSyncView: View {
     private var materials: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionLabel(title: "素材", systemImage: "film.stack")
-            // 被拦下的原因常驻写在本卡片底部（blockedReasonShown）：点这两行时不再往停止键上钉第二份
+            // 被拦下的原因常驻写在本卡片底部（blockedReasonShown）：点这两行时不再往停止键上钉第二份。
+            // 那句只在已选过视频时显示（见下方 pickerBlocked && vm.player != nil）：还没选视频时卡片底部没有原因，
+            // 照常钉在停止键上方（幕布那句只说视频，且素材区在页面下部时幕布可能已滚出屏幕）
             materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") {
-                openPicker(.video, blockedReasonShown: true)
+                openPicker(.video, blockedReasonShown: vm.player != nil)
             }
             Divider().overlay(Velvet.stroke)
             materialRow(icon: "doc.text", title: "脚本", value: vm.scriptName, action: "载入") {
-                openPicker(.script, blockedReasonShown: true)
+                openPicker(.script, blockedReasonShown: vm.player != nil)
             }
             if let s = vm.script {
                 Text("\(s.commands.count) 条命令")
