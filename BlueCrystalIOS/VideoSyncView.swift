@@ -399,7 +399,7 @@ final class VideoSyncPlayer: ObservableObject {
 
     private func sample(at t: Double, force: Bool = false) {
         guard let s = script, let ble = ble else { return }
-        // 单次 300 秒上限、30 分钟额度、冷却都由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
+        // 单次上限（SafetyLimits.maxRunSeconds）、30 分钟额度、冷却都由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
 
         currentSeconds = t
         // 修 L11：从播放起点覆盖整个连续播放区间，包括 >0.5s 的采样延迟；seek 另行重置。
@@ -478,9 +478,14 @@ struct VideoSyncView: View {
     }
 
     /// 选择器被拦下时的那句话：先处理什么、再选什么，一个出处
-    /// （旁白播的、钉在停止键上显示的、幕布上写的都是同一句）
-    private func pickerBlockedMessage(_ kind: PickerKind) -> String {
-        let what: String = kind == .video ? "视频" : "脚本"
+    /// （旁白播的、钉在停止键上显示的、幕布和素材区写的都是同一句）。kind 为 nil：视频和脚本一起说
+    private func pickerBlockedMessage(_ kind: PickerKind?) -> String {
+        let what: String
+        switch kind {
+        case .video?: what = "视频"
+        case .script?: what = "脚本"
+        case nil: what = "视频或脚本"
+        }
         return "先处理上方设备卡片的提示，再选\(what)"
     }
 
@@ -511,9 +516,9 @@ struct VideoSyncView: View {
         }
     }
 
-    /// 选择器底部：停止键（停止帧对可能还在路上）；有红字或锁存时连设备卡片一起带上
+    /// 选择器底部：停止键（停止帧对可能还在路上）；设备需要处理时连设备卡片一起带上（同 AI 设置和全屏）
     private var pickerStopBar: some View {
-        let showCard: Bool = ble.lastError != nil || ble.safety.needsPhysicalAck || ble.safety.stopRetrying
+        let showCard: Bool = ble.needsAttentionCard
         return VStack(spacing: 0) {
             if showCard {
                 DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
@@ -581,6 +586,13 @@ struct VideoSyncView: View {
         }
         // 修 CC r3 L4：attach 挂在整个页面上，与 onDisappear 对称（同 ManualControlView）
         .onAppear { vm.attach(ble: ble) }
+        // 设备那边处理好了：钉着的"先处理设备卡片"立刻收掉，不再指向一张已经不在的卡片
+        .onChange(of: pickerBlocked) { blocked in
+            guard !blocked, pickerNotice != nil else { return }
+            pickerNoticeGen += 1
+            let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+            withAnimation(settle) { pickerNotice = nil }
+        }
         // 弹出层（选择器、全屏）盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
         .sheet(item: $picker) { kind in
             // 选择器和底部停止条上下排（不用 safeAreaInset：系统选择器是远程界面，未必让出底部的
@@ -799,17 +811,24 @@ struct VideoSyncView: View {
     private var materials: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionLabel(title: "素材", systemImage: "film.stack")
-            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") { openPicker(.video) }
+            // 被拦下的原因常驻写在本卡片底部（blockedReasonShown）：点这两行时不再往停止键上钉第二份。
+            // 那句只在已选过视频时显示（见下方 pickerBlocked && vm.player != nil）：还没选视频时卡片底部没有原因，
+            // 照常钉在停止键上方（幕布那句只说视频，且素材区在页面下部时幕布可能已滚出屏幕）
+            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") {
+                openPicker(.video, blockedReasonShown: vm.player != nil)
+            }
             Divider().overlay(Velvet.stroke)
-            materialRow(icon: "doc.text", title: "脚本", value: vm.scriptName, action: "载入") { openPicker(.script) }
+            materialRow(icon: "doc.text", title: "脚本", value: vm.scriptName, action: "载入") {
+                openPicker(.script, blockedReasonShown: vm.player != nil)
+            }
             if let s = vm.script {
                 Text("\(s.commands.count) 条命令")
                     .font(.caption).foregroundColor(Velvet.textMuted)
             }
-            if pickerBlocked {
+            if pickerBlocked && vm.player != nil {
                 // 已选过视频后幕布不在了，素材行是唯一入口：被拦的原因常驻写在这里（和幕布上那句同一个意思），
-                // 不只靠停止键上方那 3 秒的提示
-                Label("先处理上方设备卡片的提示，再选视频或脚本", systemImage: "exclamationmark.triangle.fill")
+                // 不只靠停止键上方那 3 秒的提示。幕布还在时它已经写了，这里不重复
+                Label(pickerBlockedMessage(nil), systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundColor(Velvet.warning)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1126,6 +1145,30 @@ struct DocumentPicker: UIViewControllerRepresentable {
     }
 }
 
+/// 全屏里设备卡片的高度（纯布局）
+private struct WarningCardHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+/// 全屏里设备卡片往上滚了多少（纯布局）：滚到底就收起"下面还有"的提示
+private struct WarningScrollOffsetKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// 全屏里底部控制条的高度（纯布局）：设备卡片最多长到它的上沿
+private struct BottomPanelHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// 全屏播放：黑底铺满，点画面显示/隐藏控制条；所有控制都走 VideoSyncPlayer，
 /// 不用系统播放控件（会绕过联动和安全逻辑）。
 /// 停止键只有一个、永远在右下角同一个位置：控制条显示或收起（含 4 秒自动收起）都不挪地方，
@@ -1139,16 +1182,31 @@ struct FullScreenVideoView: View {
     @State private var hideGen = 0
     /// 正在拖进度条：拖动期间不收起
     @State private var scrubbing = false
+    /// 设备卡片的实际高度（量出来之前为 0）：滚动区只占这么高，不多拦一块点击
+    @State private var warningCardHeight: CGFloat = 0
+    /// 设备卡片往上滚了多少
+    @State private var warningScrollOffset: CGFloat = 0
+    /// 底部控制条的实际高度（量出来之前为 0）
+    @State private var bottomPanelHeight: CGFloat = 0
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+
+    /// 设备卡片离顶部的距离（让出退出键）
+    private static let warningTop: CGFloat = 60
+    /// 控制条上沿以上实在没地方时，设备卡片至少留这么高（露出一两行红字，其余滚动）
+    private static let minWarningBand: CGFloat = 60
+    private static let warningScrollSpace = "fullscreen-warning-scroll"
+
+    /// 横屏有提示时不画只读的强度曲线：把高度让给设备卡片，进度条和播放键不被盖住
+    private var hidesChartForWarning: Bool {
+        needsDeviceAttention && verticalSizeClass == .compact
+    }
 
     /// 停止键直径、离边缘的距离；控制条右侧给它让出的宽度（控制条的内容不压到停止键下面）
     private static let stopSize: CGFloat = 60
     private static let stopInset: CGFloat = 20
     private static let stopReserve: CGFloat = stopSize + stopInset + 8
 
-    private var needsDeviceAttention: Bool {
-        ble.lastError != nil || ble.safety.needsPhysicalAck ||
-        ble.safety.stopRetrying || ble.forceDisconnectOffered
-    }
+    private var needsDeviceAttention: Bool { ble.needsAttentionCard }
 
     /// 旁白、切换控制开着时不自动收起（找不到控件）。全键盘控制系统没有公开的检测接口，
     /// 点任何地方都会把控制条叫回来，停止键也一直在
@@ -1199,20 +1257,68 @@ struct FullScreenVideoView: View {
                 }
                 // 独立于控制条的淡入淡出：警告不动画、不自动收起。长红字 / 大字号可滚动，
                 // 上方留出退出键，下方的固定停止键仍最后绘制、始终可点。
+                // 卡片多高就占多高、贴着顶部；最多 warningHeight，也最多长到底部控制条上沿
+                // （横屏 / 大字号时不盖住进度条和播放键），实在没地方也留 minWarningBand；放不下就滚动。
+                // 始终只有这一张卡片：高度变化时「解除锁定 / 强制断开」的确认框不会因为换了一份卡片而被收掉
                 if needsDeviceAttention {
-                    VStack {
+                    let measured: CGFloat = warningCardHeight
+                    let roomAbovePanel: CGFloat = bottomPanelHeight > 0
+                        ? geo.size.height - Self.warningTop - bottomPanelHeight - 8
+                        : warningHeight
+                    let floorHeight: CGFloat = min(Self.minWarningBand, warningHeight)
+                    let cap: CGFloat = max(floorHeight, min(warningHeight, roomAbovePanel))
+                    let fits: Bool = measured > 0 && measured <= cap
+                    let bandHeight: CGFloat = measured > 0 ? min(measured, cap) : cap
+                    let atEnd: Bool = warningScrollOffset + bandHeight >= measured - 4
+                    VStack(spacing: 0) {
                         ScrollView {
-                            DeviceStatusCard(allowDisconnect: false, connectTitle: "连接",
-                                             compact: true, showsConnect: false)
-                                .padding(.horizontal, 16)
+                            warningCard
+                                .background(
+                                    GeometryReader { g in
+                                        Color.clear
+                                            .preference(key: WarningCardHeightKey.self, value: g.size.height)
+                                            .preference(key: WarningScrollOffsetKey.self,
+                                                        value: -g.frame(in: .named(Self.warningScrollSpace)).minY)
+                                    }
+                                )
                         }
-                        .frame(height: warningHeight)
+                        .coordinateSpace(name: Self.warningScrollSpace)
+                        .scrollDisabled(fits)
+                        .frame(height: bandHeight)
+                        // 放不下时（横屏常见）底边淡出并挂一个向下的小箭头：iOS 的滚动条不动时不显示，
+                        // 不提示的话「解除锁定」露半截也看不出能往上滑。滚到底就收起，不再盖着最后一个键。只是提示，不拦点击
+                        .overlay(alignment: .bottom) {
+                            if !fits && measured > 0 && !atEnd {
+                                ZStack(alignment: .bottom) {
+                                    LinearGradient(colors: [.clear, .black.opacity(0.55)],
+                                                   startPoint: .top, endPoint: .bottom)
+                                        .frame(height: 28)
+                                    Image(systemName: "chevron.compact.down")
+                                        .font(.system(size: 18, weight: .semibold))
+                                        .foregroundColor(.white.opacity(0.85))
+                                        .padding(.bottom, 2)
+                                }
+                                .padding(.horizontal, 16)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                            }
+                        }
                         Spacer(minLength: 0)
                     }
-                    .padding(.top, 60)
+                    .padding(.top, Self.warningTop)
+                    .onPreferenceChange(WarningCardHeightKey.self) { h in
+                        if abs(h - warningCardHeight) > 0.5 { warningCardHeight = h }
+                    }
+                    .onPreferenceChange(WarningScrollOffsetKey.self) { y in
+                        if abs(y - warningScrollOffset) > 0.5 { warningScrollOffset = y }
+                    }
                 }
                 // 最后画：永远在最上层、永远在同一个位置
                 stopButton
+            }
+            // 控制条收起时量到 0：保留上一次的高度
+            .onPreferenceChange(BottomPanelHeightKey.self) { h in
+                if h > 0, abs(h - bottomPanelHeight) > 0.5 { bottomPanelHeight = h }
             }
         }
         .statusBarHidden(!showControls && !needsDeviceAttention)
@@ -1235,6 +1341,11 @@ struct FullScreenVideoView: View {
                 }
             }
         }
+    }
+
+    private var warningCard: some View {
+        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
+            .padding(.horizontal, 16)
     }
 
     private var controls: some View {
@@ -1267,7 +1378,7 @@ struct FullScreenVideoView: View {
 
     private var bottomPanel: some View {
         VStack(spacing: 10) {
-            if let idx = vm.chartIndex {
+            if let idx = vm.chartIndex, !hidesChartForWarning {
                 // 只读展示，同内嵌页
                 ScriptIntensityChart(index: idx, player: vm.player, fallbackTime: vm.currentSeconds,
                                      isPlaying: vm.isPlaying, height: 44, compact: true)
@@ -1317,6 +1428,11 @@ struct FullScreenVideoView: View {
         .padding(.vertical)
         // 右边让给常驻的停止键
         .padding(.trailing, Self.stopReserve)
+        .background(
+            GeometryReader { g in
+                Color.clear.preference(key: BottomPanelHeightKey.self, value: g.size.height)
+            }
+        )
         .background(.ultraThinMaterial)
         .background(Color.black.opacity(0.35))
     }

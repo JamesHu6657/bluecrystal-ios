@@ -673,6 +673,9 @@ struct AIControlView: View {
     @StateObject private var vm = AIControlVM()
     @StateObject private var config = AIConfigWatcher()
     @State private var showSettings = false
+    /// 设置被拦下时的那句说明（3 秒后收起）和它的代次
+    @State private var settingsNotice: String?
+    @State private var settingsNoticeGen = 0
     @FocusState private var inputFocused: Bool
 
     var body: some View {
@@ -740,6 +743,12 @@ struct AIControlView: View {
         }
         .onDisappear { if !showSettings { vm.viewDisappeared() } }
         .onChange(of: scenePhase) { phase in vm.scenePhaseChanged(phase) }
+        // 设备那边处理好了：说明立刻收掉，不再指向一张已经没有提示的卡片
+        .onChange(of: settingsBlocked) { blocked in
+            guard !blocked, settingsNotice != nil else { return }
+            settingsNoticeGen += 1
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { settingsNotice = nil }
+        }
         // 解锁页上的停止：和本页停止键同一个 stopAll（停程序、作废授权）
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
@@ -773,19 +782,30 @@ struct AIControlView: View {
                     modelMenu
                 }
                 Spacer(minLength: 4)
+                // 不用 disabled：变灰了不知道为什么。暂时打不开时齿轮变淡、挂一个警示角标，点了在下面写明原因
                 Button {
-                    // L2：设置页会盖住停止键，打开前先停止
-                    vm.willOpenSettings()
-                    showSettings = true
+                    openSettings()
                 } label: {
                     Image(systemName: "gearshape")
                         .font(.system(size: 17, weight: .medium))
-                        .foregroundColor(Velvet.text)
+                        .foregroundColor(settingsBlocked ? Velvet.textMuted : Velvet.text)
                         .frame(width: 44, height: 44)
-                        .background(Circle().fill(Color.white.opacity(0.07)))
+                        .background(Circle().fill(Color.white.opacity(settingsBlocked ? 0.03 : 0.07)))
+                        .overlay(alignment: .topTrailing) {
+                            if settingsBlocked {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Velvet.warning)
+                                    .padding(3)
+                                    .background(Circle().fill(Velvet.ink))
+                                    .offset(x: 2, y: -2)
+                            }
+                        }
                 }
                 .buttonStyle(PressableStyle())
                 .accessibilityLabel("AI 设置")
+                .accessibilityValue(settingsBlocked ? "暂时打不开" : "")
+                .accessibilityHint(settingsBlocked ? Self.settingsBlockedMessage : "服务商、模型、API Key 和提示词")
             }
             HStack(spacing: 10) {
                 StatusOrb(color: vm.running ? Velvet.rose : (vm.isThinking ? Velvet.gold : Velvet.textMuted),
@@ -804,6 +824,16 @@ struct AIControlView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(Color.white.opacity(0.05)))
+            // 设置被拦下时的一句说明：就写在设备卡片正上方，指着要先处理的那张卡片
+            if let n = settingsNotice {
+                Label(n, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(Velvet.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .transition(.opacity)
+            }
             // 打字时键盘占了半屏：红字和安全状态先收成两行，点一下收起键盘就完整显示（解除锁定键始终在）
             DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, collapsed: inputFocused)
         }
@@ -814,6 +844,38 @@ struct AIControlView: View {
             LinearGradient(colors: [Velvet.ink.opacity(0.95), Velvet.ink.opacity(0.6)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea(edges: .top)
         )
+    }
+
+    /// 设备需要用户处理（停止重试中、需要确认物理关机、提供强制断开）时不弹设置页：
+    /// 设置页底部虽然也带着停止键和紧凑设备卡片，但这时让完整的页头卡片留在眼前，先把设备处理好（同一起看的选择器）
+    private var settingsBlocked: Bool {
+        ble.safety.needsPhysicalAck || ble.safety.stopRetrying || ble.forceDisconnectOffered
+    }
+
+    private static let settingsBlockedMessage = "先处理下方设备卡片的提示，再打开设置"
+
+    /// L2：设置页会盖住页面上的停止键，打开前先停止；设备需要处理时不打开：震一下，并在设备卡片上方写明原因
+    private func openSettings() {
+        guard !settingsBlocked else {
+            Haptics.warning()
+            UIAccessibility.post(notification: .announcement, argument: Self.settingsBlockedMessage)
+            flashSettingsNotice()
+            return
+        }
+        vm.willOpenSettings()
+        showSettings = true
+    }
+
+    /// 被拦下的说明显示 3 秒；重复点重新计时。减弱动态效果时不做淡入淡出
+    private func flashSettingsNotice() {
+        settingsNoticeGen += 1
+        let gen = settingsNoticeGen
+        let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+        withAnimation(settle) { settingsNotice = Self.settingsBlockedMessage }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard gen == settingsNoticeGen else { return }
+            withAnimation(settle) { settingsNotice = nil }
+        }
     }
 
     /// 运行中或等回复时不许快捷切换：设置页换模型要先停止，这里也一样；页头也不会显示一个还没在用的模型
@@ -1096,6 +1158,8 @@ private struct TypingIndicator: View {
 
 struct AISettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var ble: BLEManager
+    @EnvironmentObject var privacy: PrivacyLock
     @State private var provider = AIConfig.provider
     @State private var modelID = AIConfig.model.id
     @State private var prompt = AIConfig.systemPrompt
@@ -1103,6 +1167,9 @@ struct AISettingsView: View {
     /// 钥匙串里当前的值：只写改过的 Key。读取失败的服务商不在表里（原值未知），回滚时跳过，绝不删除
     @State private var savedKeys: [AIProvider: String] = AISettingsView.loadSavedKeys()
     @State private var saveError: String? = AISettingsView.loadReadErrors()
+    /// 正在输入 Key 或提示词：键盘弹起时底部的设备卡片收成两行，给输入框留出地方（停止键和解除锁定照常在）
+    private enum Field: Hashable { case apiKey, prompt }
+    @FocusState private var focusedField: Field?
 
     private static func loadKeys() -> [AIProvider: String] {
         Dictionary(uniqueKeysWithValues: AIProvider.allCases.map { ($0, AIConfig.apiKey(for: $0)) })
@@ -1145,6 +1212,7 @@ struct AISettingsView: View {
                     SecureField("\(provider.title) API Key", text: Binding(
                         get: { keys[provider] ?? "" },
                         set: { keys[provider] = $0 }))
+                        .focused($focusedField, equals: .apiKey)
                 } header: {
                     Text("API Key")
                 } footer: {
@@ -1154,6 +1222,7 @@ struct AISettingsView: View {
                     TextEditor(text: $prompt)
                         .font(.footnote)
                         .frame(minHeight: 260)
+                        .focused($focusedField, equals: .prompt)
                     Button("恢复默认提示词") { prompt = AIConfig.defaultPrompt }
                 } header: {
                     Text("提示词")
@@ -1164,6 +1233,8 @@ struct AISettingsView: View {
             .onChange(of: provider) { p in
                 if !p.models.contains(where: { $0.id == modelID }) { modelID = p.models[0].id }
             }
+            // 设置页盖住了 AI 页的停止键：这里常驻一个（同一起看的选择器），停止帧对万一还在路上也一下就能再发
+            .safeAreaInset(edge: .bottom) { stopBar }
             .scrollContentBackground(.hidden)
             .background(VelvetBackground(glow: 0.1).ignoresSafeArea())
             .tint(Velvet.rose)
@@ -1176,6 +1247,27 @@ struct AISettingsView: View {
                 }
             }
         }
+    }
+
+    /// 底部停止条：和解锁页的停止同一条路径（sendStop + 各页 VM 的 stopAll）；
+    /// 设备需要处理时（needsAttentionCard，同选择器、全屏和解锁页），连紧凑设备卡片（解除锁定 / 强制断开）一起带上；
+    /// 打字时卡片收成两行（同 AI 页），点红字收起键盘看全文
+    private var stopBar: some View {
+        let showCard: Bool = ble.needsAttentionCard
+        let typing: Bool = focusedField != nil
+        return VStack(spacing: 0) {
+            if showCard {
+                DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false,
+                                 collapsed: typing)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 8)
+            }
+            StopDockBar {
+                ble.sendStop()
+                privacy.requestStopAll()
+            }
+        }
+        .background(Velvet.ink.opacity(0.92).ignoresSafeArea())
     }
 
     /// 先写钥匙串；任何一个 Key 写失败就把这次已写入的 Key 改回原值，服务商/模型/提示词也不保存。

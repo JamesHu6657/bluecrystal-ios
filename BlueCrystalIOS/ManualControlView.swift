@@ -308,9 +308,11 @@ struct ManualControlView: View {
     }
 
     var body: some View {
+        // 页头问候和连接卡片的邀请用同一次取到的时段：跨过整点时两句不会一个说午后、一个说傍晚
+        let daypart = Velvet.Daypart()
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                PageHeader(title: "手感", subtitle: Velvet.greeting())
+                PageHeader(title: "手感", subtitle: daypart.greeting)
 
                 // 连接键在下面的邀请卡片上（未连接时）；设备卡片只管状态、红字、解除锁定和断开
                 if showsDeviceStatus {
@@ -323,7 +325,7 @@ struct ManualControlView: View {
                         connectedContent
                             .transition(.opacity)
                     } else {
-                        ConnectHero(favoriteCount: favorites.items.count)
+                        ConnectHero(favoriteCount: favorites.items.count, daypart: daypart)
                             .transition(.opacity)
                     }
                 }
@@ -545,6 +547,8 @@ struct ManualControlView: View {
 private struct ConnectHero: View {
     @EnvironmentObject var ble: BLEManager
     let favoriteCount: Int
+    /// 页头那句问候用的同一个时段（由手感页传进来）
+    let daypart: Velvet.Daypart
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var glow = false
 
@@ -557,18 +561,8 @@ private struct ConnectHero: View {
         case .scanning, .connecting, .discovering: return "正在找你的它…"
         case .failed: return "这次没连上"
         case .disconnecting: return "正在断开…"
-        case .idle, .ready: return connectTitle
-        }
-    }
-
-    /// 跟页头的 Velvet.greeting 用同一套时段：深夜说夜、清晨说晨，一大早不再说"今晚"
-    private var connectTitle: String {
-        switch Calendar.current.component(.hour, from: Date()) {
-        case 0..<5: return "夜深了，从连接开始"
-        case 5..<11: return "清晨正好，从连接开始"
-        case 11..<17: return "偷得半日闲，从连接开始"
-        case 17..<21: return "夜色刚好，从连接开始"
-        default: return "夜色正浓，从连接开始"
+        // 跟页头的问候同一个时段（同一次取值），但换一句接话，不重复页头的开头
+        case .idle, .ready: return daypart.connectInvite
         }
     }
 
@@ -631,11 +625,23 @@ private struct ConnectHero: View {
         }
         .frame(maxWidth: .infinity)
         .velvetCard(padding: 20)
-        .onAppear {
-            // 只在第一次出现时起呼吸动画：切走再回来不叠一层 repeatForever
-            guard !reduceMotion, !glow else { return }
-            withAnimation(.easeInOut(duration: 2.8).repeatForever(autoreverses: true)) { glow = true }
+        .onAppear { startBreathing() }
+        // 中途打开减弱动态效果：正在循环的呼吸立刻停下；关掉时再呼吸起来
+        .onChange(of: reduceMotion) { rm in
+            if rm {
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) { glow = false }
+            } else {
+                startBreathing()
+            }
         }
+    }
+
+    /// 只在没在呼吸时起动画：切走再回来不叠一层 repeatForever
+    private func startBreathing() {
+        guard !reduceMotion, !glow else { return }
+        withAnimation(.easeInOut(duration: 2.8).repeatForever(autoreverses: true)) { glow = true }
     }
 
     private var orb: some View {
@@ -886,6 +892,24 @@ private struct PresetTile: View {
         }
     }
 
+    /// 和小柱一样只列界面上的三个通道（旋转恒为 0，不显示）
+    private var levelsText: String {
+        let parts: [String] = BCProtocol.Channel.uiChannels.map { (ch: BCProtocol.Channel) -> String in
+            let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0
+            return String(v)
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// 旁白：名字和三个通道各自的档位（同收藏卡片），不只读一串数字
+    private var a11yLabel: String {
+        let parts: [String] = BCProtocol.Channel.uiChannels.map { (ch: BCProtocol.Channel) -> String in
+            let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0
+            return "\(ch.displayName) \(v)"
+        }
+        return "\(preset.title)，" + parts.joined(separator: "，")
+    }
+
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 12) {
@@ -910,7 +934,7 @@ private struct PresetTile: View {
                             .frame(width: 6, height: barHeight)
                     }
                     Spacer()
-                    Text(preset.channels.map(String.init).joined(separator: " "))
+                    Text(levelsText)
                         .font(.caption.monospacedDigit())
                         .foregroundColor(selected ? Color.white.opacity(0.85) : Velvet.textMuted)
                 }
@@ -929,6 +953,7 @@ private struct PresetTile: View {
             .shadow(color: selected ? Velvet.rose.opacity(0.45) : .clear, radius: 14)
         }
         .buttonStyle(PressableStyle())
+        .accessibilityLabel(a11yLabel)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
