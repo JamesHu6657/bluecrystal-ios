@@ -28,7 +28,7 @@ extension BLEManager {
             || (lastError != nil && (state == .ready || state == .disconnecting))
     }
 
-    /// 盖住页面的那几层（全屏视频、选择器、AI 设置、解锁页）什么时候带上紧凑设备卡片：
+    /// 盖住页面的那几层（选择器、AI 设置、解锁页）什么时候带上紧凑设备卡片：
     /// 红字、需要确认物理关机、停止重试中、提供强制断开——「解除锁定 / 强制断开」只在卡片上，一处定义，各层一致
     var needsAttentionCard: Bool {
         lastError != nil || safety.needsPhysicalAck || safety.stopRetrying || forceDisconnectOffered
@@ -205,8 +205,9 @@ struct PrivacyShell<Content: View>: View {
     }
 }
 
-/// 入口页 / 解锁页 / 隐私遮罩。根视图和每个弹出层（全屏视频、AI 设置、文件选择器）各挂一份：
-/// 弹出层显示在根视图之上，只挂在根上盖不住它们。需要 BLEManager 和 PrivacyLock 两个环境对象
+/// 入口页 / 解锁页 / 隐私遮罩。根视图和每个弹出层（AI 设置、文件选择器）各挂一份：
+/// 弹出层显示在根视图之上，只挂在根上盖不住它们。需要 BLEManager 和 PrivacyLock 两个环境对象。
+/// 视频页苹果播放器的系统全屏挂不上：由视频页自己撤画面、拦开播（SystemPlayerView.hidesVideo / externalPlayBlockReason）
 struct PrivacyCover: ViewModifier {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var lock: PrivacyLock
@@ -226,7 +227,7 @@ struct PrivacyCover: ViewModifier {
         ZStack {
             // 盖着入口页 / 解锁页时，下面的内容不能用：旁白读不到、点不到；键盘在盖上时收起，
             // AI 页发送前也会再查一次（回车不能把消息发出去）。
-            // 不用 .disabled：它走环境值，会传进从这里弹出的全屏视频 / 设置页，把那里解锁页上的停止键也禁用掉
+            // 不用 .disabled：它走环境值，会传进从这里弹出的设置页 / 选择器，把那里解锁页上的停止键也禁用掉
             content
                 .allowsHitTesting(!covered)
                 .accessibilityHidden(covered)

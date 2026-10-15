@@ -38,6 +38,9 @@ struct PlaybackScrubber {
 /// seek / seek 后缓冲期间设备保持 0，等播放头真正前进才恢复采样和 1.5 秒卡住检测。
 struct PlaybackProgressWatch {
     static let stallLimit: TimeInterval = 1.5
+    /// 等待落点前进时，一次采样（约 0.3 秒，最快 2 倍速）里正常播放最多前进这么多秒；
+    /// 往回走或跳得更远都算又一次跳转，不算恢复
+    static let maxResumeStep: Double = 1.0
     enum Observation { case moving, waitingAfterSeek, stalled, paused }
     private var position: Double = .nan
     private var progressedAt: TimeInterval = 0
@@ -70,6 +73,14 @@ struct PlaybackProgressWatch {
         // 外部暂停优先于位置变化和 seek 等待；绝不因暂停前走过几帧就恢复输出。
         if isPaused { return .paused }
         if seconds.isFinite, position.isNaN || abs(seconds - position) > 0.01 {
+            let delta = seconds - position
+            if awaitingSeekProgress, !position.isNaN, !(delta > 0 && delta <= Self.maxResumeStep) {
+                // 等待期间又跳了（系统进度条连续拖动、再次快进 / 快退）或往回走：不是正常播放，
+                // 记下新落点继续等
+                position = seconds
+                progressedAt = now
+                return .waitingAfterSeek
+            }
             position = seconds
             progressedAt = now
             awaitingSeekProgress = false
@@ -77,6 +88,99 @@ struct PlaybackProgressWatch {
         }
         if awaitingSeekProgress { return .waitingAfterSeek }
         return now - progressedAt > Self.stallLimit ? .stalled : .moving
+    }
+}
+
+/// 最低强度只在"声音真的在流过 tap"时生效。tap 装好（.ready）不代表有样本：
+/// 开播首拍、缓冲、AirPlay 时窗口是空的，这时不加最低强度（没有信号就是 0）
+struct AudioFlowWatch {
+    /// 最近一次有样本的窗口离现在不超过这么久才算在流（约两拍，容一拍抖动）
+    static let freshSeconds: TimeInterval = 0.7
+    private(set) var lastFramesAt: TimeInterval?
+
+    /// 开播 / seek / 跳转：之前的样本不作数
+    mutating func reset() { lastFramesAt = nil }
+
+    mutating func note(_ w: AudioWindow, now: TimeInterval) {
+        if w.frames > 0, now.isFinite { lastFramesAt = now }
+    }
+
+    func isFlowing(now: TimeInterval) -> Bool {
+        guard let t = lastFramesAt, now.isFinite else { return false }
+        let age = now - t
+        return age >= 0 && age < Self.freshSeconds
+    }
+
+    /// tap 就绪、播放器确实在播（不是缓冲）、样本是新鲜的：三者都满足才允许最低强度
+    func allowsFloor(tapReady: Bool, playerPlaying: Bool, now: TimeInterval) -> Bool {
+        tapReady && playerPlaying && isFlowing(now: now)
+    }
+}
+
+/// 系统播放器控件开播的判定：只在"暂停 → 非暂停"的那一下接管（缓冲 / 跳转引起的
+/// 等待 ↔ 播放来回不算开播）。用户停止 / 被动停机后锁存一次：拖动进度条时停止、
+/// 松手后系统按拖动前的速率续播，这一下不能把输出复活，先拦下并说明
+struct ExternalPlayGate {
+    enum Decision: Equatable {
+        /// 不是开播边沿
+        case ignore
+        /// 按用户点了播放处理（仍要过设备 / 安全 / 隐私检查）
+        case takeOver
+        /// 停止后的第一次外部开播：把视频停住，要求再点一次
+        case rejectAfterStop
+    }
+
+    private var wasPaused = true
+    private(set) var stopLatched = false
+
+    mutating func latchStop() { stopLatched = true }
+    mutating func clearLatch() { stopLatched = false }
+
+    /// paused：播放器现在是不是停着（KVO 值为暂停或实际 rate 为 0）
+    mutating func observe(paused: Bool) -> Decision {
+        if paused {
+            wasPaused = true
+            return .ignore
+        }
+        guard wasPaused else { return .ignore }
+        wasPaused = false
+        if stopLatched {
+            stopLatched = false
+            return .rejectAfterStop
+        }
+        return .takeOver
+    }
+}
+
+/// App 自己 seek 也会发 timeJumped；通知和 seek 完成回调各自切回主线程，先后不定。
+/// 完成回调记下落点，紧随其后、落在落点附近的那一条通知当作回声忽略（只消费一次）
+struct OwnSeekEcho {
+    static let window: TimeInterval = 0.5
+    static let tolerance: Double = 0.05
+    /// 回声晚到时播放头可能已经走了一点（最快 2 倍速）
+    static let maxRate: Double = 2
+
+    private var landed: Double = .nan
+    private var at: TimeInterval = -.infinity
+
+    mutating func record(landed seconds: Double, now: TimeInterval) {
+        landed = seconds
+        at = now
+    }
+
+    mutating func clear() {
+        landed = .nan
+        at = -.infinity
+    }
+
+    mutating func consumeIfEcho(position: Double, now: TimeInterval) -> Bool {
+        let elapsed = now - at
+        guard landed.isFinite, position.isFinite, elapsed.isFinite,
+              elapsed >= 0, elapsed < Self.window else { return false }
+        let echo = position >= landed - Self.tolerance
+            && position <= landed + Self.tolerance + elapsed * Self.maxRate
+        if echo { clear() }
+        return echo
     }
 }
 
@@ -768,15 +872,17 @@ struct AudioReactiveShaper {
         return min(100, max(0, frac * 100))
     }
 
-    /// hasAudio = false（没有音轨 / 分析失败 / 还没就绪）时不加最低强度：没有信号就不输出
+    /// hasAudio = false（没有音轨 / 分析失败 / 还没就绪 / 缓冲中 / 没有新鲜样本，见 AudioFlowWatch）
+    /// 时不加最低强度：没有信号就不输出
     mutating func step(_ w: AudioWindow, settings: AudioSyncSettings, dt: TimeInterval,
                        hasAudio: Bool = true) -> Output {
         // 计时抖动 / 主线程卡顿：步长夹在 10 ms ~ 1 s
         let step = dt.isFinite ? min(1, max(0.01, dt)) : Self.interval
         let db = Self.loudnessDb(w)
         var gain = settings.sensitivityDb
+        // 开关关着也一直学：中途打开自动灵敏度时参考响度已经是这个视频的
+        adapt(loudnessDb: db, dt: step)
         if settings.autoGain {
-            adapt(loudnessDb: db, dt: step)
             // 自动增益 + 手动灵敏度作微调
             gain = min(Self.autoGainRange.upperBound + AudioSyncSettings.sensitivityRange.upperBound,
                        max(Self.autoGainRange.lowerBound + AudioSyncSettings.sensitivityRange.lowerBound,

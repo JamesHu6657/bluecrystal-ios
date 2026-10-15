@@ -367,6 +367,85 @@ do {
     r4check(sOut.percent == 0, "自动灵敏度：纯底噪（低于 -60 dB）不会被放大")
     quietVideo.resetAdaptation()
     r4check(quietVideo.refDb == AudioReactiveShaper.autoInitialRefDb, "换视频重新学习响度")
+    var learning = AudioReactiveShaper()
+    var learnOut = learning.step(sineWindow(-40), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3)
+    for _ in 0..<60 { learnOut = learning.step(sineWindow(-40), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3) }
+    r4check(learning.refDb < -30 && learnOut.percent == 12,
+            "自动灵敏度：开关关着也在学响度（中途打开立刻合适），输出仍按手动灵敏度")
+}
+
+// 最低强度只在声音真的在流时生效：开播首拍、缓冲、AirPlay（窗口空）都不加
+do {
+    var flow = AudioFlowWatch()
+    r4check(!flow.allowsFloor(tapReady: true, playerPlaying: true, now: 10), "最低强度：开播首拍还没有样本时不加")
+    flow.note(.silent, now: 10)
+    r4check(!flow.isFlowing(now: 10), "最低强度：空窗口不算有声音")
+    flow.note(AudioWindow(peakToPeak: 0, rms: 0, frames: 4_800), now: 10.5)
+    r4check(flow.allowsFloor(tapReady: true, playerPlaying: true, now: 10.5), "最低强度：数字静音也算声音在流（不归零）")
+    r4check(!flow.allowsFloor(tapReady: true, playerPlaying: false, now: 10.5), "最低强度：缓冲中（播放器没在播）不加")
+    r4check(!flow.allowsFloor(tapReady: false, playerPlaying: true, now: 10.5), "最低强度：tap 没就绪不加")
+    flow.note(.silent, now: 10.75)
+    r4check(flow.isFlowing(now: 10.75), "最低强度：一拍空窗口容忍抖动")
+    flow.note(.silent, now: 11.5)
+    r4check(!flow.isFlowing(now: 11.5), "最低强度：连续没有样本就停（缓冲 / 外部播放）")
+    flow.note(sineWindow(-20), now: 12)
+    flow.reset()
+    r4check(!flow.isFlowing(now: 12), "最低强度：开播 / 跳转后旧样本不作数")
+    flow.note(sineWindow(-20), now: 13)
+    r4check(!flow.isFlowing(now: 12.5) && flow.isFlowing(now: 13.25), "最低强度：时间倒退不算新鲜")
+    // 和 shaper 连起来：没有新鲜样本时安静片段是 0，不是最低强度
+    var gated = AudioReactiveShaper()
+    let floorOn = AudioSyncSettings(maxPercent: 60, minPercent: 10)
+    r4check(gated.step(.silent, settings: floorOn, dt: 0.3,
+                       hasAudio: AudioFlowWatch().allowsFloor(tapReady: true, playerPlaying: true, now: 1)).percent == 0,
+            "最低强度：首拍空窗口输出 0")
+}
+
+// 跳转后等落点前进：往回走 / 跳太远都算又一次跳转（系统进度条连续拖动），只有正常播放的小步前进才恢复
+do {
+    var w = PlaybackProgressWatch()
+    w.awaitSeekProgress(from: 30, now: 0)
+    r4check(w.observe(at: 45, now: 0.25) == .waitingAfterSeek && w.awaitingSeekProgress, "跳转等待：又跳了 15 秒不算恢复")
+    r4check(w.observe(at: 40, now: 0.5) == .waitingAfterSeek && w.awaitingSeekProgress, "跳转等待：往回走不算恢复")
+    r4check(w.observe(at: 40.5, now: 0.75) == .moving && !w.awaitingSeekProgress, "跳转等待：2 倍速一拍的前进算恢复")
+    r4check(w.observe(at: 52, now: 1) == .moving, "跳转等待结束后：普通播放中的跳变照旧算前进")
+    w.awaitSeekProgress(from: 10, now: 2)
+    r4check(w.observe(at: 11, now: 2.25) == .moving, "跳转等待：正好 1 秒的前进仍算恢复")
+}
+
+// 系统控件开播：只认暂停 → 播放的边沿；停止后的第一次外部续播先拦下
+do {
+    var gate = ExternalPlayGate()
+    r4check(gate.observe(paused: true) == .ignore, "外部开播：初始暂停不是开播")
+    r4check(gate.observe(paused: false) == .takeOver, "外部开播：暂停 → 播放接管")
+    r4check(gate.observe(paused: false) == .ignore && gate.observe(paused: false) == .ignore,
+            "外部开播：等待 ↔ 播放来回不再接管（只放视频时连上设备也不会自动输出）")
+    _ = gate.observe(paused: true)
+    gate.latchStop()
+    r4check(gate.observe(paused: false) == .rejectAfterStop && !gate.stopLatched, "外部开播：停止后系统续播先拦下一次")
+    _ = gate.observe(paused: true)
+    r4check(gate.observe(paused: false) == .takeOver, "外部开播：拦下后再点播放照常接管")
+    gate.latchStop()
+    gate.clearLatch()
+    _ = gate.observe(paused: true)
+    r4check(gate.observe(paused: false) == .takeOver, "外部开播：本页播放键清掉锁存")
+    gate.latchStop()
+    r4check(gate.observe(paused: false) == .ignore && gate.stopLatched, "外部开播：不是边沿时锁存保留")
+}
+
+// App 自己 seek 的 timeJumped 回声：落点附近、0.5 秒内的那一条忽略，只消费一次
+do {
+    var echo = OwnSeekEcho()
+    r4check(!echo.consumeIfEcho(position: 30, now: 1), "seek 回声：没记录时不算")
+    echo.record(landed: 30, now: 1)
+    r4check(echo.consumeIfEcho(position: 30.25, now: 1.25), "seek 回声：落点附近、0.5 秒内的通知忽略")
+    r4check(!echo.consumeIfEcho(position: 30.25, now: 1.25), "seek 回声：只消费一次")
+    echo.record(landed: 30, now: 2)
+    r4check(!echo.consumeIfEcho(position: 40, now: 2.125), "seek 回声：紧接着的系统快进 10 秒照常处理")
+    r4check(!echo.consumeIfEcho(position: 30, now: 2.75), "seek 回声：超过 0.5 秒不再当回声")
+    echo.record(landed: 30, now: 3)
+    r4check(!echo.consumeIfEcho(position: 20, now: 3.125), "seek 回声：往回跳不是回声")
+    r4check(!echo.consumeIfEcho(position: .nan, now: 3.125), "seek 回声：位置读不出来不算")
 }
 
 let suite = "bc.round4.audiosync"
