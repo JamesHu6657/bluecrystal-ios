@@ -818,6 +818,10 @@ private struct ChannelControl: View {
                     // 缓推 / 归零这类不经 changed() 的变化：只同步触感基准，不震
                     lastHapticBucket = v / hapticBucket
                 }
+                .onAppear {
+                    // onChange 不管初值：出现时就有的档位先记为基准，第一次拖动不多震也不少震
+                    lastHapticBucket = Int(value) / hapticBucket
+                }
             if maxLevel <= 9 {
                 HStack(spacing: 0) {
                     ForEach(0...maxLevel, id: \.self) { i in

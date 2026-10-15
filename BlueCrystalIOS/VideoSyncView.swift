@@ -806,6 +806,14 @@ struct VideoSyncView: View {
                 Text("\(s.commands.count) 条命令")
                     .font(.caption).foregroundColor(Velvet.textMuted)
             }
+            if pickerBlocked {
+                // 已选过视频后幕布不在了，素材行是唯一入口：被拦的原因常驻写在这里（和幕布上那句同一个意思），
+                // 不只靠停止键上方那 3 秒的提示
+                Label("先处理上方设备卡片的提示，再选视频或脚本", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(Velvet.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .velvetCard()
     }
@@ -1295,8 +1303,9 @@ struct FullScreenVideoView: View {
                 .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
                 Text("\(Self.formatTime(vm.currentSeconds)) / \(Self.formatTime(vm.durationSeconds))")
                     .font(.caption.monospacedDigit())
-                    // 上面滑杆的旁白值读的就是这两个时间，这行字不再让旁白单独停一次
-                    .accessibilityHidden(true)
+                    // 上面滑杆的旁白值读的就是这两个时间，这行字不再让旁白单独停一次；
+                    // 时长还没读出来（滑杆还没出现）时这行字是旁白唯一的时间来源，不能藏
+                    .accessibilityHidden(vm.durationSeconds > 0)
                 Spacer()
             }
             Text(vm.statusLine)

@@ -483,13 +483,21 @@ struct FavoritesSection: View {
         switch store.add(mode: mode, levels: rules.levels) {
         case .added(let fav):
             Haptics.success()
+            rearmUndoAroundNotice()
             flash("已收藏「\(fav.name)」，点一下就回来")
         case .duplicate(let fav):
             Haptics.select()
+            rearmUndoAroundNotice()
             flash("这组已经在收藏里了：「\(fav.name)」")
         case .full, .invalid:
             break
         }
+    }
+
+    /// 收藏成功的提示也会顶掉撤销条：跟着提示重新计的撤销窗口把这几秒让出去（同 undoDelete），
+    /// 不然提示盖着"撤销"键时窗口照走，提示收掉后剩下的时间可能不够点，甚至整个窗口在提示底下走完
+    private func rearmUndoAroundNotice() {
+        if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
     }
 
     private func flash(_ text: String) {
