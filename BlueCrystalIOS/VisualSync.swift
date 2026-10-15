@@ -452,6 +452,7 @@ struct MotionNormalizer {
     static let targetPercent: Double = 75
     /// 自动适应只占一半，另一半按固定尺度：安静的片子保持偏轻，一个手势不会被当成最激烈（真机反馈 2026-10-16）
     static let adaptiveWeight: Double = 0.5
+    static let fixedRatioCap: Double = 1.15
     static let warmUpSeconds: TimeInterval = 3
     static let initialHigh: Double = log(4.0)
     static let initialLow: Double = log(1.8)
@@ -497,7 +498,8 @@ struct MotionNormalizer {
             refLow += (l - refLow) * (1 - exp(-step / lowTau))
             if !refHigh.isFinite || !refLow.isFinite { resetAdaptation() }
         }
-        let fixedRatio = (l - Self.fixedLow) / (Self.fixedHigh - Self.fixedLow)
+        // 固定尺度也封顶（0 dB 时自动模式最高约 81%）：手贴镜头这类极端画面变化不顶满，要更强靠灵敏度 / 上限
+        let fixedRatio = min(Self.fixedRatioCap, (l - Self.fixedLow) / (Self.fixedHigh - Self.fixedLow))
         var ratio = fixedRatio
         if auto {
             let hi = refHigh

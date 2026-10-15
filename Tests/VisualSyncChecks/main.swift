@@ -305,7 +305,7 @@ do {
     let late = Array(outs.suffix(67))
     let lateMean = late.reduce(0, +) / Double(late.count)
     let pinned = outs.filter { $0 >= 99 }.count
-    vcheck(lateMean >= 70, "归一化：大动作视频（e 8~20）动作段 ≥ 70%（后 20 秒均值 \(Int(lateMean))）")
+    vcheck(lateMean >= 65, "归一化：大动作视频（e 8~20）动作段 ≥ 65%（后 20 秒均值 \(Int(lateMean))）")
     vcheck(pinned * 10 < outs.count, "归一化：大动作视频不长期顶在 100（≥ 99 的拍数 \(pinned)/\(outs.count)）")
 }
 
@@ -328,6 +328,13 @@ do {
     var peak = 0.0
     for _ in 0..<5 { peak = max(peak, c.step(vsWindow(8))) }
     vcheck(peak >= 40 && peak <= 80, "归一化：安静片子里 1.5 秒的大动作落在 40~80%，不顶满（得到 \(Int(peak))）")
+}
+for e in [20.0, 40.0, 200.0] {
+    var c = VSChain()
+    for _ in 0..<100 { _ = c.step(vsWindow(0.8)) }
+    var peak = 0.0
+    for _ in 0..<5 { peak = max(peak, c.step(vsWindow(e))) }
+    vcheck(peak <= 85, "归一化：安静片子里极端画面变化（e = \(Int(e))）0 dB 时不超过 85%（得到 \(Int(peak))）")
 }
 
 do {
