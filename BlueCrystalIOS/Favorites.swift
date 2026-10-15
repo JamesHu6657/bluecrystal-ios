@@ -9,6 +9,8 @@ import UIKit
 
 final class FavoriteStore: ObservableObject {
     static let storageKey = "bc.ui.favorites.v1"
+    /// 第四轮：启动时有记录读不出来，就把当时的原始数据另存在这里（之后的保存只写 storageKey，不会把它盖掉）
+    static let backupKey = "bc.ui.favorites.v1.unreadableBackup"
 
     @Published private(set) var items: [FavoriteSetting]
 
@@ -23,10 +25,19 @@ final class FavoriteStore: ObservableObject {
     struct Removed: Equatable {
         let item: FavoriteSetting
         let index: Int
+        /// 第四轮：删除那一刻全部收藏的顺序（含它自己）。连续删几组再任意顺序撤销，也按原顺序放回
+        var order: [UUID] = []
     }
 
     init() {
-        items = FavoriteCodec.decode(UserDefaults.standard.data(forKey: Self.storageKey))
+        let defaults = UserDefaults.standard
+        let raw = defaults.data(forKey: Self.storageKey)
+        // 第四轮：逐条解码，一条坏记录不再把全部收藏清空；读不出来的那部分连同原始数据先另存一份
+        let decoded = FavoriteCodec.decodeReport(raw)
+        items = decoded.items
+        if decoded.unreadable > 0, let r = raw {
+            defaults.set(r, forKey: Self.backupKey)
+        }
         // 上次整理到一半被系统杀掉：草稿名字（空的、带首尾空格的、超长的）在这里收好
         finalizeNames()
     }
@@ -46,7 +57,7 @@ final class FavoriteStore: ObservableObject {
     @discardableResult
     func remove(_ id: UUID) -> Removed? {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return nil }
-        let removed = Removed(item: items[i], index: i)
+        let removed = Removed(item: items[i], index: i, order: items.map { $0.id })
         items.remove(at: i)
         persist()
         return removed
@@ -59,13 +70,15 @@ final class FavoriteStore: ObservableObject {
         case full
     }
 
-    /// 撤销删除：放回原位；已经在了 / 同样的手感又收藏过一次、或满了就不放
+    /// 撤销删除：放回原位；已经在了 / 同样的手感又收藏过一次、或满了就不放。
+    /// 第四轮：位置按删除时的顺序快照算（FavoriteRestore），连续删除后以任意顺序撤销都回到原来的顺序
     @discardableResult
     func restore(_ r: Removed) -> RestoreResult {
         if items.contains(where: { $0.id == r.item.id || $0.sameSetting(as: r.item) }) { return .duplicate }
         guard !isFull else { return .full }
-        let at: Int = min(max(0, r.index), items.count)
-        items.insert(r.item, at: at)
+        let at: Int = FavoriteRestore.insertionIndex(of: r.item.id, order: r.order,
+                                                     current: items.map { $0.id }, fallback: r.index)
+        items.insert(r.item, at: min(max(0, at), items.count))
         persist()
         return .restored
     }
@@ -103,8 +116,10 @@ final class FavoriteStore: ObservableObject {
         return items.first { $0.modeRaw == mode.rawValue && $0.clampedLevels == current }
     }
 
+    /// 第四轮：编码失败时不写——UserDefaults.set(nil, forKey:) 会把已存的收藏整个删掉，保留上一次成功写入的版本
     private func persist() {
-        UserDefaults.standard.set(FavoriteCodec.encode(items), forKey: Self.storageKey)
+        guard let data = FavoriteCodec.encode(items) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
     }
 }
 
