@@ -856,7 +856,9 @@ struct AudioReactiveShaper {
     /// 当前自动增益（dB）：把参考响度放到 autoTargetPercent
     var autoGainDb: Double {
         let targetDb = Self.floorDb + Self.autoTargetPercent / 100 * (Self.ceilingDb - Self.floorDb)
-        let g = (targetDb - refDb) * Self.autoCompensation
+        let raw = targetDb - refDb
+        // 只减半「放大」；响的视频照常整段压低，不比以前更强
+        let g = raw > 0 ? raw * Self.autoCompensation : raw
         guard g.isFinite else { return 0 }
         return min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, g))
     }
