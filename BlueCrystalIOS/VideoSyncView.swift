@@ -118,6 +118,10 @@ final class VideoSyncPlayer: ObservableObject {
                    !self.isSeeking {
                     self.handlePausedPlayer(p)
                 }
+                // 系统播放器控件（播放键 / 拖完自动续播 / 重播）把视频播起来了，vm 还没在联动：跟上
+                if status != .paused, p.rate > 0, !self.isPlaying, !self.isSeeking {
+                    self.handleExternalPlay(p)
+                }
                 // 缓冲（waitingToPlayAtSpecifiedRate）不在这里单独处理：tick 看播放头有没有前进
             }
             .store(in: &playerCancellables)
@@ -131,6 +135,44 @@ final class VideoSyncPlayer: ObservableObject {
             return
         }
         handleExternalPause()
+    }
+
+    /// 系统控件开播：等同用户点了播放（同样先过准入 / 锁存检查，再显式开闸）。
+    /// 设备没连上时只放视频、不输出；被安全状态拦下时把视频也停住，让原因看得见
+    private func handleExternalPlay(_ p: AVPlayer) {
+        guard p === player else { return }
+        guard ble?.state == .ready else {
+            statusLine = "设备未连接，只播放视频"
+            return
+        }
+        if let reason = ble?.safety.blockReason {
+            p.pause()
+            statusLine = reason
+            return
+        }
+        isPlaying = true
+        ble?.userResumeOutput()
+        meter?.reset()
+        shaper.reset()
+        lastActive = .zero
+        startTimer()
+        statusLine = "播放中"
+    }
+
+    /// 系统控件跳转（拖进度条、快进 / 快退 10 秒）：跳过的区间不分析，设备先归零，等播放头真正前进再恢复
+    private func handleTimeJump(_ p: AVPlayer) {
+        guard p === player, !isSeeking else { return }
+        let landed = p.currentTime().seconds
+        if landed.isFinite { currentSeconds = landed }
+        meter?.reset()
+        shaper.reset()
+        guard isPlaying else { return }
+        ble?.sendTick(levels: ActiveChannels.zero.values)
+        lastActive = .zero
+        intensity = 0
+        needsResync = true
+        progressWatch.awaitSeekProgress(from: landed, now: Self.now())
+        statusLine = "正在跳转，设备暂停输出"
     }
 
     /// 外部暂停：只停止设备
@@ -222,6 +264,13 @@ final class VideoSyncPlayer: ObservableObject {
             .sink { [weak self, weak p] _ in
                 guard let self = self, let p = p else { return }
                 self.handleNaturalCompletion(p)
+            }
+            .store(in: &playerCancellables)
+        NotificationCenter.default.publisher(for: AVPlayerItem.timeJumpedNotification, object: item)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak p] _ in
+                guard let self = self, let p = p else { return }
+                self.handleTimeJump(p)
             }
             .store(in: &playerCancellables)
         item.publisher(for: \.duration)
@@ -468,7 +517,7 @@ final class VideoSyncPlayer: ObservableObject {
     }
 }
 
-/// 无系统控件的视频预览（系统自带播放/暂停/拖动会绕过 vm，必须禁用）
+/// 无系统控件的视频预览（旧全屏页仍在用）
 struct NoControlsPlayerView: UIViewControllerRepresentable {
     let player: AVPlayer
 
@@ -483,6 +532,54 @@ struct NoControlsPlayerView: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
         // 换视频后预览也要换成新播放器
         if uiViewController.player !== player { uiViewController.player = player }
+    }
+}
+
+/// 苹果自带播放器（播放 / 暂停、快进快退、进度条、倍速、系统全屏）。
+/// 控件直接操作 AVPlayer，vm 通过 timeControlStatus / timeJumped / 播完通知跟随：
+/// 暂停 = 设备立刻停止，跳转 = 先归零再恢复，开播 = 先过安全检查。
+/// 关掉画中画和锁屏「正在播放」控件：退到后台本来就会停机，不留一个绕过 vm 的入口
+struct SystemPlayerView: UIViewControllerRepresentable {
+    let player: AVPlayer
+    /// 系统全屏进出（全屏弹出时 SwiftUI 页面可能收到 onDisappear，不能因此停机）
+    var onFullScreenChange: (Bool) -> Void = { _ in }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onFullScreenChange: onFullScreenChange) }
+
+    func makeUIViewController(context: Context) -> AVPlayerViewController {
+        let vc = AVPlayerViewController()
+        vc.player = player
+        vc.showsPlaybackControls = true
+        vc.videoGravity = .resizeAspect
+        vc.allowsPictureInPicturePlayback = false
+        vc.updatesNowPlayingInfoCenter = false
+        vc.entersFullScreenWhenPlaybackBegins = false
+        vc.exitsFullScreenWhenPlaybackEnds = true
+        vc.delegate = context.coordinator
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
+        context.coordinator.onFullScreenChange = onFullScreenChange
+        if uiViewController.player !== player { uiViewController.player = player }
+    }
+
+    final class Coordinator: NSObject, AVPlayerViewControllerDelegate {
+        var onFullScreenChange: (Bool) -> Void
+        init(onFullScreenChange: @escaping (Bool) -> Void) { self.onFullScreenChange = onFullScreenChange }
+
+        func playerViewController(_ playerViewController: AVPlayerViewController,
+                                  willBeginFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+            onFullScreenChange(true)
+        }
+
+        func playerViewController(_ playerViewController: AVPlayerViewController,
+                                  willEndFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+            coordinator.animate(alongsideTransition: nil) { [weak self] ctx in
+                // 取消了退出全屏就还在全屏
+                if !ctx.isCancelled { self?.onFullScreenChange(false) }
+            }
+        }
     }
 }
 
@@ -532,6 +629,8 @@ struct VideoSyncView: View {
     @State private var showPicker = false
     /// 全屏播放中：内嵌预览让出播放器，onDisappear 不把全屏误判成离开页面
     @State private var isFullScreen = false
+    /// 苹果播放器自己的全屏
+    @State private var systemFullScreen = false
     /// 选择器被拦下的那句说明：钉在停止键上方一小会儿
     @State private var pickerNotice: String?
     /// 提示代次：重复点被拦下的入口时重新计时
@@ -696,7 +795,7 @@ struct VideoSyncView: View {
                 .environmentObject(ble)
         }
         // 弹出全屏时部分系统版本也会触发 onDisappear：全屏中不停机
-        .onDisappear { if !isFullScreen { vm.stopAll() } }
+        .onDisappear { if !isFullScreen && !systemFullScreen { vm.stopAll() } }
         // 解锁页上的停止：和本页停止键同一个 stopAll
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
@@ -706,29 +805,14 @@ struct VideoSyncView: View {
         if let p = vm.player {
             ZStack(alignment: .topTrailing) {
                 if !isFullScreen {
-                    NoControlsPlayerView(player: p)
-                        .frame(height: 220)
+                    // 苹果自带控件：播放 / 暂停、快进快退、进度条、倍速、全屏
+                    SystemPlayerView(player: p) { systemFullScreen = $0 }
+                        .frame(height: 240)
                         .frame(maxWidth: .infinity)
                         .background(Color.black)
                 } else {
-                    Color.black.frame(height: 220)
+                    Color.black.frame(height: 240)
                 }
-                Button {
-                    isFullScreen = true
-                } label: {
-                    Label("全屏播放", systemImage: "arrow.up.left.and.arrow.down.right")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .foregroundColor(.white)
-                        // 点击区域至少 44pt，外观不变
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(PressableStyle())
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
             }
             .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Velvet.stroke, lineWidth: 1))
