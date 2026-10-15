@@ -54,17 +54,83 @@ enum Velvet {
         }
     }
 
+    /// 固定字号的衬线字：只给不能跟着放大的地方用（圆里的数字等）
     static func serif(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
         .system(size: size, weight: weight, design: .serif)
+    }
+
+    /// 跟随动态字体的衬线标题（标题、卡片名字、空状态）
+    static func display(_ style: Font.TextStyle, _ weight: Font.Weight = .semibold) -> Font {
+        Font.system(style, design: .serif).weight(weight)
+    }
+
+    /// 按时间说一句话（手感页页头）：深夜、清晨、午后、傍晚各一句
+    static func greeting(hour: Int = Calendar.current.component(.hour, from: Date())) -> String {
+        switch hour {
+        case 0..<5: return "夜深了，只剩你和指尖的温度"
+        case 5..<11: return "清晨的慵懒，适合慢慢醒来"
+        case 11..<17: return "偷得半日闲，给自己一点甜"
+        case 17..<21: return "夜色刚好，把节奏交给指尖"
+        default: return "夜色正浓，每一分力度都被温柔回应"
+        }
     }
 }
 
 // MARK: - 触感
 
+/// 只在主线程调用。生成器复用（每次新建会有几十毫秒的启动延迟，滑杆的档位感就跟不上手）
 enum Haptics {
-    static func stop() { UIImpactFeedbackGenerator(style: .heavy).impactOccurred() }
-    static func soft() { UIImpactFeedbackGenerator(style: .soft).impactOccurred() }
-    static func select() { UISelectionFeedbackGenerator().selectionChanged() }
+    private static let heavy = UIImpactFeedbackGenerator(style: .heavy)
+    private static let softImpact = UIImpactFeedbackGenerator(style: .soft)
+    private static let lightImpact = UIImpactFeedbackGenerator(style: .light)
+    private static let selection = UISelectionFeedbackGenerator()
+    private static let notification = UINotificationFeedbackGenerator()
+
+    static func stop() { heavy.impactOccurred() }
+    static func soft() { softImpact.impactOccurred() }
+    static func light() { lightImpact.impactOccurred(intensity: 0.7) }
+    static func select() { selection.selectionChanged() }
+    static func success() { notification.notificationOccurred(.success) }
+    /// 同一件事常常同时改好几个状态（连接失败 + 红字）：0.8 秒内只震一次
+    static func warning() {
+        let now: TimeInterval = ProcessInfo.processInfo.systemUptime
+        guard now - lastWarningAt >= 0.8 else { return }
+        lastWarningAt = now
+        notification.notificationOccurred(.warning)
+    }
+    private static var lastWarningAt: TimeInterval = -.infinity
+}
+
+// MARK: - 入场：轻轻浮上来（减弱动态效果时只淡入、不位移；旁白开着时不做入场）
+
+struct VelvetAppear: ViewModifier {
+    var delay: Double = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var shown = false
+
+    func body(content: Content) -> some View {
+        let offset: CGFloat = (shown || reduceMotion) ? 0 : 14
+        content
+            .opacity(shown ? 1 : 0)
+            .offset(y: offset)
+            .onAppear {
+                // 旁白开着：直接显示（透明的元素拿不到第一个焦点，也点不到）
+                if UIAccessibility.isVoiceOverRunning {
+                    shown = true
+                    return
+                }
+                let duration: Double = reduceMotion ? 0.2 : 0.55
+                let wait: Double = reduceMotion ? 0 : delay
+                withAnimation(.easeOut(duration: duration).delay(wait)) { shown = true }
+            }
+    }
+}
+
+extension View {
+    /// 只用在装饰和文案上：停止键和实时的安全警告（红字、锁存、解除锁定）永远不加入场动画
+    func velvetAppear(delay: Double = 0) -> some View {
+        modifier(VelvetAppear(delay: delay))
+    }
 }
 
 // MARK: - 背景：缓慢漂移的两团光，glow（0~1）越高越亮
@@ -160,10 +226,14 @@ struct SectionLabel: View {
     var body: some View {
         HStack(spacing: 6) {
             if let s = systemImage {
+                // 图标只是装饰：旁白只读标题，不读符号名
                 Image(systemName: s).font(.system(size: 11, weight: .semibold))
+                    .accessibilityHidden(true)
             }
             Text(title).font(.footnote.weight(.semibold)).tracking(1.5)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
         .foregroundColor(Velvet.gold.opacity(0.9))
     }
 }
@@ -178,13 +248,16 @@ struct PageHeader<Trailing: View>: View {
         HStack(alignment: .bottom) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
-                    .font(Velvet.serif(34, .semibold))
+                    .font(Velvet.display(.largeTitle))
                     .foregroundStyle(LinearGradient(colors: [Velvet.text, Velvet.blush],
                                                     startPoint: .leading, endPoint: .trailing))
                 Text(subtitle)
                     .font(.footnote)
                     .foregroundColor(Velvet.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
             Spacer(minLength: 8)
             trailing()
         }
@@ -285,6 +358,7 @@ struct StopDock: View {
         }
         .buttonStyle(PressableStyle())
         .accessibilityLabel("停止")
+        .accessibilityHint("立即停止所有输出")
     }
 }
 

@@ -304,16 +304,25 @@ struct AgeGateView: View {
                             .foregroundStyle(LinearGradient(colors: [Velvet.text, Velvet.blush],
                                                             startPoint: .top, endPoint: .bottom))
                     }
+                    .velvetAppear()
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("仅限 18 岁以上")
                     VStack(spacing: 10) {
                         Text("只属于成年人的夜晚")
-                            .font(Velvet.serif(26, .semibold))
+                            .font(Velvet.display(.title2))
                             .foregroundColor(Velvet.text)
+                            .multilineTextAlignment(.center)
+                            .accessibilityAddTraits(.isHeader)
+                        Text("你的节奏，由你做主")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundColor(Velvet.blush)
                         Text("BlueCrystal 用来控制成人亲密用品，内容仅面向年满 18 周岁的成年人。请在私密、安全、随手能关掉设备电源的环境里使用。")
                             .font(.subheadline)
                             .foregroundColor(Velvet.textSecondary)
                             .multilineTextAlignment(.center)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    .velvetAppear(delay: 0.08)
                     VStack(alignment: .leading, spacing: 10) {
                         Label("点红色「停止」（「她」页面也可以输入“停”）会立刻发送停止，设备确认后才算停下", systemImage: "stop.circle.fill")
                         Label("第一次使用前，先在不接触身体时试一次停止", systemImage: "hand.raised.fill")
@@ -322,6 +331,7 @@ struct AgeGateView: View {
                     .font(.footnote)
                     .foregroundColor(Velvet.textSecondary)
                     .velvetCard()
+                    .velvetAppear(delay: 0.14)
 
                     if let name = lock.biometry?.name {
                         Toggle(isOn: $useBiometric) {
@@ -332,6 +342,7 @@ struct AgeGateView: View {
                         }
                         .tint(Velvet.rose)
                         .velvetCard()
+                        // 入场动画只给装饰和文案：开关是能点的东西，不淡入（淡入中也能点到看不见的控件）
                     }
 
                     VStack(spacing: 12) {
@@ -348,6 +359,7 @@ struct AgeGateView: View {
                             .font(.caption)
                             .foregroundColor(Velvet.textMuted)
                     }
+                    // 同上：「我已年满 18 岁，进入」不加入场动画，一出现就看得见、点得到
                     Spacer(minLength: 20)
                 }
                 .padding(.horizontal, 24)
@@ -379,10 +391,14 @@ struct LockScreenView: View {
                 Image(systemName: "lock.fill")
                     .font(.system(size: 40, weight: .light))
                     .foregroundStyle(Velvet.roseGradient)
+                    .shadow(color: Velvet.rose.opacity(0.5), radius: 16)
+                    .velvetAppear()
+                    .accessibilityHidden(true)
                 Text("只给你看")
-                    .font(Velvet.serif(28, .semibold))
+                    .font(Velvet.display(.title))
                     .foregroundColor(Velvet.text)
-                Text("验证后继续")
+                    .accessibilityAddTraits(.isHeader)
+                Text("验证一下，再继续今晚")
                     .font(.subheadline)
                     .foregroundColor(Velvet.textSecondary)
                 if let m = lock.message {

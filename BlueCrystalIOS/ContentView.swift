@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var ble: BLEManager
+    @State private var previousError: String?
 
     var body: some View {
         PrivacyShell {
@@ -27,6 +28,21 @@ struct ContentView: View {
             .tint(Velvet.rose)
         }
         .preferredColorScheme(.dark)
+        // 触感（纯反馈，不改任何状态）：连上了轻轻一下"成功"；连接失败、出现新的红字（自动停机、停止未确认等）
+        // 震一下"警告"，手机不在眼前时也能感觉到发生了什么
+        .onChange(of: ble.state) { s in
+            if s == .ready { Haptics.success() }
+            if s == .failed { Haptics.warning() }
+        }
+        .onChange(of: ble.lastError) { err in
+            // 文本完全相同不会触发 onChange；同一条红字清掉又出现是新的坏消息，也要提醒。
+            // 不用 contains：更严重的新提示常常是在旧文本后追加一行（停止未确认 + 设备可能仍在输出）
+            if let err = err, !err.isEmpty, err != previousError {
+                Haptics.warning()
+            }
+            previousError = err
+        }
+        .onAppear { previousError = ble.lastError }
         // 发现未绑定过的设备时弹确认框（防连到别人的设备）。
         // 直接用 showDeviceConfirm 做 binding：点"连接"和点"取消"走各自的方法，
         // 不会像之前那样在 set(false) 里误调 cancel 把 confirm 的设备抢掉（修 N7）。
@@ -64,6 +80,7 @@ struct DeviceStatusCard: View {
     var collapsed = false
     @State private var confirmForceDisconnect = false
     @State private var confirmPhysicalAck = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var orbColor: Color {
         switch ble.state {
@@ -154,6 +171,7 @@ struct DeviceStatusCard: View {
             if !compact {
                 safetySummary
             }
+            runMeter
         }
         .velvetCard(padding: compact ? 10 : 16,
                     tint: ble.lastError != nil || ble.safety.needsPhysicalAck ? Velvet.danger : nil)
@@ -168,6 +186,28 @@ struct DeviceStatusCard: View {
         }
         .font(.caption)
         .foregroundColor(Velvet.danger)
+    }
+
+    /// 正在输出时：本次还剩多少的细条（纯展示；文字说明在 safetySummary 里，旁白读那一行）
+    @ViewBuilder private var runMeter: some View {
+        if let remaining = ble.safety.runRemaining, ble.safety.runAllowed > 0 {
+            let total: Double = Double(ble.safety.runAllowed)
+            let left: Double = Double(max(0, remaining))
+            let frac: CGFloat = CGFloat(min(1.0, left / total))
+            let warn: Bool = remaining <= 60
+            GeometryReader { geo in
+                let width: CGFloat = geo.size.width * frac
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.white.opacity(0.08))
+                    Capsule()
+                        .fill(warn ? AnyShapeStyle(Velvet.warning) : AnyShapeStyle(Velvet.roseGradient))
+                        .frame(width: width)
+                }
+            }
+            .frame(height: 4)
+            .animation(reduceMotion ? nil : .linear(duration: 1), value: remaining)
+            .accessibilityHidden(true)
+        }
     }
 
     /// 修 M2/M3：单次上限、冷却、30 分钟额度

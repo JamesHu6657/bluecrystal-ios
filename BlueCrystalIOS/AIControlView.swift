@@ -284,7 +284,7 @@ final class AIControlVM: ObservableObject {
     @Published var input = ""
     @Published var isThinking = false
     @Published var running = false
-    @Published var statusLine = "未运行"
+    @Published var statusLine = "未运行，她在等你开口"
 
     /// 每次请求带上最近这么多条消息（不是轮数）
     static let historyLimit = 20
@@ -302,7 +302,7 @@ final class AIControlVM: ObservableObject {
     /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断、总时长到点）结果直接丢弃
     private var requestID = 0
     private var requestTask: Task<Void, Never>?
-    private var tabActive = false
+    private(set) var tabActive = false
     private var sceneActive = true
     /// 程序当前在设备上的强度（爬升的起点）；停止后归零
     private var currentLevels = [0, 0, 0, 0]
@@ -669,6 +669,7 @@ struct AIControlView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var privacy: PrivacyLock
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var vm = AIControlVM()
     @StateObject private var config = AIConfigWatcher()
     @State private var showSettings = false
@@ -703,12 +704,27 @@ struct AIControlView: View {
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: vm.messages.count) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
+                    // 她回话了：轻轻一下（出错提示不震，红字另有警告触感）。
+                    // 切到别的标签页时回复也可能回来（程序已作废，只是文字）：那时不震，避免没头没脑的一下
+                    if vm.tabActive, let last = vm.messages.last, !last.isUser, !last.isError { Haptics.soft() }
                 }
                 .onChange(of: vm.isThinking) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
                 }
             }
-            inputBar
+            // 快捷话和输入栏共用一层底色（之前两层深浅不同，中间有一道接缝）
+            VStack(spacing: 0) {
+                if showQuickReplies {
+                    // 减弱动态效果时只淡入淡出，不位移
+                    quickReplies
+                        .transition(quickReplyTransition)
+                }
+                inputBar
+            }
+            // 只给快捷话这一层做动画，不把聊天记录一起带着动
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: showQuickReplies)
+            .background(.ultraThinMaterial)
+            .background(Velvet.ink.opacity(0.5))
         }
         .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
         .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) {
@@ -748,7 +764,7 @@ struct AIControlView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("她")
-                            .font(Velvet.serif(26, .semibold))
+                            .font(Velvet.display(.title))
                             .foregroundColor(Velvet.text)
                         Text("明月栞那")
                             .font(.footnote)
@@ -850,6 +866,77 @@ struct AIControlView: View {
         vm.send()
     }
 
+    /// 快捷话出现 / 收起：减弱动态效果时只淡入淡出（写成明确类型，避开 iOS 17 Transition 重载的推断）
+    private var quickReplyTransition: AnyTransition {
+        if reduceMotion { return AnyTransition.opacity }
+        let move: AnyTransition = AnyTransition.move(edge: .bottom)
+        return move.combined(with: AnyTransition.opacity)
+    }
+
+    /// 输入框空着且设备允许输出时才出快捷话（不邀请尚不能开始的输出，也不盖掉输入）。
+    /// 等回复期间不收起（之前每发一句都收起再弹出，聊天区跟着上下跳），只是暂时点不了
+    private var showQuickReplies: Bool {
+        vm.input.isEmpty && ble.state == .ready && ble.safety.blockReason == nil
+    }
+
+    /// 快捷话：一点就发，和自己打字回车完全同一条路径（submit → vm.send）。
+    /// 都不是停止词（ProtocolChecks 钉住）；停止仍然是左下角的红色停止键或说"停"。
+    /// 没开始时是邀请的话，她在带节奏时换成调快慢的话
+    private var quickReplies: some View {
+        let phrases: [String] = AIQuickReplies.current(running: vm.running)
+        return ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(phrases, id: \.self) { phrase in
+                    Button {
+                        sendQuickReply(phrase)
+                    } label: {
+                        Text(phrase)
+                            .font(.footnote.weight(.medium))
+                            .foregroundColor(Velvet.text)
+                            .padding(.horizontal, 14)
+                            .frame(minHeight: 36)
+                            .background(Capsule().fill(Color.white.opacity(0.07)))
+                            .overlay(Capsule().strokeBorder(Velvet.rose.opacity(0.35), lineWidth: 1))
+                            // 看起来 36pt 高，点按区 44pt
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressableStyle())
+                    .disabled(vm.isThinking)
+                    .accessibilityHint(vm.isThinking ? "她回复后可以点" : "发送这句话")
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+        .padding(.top, 4)
+    }
+
+    /// 隐私遮挡期间不发，也不把这句留在输入框里
+    private func sendQuickReply(_ phrase: String) {
+        guard !privacy.isCovering(ble) else {
+            PrivacyLock.dismissKeyboard()
+            return
+        }
+        Haptics.select()
+        vm.input = phrase
+        submit()
+    }
+
+    /// 空状态文案跟着快捷话走：快捷话没出现，就不邀请"点下面的一句"
+    private var emptyStateLine: String {
+        if showQuickReplies {
+            return "跟她说句话，或点下面的一句就开始。随时说“停”或点红色停止，本地立刻停。"
+        }
+        return "跟她说句话就开始。随时说“停”或点红色停止，本地立刻停。"
+    }
+
+    /// 快捷话暂时不出现的原因（设备没连上 / 安全规则暂时不许输出）
+    private var emptyStateFootnote: String? {
+        if ble.state == .ready && ble.safety.blockReason == nil { return nil }
+        if ble.state != .ready { return "连上设备后，这里还会出现一点就能发的快捷话" }
+        return "等安全限制解除，这里还会出现一点就能发的快捷话"
+    }
+
     private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: "heart.fill")
@@ -857,15 +944,24 @@ struct AIControlView: View {
                 .foregroundStyle(Velvet.roseGradient)
                 .shadow(color: Velvet.rose.opacity(0.6), radius: 12)
             Text("她在等你开口")
-                .font(Velvet.serif(20, .medium))
+                .font(Velvet.display(.title3, .medium))
                 .foregroundColor(Velvet.text)
-            Text("跟她说句话就开始。随时说“停”或点停止，本地立刻停。")
+            Text(emptyStateLine)
                 .font(.caption)
                 .foregroundColor(Velvet.textSecondary)
                 .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            if let footnote = emptyStateFootnote {
+                Text(footnote)
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
+        .velvetAppear()
     }
 
     private var inputBar: some View {
@@ -885,6 +981,7 @@ struct AIControlView: View {
             }
             .buttonStyle(PressableStyle())
             .accessibilityLabel("停止")
+            .accessibilityHint("立即停止所有输出")
             // 等回复期间输入框也保持可用：停止词随时能发
             TextField(vm.isThinking ? "她在回复…说“停”随时停" : "说点什么…", text: $vm.input)
                 .focused($inputFocused)
@@ -908,8 +1005,6 @@ struct AIControlView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
-        .background(Velvet.ink.opacity(0.5))
     }
 }
 
