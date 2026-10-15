@@ -365,6 +365,13 @@ do {
     var sOut = silentAuto.step(.silent, settings: auto, dt: 0.3)
     for _ in 0..<100 { sOut = silentAuto.step(AudioWindow(peakToPeak: 0.0004, rms: 0.0001, frames: 1000), settings: auto, dt: 0.3) }
     r4check(sOut.percent == 0, "自动灵敏度：纯底噪（低于 -60 dB）不会被放大")
+    // 自动模式：响视频里的安静段底噪（约 -55 dB）不放大，只剩最低强度
+    let autoFloor = AudioSyncSettings(sensitivityDb: 18, maxPercent: 100, minPercent: 10, autoGain: true)
+    var gated = AudioReactiveShaper()
+    var g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3)
+    for _ in 0..<60 { g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3) }
+    for _ in 0..<20 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
+    r4check(g.percent == 10, "自动灵敏度：安静段底噪不被放大，只保持最低强度（得到 \(g.percent)）")
     quietVideo.resetAdaptation()
     r4check(quietVideo.refDb == AudioReactiveShaper.autoInitialRefDb, "换视频重新学习响度")
     var learning = AudioReactiveShaper()

@@ -70,6 +70,8 @@ final class VideoSyncPlayer: ObservableObject {
     private var ownSeekEcho = OwnSeekEcho()
     /// vm 停着是因为系统控件暂停（含拖进度条时的暂停）：这时停止 / 被动停机要锁存，松手续播不能复活输出
     private var pausedByExternal = false
+    /// seek 进行中看到过系统控件开播（之后的暂停是用户的，不是 seek 自己的）
+    private var seekSawPlay = false
     /// 隐私锁（页面出现时传进来）。系统全屏是 UIKit 弹出层，盖在隐私锁之上，只靠界面遮挡拦不住
     private weak var privacy: PrivacyLock?
 
@@ -141,6 +143,20 @@ final class VideoSyncPlayer: ObservableObject {
                    !self.isSeeking {
                     self.handlePausedPlayer(p)
                 }
+                // seek 进行中：seek 自己先暂停了播放器；之后系统控件先播再停 = 用户的暂停，不能被吞掉，
+                // 否则 seek 完成回调会 p.play() 把输出恢复
+                if self.isSeeking {
+                    if status != .paused {
+                        self.seekSawPlay = true
+                    } else if self.seekSawPlay, self.isPlaying {
+                        self.seekSawPlay = false
+                        self.isPlaying = false
+                        self.pausedByExternal = false
+                        self.stopTimer(sendZero: true)
+                        self.zeroDisplay()
+                        self.statusLine = "已暂停"
+                    }
+                }
                 // 系统播放器控件（播放键 / 拖完自动续播 / 重播）把视频播起来了，vm 还没在联动：跟上。
                 // 只认暂停 → 播放的边沿：只放视频（设备没连）或 seek 中开播时边沿已用掉，
                 // 之后缓冲 / 跳转引起的等待 ↔ 播放来回不会在没人点播放时开始输出
@@ -151,7 +167,10 @@ final class VideoSyncPlayer: ObservableObject {
                     self.statusLine = "已停止；要继续请再点一次播放"
                     return
                 }
-                guard !self.isSeeking else { return }
+                guard !self.isSeeking else {
+                    self.statusLine = "正在跳转；跳完后再点播放开始联动"
+                    return
+                }
                 self.handleExternalPlay(p)
                 // 缓冲（waitingToPlayAtSpecifiedRate）不在这里单独处理：tick 看播放头有没有前进
             }
@@ -437,6 +456,7 @@ final class VideoSyncPlayer: ObservableObject {
         meter?.reset()
         shaper.reset()
         audioFlow.reset()
+        seekSawPlay = false
         p.pause()
         if isPlaying {
             // 全零走完整停止帧对但保留本次运行和闸门；不改 STOP / 上限 / 额度语义
@@ -571,6 +591,20 @@ final class VideoSyncPlayer: ObservableObject {
         case .paused:
             return
         }
+        // 缓冲 / 等待中：立刻归零（不等平滑慢慢落下），丢掉这段样本；卡住计时照常由 progressWatch 算
+        if p.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+            _ = meter?.drain()
+            shaper.reset()
+            level = 0
+            intensity = 0
+            if lastActive != .zero, settings.enabled {
+                ble.sendTick(levels: ActiveChannels.zero.values)
+                lastActive = .zero
+                statusLine = "视频缓冲中，设备暂停输出"
+            }
+            needsResync = true
+            return
+        }
         guard t.isFinite else { return }
         currentSeconds = t
 
@@ -608,6 +642,8 @@ struct SystemPlayerView: UIViewControllerRepresentable {
     var hidesVideo = false
     /// 现查隐私锁是否盖着（回前台时页面未必已刷新，不能只信 hidesVideo）
     var isCovered: () -> Bool = { false }
+    /// 设备需要用户处理：在系统全屏里就退出来，让设备卡片露出来
+    var attentionNeeded = false
     /// 系统全屏进出（全屏弹出时 SwiftUI 页面可能收到 onDisappear，不能因此停机）
     var onFullScreenChange: (Bool) -> Void = { _ in }
 
@@ -638,6 +674,7 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         context.coordinator.hidesVideo = hidesVideo
         context.coordinator.isCovered = isCovered
         context.coordinator.applyPlayer()
+        context.coordinator.exitFullScreenIfNeeded(attentionNeeded)
     }
 
     final class Coordinator: NSObject, AVPlayerViewControllerDelegate {
@@ -679,6 +716,19 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         func playerViewController(_ playerViewController: AVPlayerViewController,
                                   willBeginFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
             onFullScreenChange(true)
+            coordinator.animate(alongsideTransition: nil) { [weak self] ctx in
+                // 捏合进全屏中途松手 = 取消：不会再有 willEnd，必须在这里把标志改回来，
+                // 否则离开页面时 onDisappear 会把它当成全屏而不停机
+                if ctx.isCancelled { self?.onFullScreenChange(false) }
+            }
+        }
+
+        /// 设备需要处理（停止未确认 / 要物理关机 / 断开后可能仍在输出）时退出系统全屏：
+        /// 全屏盖在设备卡片和隐私层之上，警告和「解除锁定 / 强制断开」必须看得见
+        func exitFullScreenIfNeeded(_ needed: Bool) {
+            guard needed, let vc = playerViewController, let presented = vc.presentedViewController,
+                  !presented.isBeingDismissed else { return }
+            presented.dismiss(animated: true)
         }
 
         func playerViewController(_ playerViewController: AVPlayerViewController,
@@ -916,7 +966,8 @@ struct VideoSyncView: View {
             let lock: PrivacyLock = privacy
             let manager: BLEManager = ble
             SystemPlayerView(player: p, hidesVideo: hidesVideo,
-                             isCovered: { lock.isCovering(manager) }) { systemFullScreen = $0 }
+                             isCovered: { lock.isCovering(manager) },
+                             attentionNeeded: ble.needsAttentionCard || pickerBlocked) { systemFullScreen = $0 }
                 .frame(height: 240)
                 .frame(maxWidth: .infinity)
                 .background(Color.black)

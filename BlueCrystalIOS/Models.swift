@@ -816,6 +816,10 @@ struct AudioReactiveShaper {
     static let autoTargetPercent: Double = 85
     /// 自动增益的范围（dB）：再安静的视频也最多放大这么多，避免把纯底噪放大成强输出
     static let autoGainRange: ClosedRange<Double> = -12...24
+    /// 自动模式下手动灵敏度只做微调（±6 dB），总增益仍夹在 autoGainRange 内
+    static let autoTrimRange: ClosedRange<Double> = -6...6
+    /// 自动模式的相对噪声门：比参考响度低这么多以上算底噪，不放大成输出
+    static let autoRelativeGateDb: Double = 24
 
     struct Output: Equatable {
         /// 灵敏度之后、噪声门之前的电平（0~100），界面电平条用
@@ -884,11 +888,12 @@ struct AudioReactiveShaper {
         adapt(loudnessDb: db, dt: step)
         if settings.autoGain {
             // 自动增益 + 手动灵敏度作微调
-            gain = min(Self.autoGainRange.upperBound + AudioSyncSettings.sensitivityRange.upperBound,
-                       max(Self.autoGainRange.lowerBound + AudioSyncSettings.sensitivityRange.lowerBound,
-                           autoGainDb + settings.sensitivityDb))
+            let trim = min(Self.autoTrimRange.upperBound, max(Self.autoTrimRange.lowerBound, settings.sensitivityDb))
+            gain = min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, autoGainDb + trim))
         }
-        let level = Self.targetPercent(loudnessDb: db, sensitivityDb: gain)
+        var level = Self.targetPercent(loudnessDb: db, sensitivityDb: gain)
+        // 自动模式：远低于这个视频响段的声音（安静段底噪）不输出，只剩最低强度
+        if settings.autoGain, db.isFinite, db < refDb - Self.autoRelativeGateDb { level = 0 }
         if gateOpen {
             if level < Self.gateClosePercent { gateOpen = false }
         } else if level >= Self.gateOpenPercent {
