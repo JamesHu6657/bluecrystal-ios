@@ -18,6 +18,7 @@ import os
 /// 30 秒仍未确认时拉起操作员锁存，只有用户确认已物理关机才解除（修 M4，legacy watchdog.py）。
 /// 停止进行中绝不发非停止帧：期间到来的输出帧先记下，停止确认后再重新走准入。
 /// 意外断链 / 蓝牙重新打开 / 重启后设备可能仍在输出时，自动重连已绑定的设备去发停止帧对（第三轮 M1，见 AutoReconnect）。
+/// 写入超时后链路卡死（那笔写一直没有回执，排在后面的停止帧对发不出去）时主动断开、走同一条自动重连去发停止（第四轮 M1）。
 ///
 /// 输出准入（修 M2/M3/L5）：手动、技能、视频的每一帧非停止帧都只经过 submitOutput：
 /// 锁存/设备可能仍在输出时拒绝；停机状态下开始新一次运行要过冷却和 30 分钟额度检查，
@@ -50,6 +51,8 @@ final class BLEManager: NSObject, ObservableObject {
     static let forceDisconnectOfferAfter: TimeInterval = writeTimeout * 2 + 0.5
     /// 退后台时最多持有后台任务这么久等停止确认
     static let backgroundStopDeadline: TimeInterval = 20.0
+    /// 第四轮 M1：某笔写入超时后再等这么久，它仍然没有任何回执就判定链路卡死，主动断开重连去发停止
+    static let linkStallGrace: TimeInterval = 1.0
 
     enum State: String {
         case idle = "未连接"
@@ -259,6 +262,8 @@ final class BLEManager: NSObject, ObservableObject {
     /// 连接代次：连接超时只对本次连接有效（修 Factory L6）
     private var connectGen = 0
     static let connectTimeout: TimeInterval = 10
+    /// 第四轮 M1：因为链路卡死而主动断开时的说明，didDisconnect 里取走当提示前缀
+    private var linkStallReason: String?
     private var notificationAuthRequested = false
     private var lastPublishedSafety: SafetyStatus?
 
@@ -941,6 +946,11 @@ final class BLEManager: NSObject, ObservableObject {
         guard let idx = pendingWrites.firstIndex(where: { $0.id == id }),
               !pendingWrites[idx].timedOut else { return }
         pendingWrites[idx].timedOut = true
+        // 第四轮 M1：withResponse 写在链路上是串行的，这笔卡住时排在它后面的停止帧对也发不出去。
+        // 宽限期过后它还没有任何回执，就主动断开重连（见 checkLinkStall）
+        bleQueue.asyncAfter(deadline: .now() + Self.linkStallGrace) { [weak self] in
+            self?.checkLinkStall(writeId: id)
+        }
         switch pendingWrites[idx].kind {
         case .output:
             outputWriteFailed("写入超时（\(Int(Self.writeTimeout)) 秒没有回执）")
@@ -950,6 +960,24 @@ final class BLEManager: NSObject, ObservableObject {
                 stopAttemptFailed(reason: "写入超时")
             }
         }
+    }
+
+    /// 第四轮 M1：超时的那笔写到现在还没有任何回执。回执按 FIFO 到达，它还留在队列里，
+    /// 就说明它之后发出的写入（包括停止帧对）也都没有回执：链路卡死。
+    /// 之前只能等系统约 30 秒的 ATT 超时把链路断掉，停止帧对才有机会发出去；现在主动断开，
+    /// didDisconnect 记下"可能仍在输出"，reconnectForStopIfNeeded 重连已绑定设备，连上先发必须确认的停止帧对。
+    /// 只在需要确认的停止上触发（冗余停止不为此断链）；只往"更早停"的方向改：闸门保持锁住，
+    /// 不放宽任何上限，锁存 / 物理关机确认照旧
+    private func checkLinkStall(writeId: Int) {
+        guard let p = peripheral, queueState == .ready,
+              pendingWrites.contains(where: { $0.id == writeId && $0.timedOut }),
+              stopNeeded || (stopOp?.needed ?? false) else { return }
+        Self.log.error("写入 #\(writeId) 超时后仍无回执，链路卡死：主动断开，重连后发送停止")
+        outputLocked = true
+        deferredFrame = nil
+        outputWrites.dropPending()
+        linkStallReason = "蓝牙写入卡住（\(Int(Self.writeTimeout + Self.linkStallGrace)) 秒没有回执），停止帧发不出去：已断开，正在自动重连去发送停止"
+        central.cancelPeripheralConnection(p)
     }
 
     /// 修 L6：非停止帧写失败/超时 —— 设备停在哪一档不确定：锁闸、界面归零、发停止帧对
@@ -1028,6 +1056,7 @@ final class BLEManager: NSObject, ObservableObject {
         disconnecting = false
         disconnectGen += 1
         runGen += 1
+        linkStallReason = nil
         // M5：断链也算被动停机，之前读到的代次全部作废
         let epoch = bumpGateEpoch()
         DispatchQueue.main.async { [weak self] in
@@ -1356,6 +1385,8 @@ extension BLEManager: CBCentralManagerDelegate {
         guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
         // 修 Factory H1：清理前先记下设备是否可能还在输出（断开流程中的停止也算没确认）
         let mayBeActive = isActive || stopUnconfirmed || (stopOp?.needed ?? false)
+        // 第四轮 M1：链路卡死时是我们主动断开的（resetLinkState 会清掉，先取出来）
+        let stallReason = linkStallReason
         // 意外断开：清理并通知 UI（VM 会订阅 state 变化停掉 Timer、归零滑杆）
         resetLinkState()
         if let error = error {
@@ -1363,7 +1394,9 @@ extension BLEManager: CBCentralManagerDelegate {
         } else {
             updateState(.idle)
         }
-        if mayBeActive { markDeviceMayBeActive(prefix: error.map { "设备意外断开：\($0.localizedDescription)" }) }
+        if mayBeActive {
+            markDeviceMayBeActive(prefix: error.map { "设备意外断开：\($0.localizedDescription)" } ?? stallReason)
+        }
         // 第三轮 M1：设备可能仍在输出时自动重连已绑定的设备去发停止（之前要等用户点"连接"）
         reconnectForStopIfNeeded()
     }
