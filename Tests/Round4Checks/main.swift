@@ -17,7 +17,7 @@ func r4check(_ ok: Bool, _ name: String) {
 
 r4check(AIReply.detectionForm("［STOP］") == "[STOP]", "M2 归一化：全角方括号 → 方括号")
 r4check(AIReply.detectionForm("[ST\u{200B}OP]") == "[STOP]", "M2 归一化：去掉零宽空格")
-for s in ["［STOP］", "【STOP】", "〔STOP〕", "[ＳＴＯＰ]", "[ST\u{200B}OP]", "\u{FEFF}[STOP\u{200D}]"] {
+for s in ["［STOP］", "【STOP】", "〔STOP〕", "[ＳＴＯＰ]", "[ST\u{200B}OP]", "\u{FEFF}[ST\u{200C}OP]"] {
     r4check(AIReply.looksLikeNonstandardCommand(s), "M2 判为写法不标准：\(s.unicodeScalars.map { String(format: "%04X", $0.value) }.joined(separator: " "))")
 }
 r4check(!AIReply.looksLikeNonstandardCommand("[STOP]"), "M2 标准 [STOP] 不算写法不标准")
@@ -27,6 +27,9 @@ let fullWidthStop = AIReply.parse("好的，马上停\n［STOP］")
 r4check(fullWidthStop.rejection != nil && fullWidthStop.steps.isEmpty, "M2 ［STOP］ 整条作废（调用方在输出中会安全停止）")
 let zwStop = AIReply.parse("[ST\u{200B}OP]")
 r4check(zwStop.rejection != nil && zwStop.steps.isEmpty, "M2 夹零宽字符的 STOP 整条作废")
+// STOP 后面紧跟零宽字符：原文已经匹配指令正则（(?![A-Za-z]) 不挡零宽），不归 M2 新规则管，走原有格式错路径整条作废
+r4check(!AIReply.looksLikeNonstandardCommand("[STOP\u{200D}]"), "M2 原文已像指令的不重复判定")
+r4check(AIReply.parse("\u{FEFF}[STOP\u{200D}]").rejection != nil, "M2 STOP 后夹零宽字符走原有格式错路径整条作废")
 let lenticular = AIReply.parse("【STOP】")
 r4check(lenticular.rejection != nil && lenticular.steps.isEmpty, "M2 【STOP】 整条作废")
 r4check(AIReply.parse("[STOP]").rejection == nil, "M2 标准 [STOP] 照常解析")
