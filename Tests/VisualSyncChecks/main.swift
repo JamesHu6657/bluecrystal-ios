@@ -323,12 +323,16 @@ do {
 do {
     var plain = MotionNormalizer()
     var boosted = MotionNormalizer()
+    var quiet = MotionNormalizer()
     var capped = MotionNormalizer()
+    var loud = MotionNormalizer()
     let a = plain.step(vsWindow(2.25), gainDb: 0, auto: false, dt: 0.3)
     let b = boosted.step(vsWindow(2.25), gainDb: 6, auto: false, dt: 0.3)
-    let c = capped.step(vsWindow(2.25), gainDb: 99, auto: false, dt: 0.3)
+    let q = quiet.step(vsWindow(1), gainDb: 0, auto: false, dt: 0.3)
+    let c = capped.step(vsWindow(1), gainDb: 99, auto: false, dt: 0.3)
     vcheck(a > 0 && b > a * 1.9 && b < a * 2.1, "画面灵敏度：+6 dB ≈ ×2")
-    vcheck(c <= 100 && abs(c - a * pow(10, 12.0 / 20)) < 1e-6, "画面灵敏度：超范围夹到 +12 dB")
+    vcheck(q > 0 && c < 100 && abs(c - q * pow(10, 12.0 / 20)) < 1e-6, "画面灵敏度：超范围夹到 +12 dB（\(q) → \(c)）")
+    vcheck(loud.step(vsWindow(40), gainDb: 12, auto: false, dt: 0.3) == 100, "画面灵敏度：放大后仍夹在 100")
 }
 
 do {
