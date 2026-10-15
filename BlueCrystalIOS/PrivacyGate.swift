@@ -25,6 +25,12 @@ extension BLEManager {
             || state == .connecting || state == .discovering || state == .disconnecting
             || (lastError != nil && (state == .ready || state == .disconnecting))
     }
+
+    /// 盖住页面的那几层（全屏视频、选择器、AI 设置、解锁页）什么时候带上紧凑设备卡片：
+    /// 红字、需要确认物理关机、停止重试中、提供强制断开——「解除锁定 / 强制断开」只在卡片上，一处定义，各层一致
+    var needsAttentionCard: Bool {
+        lastError != nil || safety.needsPhysicalAck || safety.stopRetrying || forceDisconnectOffered
+    }
 }
 
 final class PrivacyLock: ObservableObject {
@@ -385,7 +391,7 @@ struct AgeGateView: View {
 }
 
 /// 面容 ID 解锁页：不自动弹验证，点「解锁」才弹；底部常驻停止键。
-/// 有红字或需要确认物理关机时，上面钉一张紧凑设备卡片（没有连接键：连接中会撤掉解锁页）
+/// 设备需要处理时（同 needsAttentionCard），上面钉一张紧凑设备卡片（没有连接键：连接中会撤掉解锁页）
 struct LockScreenView: View {
     @EnvironmentObject var ble: BLEManager
     @ObservedObject var lock: PrivacyLock
@@ -395,7 +401,7 @@ struct LockScreenView: View {
         ZStack {
             VelvetBackground(glow: 0.2).ignoresSafeArea()
             VStack(spacing: 22) {
-                if ble.lastError != nil || ble.safety.needsPhysicalAck {
+                if ble.needsAttentionCard {
                     DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
                         .padding(.top, 8)
                 }
@@ -411,7 +417,7 @@ struct LockScreenView: View {
                     .foregroundColor(Velvet.text)
                     .accessibilityAddTraits(.isHeader)
                 // 不写"今晚"：白天打开也说得通
-                Text("验证一下，再回到只属于你的时光")
+                Text("验证一下，再回到你的私密时光")
                     .font(.subheadline)
                     .foregroundColor(Velvet.textSecondary)
                     // 大字号时会折行：折行后也居中，不整段压扁

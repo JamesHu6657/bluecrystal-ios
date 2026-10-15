@@ -94,8 +94,8 @@ enum Velvet {
         var connectInvite: String {
             switch self {
             case .lateNight: return "轻轻唤醒它，就从连接开始"
-            case .morning: return "晨光微暖，让它来到你身边"
-            case .afternoon: return "午后的光正软，让它靠近一点"
+            case .morning: return "阳光刚好，让它来到你身边"
+            case .afternoon: return "午后的光正软，唤它来陪你"
             case .evening: return "灯光调暗，把它唤到身边"
             // 不说"一切就绪"：蓝牙关着、设备没开机时这张卡片也在
             case .night: return "此刻只属于你，与它相连"

@@ -516,9 +516,9 @@ struct VideoSyncView: View {
         }
     }
 
-    /// 选择器底部：停止键（停止帧对可能还在路上）；有红字或锁存时连设备卡片一起带上
+    /// 选择器底部：停止键（停止帧对可能还在路上）；设备需要处理时连设备卡片一起带上（同 AI 设置和全屏）
     private var pickerStopBar: some View {
-        let showCard: Bool = ble.lastError != nil || ble.safety.needsPhysicalAck || ble.safety.stopRetrying
+        let showCard: Bool = ble.needsAttentionCard
         return VStack(spacing: 0) {
             if showCard {
                 DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
@@ -823,9 +823,9 @@ struct VideoSyncView: View {
                 Text("\(s.commands.count) 条命令")
                     .font(.caption).foregroundColor(Velvet.textMuted)
             }
-            if pickerBlocked {
+            if pickerBlocked && vm.player != nil {
                 // 已选过视频后幕布不在了，素材行是唯一入口：被拦的原因常驻写在这里（和幕布上那句同一个意思），
-                // 不只靠停止键上方那 3 秒的提示
+                // 不只靠停止键上方那 3 秒的提示。幕布还在时它已经写了，这里不重复
                 Label(pickerBlockedMessage(nil), systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundColor(Velvet.warning)
@@ -1151,6 +1151,14 @@ private struct WarningCardHeightKey: PreferenceKey {
     }
 }
 
+/// 全屏里设备卡片往上滚了多少（纯布局）：滚到底就收起"下面还有"的提示
+private struct WarningScrollOffsetKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 /// 全屏里底部控制条的高度（纯布局）：设备卡片最多长到它的上沿
 private struct BottomPanelHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
@@ -1174,13 +1182,17 @@ struct FullScreenVideoView: View {
     @State private var scrubbing = false
     /// 设备卡片的实际高度（量出来之前为 0）：滚动区只占这么高，不多拦一块点击
     @State private var warningCardHeight: CGFloat = 0
+    /// 设备卡片往上滚了多少
+    @State private var warningScrollOffset: CGFloat = 0
     /// 底部控制条的实际高度（量出来之前为 0）
     @State private var bottomPanelHeight: CGFloat = 0
     @Environment(\.verticalSizeClass) private var verticalSizeClass
 
-    /// 设备卡片离顶部的距离（让出退出键）；放不下时至少留这么高给红字（再多就滚动）
+    /// 设备卡片离顶部的距离（让出退出键）
     private static let warningTop: CGFloat = 60
-    private static let minWarningBand: CGFloat = 120
+    /// 控制条上沿以上实在没地方时，设备卡片至少留这么高（露出一两行红字，其余滚动）
+    private static let minWarningBand: CGFloat = 60
+    private static let warningScrollSpace = "fullscreen-warning-scroll"
 
     /// 横屏有提示时不画只读的强度曲线：把高度让给设备卡片，进度条和播放键不被盖住
     private var hidesChartForWarning: Bool {
@@ -1192,10 +1204,7 @@ struct FullScreenVideoView: View {
     private static let stopInset: CGFloat = 20
     private static let stopReserve: CGFloat = stopSize + stopInset + 8
 
-    private var needsDeviceAttention: Bool {
-        ble.lastError != nil || ble.safety.needsPhysicalAck ||
-        ble.safety.stopRetrying || ble.forceDisconnectOffered
-    }
+    private var needsDeviceAttention: Bool { ble.needsAttentionCard }
 
     /// 旁白、切换控制开着时不自动收起（找不到控件）。全键盘控制系统没有公开的检测接口，
     /// 点任何地方都会把控制条叫回来，停止键也一直在
@@ -1246,8 +1255,8 @@ struct FullScreenVideoView: View {
                 }
                 // 独立于控制条的淡入淡出：警告不动画、不自动收起。长红字 / 大字号可滚动，
                 // 上方留出退出键，下方的固定停止键仍最后绘制、始终可点。
-                // 卡片多高就占多高、贴着顶部；最多 warningHeight，也最多长到底部控制条上沿（横屏时不盖住进度条和播放键），
-                // 但至少留 minWarningBand 给红字；放不下才滚动。
+                // 卡片多高就占多高、贴着顶部；最多 warningHeight，也最多长到底部控制条上沿
+                // （横屏 / 大字号时不盖住进度条和播放键），实在没地方也留 minWarningBand；放不下就滚动。
                 // 始终只有这一张卡片：高度变化时「解除锁定 / 强制断开」的确认框不会因为换了一份卡片而被收掉
                 if needsDeviceAttention {
                     let measured: CGFloat = warningCardHeight
@@ -1258,21 +1267,26 @@ struct FullScreenVideoView: View {
                     let cap: CGFloat = max(floorHeight, min(warningHeight, roomAbovePanel))
                     let fits: Bool = measured > 0 && measured <= cap
                     let bandHeight: CGFloat = measured > 0 ? min(measured, cap) : cap
+                    let atEnd: Bool = warningScrollOffset + bandHeight >= measured - 4
                     VStack(spacing: 0) {
                         ScrollView {
                             warningCard
                                 .background(
                                     GeometryReader { g in
-                                        Color.clear.preference(key: WarningCardHeightKey.self, value: g.size.height)
+                                        Color.clear
+                                            .preference(key: WarningCardHeightKey.self, value: g.size.height)
+                                            .preference(key: WarningScrollOffsetKey.self,
+                                                        value: -g.frame(in: .named(Self.warningScrollSpace)).minY)
                                     }
                                 )
                         }
+                        .coordinateSpace(name: Self.warningScrollSpace)
                         .scrollDisabled(fits)
                         .frame(height: bandHeight)
                         // 放不下时（横屏常见）底边淡出并挂一个向下的小箭头：iOS 的滚动条不动时不显示，
-                        // 不提示的话「解除锁定」露半截也看不出能往上滑。只是提示，不拦点击
+                        // 不提示的话「解除锁定」露半截也看不出能往上滑。滚到底就收起，不再盖着最后一个键。只是提示，不拦点击
                         .overlay(alignment: .bottom) {
-                            if !fits && measured > 0 {
+                            if !fits && measured > 0 && !atEnd {
                                 ZStack(alignment: .bottom) {
                                     LinearGradient(colors: [.clear, .black.opacity(0.55)],
                                                    startPoint: .top, endPoint: .bottom)
@@ -1292,6 +1306,9 @@ struct FullScreenVideoView: View {
                     .padding(.top, Self.warningTop)
                     .onPreferenceChange(WarningCardHeightKey.self) { h in
                         if abs(h - warningCardHeight) > 0.5 { warningCardHeight = h }
+                    }
+                    .onPreferenceChange(WarningScrollOffsetKey.self) { y in
+                        if abs(y - warningScrollOffset) > 0.5 { warningScrollOffset = y }
                     }
                 }
                 // 最后画：永远在最上层、永远在同一个位置

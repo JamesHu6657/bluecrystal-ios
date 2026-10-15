@@ -1250,11 +1250,10 @@ struct AISettingsView: View {
     }
 
     /// 底部停止条：和解锁页的停止同一条路径（sendStop + 各页 VM 的 stopAll）；
-    /// 有红字、需要确认物理关机或停止重试中时，连紧凑设备卡片（解除锁定 / 强制断开）一起带上；
+    /// 设备需要处理时（needsAttentionCard，同选择器、全屏和解锁页），连紧凑设备卡片（解除锁定 / 强制断开）一起带上；
     /// 打字时卡片收成两行（同 AI 页），点红字收起键盘看全文
     private var stopBar: some View {
-        let showCard: Bool = ble.lastError != nil || ble.safety.needsPhysicalAck || ble.safety.stopRetrying
-            || ble.forceDisconnectOffered
+        let showCard: Bool = ble.needsAttentionCard
         let typing: Bool = focusedField != nil
         return VStack(spacing: 0) {
             if showCard {
