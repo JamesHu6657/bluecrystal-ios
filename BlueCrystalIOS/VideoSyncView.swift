@@ -4,9 +4,12 @@ import AVKit
 import UniformTypeIdentifiers
 import Combine
 
-/// 视频联动播放器（ViewModel）：本地视频 + 声音联动。
-/// 强度来源只有一个：MTAudioProcessingTap 实时分析的音轨响度（AudioLevelTap / AudioLevelMeter），
-/// 经 AudioReactiveShaper（灵敏度、噪声门、平滑、上限）后每 0.3 秒走 BLEManager.sendTick。
+/// 视频联动播放器（ViewModel）：本地视频 + 声音 / 画面联动。
+/// 强度来源二选一（VisualSyncSettings.source）：
+/// - 声音（默认）：MTAudioProcessingTap 实时分析的音轨响度（AudioLevelTap / AudioLevelMeter），
+///   经 AudioReactiveShaper（灵敏度、噪声门、平滑、上限）后每 0.3 秒走 BLEManager.sendTick（和以前逐位相同）；
+/// - 画面：AVPlayerItemVideoOutput 拉帧的运动能量（VideoMotionTap / VideoMotionMeter），经 MotionNormalizer /
+///   MotionShaper / SyncOutputStage（最低强度 / 上限 / 升幅限速 / 归零保持）后同样只经 tick() 发出。
 /// 暂停、缓冲、seek、播完、页面消失、退后台、蓝牙断开都立刻归零；所有输出都过 BLEManager 的准入 / 额度 / 看门狗。
 final class VideoSyncPlayer: ObservableObject {
     @Published var player: AVPlayer?
@@ -17,9 +20,12 @@ final class VideoSyncPlayer: ObservableObject {
     @Published var durationSeconds: Double = 0
     /// 电平条：灵敏度之后、噪声门之前的响度（0~100），纯展示
     @Published private(set) var level: Double = 0
+    /// 画面条：归一化之后、噪声门之前的运动量（0~100），纯展示
+    @Published private(set) var motionLevel: Double = 0
     /// 实际输出的强度（0 ~ 强度上限）
     @Published private(set) var intensity: Int = 0
     @Published private(set) var audioStatus: AudioLevelTap.Status = .none
+    @Published private(set) var motionStatus: VideoMotionTap.Status = .none
     @Published private var scrubber = PlaybackScrubber()
 
     var displaySeconds: Double { scrubber.position ?? currentSeconds }
@@ -64,6 +70,17 @@ final class VideoSyncPlayer: ObservableObject {
     private var lastTickAt: TimeInterval?
     /// 最低强度只在 tap 真的有新鲜样本、播放器真的在播时生效
     private var audioFlow = AudioFlowWatch()
+    /// 画面联动：只在跟随画面时安装取帧（声音模式零开销）。安装代次作废旧视频 / 已拆掉的 tap 晚到的回调
+    private var motionMeter: VideoMotionMeter?
+    private var motionTap: VideoMotionTap?
+    private var motionGen = 0
+    private var motionNormalizer = MotionNormalizer()
+    private var motionShaper = MotionShaper()
+    /// 画面模式的最低强度只在最近 1 秒确实有画面样本时生效
+    private var motionFlow = MotionFlowWatch()
+    /// 画面模式的出口：上限 / 最低强度（与声音侧逐位一致）+ 升幅限速 + 归零保持
+    private var outputStage = SyncOutputStage()
+    private var visualSettings = VisualSyncSettings()
     /// 系统控件开播：只认"暂停 → 播放"的边沿；停止后锁存一次
     private var externalPlay = ExternalPlayGate()
     /// App 自己 seek 引起的 timeJumped 回声
@@ -93,11 +110,32 @@ final class VideoSyncPlayer: ObservableObject {
         settings = s
         if wasEnabled && !s.enabled {
             shaper.reset()
+            motionShaper.reset()
+            outputStage.reset()
             intensity = 0
             // 全零帧在运行中会换成完整停止帧对、运行继续（OutputGate），设备没在输出时不发
             ble?.sendTick(levels: ActiveChannels.zero.values)
             lastActive = .zero
             if isPlaying { statusLine = "联动已关闭，视频继续播放" }
+        }
+        needsResync = true
+    }
+
+    /// 画面联动设置变化。切换来源不停播、不归零：下一拍按新来源算，升幅从设备现在的实际输出算起；
+    /// 切到画面才安装取帧，切回声音就拆掉（声音模式零开销）
+    func applyVisualSettings(_ v: VisualSyncSettings) {
+        let previous = visualSettings.source
+        visualSettings = v
+        if v.source != previous {
+            switch v.source {
+            case .motion:
+                if let item = player?.currentItem { installMotion(on: item, asset: item.asset) }
+            case .audio:
+                uninstallMotion()
+            }
+            outputStage.seed(lastActive.values)
+            motionShaper.reset()
+            motionFlow.reset()
         }
         needsResync = true
     }
@@ -213,6 +251,7 @@ final class VideoSyncPlayer: ObservableObject {
         ble?.userResumeOutput()
         meter?.reset()
         shaper.reset()
+        resetMotionSide()
         lastActive = .zero
         // 系统控件开播时播放器多半还在等（拖完续播 / 跳转 / 播完重播）：等播放头真正前进再输出
         if p.timeControlStatus != .playing {
@@ -233,6 +272,8 @@ final class VideoSyncPlayer: ObservableObject {
         meter?.reset()
         shaper.reset()
         audioFlow.reset()
+        // 画面侧同样不和跳转前的画面做差
+        resetMotionSide()
         needsResync = true
         // 暂停中跳转也记下落点（同 seek()）：之后不论哪个播放键开播，都等播放头真正前进
         if landed.isFinite { progressWatch.awaitSeekProgress(from: landed, now: Self.now()) }
@@ -290,6 +331,10 @@ final class VideoSyncPlayer: ObservableObject {
         meterGen += 1
         shaper.resetAdaptation()
         audioFlow.reset()
+        // 画面侧：旧视频的取帧拆掉，重新学这个视频的运动范围
+        uninstallMotion()
+        motionNormalizer.resetAdaptation()
+        outputStage.reset()
         // 新播放器从暂停开始；旧视频的停止锁存和 seek 回声不带过来
         externalPlay = ExternalPlayGate()
         ownSeekEcho.clear()
@@ -336,13 +381,16 @@ final class VideoSyncPlayer: ObservableObject {
             case .ready:
                 if self.statusLine == "—" { self.statusLine = "视频就绪" }
             case .noAudio:
-                self.statusLine = "视频没有音轨，联动没有输出"
+                // 跟随画面时音轨有没有不影响输出
+                if self.visualSettings.source == .audio { self.statusLine = "视频没有音轨，联动没有输出" }
             case .failed(let why):
-                self.statusLine = "音频分析不可用（\(why)），联动没有输出"
+                if self.visualSettings.source == .audio { self.statusLine = "音频分析不可用（\(why)），联动没有输出" }
             case .none, .loading:
                 break
             }
         }
+        // 画面联动：只在跟随画面时挂取帧
+        installMotion(on: item, asset: asset)
         observeTimeControlStatus(p)
         NotificationCenter.default.publisher(for: AVPlayerItem.didPlayToEndTimeNotification, object: item)
             .receive(on: DispatchQueue.main)
@@ -381,6 +429,57 @@ final class VideoSyncPlayer: ObservableObject {
                 }
             }
             .store(in: &playerCancellables)
+    }
+
+    /// 跟随画面时给当前 item 挂取帧（已经挂着就不重复挂）。回调到主线程时核对还是不是当前视频、当前安装
+    private func installMotion(on item: AVPlayerItem, asset: AVAsset) {
+        guard visualSettings.source == .motion, motionTap == nil else { return }
+        motionGen += 1
+        let gen = motionGen
+        let m = VideoMotionMeter()
+        motionMeter = m
+        motionStatus = .loading
+        motionFlow.reset()
+        motionTap = VideoMotionTap.install(on: item, asset: asset, meter: m) { [weak self, weak item] status in
+            guard let self = self, let item = item,
+                  item === self.player?.currentItem, gen == self.motionGen else { return }
+            self.motionStatus = status
+            guard self.visualSettings.source == .motion else { return }
+            switch status {
+            case .ready:
+                if self.statusLine == "—" { self.statusLine = "视频就绪" }
+                if self.statusLine.hasPrefix("手机发热") { self.statusLine = "画面分析已恢复" }
+            case .noVideo:
+                self.statusLine = "视频没有画面轨，画面联动没有输出"
+            case .failed(let why):
+                self.statusLine = "画面分析不可用（\(why)），联动没有输出"
+            case .degraded(let why):
+                self.statusLine = why
+            case .none, .loading:
+                break
+            }
+        }
+    }
+
+    /// 拆掉取帧（停定时器、item.remove(output)），智晚到的回调按代次作废
+    private func uninstallMotion() {
+        motionGen += 1
+        motionTap?.uninstall()
+        motionTap = nil
+        motionMeter = nil
+        motionStatus = .none
+        motionLevel = 0
+        motionShaper.reset()
+        motionFlow.reset()
+    }
+
+    /// 画面侧跟声音侧一起清：丢掉没取走的画面窗口（分析器也丢掉参考帧，不和之前的画面做差），
+    /// 平滑 / 升幅基准从 0 起，旧样本不算新鲜
+    private func resetMotionSide() {
+        motionMeter?.reset()
+        motionShaper.reset()
+        motionFlow.reset()
+        outputStage.reset()
     }
 
     /// 当前视频在 App 目录里的副本（换视频时删旧的，避免占空间）
@@ -432,6 +531,7 @@ final class VideoSyncPlayer: ObservableObject {
             ble?.userResumeOutput()
             meter?.reset()
             shaper.reset()
+            resetMotionSide()
             lastActive = .zero
             // 暂停中的 seek 还没完成：完成回调会按最新的播放意图开始，不先播放旧位置
             guard !isSeeking else { return }
@@ -452,10 +552,11 @@ final class VideoSyncPlayer: ObservableObject {
         let gen = seekGen
         isSeeking = true
         currentSeconds = target
-        // seek 造成采样不连续：旧位置还没取走的声音不能算进新窗口
+        // seek 造成采样不连续：旧位置还没取走的声音 / 画面不能算进新窗口
         meter?.reset()
         shaper.reset()
         audioFlow.reset()
+        resetMotionSide()
         seekSawPlay = false
         p.pause()
         if isPlaying {
@@ -482,6 +583,7 @@ final class VideoSyncPlayer: ObservableObject {
                     return
                 }
                 self.meter?.reset()
+                self.motionMeter?.reset()
                 self.needsResync = true
                 self.progressWatch.awaitSeekProgress(from: landed, now: Self.now())
                 // 这次 seek 的 timeJumped 若晚于本回调到达，按回声忽略
@@ -525,8 +627,11 @@ final class VideoSyncPlayer: ObservableObject {
     private func zeroDisplay() {
         lastActive = .zero
         level = 0
+        motionLevel = 0
         intensity = 0
         shaper.reset()
+        motionShaper.reset()
+        outputStage.reset()
     }
 
     var canPlay: Bool {
@@ -539,6 +644,7 @@ final class VideoSyncPlayer: ObservableObject {
         stopTimer(sendZero: false)
         // 开播前的样本不作数：首拍还没有新鲜样本时不加最低强度
         audioFlow.reset()
+        motionFlow.reset()
         // 普通播放从头监视；seek 等待不因点播放或重建 Timer 被清掉
         progressWatch.startPlayback(at: player?.currentTime().seconds ?? .nan, now: Self.now())
         // 用 common modes，滚动页面时 tick 不暂停
@@ -559,7 +665,8 @@ final class VideoSyncPlayer: ObservableObject {
         }
     }
 
-    /// 每 0.3 秒：取走音频窗口 → 灵敏度 / 噪声门 / 平滑 / 上限 → 变化时才发帧（约 3.3 Hz，低于节流能力）
+    /// 每 0.3 秒：取走音频窗口 → 灵敏度 / 噪声门 / 平滑 / 上限 → 变化时才发帧（约 3.3 Hz，低于节流能力）。
+    /// 跟随画面时声音照常分析（自动灵敏度继续学），输出改由 motionTick 决定；跟随声音时这条路和以前逐位相同
     private func tick() {
         guard let p = player, let ble = ble else { return }
         // 拖进度条期间界面是活的，心跳照发，避免长时间拖动误触看门狗
@@ -580,8 +687,9 @@ final class VideoSyncPlayer: ObservableObject {
         // 播放器没停、播放头却不走（缓冲 / 解码卡住 / 时间读不出来）：超过 stallLimit 就停机
         switch observation {
         case .waitingAfterSeek:
-            // 等待落点前进期间 tap 可能已经在走：丢掉这几帧，恢复时不把跳转处的旧声音当成一阵强音
+            // 等待落点前进期间 tap 可能已经在走：丢掉这几帧，恢复时不把跳转处的旧声音 / 旧画面当成一阵强输出
             _ = meter?.drain()
+            _ = motionMeter?.drain()
             return
         case .stalled:
             handleStall()
@@ -595,7 +703,11 @@ final class VideoSyncPlayer: ObservableObject {
         if p.timeControlStatus == .waitingToPlayAtSpecifiedRate {
             _ = meter?.drain()
             shaper.reset()
+            _ = motionMeter?.drain()
+            motionShaper.reset()
+            outputStage.reset()
             level = 0
+            motionLevel = 0
             intensity = 0
             if lastActive != .zero, settings.enabled {
                 ble.sendTick(levels: ActiveChannels.zero.values)
@@ -618,6 +730,10 @@ final class VideoSyncPlayer: ObservableObject {
                                                  playerPlaying: p.timeControlStatus == .playing, now: now)
         let out = shaper.step(window, settings: settings, dt: dt, hasAudio: floorAllowed)
         level = out.level
+        if visualSettings.source == .motion {
+            motionTick(p, ble: ble, t: t, now: now, dt: dt)
+            return
+        }
         intensity = out.percent
         guard settings.enabled else { return }
         let vals = settings.channels.levels(percent: out.percent)
@@ -628,6 +744,37 @@ final class VideoSyncPlayer: ObservableObject {
             // tick 走不开闸的发送路径，看门狗锁住的闸不会被自动帧打开
             ble.sendTick(levels: vals)
             statusLine = String(format: "t=%.1fs 强度 %d", t, out.percent)
+        }
+    }
+
+    /// 跟随画面的一拍：画面窗口 → 自适应归一化 → 门 / 平滑 → 出口（最低强度 / 上限 / 升幅限速 / 归零保持 / 夹紧）
+    /// → 变化才发。最低强度只在分析在跑、播放器确实在播、最近 1 秒有画面样本时生效；没有新鲜画面就是 0
+    private func motionTick(_ p: AVPlayer, ble: BLEManager, t: Double, now: TimeInterval, dt: TimeInterval) {
+        let window = motionMeter?.drain() ?? .empty
+        motionFlow.note(window, now: now)
+        let target = motionNormalizer.step(window, gainDb: visualSettings.motionGainDb,
+                                           auto: visualSettings.autoMotion, dt: dt)
+        let shaped = motionShaper.step(target: target, dt: dt)
+        motionLevel = shaped.level
+        let hasSignal = motionFlow.allowsFloor(analyzerRunning: motionStatus.isAnalyzing,
+                                               playerPlaying: p.timeControlStatus == .playing, now: now)
+        let value = hasSignal ? motionNormalizer.confidence * shaped.smoothed : 0
+        guard settings.enabled else {
+            // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
+            outputStage.reset()
+            intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
+            return
+        }
+        let vals = outputStage.step(value, settings: settings, hasSignal: hasSignal)
+        let shown = vals.max() ?? 0
+        intensity = shown
+        let active = ActiveChannels(values: vals)
+        if needsResync || active != lastActive {
+            needsResync = false
+            lastActive = active
+            // 同声音侧：只走不开闸的 sendTick
+            ble.sendTick(levels: vals)
+            statusLine = String(format: "t=%.1fs 画面强度 %d", t, shown)
         }
     }
 }
@@ -777,8 +924,8 @@ private struct MeterBar: View {
     }
 }
 
-/// 一起看：播本地视频，声音的响度实时变成伸缩 / 震动的强度（官方 0x08 帧）。
-/// 没有脚本：强度只来自音轨，暂停 / 跳转 / 缓冲 / 播完都归零。
+/// 一起看：播本地视频，声音的响度（或画面的动作）实时变成伸缩 / 震动的强度（官方 0x08 帧）。
+/// 没有脚本：强度只来自音轨或画面，暂停 / 跳转 / 缓冲 / 播完都归零。
 struct VideoSyncView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var privacy: PrivacyLock
@@ -801,12 +948,30 @@ struct VideoSyncView: View {
     @AppStorage(AudioSyncSettings.Keys.channels) private var channelsRaw = AudioSyncSettings.defaultChannels.rawValue
     @AppStorage(AudioSyncSettings.Keys.minPercent) private var minPercent = AudioSyncSettings.defaultMinPercent
     @AppStorage(AudioSyncSettings.Keys.autoGain) private var autoGain = AudioSyncSettings.defaultAutoGain
+    // 画面联动设置（同上；来源默认声音，老用户无感升级）
+    @AppStorage(VisualSyncSettings.Keys.source) private var visualSourceRaw = VisualSyncSettings.defaultSource.rawValue
+    @AppStorage(VisualSyncSettings.Keys.motionGainDb) private var motionGainDb = VisualSyncSettings.defaultMotionGainDb
+    @AppStorage(VisualSyncSettings.Keys.autoMotion) private var autoMotion = VisualSyncSettings.defaultAutoMotion
 
     private var audioSettings: AudioSyncSettings {
         AudioSyncSettings(enabled: syncEnabled, sensitivityDb: sensitivityDb,
                           maxPercent: maxPercent,
                           channels: AudioSyncChannels(rawValue: channelsRaw) ?? .both,
                           minPercent: minPercent, autoGain: autoGain)
+    }
+
+    /// 存储里认不出的来源（含 P2 才有的「声音+画面」）按声音
+    private var visualSource: VisualSyncSource { VisualSyncSettings.resolveSource(rawValue: visualSourceRaw) }
+
+    private var followsMotion: Bool { visualSource == .motion }
+
+    private var visualSettings: VisualSyncSettings {
+        VisualSyncSettings(source: visualSource, motionGainDb: motionGainDb, autoMotion: autoMotion)
+    }
+
+    private var sourceBinding: Binding<VisualSyncSource> {
+        Binding(get: { VisualSyncSettings.resolveSource(rawValue: visualSourceRaw) },
+                set: { visualSourceRaw = $0.rawValue })
     }
 
     /// 设备需要用户处理（停止重试中、需要确认物理关机、提供强制断开）时不弹选择器：
@@ -877,7 +1042,7 @@ struct VideoSyncView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                PageHeader(title: "一起看", subtitle: "声音起伏，身体也跟着一起")
+                PageHeader(title: "一起看", subtitle: followsMotion ? "画面起伏，身体也跟着一起" : "声音起伏，身体也跟着一起")
 
                 // 警告 / 锁存 / 断开中不带动画：一出现就完整可见。没连上时连接走「设备」准备项
                 if showsDeviceStatus {
@@ -921,6 +1086,7 @@ struct VideoSyncView: View {
         .onAppear {
             vm.attach(ble: ble)
             vm.applySettings(audioSettings)
+            vm.applyVisualSettings(visualSettings)
             vm.attachPrivacy(privacy)
         }
         // 设备那边处理好了：钉着的"先处理设备卡片"立刻收掉
@@ -937,6 +1103,8 @@ struct VideoSyncView: View {
         .onChange(of: channelsRaw) { _ in vm.applySettings(audioSettings) }
         .onChange(of: minPercent) { _ in vm.applySettings(audioSettings) }
         .onChange(of: autoGain) { _ in vm.applySettings(audioSettings) }
+        // 跟随来源 / 画面灵敏度 / 自动适应画面：播放中即时生效，不停播
+        .onChange(of: visualSettings) { v in vm.applyVisualSettings(v) }
         // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
         .sheet(isPresented: $showPicker) {
             // 选择器和底部停止条上下排：系统选择器是远程界面，未必让出底部标签栏
@@ -989,7 +1157,7 @@ struct VideoSyncView: View {
                             .font(.caption)
                             .foregroundColor(Velvet.warning)
                     } else {
-                        Text("视频的声音会实时变成她的节奏")
+                        Text(followsMotion ? "视频的画面会实时变成她的节奏" : "视频的声音会实时变成她的节奏")
                             .font(.caption)
                             .foregroundColor(Velvet.textSecondary)
                     }
@@ -1013,45 +1181,22 @@ struct VideoSyncView: View {
         }
     }
 
-    /// 声音联动：开关、灵敏度、上限、输出通道和实时电平
+    /// 视频联动：开关、跟随（声音 / 画面）、实时电平、灵敏度、上限、最低强度、输出通道
     private var link: some View {
         VStack(alignment: .leading, spacing: 14) {
             Toggle(isOn: $syncEnabled) {
-                Label("声音联动", systemImage: "speaker.wave.2.fill")
+                Label("视频联动", systemImage: followsMotion ? "eye.fill" : "speaker.wave.2.fill")
                     .font(Velvet.display(.headline, .medium))
                     .foregroundColor(Velvet.text)
             }
             .tint(Velvet.rose)
-            .accessibilityHint("打开后，视频声音的响度实时变成设备强度")
+            .accessibilityHint(followsMotion ? "打开后，视频画面的动作实时变成设备强度" : "打开后，视频声音的响度实时变成设备强度")
 
-            MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
-                     valueText: "\(Int(vm.level.rounded()))")
-            MeterBar(title: "强度", fraction: Double(vm.intensity) / 100, color: Velvet.rose,
-                     valueText: "\(vm.intensity)%")
+            sourcePicker
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("灵敏度")
-                        .font(.subheadline)
-                        .foregroundColor(Velvet.text)
-                    Spacer()
-                    Text(sensitivityText)
-                        .font(.caption.monospacedDigit())
-                        .foregroundColor(Velvet.textSecondary)
-                }
-                Slider(value: $sensitivityDb,
-                       in: AudioSyncSettings.sensitivityRange, step: 1)
-                    .tint(Velvet.rose)
-                    .accessibilityLabel("灵敏度")
-                    .accessibilityValue(sensitivityText)
-                HStack {
-                    Text("安静的视频也能带动")
-                    Spacer()
-                    Text("响的视频不顶满")
-                }
-                .font(.caption2)
-                .foregroundColor(Velvet.textMuted)
-            }
+            meters
+
+            sensitivityControls
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -1087,18 +1232,6 @@ struct VideoSyncView: View {
                     .accessibilityValue("\(Int(min(minPercent, maxPercent)))%")
             }
 
-            Toggle(isOn: $autoGain) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("自动灵敏度")
-                        .font(.subheadline)
-                        .foregroundColor(Velvet.text)
-                    Text("按这个视频自己的音量自动调整，灵敏度滑块变成微调")
-                        .font(.caption2)
-                        .foregroundColor(Velvet.textMuted)
-                }
-            }
-            .tint(Velvet.gold)
-
             VStack(alignment: .leading, spacing: 6) {
                 Text("输出到")
                     .font(.subheadline)
@@ -1112,23 +1245,160 @@ struct VideoSyncView: View {
                 .accessibilityLabel("输出到")
             }
 
-            if vm.audioStatus == .noAudio {
-                Label("这个视频没有音轨，联动没有输出", systemImage: "speaker.slash")
-                    .font(.caption)
-                    .foregroundColor(Velvet.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if case .failed = vm.audioStatus {
-                Label("音频分析不可用，联动没有输出", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundColor(Velvet.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            statusNotes
         }
         .velvetCard()
     }
 
+    /// 跟随：声音 / 画面（P1 只有这两个）
+    private var sourcePicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("跟随")
+                .font(.subheadline)
+                .foregroundColor(Velvet.text)
+            Picker("跟随", selection: sourceBinding) {
+                ForEach(VisualSyncSource.allCases) { s in
+                    Text(s.title).tag(s)
+                }
+            }
+            .pickerStyle(.segmented)
+            .accessibilityLabel("跟随")
+            .accessibilityValue(visualSource.title)
+        }
+    }
+
+    /// 电平（跟随声音）或画面（跟随画面）+ 实际强度
+    private var meters: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if followsMotion {
+                MeterBar(title: "画面", fraction: vm.motionLevel / 100, color: Velvet.gold,
+                         valueText: "\(Int(vm.motionLevel.rounded()))")
+            } else {
+                MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
+                         valueText: "\(Int(vm.level.rounded()))")
+            }
+            MeterBar(title: "强度", fraction: Double(vm.intensity) / 100, color: Velvet.rose,
+                     valueText: "\(vm.intensity)%")
+        }
+    }
+
+    /// 灵敏度 + 自动适应：跟随声音时是音量的，跟随画面时是动作幅度的
+    @ViewBuilder private var sensitivityControls: some View {
+        if followsMotion {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("画面灵敏度")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Spacer()
+                        Text(motionGainText)
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(Velvet.textSecondary)
+                    }
+                    Slider(value: $motionGainDb,
+                           in: VisualSyncSettings.motionGainRange, step: 1)
+                        .tint(Velvet.rose)
+                        .accessibilityLabel("画面灵敏度")
+                        .accessibilityValue(motionGainText)
+                    HStack {
+                        Text("小动作也能带动")
+                        Spacer()
+                        Text("大动作不顶满")
+                    }
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                }
+                Toggle(isOn: $autoMotion) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("自动适应画面")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Text("按这个视频自己的动作幅度自动调整，画面灵敏度变成微调")
+                            .font(.caption2)
+                            .foregroundColor(Velvet.textMuted)
+                    }
+                }
+                .tint(Velvet.gold)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("灵敏度")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Spacer()
+                        Text(sensitivityText)
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(Velvet.textSecondary)
+                    }
+                    Slider(value: $sensitivityDb,
+                           in: AudioSyncSettings.sensitivityRange, step: 1)
+                        .tint(Velvet.rose)
+                        .accessibilityLabel("灵敏度")
+                        .accessibilityValue(sensitivityText)
+                    HStack {
+                        Text("安静的视频也能带动")
+                        Spacer()
+                        Text("响的视频不顶满")
+                    }
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                }
+                Toggle(isOn: $autoGain) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("自动灵敏度")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Text("按这个视频自己的音量自动调整，灵敏度滑块变成微调")
+                            .font(.caption2)
+                            .foregroundColor(Velvet.textMuted)
+                    }
+                }
+                .tint(Velvet.gold)
+            }
+        }
+    }
+
+    /// 当前来源的状态提示（没有音轨 / 画面轨、分析不可用、发热降频）
+    @ViewBuilder private var statusNotes: some View {
+        if let note = linkStatusNote {
+            Label(note.text, systemImage: note.icon)
+                .font(.caption)
+                .foregroundColor(Velvet.warning)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var linkStatusNote: (text: String, icon: String)? {
+        if followsMotion {
+            switch vm.motionStatus {
+            case .noVideo:
+                return ("这个视频没有画面轨，画面联动没有输出", "video.slash")
+            case .failed:
+                return ("画面分析不可用，联动没有输出", "exclamationmark.triangle")
+            case .degraded(let why):
+                return (why, "thermometer.sun")
+            case .none, .loading, .ready:
+                return nil
+            }
+        }
+        if vm.audioStatus == .noAudio {
+            return ("这个视频没有音轨，联动没有输出", "speaker.slash")
+        }
+        if case .failed = vm.audioStatus {
+            return ("音频分析不可用，联动没有输出", "exclamationmark.triangle")
+        }
+        return nil
+    }
+
     private var sensitivityText: String {
         String(format: "×%.1f", pow(10, sensitivityDb / 20))
+    }
+
+    private var motionGainText: String {
+        String(format: "×%.1f", pow(10, motionGainDb / 20))
     }
 
     /// 播放控制
