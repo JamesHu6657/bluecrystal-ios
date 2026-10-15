@@ -325,7 +325,8 @@ struct FavoritesSection: View {
                         Text("收藏此刻的手感")
                             .font(Velvet.display(.headline))
                             .foregroundColor(Velvet.text)
-                        Text("下次点一下，就缓缓回到这里")
+                        // 能收时是承诺；不能收时把原因写在卡片上（和加号卡片一样），别让人点了个没反应的键
+                        Text(canSave ? "下次点一下，就缓缓回到这里" : saveCaption)
                             .font(.caption)
                             .foregroundColor(Velvet.textSecondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -390,7 +391,8 @@ struct FavoritesSection: View {
             }
             .transition(.opacity)
         } else if !editing, let status = rules.status(for: store.items) {
-            Label(status, systemImage: "lock.fill")
+            // 真被安全规则挡住才用锁；没连上只是还没开始，用连接的图标
+            Label(status, systemImage: isConnected ? "lock.fill" : "dot.radiowaves.left.and.right")
                 .font(.caption)
                 .foregroundColor(Velvet.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -454,15 +456,20 @@ struct FavoritesSection: View {
 
     private func undoDelete(_ r: FavoriteStore.Removed) {
         let ok = store.restore(r)
-        undoStack.removeAll { $0 == r }
-        // 还有别的可撤销的：窗口重新计，提示收掉后撤销条就回来
-        if !undoStack.isEmpty { armUndoDismissal() }
         if ok {
+            // 放回成功才消费这条撤销；还有别的可撤销的：窗口重新计
+            undoStack.removeAll { $0 == r }
+            if !undoStack.isEmpty { armUndoDismissal() }
             Haptics.select()
             flash("已放回「\(r.item.name)」")
         } else if store.isFull {
-            flash("收藏已满 \(FavoriteSetting.maxCount) 组，放不回去了")
+            // 满了放不回去：撤销条留着（先整理出一格，再点撤销还能放回），窗口重新计
+            armUndoDismissal()
+            flash("收藏已满 \(FavoriteSetting.maxCount) 组，先整理出一格，再点撤销")
         } else {
+            // 同样的手感已经在收藏里：这条撤销没有意义了，别让用户再点进同一个失败
+            undoStack.removeAll { $0 == r }
+            if !undoStack.isEmpty { armUndoDismissal() }
             flash("同样的手感已经在收藏里了")
         }
     }

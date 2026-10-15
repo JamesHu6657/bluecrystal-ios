@@ -455,6 +455,12 @@ struct VideoSyncView: View {
     @State private var picker: PickerKind?
     /// 全屏播放中：内嵌预览让出播放器，onDisappear 不把全屏误判成离开页面
     @State private var isFullScreen = false
+    /// 选择器被拦下的那句说明：钉在停止键上方一小会儿（设备卡片可能在屏幕外——素材区在页面下部），
+    /// 把话说在手边，不只震一下
+    @State private var pickerNotice: String?
+    /// 提示代次：重复点被拦下的入口时重新计时
+    @State private var pickerNoticeGen = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// 设备需要用户处理（停止重试中、需要确认物理关机、提供强制断开）时不弹选择器：
     /// 选择器是整页弹出层，会盖住红字和「解除锁定 / 强制断开」这些只在设备卡片上的按钮
@@ -476,10 +482,25 @@ struct VideoSyncView: View {
         guard !pickerBlocked else {
             Haptics.warning()
             UIAccessibility.post(notification: .announcement, argument: "先处理设备卡片上的提示，再选文件")
+            flashPickerNotice()
             return
         }
         vm.stopBeforePicker()
         picker = kind
+    }
+
+    /// 被拦下的说明只显示一小会儿（3 秒）；减弱动态效果时只淡入淡出
+    private func flashPickerNotice() {
+        pickerNoticeGen += 1
+        let gen = pickerNoticeGen
+        let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+        withAnimation(settle) {
+            pickerNotice = "先处理上方设备卡片的提示，再选文件"
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            guard gen == pickerNoticeGen else { return }
+            withAnimation(settle) { pickerNotice = nil }
+        }
     }
 
     /// 选择器底部：停止键（停止帧对可能还在路上）；有红字或锁存时连设备卡片一起带上
@@ -527,9 +548,28 @@ struct VideoSyncView: View {
             .padding(.bottom, 16)
         }
         .background(VelvetBackground(glow: vm.isPlaying ? 0.6 : 0.15).ignoresSafeArea())
-        // 停止常驻底部，任何时候一下就停（和原来的停止键一样不受连接状态限制）
+        // 停止常驻底部，任何时候一下就停（和原来的停止键一样不受连接状态限制）。
+        // 选择器被拦下时的一句说明就贴在停止键上面：滚到哪儿都看得见，也不盖住停止键
         .safeAreaInset(edge: .bottom) {
-            StopDockBar { vm.stopAll() }
+            VStack(spacing: 0) {
+                if let n = pickerNotice {
+                    Label(n, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundColor(Velvet.warning)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Velvet.ink.opacity(0.95)))
+                        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(Velvet.warning.opacity(0.4), lineWidth: 1))
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 6)
+                        .transition(.opacity)
+                }
+                StopDockBar { vm.stopAll() }
+            }
         }
         // 修 CC r3 L4：attach 挂在整个页面上，与 onDisappear 对称（同 ManualControlView）
         .onAppear { vm.attach(ble: ble) }
@@ -695,6 +735,8 @@ struct VideoSyncView: View {
                 )
                 .tint(Velvet.rose)
                 .disabled(!vm.canPlay)
+                .accessibilityLabel("播放进度")
+                .accessibilityValue("\(formatTime(vm.currentSeconds))，共 \(formatTime(vm.durationSeconds))")
             }
             if !vm.canPlay {
                 readiness
@@ -1226,6 +1268,8 @@ struct FullScreenVideoView: View {
                 )
                 .tint(Velvet.rose)
                 .disabled(!vm.canPlay)
+                .accessibilityLabel("播放进度")
+                .accessibilityValue("\(Self.formatTime(vm.currentSeconds))，共 \(Self.formatTime(vm.durationSeconds))")
             }
             HStack(spacing: 18) {
                 // 颜色写在标签上：.borderless 下按钮的 tint / 角色色会盖过外层的白色

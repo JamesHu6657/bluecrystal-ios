@@ -557,7 +557,18 @@ private struct ConnectHero: View {
         case .scanning, .connecting, .discovering: return "正在找你的它…"
         case .failed: return "这次没连上"
         case .disconnecting: return "正在断开…"
-        case .idle, .ready: return "今晚，从连接开始"
+        case .idle, .ready: return connectTitle
+        }
+    }
+
+    /// 跟页头的 Velvet.greeting 用同一套时段：深夜说夜、清晨说晨，一大早不再说"今晚"
+    private var connectTitle: String {
+        switch Calendar.current.component(.hour, from: Date()) {
+        case 0..<5: return "夜深了，从连接开始"
+        case 5..<11: return "清晨正好，从连接开始"
+        case 11..<17: return "偷得半日闲，从连接开始"
+        case 17..<21: return "夜色刚好，从连接开始"
+        default: return "夜色正浓，从连接开始"
         }
     }
 
@@ -621,7 +632,8 @@ private struct ConnectHero: View {
         .frame(maxWidth: .infinity)
         .velvetCard(padding: 20)
         .onAppear {
-            guard !reduceMotion else { return }
+            // 只在第一次出现时起呼吸动画：切走再回来不叠一层 repeatForever
+            guard !reduceMotion, !glow else { return }
             withAnimation(.easeInOut(duration: 2.8).repeatForever(autoreverses: true)) { glow = true }
         }
     }
@@ -767,6 +779,9 @@ private struct ChannelControl: View {
     @Environment(\.isEnabled) private var isEnabled
     /// 数值跟着动态字体放大（低视力用户也要读得到当前强度）
     @ScaledMetric(relativeTo: .title2) private var valueFontSize: CGFloat = 30
+    /// 上次触感的档位桶。拖动事件可能比渲染更密（一帧里连跳几档），
+    /// 以"上次处理过的拖动"为基准，不以还没渲染回来的 value 为基准
+    @State private var lastHapticBucket: Int = 0
 
     var body: some View {
         let color = Velvet.channel(channel)
@@ -799,6 +814,10 @@ private struct ChannelControl: View {
                 .tint(color)
                 .accessibilityLabel(channel.displayName)
                 .accessibilityValue("\(Int(value))，最高 \(maxLevel)")
+                .onChange(of: Int(value)) { v in
+                    // 缓推 / 归零这类不经 changed() 的变化：只同步触感基准，不震
+                    lastHapticBucket = v / hapticBucket
+                }
             if maxLevel <= 9 {
                 HStack(spacing: 0) {
                     ForEach(0...maxLevel, id: \.self) { i in
@@ -830,12 +849,18 @@ private struct ChannelControl: View {
         .animation(.easeOut(duration: 0.2), value: value)
     }
 
+    /// 档位感的粒度：变频每一档、手动每 10
+    private var hapticBucket: Int {
+        maxLevel <= BCProtocol.maxModeLevel ? 1 : 10
+    }
+
     /// 档位感：变频每一档、手动每 10 轻轻一下（选择触感；只在手指拖动时，停止归零不震）
     private func changed(to newValue: Double) {
-        let old = Int(value)
-        let new = Int(newValue)
-        let bucket = maxLevel <= BCProtocol.maxModeLevel ? 1 : 10
-        if old / bucket != new / bucket { Haptics.select() }
+        let bucket = Int(newValue) / hapticBucket
+        if lastHapticBucket != bucket {
+            lastHapticBucket = bucket
+            Haptics.select()
+        }
         onChange(newValue)
     }
 }
