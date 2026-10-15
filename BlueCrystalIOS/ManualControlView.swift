@@ -330,7 +330,7 @@ struct ManualControlView: View {
                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: isConnected)
 
                 // 连接前也能查看、重命名、删除；召回仍由 rules 锁住。只保留一份收藏区。
-                FavoritesSection(store: favorites, rules: recallRules, isGliding: vm.isGliding) {
+                FavoritesSection(store: favorites, rules: recallRules, isGliding: vm.isGliding, isConnected: isConnected) {
                     vm.applyFavorite($0)
                 }
 
@@ -830,12 +830,12 @@ private struct ChannelControl: View {
         .animation(.easeOut(duration: 0.2), value: value)
     }
 
-    /// 档位感：变频每一档、手动每 10 轻轻一下（只在手指拖动时，停止归零不震）
+    /// 档位感：变频每一档、手动每 10 轻轻一下（选择触感；只在手指拖动时，停止归零不震）
     private func changed(to newValue: Double) {
         let old = Int(value)
         let new = Int(newValue)
         let bucket = maxLevel <= BCProtocol.maxModeLevel ? 1 : 10
-        if old / bucket != new / bucket { Haptics.detent() }
+        if old / bucket != new / bucket { Haptics.select() }
         onChange(newValue)
     }
 }

@@ -90,8 +90,6 @@ enum Haptics {
     static func soft() { softImpact.impactOccurred() }
     static func light() { lightImpact.impactOccurred(intensity: 0.7) }
     static func select() { selection.selectionChanged() }
-    /// 滑杆跨过一个档位（变频每一档、手动每 10）
-    static func detent() { selection.selectionChanged() }
     static func success() { notification.notificationOccurred(.success) }
     /// 同一件事常常同时改好几个状态（连接失败 + 红字）：0.8 秒内只震一次
     static func warning() {

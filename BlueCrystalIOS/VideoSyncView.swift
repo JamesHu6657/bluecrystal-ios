@@ -463,7 +463,8 @@ struct VideoSyncView: View {
     }
 
     /// 同手感页的规则：连上或有任何提示（红字 / 冷却等 / 锁存 / 停止重试 / 断开中 / 强制断开）时才显示设备卡片；
-    /// 平常没连上时不让技术卡片抢画面，连接入口在播放卡的「设备」准备项上
+    /// 平常没连上时不让技术卡片抢画面。卡片不摆连接键（showsConnect: false）：
+    /// 没连上时播放键下面的「设备」准备项就是唯一的连接入口，不再两个按钮管同一件事
     private var showsDeviceStatus: Bool {
         ble.state == .ready || ble.lastError != nil || ble.safety.needsPhysicalAck ||
         ble.safety.blockReason != nil || ble.safety.stopRetrying ||
@@ -500,9 +501,9 @@ struct VideoSyncView: View {
             VStack(alignment: .leading, spacing: 18) {
                 PageHeader(title: "一起看", subtitle: "画面起伏，身体也跟着一起")
 
-                // 警告 / 锁存 / 断开中不带动画：一出现就完整可见
+                // 警告 / 锁存 / 断开中不带动画：一出现就完整可见。没连上时连接走「设备」准备项
                 if showsDeviceStatus {
-                    DeviceStatusCard(allowDisconnect: false, connectTitle: "连接")
+                    DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", showsConnect: false)
                 }
 
                 stage

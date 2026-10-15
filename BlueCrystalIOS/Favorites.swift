@@ -103,18 +103,27 @@ final class FavoriteStore: ObservableObject {
 // MARK: - 我的收藏（滑杆下面）：一排卡片 + 行尾「收藏此刻」，整理就地展开
 
 /// 手感页唯一的收藏区：点卡片召回、点行尾的加号卡片收藏此刻、「整理」就地重命名 / 删除（可撤销）。
-/// 卡片能不能点由 FavoriteRecallRules 决定；最下面最多一行字：撤销 > 刚做完的事 > 为什么点不了
+/// 卡片能不能点由 FavoriteRecallRules 决定；最下面最多一行字：刚做完的事 > 撤销 > 为什么点不了
+/// （提示只显示一小会儿，收掉后剩下的撤销条会自己回来）
 struct FavoritesSection: View {
     @ObservedObject var store: FavoriteStore
     let rules: FavoriteRecallRules
     let isGliding: Bool
+    /// 未连接时收藏照常能看、能整理；只是滑杆还没出现，文案不再引导"先推滑杆"
+    let isConnected: Bool
     let onRecall: (FavoriteSetting) -> Void
 
     @State private var editing = false
     @State private var notice: String?
-    /// 撤销栈：连续删除时每一条都能救回（最多记 3 条，撤销条渲染栈顶那条）
+    /// 撤销栈：连续删除时每一条都记着（最多 3 条）；撤销条渲染栈顶那条，
+    /// 撤销 / 删除各重新计时一次，撤销后剩下的条目还有完整的可撤销时间
     @State private var undoStack: [FavoriteStore.Removed] = []
+    /// 刚做完的事（提示）的代次：提示只显示一小会儿，收掉后剩下的撤销条会自己回来
     @State private var noticeGen = 0
+    /// 撤销条整组收起的代次（和提示分开计时：显示提示不再清空撤销栈）
+    @State private var undoGen = 0
+    /// 缓推中点亮的是召回的那张（缓推会路过别的收藏的档位，别让高亮中途跳到别人身上）
+    @State private var glidingTarget: UUID?
     @FocusState private var focusedName: UUID?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// 卡片宽度跟着字号放大
@@ -131,14 +140,20 @@ struct FavoritesSection: View {
 
     private var canSave: Bool { hasOutputToSave && !store.isFull && !editing && !isGliding }
 
-    private var activeID: UUID? { store.match(mode: mode, levels: rules.levels)?.id }
+    /// 缓推中高亮召回的那张（缓推结束后滑杆正好就是它的档位，无缝衔接）；
+    /// 缓推被取消时按实际滑杆值重新算
+    private var activeID: UUID? {
+        if isGliding { return glidingTarget }
+        return store.match(mode: mode, levels: rules.levels)?.id
+    }
 
     /// 撤销条显示栈顶（最近删除的那条）
     private var undo: FavoriteStore.Removed? { undoStack.last }
 
-    /// 加号卡片上的小字：能收藏时说收什么，不能时说为什么
+    /// 加号卡片上的小字：能收藏时说收什么，不能时说为什么（未连接时滑杆还没出现，不说"先推滑杆"）
     private var saveCaption: String {
         if store.isFull { return "已满 \(FavoriteSetting.maxCount) 组" }
+        if !isConnected { return "连上设备后可收藏" }
         if isGliding { return "缓推完成后再收藏" }
         if !hasOutputToSave { return "先推滑杆" }
         return "存下这一刻"
@@ -146,6 +161,7 @@ struct FavoritesSection: View {
 
     private var saveHint: String {
         if store.isFull { return "最多收藏 \(FavoriteSetting.maxCount) 组，先整理掉不常用的" }
+        if !isConnected { return "先连接设备，调出喜欢的手感再收藏" }
         if isGliding { return "等强度缓缓推到目标后，再收藏" }
         if !hasOutputToSave { return "先把滑杆推到喜欢的位置，再收藏" }
         return "收藏后点一下就回来：强度会缓缓推上去"
@@ -218,6 +234,7 @@ struct FavoritesSection: View {
                         let active: Bool = activeID == fav.id
                         let hint: String = rules.hint(for: fav)
                         FavoriteTile(fav: fav, active: active, hint: hint) {
+                            glidingTarget = fav.id
                             onRecall(fav)
                             Haptics.light()
                         }
@@ -344,9 +361,16 @@ struct FavoritesSection: View {
         }
     }
 
-    /// 最多一行：撤销 > 刚做完的事 > 为什么点不了 > 空列表时怎么开始
+    /// 最多一行：刚做完的事 > 撤销 > 为什么点不了 > 空列表时怎么开始
+    /// （提示只显示一小会儿，收掉后剩下的撤销条会自己回来）
     @ViewBuilder private var footnote: some View {
-        if let u = undo {
+        if let n = notice {
+            Label(n, systemImage: "checkmark.seal.fill")
+                .font(.caption)
+                .foregroundColor(Velvet.blush)
+                .fixedSize(horizontal: false, vertical: true)
+                .transition(.opacity)
+        } else if let u = undo {
             HStack(spacing: 8) {
                 Label("已删除「\(u.item.name)」", systemImage: "trash")
                     .font(.caption)
@@ -365,12 +389,6 @@ struct FavoritesSection: View {
                 .accessibilityHint("把\(u.item.name)放回收藏")
             }
             .transition(.opacity)
-        } else if let n = notice {
-            Label(n, systemImage: "checkmark.seal.fill")
-                .font(.caption)
-                .foregroundColor(Velvet.blush)
-                .fixedSize(horizontal: false, vertical: true)
-                .transition(.opacity)
         } else if !editing, let status = rules.status(for: store.items) {
             Label(status, systemImage: "lock.fill")
                 .font(.caption)
@@ -410,19 +428,26 @@ struct FavoritesSection: View {
             focusedName = nil
             editing = false
         }
+        // 新的撤销条顶掉可能还在显示的提示（提示的定时器一并作废）
         noticeGen += 1
-        let gen = noticeGen
-        // 动画在调度的当下就定好（不在延迟闭包里读环境值）
-        let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
-        withAnimation(settle) {
+        withAnimation(settleAnimation()) {
             notice = nil
             undoStack.append(removed)
             // 撤销条只有一行：栈太深也摆不下，留最近 3 条
             if undoStack.count > 3 { undoStack.removeFirst(undoStack.count - 3) }
         }
         UIAccessibility.post(notification: .announcement, argument: "已删除\(removed.item.name)，可以撤销")
+        armUndoDismissal()
+    }
+
+    /// 撤销条整组收起的计时：删除和撤销各重新计一次，
+    /// 撤销一条后剩下的条目还有完整的可撤销时间（提示的显示不清空撤销栈）
+    private func armUndoDismissal() {
+        undoGen += 1
+        let gen = undoGen
+        let settle: Animation? = settleAnimation()
         DispatchQueue.main.asyncAfter(deadline: .now() + undoSeconds) {
-            guard gen == noticeGen else { return }
+            guard gen == undoGen else { return }
             withAnimation(settle) { undoStack = [] }
         }
     }
@@ -430,6 +455,8 @@ struct FavoritesSection: View {
     private func undoDelete(_ r: FavoriteStore.Removed) {
         let ok = store.restore(r)
         undoStack.removeAll { $0 == r }
+        // 还有别的可撤销的：窗口重新计，提示收掉后撤销条就回来
+        if !undoStack.isEmpty { armUndoDismissal() }
         if ok {
             Haptics.select()
             flash("已放回「\(r.item.name)」")
@@ -457,10 +484,8 @@ struct FavoritesSection: View {
     private func flash(_ text: String) {
         noticeGen += 1
         let gen = noticeGen
-        // 同 delete：动画在调度的当下定好，不在延迟闭包里读环境值
-        let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+        let settle: Animation? = settleAnimation()
         withAnimation(settle) {
-            undoStack = []
             notice = text
         }
         UIAccessibility.post(notification: .announcement, argument: text)
@@ -468,6 +493,11 @@ struct FavoritesSection: View {
             guard gen == noticeGen else { return }
             withAnimation(settle) { notice = nil }
         }
+    }
+
+    /// 动画在调度的当下就定好（不在延迟闭包里读环境值）
+    private func settleAnimation() -> Animation? {
+        reduceMotion ? nil : .easeInOut(duration: 0.2)
     }
 }
 
@@ -617,8 +647,9 @@ private struct FavoriteEditTile: View {
                 }
             }
             Button(role: .destructive, action: onDelete) {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 20))
+                // 和撤销条上的同一个操作用同一个图标（trash）：一眼认得出是删除
+                Image(systemName: "trash")
+                    .font(.system(size: 18))
                     .foregroundColor(Velvet.textSecondary)
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())

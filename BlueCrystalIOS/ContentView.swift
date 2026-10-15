@@ -35,7 +35,9 @@ struct ContentView: View {
             if s == .failed { Haptics.warning() }
         }
         .onChange(of: ble.lastError) { err in
-            if let err = err, !err.isEmpty, !(previousError ?? "").contains(err) {
+            // 文本完全相同不会触发 onChange；同一条红字清掉又出现是新的坏消息，也要提醒。
+            // 不用 contains：更严重的新提示常常是在旧文本后追加一行（停止未确认 + 设备可能仍在输出）
+            if let err = err, !err.isEmpty, err != previousError {
                 Haptics.warning()
             }
             previousError = err
