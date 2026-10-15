@@ -933,6 +933,16 @@ check(AISafety.holdIdleExpired(now: 1170, holdStartedAt: 1000, lastUserMessageAt
 check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: nil), "没有用户消息记录时从保持开始算")
 
 // Brain 审查 H1：在场超时覆盖整个运行（执行程序期间也算），单条程序总时长 ≤120 秒
+// 2026-10-15 用户要求关闭在场超时和程序时长上限：默认关闭
+check(!AISafety.presenceTimeoutEnabled, "在场超时默认关闭")
+check(!AISafety.presenceExpired(now: 99999, lastUserMessageAt: 1000, runStartedAt: 1010), "关闭后很久没消息也不停")
+check(!AISafety.holdIdleExpired(now: 99999, holdStartedAt: 1000, lastUserMessageAt: nil), "关闭后保持不超时")
+do {
+    let longP = AISafety.enforce(AIReply.parse((0..<AIReply.maxSteps).map { _ in "[CH 20 0 0 0]\n[HOLD 60000]" }.joined(separator: "\n")).steps, from: [0, 0, 0, 0])
+    check(AISafety.programTooLong(longP) == nil, "关闭后长程序也执行")
+}
+// 以下原有测试：打开开关验证原逻辑
+AISafety.presenceTimeoutEnabled = true
 check(!AISafety.presenceExpired(now: 1119, lastUserMessageAt: 1000, runStartedAt: 1010), "最近一条消息后 119 秒：继续")
 check(AISafety.presenceExpired(now: 1120, lastUserMessageAt: 1000, runStartedAt: 1010),
       "程序还在执行，离最近一条消息 120 秒也停止")

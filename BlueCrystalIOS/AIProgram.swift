@@ -346,6 +346,9 @@ enum AISafety {
     static let holdIdleTimeout: TimeInterval = 120
     /// 单条程序（含插入的爬升/等待步）总时长上限（H1）：超过的回复整条不执行
     static let maxProgramSeconds: TimeInterval = holdIdleTimeout
+    /// 2026-10-15 用户明确要求关闭：在场超时（120 秒没新消息停止）和单条程序总时长上限都不生效。
+    /// 强度上限、爬升限制、STOP、BLE 看门狗不变。var 只为测试能打开它；App 内不可配置
+    static var presenceTimeoutEnabled = false
 
     struct Program: Equatable {
         /// 实际执行的步骤（含插入的爬升步、等待步）
@@ -422,7 +425,7 @@ enum AISafety {
 
     /// 程序总时长超过上限时返回作废原因（H1）
     static func programTooLong(_ p: Program) -> String? {
-        guard p.totalSeconds > maxProgramSeconds else { return nil }
+        guard presenceTimeoutEnabled, p.totalSeconds > maxProgramSeconds else { return nil }
         return "程序总时长 \(Int(p.totalSeconds.rounded(.up))) 秒，超过上限 \(Int(maxProgramSeconds)) 秒，整条不执行"
     }
 
@@ -444,7 +447,7 @@ enum AISafety {
     /// 保持中是否已经超过空闲时限；holdStartedAt 为 nil 表示没在保持
     static func holdIdleExpired(now: TimeInterval, holdStartedAt: TimeInterval?,
                                 lastUserMessageAt: TimeInterval?) -> Bool {
-        guard let h = holdStartedAt else { return false }
+        guard presenceTimeoutEnabled, let h = holdStartedAt else { return false }
         return now - max(h, lastUserMessageAt ?? h) >= holdIdleTimeout
     }
 
@@ -452,7 +455,7 @@ enum AISafety {
     /// 没有用户消息记录时从开始运行算；两个都没有表示没在运行
     static func presenceExpired(now: TimeInterval, lastUserMessageAt: TimeInterval?,
                                 runStartedAt: TimeInterval?) -> Bool {
-        guard let ref = lastUserMessageAt ?? runStartedAt else { return false }
+        guard presenceTimeoutEnabled, let ref = lastUserMessageAt ?? runStartedAt else { return false }
         return now - ref >= holdIdleTimeout
     }
 }

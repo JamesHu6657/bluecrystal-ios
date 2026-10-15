@@ -1257,7 +1257,7 @@ struct AISettingsView: View {
                 } header: {
                     Text("提示词")
                 } footer: {
-                    Text("指令格式：[CH 伸缩 震动 0 0]（0~99，超过 99 整条不执行，后两位恒为 0）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)，单条程序总长超过 \(Int(AISafety.maxProgramSeconds)) 秒整条不执行，离最近一条消息 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息就停止。")
+                    Text("指令格式：[CH 伸缩 震动 0 0]（0~99，超过 99 整条不执行，后两位恒为 0）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)。")
                 }
             }
             .onChange(of: provider) { p in

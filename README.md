@@ -42,6 +42,7 @@
 
 ## 安全机制（数值照搬 legacy `src/safety/limits.py`）
 
+- AI 页在场超时（120 秒没新消息停止）和单条程序 120 秒上限已按用户要求关闭（`AISafety.presenceTimeoutEnabled = false`）
 - 时间上限（单次 20 分钟、滚动 30 分钟 1200 秒额度）已按用户要求关闭（`SafetyLimits.timeLimitsEnabled = false`）；STOP、停止确认、锁存、心跳看门狗、断链 / 退后台停机照旧
 - 手动、技能、视频的每一帧都经过同一个准入检查；额度跨 App 重启保留，未知运行时长仍保守耗尽完整窗口额度
 - 停止 = 0x08 停止帧 → 100ms → 0x06 停止帧（官方迷姬专用停止 video.js handleSlide 的顺序），两帧都收到写入回执才算停；
