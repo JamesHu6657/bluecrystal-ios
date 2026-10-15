@@ -302,7 +302,7 @@ final class AIControlVM: ObservableObject {
     /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断、总时长到点）结果直接丢弃
     private var requestID = 0
     private var requestTask: Task<Void, Never>?
-    private var tabActive = false
+    private(set) var tabActive = false
     private var sceneActive = true
     /// 程序当前在设备上的强度（爬升的起点）；停止后归零
     private var currentLevels = [0, 0, 0, 0]
@@ -704,8 +704,9 @@ struct AIControlView: View {
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: vm.messages.count) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
-                    // 她回话了：轻轻一下（出错提示不震，红字另有警告触感）
-                    if let last = vm.messages.last, !last.isUser, !last.isError { Haptics.soft() }
+                    // 她回话了：轻轻一下（出错提示不震，红字另有警告触感）。
+                    // 切到别的标签页时回复也可能回来（程序已作废，只是文字）：那时不震，避免没头没脑的一下
+                    if vm.tabActive, let last = vm.messages.last, !last.isUser, !last.isError { Haptics.soft() }
                 }
                 .onChange(of: vm.isThinking) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
@@ -921,6 +922,21 @@ struct AIControlView: View {
         submit()
     }
 
+    /// 空状态文案跟着快捷话走：快捷话没出现，就不邀请"点下面的一句"
+    private var emptyStateLine: String {
+        if showQuickReplies {
+            return "跟她说句话，或点下面的一句就开始。随时说“停”或点红色停止，本地立刻停。"
+        }
+        return "跟她说句话就开始。随时说“停”或点红色停止，本地立刻停。"
+    }
+
+    /// 快捷话暂时不出现的原因（设备没连上 / 安全规则暂时不许输出）
+    private var emptyStateFootnote: String? {
+        if ble.state == .ready && ble.safety.blockReason == nil { return nil }
+        if ble.state != .ready { return "连上设备后，这里还会出现一点就能发的快捷话" }
+        return "等安全限制解除，这里还会出现一点就能发的快捷话"
+    }
+
     private var emptyState: some View {
         VStack(spacing: 12) {
             Image(systemName: "heart.fill")
@@ -930,11 +946,18 @@ struct AIControlView: View {
             Text("她在等你开口")
                 .font(Velvet.display(.title3, .medium))
                 .foregroundColor(Velvet.text)
-            Text("跟她说句话，或点下面的一句就开始。随时说“停”或点红色停止，本地立刻停。")
+            Text(emptyStateLine)
                 .font(.caption)
                 .foregroundColor(Velvet.textSecondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
+            if let footnote = emptyStateFootnote {
+                Text(footnote)
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)

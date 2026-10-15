@@ -112,7 +112,8 @@ struct FavoritesSection: View {
 
     @State private var editing = false
     @State private var notice: String?
-    @State private var undo: FavoriteStore.Removed?
+    /// 撤销栈：连续删除时每一条都能救回（最多记 3 条，撤销条渲染栈顶那条）
+    @State private var undoStack: [FavoriteStore.Removed] = []
     @State private var noticeGen = 0
     @FocusState private var focusedName: UUID?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -131,6 +132,9 @@ struct FavoritesSection: View {
     private var canSave: Bool { hasOutputToSave && !store.isFull && !editing && !isGliding }
 
     private var activeID: UUID? { store.match(mode: mode, levels: rules.levels)?.id }
+
+    /// 撤销条显示栈顶（最近删除的那条）
+    private var undo: FavoriteStore.Removed? { undoStack.last }
 
     /// 加号卡片上的小字：能收藏时说收什么，不能时说为什么
     private var saveCaption: String {
@@ -408,20 +412,24 @@ struct FavoritesSection: View {
         }
         noticeGen += 1
         let gen = noticeGen
-        withAnimation {
+        // 动画在调度的当下就定好（不在延迟闭包里读环境值）
+        let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+        withAnimation(settle) {
             notice = nil
-            undo = removed
+            undoStack.append(removed)
+            // 撤销条只有一行：栈太深也摆不下，留最近 3 条
+            if undoStack.count > 3 { undoStack.removeFirst(undoStack.count - 3) }
         }
         UIAccessibility.post(notification: .announcement, argument: "已删除\(removed.item.name)，可以撤销")
         DispatchQueue.main.asyncAfter(deadline: .now() + undoSeconds) {
             guard gen == noticeGen else { return }
-            withAnimation { undo = nil }
+            withAnimation(settle) { undoStack = [] }
         }
     }
 
     private func undoDelete(_ r: FavoriteStore.Removed) {
         let ok = store.restore(r)
-        undo = nil
+        undoStack.removeAll { $0 == r }
         if ok {
             Haptics.select()
             flash("已放回「\(r.item.name)」")
@@ -449,14 +457,16 @@ struct FavoritesSection: View {
     private func flash(_ text: String) {
         noticeGen += 1
         let gen = noticeGen
-        withAnimation {
-            undo = nil
+        // 同 delete：动画在调度的当下定好，不在延迟闭包里读环境值
+        let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
+        withAnimation(settle) {
+            undoStack = []
             notice = text
         }
         UIAccessibility.post(notification: .announcement, argument: text)
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
             guard gen == noticeGen else { return }
-            withAnimation { notice = nil }
+            withAnimation(settle) { notice = nil }
         }
     }
 }

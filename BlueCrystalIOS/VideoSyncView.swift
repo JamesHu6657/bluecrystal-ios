@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import AVKit
 import UniformTypeIdentifiers
 import Combine
@@ -461,6 +462,14 @@ struct VideoSyncView: View {
         ble.safety.needsPhysicalAck || ble.safety.stopRetrying || ble.forceDisconnectOffered
     }
 
+    /// 同手感页的规则：连上或有任何提示（红字 / 冷却等 / 锁存 / 停止重试 / 断开中 / 强制断开）时才显示设备卡片；
+    /// 平常没连上时不让技术卡片抢画面，连接入口在播放卡的「设备」准备项上
+    private var showsDeviceStatus: Bool {
+        ble.state == .ready || ble.lastError != nil || ble.safety.needsPhysicalAck ||
+        ble.safety.blockReason != nil || ble.safety.stopRetrying ||
+        ble.state == .disconnecting || ble.forceDisconnectOffered
+    }
+
     /// 选择器弹出前先停（选择器会盖住页面底部的停止键；选择器里另有一个停止键）
     private func openPicker(_ kind: PickerKind) {
         guard !pickerBlocked else {
@@ -491,7 +500,10 @@ struct VideoSyncView: View {
             VStack(alignment: .leading, spacing: 18) {
                 PageHeader(title: "一起看", subtitle: "画面起伏，身体也跟着一起")
 
-                DeviceStatusCard(allowDisconnect: false, connectTitle: "连接")
+                // 警告 / 锁存 / 断开中不带动画：一出现就完整可见
+                if showsDeviceStatus {
+                    DeviceStatusCard(allowDisconnect: false, connectTitle: "连接")
+                }
 
                 stage
 
@@ -721,10 +733,11 @@ struct VideoSyncView: View {
                           hint: busy ? "" : "连接设备", enabled: !busy, tappableWhenDone: false) {
                 if !connected && !busy { ble.startScan() }
             }
+            // 设备需要处理时不灰掉视频 / 脚本准备项：点了由 openPicker 拦下并说明，和选视频幕布一致
             ReadinessChip(title: "视频", done: hasVideo, icon: "film",
-                          hint: "选择视频", enabled: !pickerBlocked) { openPicker(.video) }
+                          hint: "选择视频") { openPicker(.video) }
             ReadinessChip(title: "脚本", done: hasScript, icon: "doc.text",
-                          hint: "载入时间轴脚本", enabled: !pickerBlocked) { openPicker(.script) }
+                          hint: "载入时间轴脚本") { openPicker(.script) }
         }
     }
 
@@ -756,9 +769,9 @@ struct VideoSyncView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 8)
+            // 同上：设备需要处理时不用 disabled（灰了不知道为什么），点一下由 openPicker 拦下并说明
             Button(action, action: perform)
                 .buttonStyle(PillButtonStyle(kind: .secondary))
-                .disabled(pickerBlocked)
         }
     }
 

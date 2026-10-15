@@ -122,8 +122,9 @@ struct ActiveChannels: Equatable {
 struct FavoriteSetting: Codable, Identifiable, Equatable {
     static let maxCount = 8
     static let maxNameLength = 12
-    /// 打字过程中的草稿上限：比 maxNameLength 宽松得多，拼音还没上屏时不会被截断（完成时再截到 maxNameLength）
-    static let maxDraftLength = 40
+    /// 打字过程中的草稿上限：远超 12 字成品名的任何输入法组合长度（拼音还没上屏时不回写不同长度的字符串，
+    /// 组合不会被截断打断）；真正的字数限制在 finalizeNames 里收（完成 / 切走 / 下次启动）
+    static let maxDraftLength = 200
     /// 自动起的名字（按顺序取第一个没用过的）
     static let suggestedNames = ["微醺", "心动", "缠绵", "悸动", "沉溺", "迷离", "余温", "失控边缘"]
 

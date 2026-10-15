@@ -342,7 +342,7 @@ struct AgeGateView: View {
                         }
                         .tint(Velvet.rose)
                         .velvetCard()
-                        .velvetAppear(delay: 0.18)
+                        // 入场动画只给装饰和文案：开关是能点的东西，不淡入（淡入中也能点到看不见的控件）
                     }
 
                     VStack(spacing: 12) {
@@ -359,7 +359,7 @@ struct AgeGateView: View {
                             .font(.caption)
                             .foregroundColor(Velvet.textMuted)
                     }
-                    .velvetAppear(delay: 0.2)
+                    // 同上：「我已年满 18 岁，进入」不加入场动画，一出现就看得见、点得到
                     Spacer(minLength: 20)
                 }
                 .padding(.horizontal, 24)

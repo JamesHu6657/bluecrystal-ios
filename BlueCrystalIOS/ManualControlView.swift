@@ -451,7 +451,7 @@ struct ManualControlView: View {
     private var settingsCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             Button {
-                withAnimation(.easeInOut(duration: 0.25)) { showDetails.toggle() }
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.25)) { showDetails.toggle() }
                 Haptics.select()
             } label: {
                 HStack {
@@ -765,6 +765,8 @@ private struct ChannelControl: View {
     let maxLevel: Int
     let onChange: (Double) -> Void
     @Environment(\.isEnabled) private var isEnabled
+    /// 数值跟着动态字体放大（低视力用户也要读得到当前强度）
+    @ScaledMetric(relativeTo: .title2) private var valueFontSize: CGFloat = 30
 
     var body: some View {
         let color = Velvet.channel(channel)
@@ -785,7 +787,7 @@ private struct ChannelControl: View {
                     .foregroundColor(Velvet.text)
                 Spacer()
                 Text("\(Int(value))")
-                    .font(Velvet.serif(30, .light))
+                    .font(Velvet.serif(valueFontSize, .light))
                     .monospacedDigit()
                     .foregroundColor(Velvet.text)
                 Text("/ \(maxLevel)")
