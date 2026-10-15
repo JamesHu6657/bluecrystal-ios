@@ -42,6 +42,9 @@ struct AIStep: Equatable {
 /// - 只要出现任何不算数的指令样式文字（行内、引用、代码块里、格式错、STOP 之后还有指令），
 ///   或步数超过 maxSteps，整条回复的程序都作废：只显示文字，一步都不执行
 ///   （调用方此时如果在输出，要安全停止）。
+/// - 第四轮 M2：去掉格式类字符（零宽空格等）、做 NFKC、把中文括号当成方括号之后才像指令的文字
+///   （［STOP］、【STOP】、[ＳＴＯＰ]、[ST​OP]）也算格式错，整条作废。之前它们被当成普通文字放过，
+///   模型想停却继续保持最后的强度。
 /// - CH 任何一个值超过 BCProtocol.maxManualLevel（99）都算格式错，整条作废（不夹紧）。
 /// - 合法时 c3（旋转）恒为 0，HOLD 夹到 500~60000 毫秒。
 ///   AI 强度上限 70、每秒每通道最多 +20、从 0 爬升、总时长上限由执行前的 AISafety 处理。
@@ -73,6 +76,27 @@ struct AIReply {
     private static func containsCommandToken(_ s: String) -> Bool {
         guard let re = tokenRegex else { return s.contains("[") }
         return re.firstMatch(in: s, range: NSRange(location: 0, length: (s as NSString).length)) != nil
+    }
+
+    /// 第四轮 M2：常见的中文 / 数学括号，只在"像不像指令"的判断里当成方括号（全角 ［］ NFKC 本来就会折叠，这里一并列上）
+    private static let bracketLookalikes: [Character: Character] = [
+        "【": "[", "】": "]", "〔": "[", "〕": "]", "〖": "[", "〗": "]",
+        "〘": "[", "〙": "]", "〚": "[", "〛": "]", "⟦": "[", "⟧": "]", "［": "[", "］": "]",
+    ]
+
+    /// 第四轮 M2：只用来判断"像不像指令"（绝不用来解析执行）。
+    /// 去掉格式类字符（Cf：零宽空格、零宽连接符、BOM、方向控制符…），做 NFKC（全角字母 / 括号 → 半角），
+    /// 再把中文括号换成方括号
+    static func detectionForm(_ s: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: s.unicodeScalars.filter { $0.properties.generalCategory != .format })
+        let folded = String(scalars).precomposedStringWithCompatibilityMapping
+        return String(folded.map { bracketLookalikes[$0] ?? $0 })
+    }
+
+    /// 第四轮 M2：原文不算指令、归一化之后却像指令（［STOP］、【STOP】、[ＳＴＯＰ]、[ST​OP]）：写法不标准
+    static func looksLikeNonstandardCommand(_ s: String) -> Bool {
+        !containsCommandToken(s) && containsCommandToken(detectionForm(s))
     }
 
     private static func isDecimal(_ s: Substring) -> Bool {
@@ -177,6 +201,11 @@ struct AIReply {
         for rawLine in lines {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             let hasToken = containsCommandToken(line)
+            // 第四轮 M2：写法不标准的"指令"（全角 / 中文括号、全角字母、夹了零宽字符）不再当普通文字放过：
+            // 模型很可能就是想停，按格式错整条作废，调用方在输出中会安全停止
+            if !hasToken, rejection == nil, looksLikeNonstandardCommand(line) {
+                rejection = "指令写法不标准（全角括号、全角字母或隐藏字符），整条不执行：\(line)"
+            }
             let indent = rawLine.prefix(while: { $0.isWhitespace })
             let plainIndent = indent.count <= 3 && indent.allSatisfy { $0 == " " }
             let run = fenceRun(rawLine.dropFirst(indent.count))

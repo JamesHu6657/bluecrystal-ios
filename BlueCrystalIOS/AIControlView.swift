@@ -299,7 +299,7 @@ final class AIControlVM: ObservableObject {
     private var endWithStop = false
     /// 回复授权（只在主线程读写，规则见 ReplyAuthorization）：所有停止都经 terminalStop 作废
     private var auth = ReplyAuthorization()
-    /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断、总时长到点）结果直接丢弃
+    /// 只有最新一次请求的结果会被处理；被取代的请求（停止词打断、总时长到点、用户点停止）结果直接丢弃
     private var requestID = 0
     private var requestTask: Task<Void, Never>?
     private(set) var tabActive = false
@@ -381,6 +381,24 @@ final class AIControlVM: ObservableObject {
     /// 用户点停止 / 说了停止词 / 离开页面
     func stopAll(reason: String = "已停止") {
         terminalStop(reason: reason, sendStop: true)
+    }
+
+    /// 用户点了停止键（本页页头 / 输入栏 / 解锁页 / 设置页，后两个经 PrivacyLock.stopAllRequested）：
+    /// 和 stopAll 一样停程序、作废授权、发停止帧对，另外放弃正在等的回复。
+    /// 第四轮：之前 isThinking 一直挂到 45 秒总时限，这期间发不了新消息（只有停止词能发）。
+    /// 被动停机、程序自然结束不走这里：那时可能正在等用户新一句话的回复，不能把它丢掉
+    func userStop() {
+        stopAll()
+        abandonPendingRequest()
+    }
+
+    /// 放弃进行中的请求：requestID 变了，取消后的报错、迟到的结果和总时限到点都不再处理
+    private func abandonPendingRequest() {
+        guard isThinking || requestTask != nil else { return }
+        requestTask?.cancel()
+        requestTask = nil
+        requestID &+= 1
+        isThinking = false
     }
 
     /// 所有真正的停止都走这里：先作废停止前发出的请求，再停程序。
@@ -749,8 +767,8 @@ struct AIControlView: View {
             settingsNoticeGen += 1
             withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) { settingsNotice = nil }
         }
-        // 解锁页上的停止：和本页停止键同一个 stopAll（停程序、作废授权）
-        .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
+        // 解锁页 / 设置页上的停止：和本页停止键同一个 userStop（停程序、作废授权、放弃正在等的回复）
+        .onReceive(privacy.stopAllRequested) { _ in vm.userStop() }
     }
 
     private static let bottomID = "chat-bottom"
@@ -816,7 +834,7 @@ struct AIControlView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 4)
                 Button("停止", role: .destructive) {
-                    vm.stopAll()
+                    vm.userStop()
                     Haptics.stop()
                 }
                 .buttonStyle(PillButtonStyle(kind: .danger))
@@ -1031,7 +1049,7 @@ struct AIControlView: View {
             // 第三轮 M2：停止键常驻输入栏。聊天记录一长页头之外的内容会滚走，
             // 输入栏始终在底部，不用滚动、不用打字也能一下停
             Button(role: .destructive) {
-                vm.stopAll()
+                vm.userStop()
                 Haptics.stop()
             } label: {
                 Image(systemName: "stop.fill")
