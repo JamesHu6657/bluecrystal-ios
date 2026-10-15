@@ -370,8 +370,11 @@ do {
     var gated = AudioReactiveShaper()
     var g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3)
     for _ in 0..<60 { g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3) }
-    for _ in 0..<200 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
+    for _ in 0..<1_000 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
     r4check(g.percent == 10, "自动灵敏度：安静段底噪不被放大，只保持最低强度（得到 \(g.percent)）")
+    var allQuiet = AudioReactiveShaper()
+    for _ in 0..<1_000 { _ = allQuiet.step(sineWindow(-50), settings: auto, dt: 0.3) }
+    r4check(allQuiet.refDb < -40, "自动灵敏度：整段都很安静的视频几分钟内也能学会自己的响度（refDb \(allQuiet.refDb)）")
     quietVideo.resetAdaptation()
     r4check(quietVideo.refDb == AudioReactiveShaper.autoInitialRefDb, "换视频重新学习响度")
     var learning = AudioReactiveShaper()

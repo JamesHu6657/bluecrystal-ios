@@ -732,21 +732,31 @@ struct SystemPlayerView: UIViewControllerRepresentable {
                     return
                 }
                 self.fullScreenVC = target
-                // 进全屏时设备已经需要处理：弹出动画中 dismiss 会被忽略，动画结束后补一次
-                self.exitFullScreenIfNeeded(self.attentionNeeded)
+                // 进全屏时设备已经需要处理：弹出动画中 dismiss 会被忽略，转场彻底结束后（下一轮主队列）补一次
+                self.retryExitSoon()
             }
         }
 
         /// 设备需要处理（停止未确认 / 要物理关机 / 断开后可能仍在输出）时退出系统全屏：
         /// 全屏盖在设备卡片和隐私层之上，警告和「解除锁定 / 强制断开」必须看得见
+        func retryExitSoon() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.exitFullScreenIfNeeded(self.attentionNeeded)
+            }
+        }
+
         func exitFullScreenIfNeeded(_ needed: Bool) {
             attentionNeeded = needed
             // 只关 AVKit 自己的全屏：presentedViewController 也可能是页面上的 sheet / 确认框，不能误关
             guard needed, let vc = playerViewController, let fs = fullScreenVC,
                   let presented = vc.presentedViewController, presented === fs,
                   !presented.isBeingPresented, !presented.isBeingDismissed else { return }
-            presented.dismiss(animated: true) { [weak self] in
-                // 程序化关闭不保证回调 willEnd：这里也把标志落回，离开页面时照常停机
+            // 由弹出者关闭：全屏上面若还压着别的层，也连同全屏一起关掉
+            guard let presenter = fs.presentingViewController else { return }
+            presenter.dismiss(animated: true) { [weak self, weak fs] in
+                // 程序化关闭不保证回调 willEnd：真关掉了才把标志落回，离开页面时照常停机
+                guard fs?.presentingViewController == nil else { return }
                 self?.fullScreenVC = nil
                 self?.onFullScreenChange(false)
             }
@@ -759,6 +769,9 @@ struct SystemPlayerView: UIViewControllerRepresentable {
                 if !ctx.isCancelled {
                     self?.fullScreenVC = nil
                     self?.onFullScreenChange(false)
+                } else {
+                    // 下滑退出中途取消：退出过程中错过的「需要处理」在这里补上
+                    self?.retryExitSoon()
                 }
             }
         }
