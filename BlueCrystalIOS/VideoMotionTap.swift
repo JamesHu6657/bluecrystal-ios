@@ -108,6 +108,10 @@ final class VideoMotionTap {
     private var analyzer = MotionAnalyzer()
     private var frame = LumaFrame()
     private var analyzedGeneration = -1
+    /// 帧的内容时间戳（algo-opt-1）：24 / 25 / 30 fps 片源 15 Hz 拉帧时能量不再一大一小地抖
+    private var displayClock = MotionDisplayClock()
+    /// Instruments「Points of Interest」里看每帧降采样 / 帧差耗时（不开 Instruments 时几乎零开销）
+    private static let signpostLog = OSLog(subsystem: "BlueCrystal.VisualSync", category: .pointsOfInterest)
     /// 上一拍的播放位置、上一次出样本的 host 时间：VFR 静止段（没有新帧但播放头在走）补零能量样本
     private var lastItemSeconds: Double = .nan
     private var lastSampleHost: CFTimeInterval = 0
@@ -258,11 +262,12 @@ final class VideoMotionTap {
     }
 
     /// workQueue：拉一帧（暂停时 hasNewPixelBuffer 为 false，自然没有样本）→ Y 平面降采样 → 帧差 → 写进电平计。
-    /// 时间戳用 host 时间（人眼看到的速度，倍速时能量跟着变快）
+    /// 时间戳用 host 时间轴（人眼看到的速度，倍速时能量跟着变快），按帧的显示时间校正到「这帧该显示的时刻」
     private func analyze(output: AVPlayerItemVideoOutput, hostTime: CFTimeInterval) {
         let generation = meter.currentGeneration
         if generation != analyzedGeneration {
             analyzer.reset()
+            displayClock.reset()
             analyzedGeneration = generation
         }
         let itemTime = output.itemTime(forHostTime: hostTime)
@@ -276,12 +281,14 @@ final class VideoMotionTap {
             if advancing, hostTime - lastSampleHost >= Self.stillFillInterval,
                hostTime - lastRealFrameHost <= Self.stillFillLimit,
                let still = analyzer.still(at: hostTime) {
+                displayClock.noteStill(at: hostTime)
                 lastSampleHost = hostTime
                 meter.add(still, generation: generation)
             }
             return
         }
-        guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else { return }
+        var shown = CMTime.invalid
+        guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &shown) else { return }
         guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { return }
         defer { _ = CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let format = CVPixelBufferGetPixelFormatType(buffer)
@@ -294,10 +301,19 @@ final class VideoMotionTap {
         let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
         guard width > 0, height > 0, rowBytes >= width else { return }
         let luma = UnsafeRawBufferPointer(start: UnsafeRawPointer(base), count: rowBytes * height)
-        guard downscaler.downscale(luma, width: width, height: height, bytesPerRow: rowBytes, into: &frame) else { return }
+        os_signpost(.begin, log: Self.signpostLog, name: "MotionDownscale")
+        let scaled = downscaler.downscale(luma, width: width, height: height, bytesPerRow: rowBytes, into: &frame)
+        os_signpost(.end, log: Self.signpostLog, name: "MotionDownscale")
+        guard scaled else { return }
         // 真实帧（含开播 / seek 后的参考帧）都算：之后的静止段照常补零
         lastRealFrameHost = hostTime
-        guard let sample = analyzer.analyze(frame, time: hostTime) else { return }
+        // 这一帧真正的显示时刻（换算到 host 时间轴；拿不到 / 不可信时就是 hostTime）
+        let frameTime = displayClock.time(host: hostTime, item: itemSeconds,
+                                          shown: shown.isValid ? shown.seconds : .nan)
+        os_signpost(.begin, log: Self.signpostLog, name: "MotionAnalyze")
+        let analyzed = analyzer.analyze(frame, time: frameTime)
+        os_signpost(.end, log: Self.signpostLog, name: "MotionAnalyze")
+        guard let sample = analyzed else { return }
         lastSampleHost = hostTime
         meter.add(sample, generation: generation)
     }

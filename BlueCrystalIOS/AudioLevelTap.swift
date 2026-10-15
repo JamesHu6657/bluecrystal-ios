@@ -60,6 +60,7 @@ final class AudioLevelMeter {
         var chunkPeakToPeak = 0.0
         var chunkMeanSquare = 0.0
         var chunkFrames = 0
+        var chunkBlocks = AudioBlockStats()
         for buffer in UnsafeMutableAudioBufferListPointer(list) {
             guard let data = buffer.mData else { continue }
             let channels = max(1, Int(buffer.mNumberChannels))
@@ -68,13 +69,15 @@ final class AudioLevelMeter {
             for ch in 0..<channels {
                 let stats = Self.channelStats(data, format: f, frames: n, channels: channels, channel: ch)
                 chunkPeakToPeak = max(chunkPeakToPeak, stats.peakToPeak)
+                // 块电平取最响那个声道的（同 meanSquare 的选法）
+                if stats.meanSquare >= chunkMeanSquare { chunkBlocks = stats.blocks }
                 chunkMeanSquare = max(chunkMeanSquare, stats.meanSquare)
             }
             chunkFrames = max(chunkFrames, n)
         }
         guard chunkFrames > 0 else { return }
         os_unfair_lock_lock(lock)
-        accumulator.add(peakToPeak: chunkPeakToPeak, meanSquare: chunkMeanSquare, frames: chunkFrames)
+        accumulator.add(peakToPeak: chunkPeakToPeak, meanSquare: chunkMeanSquare, frames: chunkFrames, blocks: chunkBlocks)
         os_unfair_lock_unlock(lock)
     }
 
@@ -96,6 +99,7 @@ final class AudioLevelMeter {
             let p = data.assumingMemoryBound(to: Int32.self)
             for i in 0..<n { s.add(Double(p[i * channels + ch]) * scale) }
         }
+        s.finish()
         return s
     }
 }

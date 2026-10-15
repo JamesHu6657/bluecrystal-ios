@@ -470,8 +470,9 @@ let suite = "bc.round4.audiosync"
 if let defaults = UserDefaults(suiteName: suite) {
     defaults.removePersistentDomain(forName: suite)
     r4check(AudioSyncSettings.load(from: defaults) == AudioSyncSettings(minPercent: AudioSyncSettings.defaultMinPercent,
-                                                                         autoGain: AudioSyncSettings.defaultAutoGain),
-            "声音设置：没存过用默认（最低强度 10%、自动灵敏度开）")
+                                                                         autoGain: AudioSyncSettings.defaultAutoGain,
+                                                                         softDuck: AudioSyncSettings.defaultSoftDuck),
+            "声音设置：没存过用默认（最低强度 10%、自动灵敏度开、轻柔声音降权开）")
     defaults.set("abc", forKey: AudioSyncSettings.Keys.maxPercent)
     defaults.set(9, forKey: AudioSyncSettings.Keys.channels)
     defaults.set(400.0, forKey: AudioSyncSettings.Keys.sensitivityDb)

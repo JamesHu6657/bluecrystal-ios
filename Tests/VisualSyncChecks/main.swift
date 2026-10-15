@@ -586,6 +586,310 @@ if let defaults = UserDefaults(suiteName: vsSuite) {
     vcheck(false, "画面设置：创建测试用 UserDefaults")
 }
 
+// MARK: - algo-opt-1：稳健去均值 / 近场分数 / 内容时间戳 / 来源交接 / 轻柔声音降权
+
+func vsNoise(_ x: Int, _ y: Int) -> UInt8 {
+    let h = (x &* 73_856_093) ^ (y &* 19_349_663)
+    return UInt8(40 + (h & 0x7fff_ffff) % 160)
+}
+
+do {
+    // 左边 40% 变暗 90：原来按整帧均值去均值，没动的右边也会被算成在动（覆盖率 ≈ 1）；中位数去均值后只剩左边几列
+    var an = MotionAnalyzer()
+    _ = an.analyze(vsFrame { x, y in vsNoise(x, y) }, time: 0)
+    let s = an.analyze(vsFrame { x, y in x < 26 ? UInt8(max(0, Int(vsNoise(x, y)) - 90)) : vsNoise(x, y) }, time: vsDt)
+    let c = s?.coverage ?? 1
+    vcheck(c > 0.3 && c <= 0.55, "稳健去均值：左 40% 变暗 → 覆盖率约 0.4~0.5、不是整幅（\(c)）")
+    vcheck(MotionAnalyzer.histogramMedian([0, 3, 0, 2], count: 5) == 1, "稳健去均值：直方图中位数（奇数个）")
+    vcheck(MotionAnalyzer.histogramMedian([0, 2, 0, 2], count: 4) == 2, "稳健去均值：直方图中位数（偶数个取中间两个平均）")
+    vcheck(MotionAnalyzer.histogramMedian([0, 0], count: 0) == 255, "稳健去均值：没有像素 → 差值 0")
+}
+
+/// 近场测试：前 2 秒小方块来回动；之后一个暗的、软纹理的「手」从左边 1 秒滑进来盖住 3/4 画面，再左右晃 5 像素
+func vsHand(_ i: Int) -> LumaFrame {
+    if i < 30 {
+        let bx = 10 + (i % 2) * 4
+        return vsFrame { x, y in (x >= bx && x < bx + 8 && y >= 14 && y < 22) ? 220 : vsNoise(x, y) }
+    }
+    let edge = i < 45 ? (i - 30) * 3 + 3 : 48 + (i % 2 == 0 ? 0 : 5)
+    return vsFrame { x, y in
+        guard x < edge else { return vsNoise(x, y) }
+        let ex = Double(x - edge + 48)
+        return UInt8(max(0, min(255, 35 + 20 * sin(ex / 4) + 10 * cos(Double(y) / 5))))
+    }
+}
+
+/// 跑一段画面：返回（最后 30 个样本的平均近场分数, 最大近场分数, 最后一拍输出, 同样窗口但近场分数清零的输出）
+func vsRunNear(_ frames: Int, _ gen: (Int) -> LumaFrame) -> (near: Double, maxNear: Double, out: Double, plain: Double) {
+    var an = MotionAnalyzer()
+    var acc = MotionWindowAccumulator()
+    var norm = MotionNormalizer()
+    var plainNorm = MotionNormalizer()
+    var nears: [Double] = []
+    var out = 0.0
+    var plain = 0.0
+    for i in 0..<frames {
+        if let s = an.analyze(gen(i), time: Double(i) * vsDt) {
+            acc.add(s)
+            nears.append(s.nearField)
+        }
+        if i % 5 == 4 {
+            let w = acc.drain()
+            var w0 = w
+            w0.nearField = 0
+            out = norm.step(w, gainDb: 0, auto: true, dt: 1.0 / 3)
+            plain = plainNorm.step(w0, gainDb: 0, auto: true, dt: 1.0 / 3)
+        }
+    }
+    let tail = nears.suffix(30)
+    return (tail.reduce(0, +) / Double(max(1, tail.count)), nears.max() ?? 0, out, plain)
+}
+
+do {
+    let hand = vsRunNear(100, vsHand)
+    vcheck(hand.near > 0.6, "近场：手滑进来盖住大半画面再晃 → 近场分数高（\(hand.near)）")
+    vcheck(hand.plain > 50 && hand.out <= 0.75 * hand.plain,
+           "近场：同一段画面输出明显变低（\(Int(hand.out)) vs 不降权 \(Int(hand.plain))）")
+    let pan = vsRunNear(90) { i in vsFrame { x, y in vsNoise(x - 2 * i, y) } }
+    vcheck(pan.maxNear <= 0.05 && pan.out == pan.plain, "近场：纯平移镜头不算近场（最大 \(pan.maxNear)）")
+    let small = vsRunNear(90) { i in
+        let bx = 10 + (i % 2) * 4
+        return vsFrame { x, y in (x >= bx && x < bx + 8 && y >= 14 && y < 22) ? 220 : vsNoise(x, y) }
+    }
+    vcheck(small.maxNear == 0 && small.out == small.plain && small.out > 0,
+           "近场：小物体来回动不受影响（输出 \(Int(small.out))）")
+    let big = vsRunNear(90) { i in
+        let o = (i % 2) * 3
+        return vsFrame { x, y in (x > 8 && x < 56) ? vsNoise(x + o, y + 50) : vsNoise(x, y) }
+    }
+    vcheck(big.near < 0.1 && abs(big.out - big.plain) <= 2,
+           "近场：大面积但同类纹理的动作基本不受影响（\(big.near)，\(Int(big.out)) vs \(Int(big.plain))）")
+}
+
+do {
+    // 近场窗口不训练参考值；近场只降不升
+    var learn = MotionNormalizer()
+    var frozen = MotionNormalizer()
+    for _ in 0..<30 {
+        _ = learn.step(MotionWindow(meanEnergy: 30, peakEnergy: 30, frames: 4, cutCount: 0, heldCount: 0),
+                       gainDb: 0, auto: true, dt: 0.3)
+        _ = frozen.step(MotionWindow(meanEnergy: 30, peakEnergy: 30, frames: 4, cutCount: 0, heldCount: 0,
+                                     coverage: 0.9, nearField: 0.8), gainDb: 0, auto: true, dt: 0.3)
+    }
+    vcheck(learn.refHigh > MotionNormalizer.initialHigh + 0.5 && frozen.refHigh == MotionNormalizer.initialHigh
+           && frozen.refLow == MotionNormalizer.initialLow, "近场：近场分数 ≥ 0.5 的窗口不学参考值")
+    var onlyLower = true
+    var inRange = true
+    for _ in 0..<2_000 {
+        var a = MotionNormalizer()
+        var b = MotionNormalizer()
+        let e = vsRandom() * 60
+        let near = vsRandom() < 0.1 ? Double.nan : vsRandom() * 1.2 - 0.1
+        let gain = -10 + vsRandom() * 25
+        let auto = vsRandom() < 0.5
+        let w = MotionWindow(meanEnergy: e, peakEnergy: e * (1 + vsRandom()), frames: 4, cutCount: 0, heldCount: 0,
+                             coverage: vsRandom(), nearField: near)
+        var w0 = w
+        w0.nearField = 0
+        let x = a.step(w, gainDb: gain, auto: auto, dt: 0.3)
+        let y = b.step(w0, gainDb: gain, auto: auto, dt: 0.3)
+        if x > y + 1e-9 { onlyLower = false }
+        if !(x >= 0 && x <= 100) { inRange = false }
+    }
+    vcheck(onlyLower && inRange, "近场：2000 组随机（含 NaN / 越界分数）只降不升、输出在 0~100")
+    var acc = MotionWindowAccumulator()
+    acc.add(MotionSample(time: 0, energy: 2, coverage: 0.2, isCut: false, isHeld: false, nearField: 0.4))
+    acc.add(MotionSample(time: 0.07, energy: 4, coverage: 0.6, isCut: false, isHeld: false, nearField: .nan))
+    let w = acc.drain()
+    vcheck(abs(w.coverage - 0.4) < 1e-12 && abs(w.nearField - 0.2) < 1e-12, "窗口：覆盖率 / 近场分数取平均（NaN 当 0）")
+}
+
+do {
+    // 24 fps 片源、15 Hz 拉帧：方块每个内容帧走 1 像素。按拉帧时刻算能量一大一小，按显示时刻算几乎恒定
+    func run(clocked: Bool) -> (spread: Double, monotonic: Bool) {
+        var an = MotionAnalyzer()
+        var clock = MotionDisplayClock()
+        var energies: [Double] = []
+        var last = -Double.infinity
+        var monotonic = true
+        for k in 0..<30 {
+            let host = 50 + Double(k) / 15
+            let item = Double(k) / 15
+            let shownFrame = Int((item * 24).rounded(.down))
+            let shown = Double(shownFrame) / 24
+            let t = clocked ? clock.time(host: host, item: item, shown: shown) : host
+            if t <= last || t > host { monotonic = false }
+            last = t
+            let bx = 4 + shownFrame
+            if let s = an.analyze(vsBlock(bx), time: t), s.energy > 0 { energies.append(s.energy) }
+        }
+        guard let lo = energies.min(), let hi = energies.max(), lo > 0 else { return (99, monotonic) }
+        return (hi / lo, monotonic)
+    }
+    let host = run(clocked: false)
+    let clocked = run(clocked: true)
+    vcheck(host.spread > 1.5 && clocked.spread < 1.1,
+           "内容时间戳：24 fps 片源能量不再一大一小（\(host.spread) → \(clocked.spread)）")
+    vcheck(clocked.monotonic, "内容时间戳：时间单调递增且不晚于拉帧时刻")
+    var c = MotionDisplayClock()
+    vcheck(c.time(host: 10, item: 5, shown: 4) == 10, "内容时间戳：滞后超过 0.5 秒不信，用拉帧时刻")
+    vcheck(c.time(host: 10.1, item: 5.1, shown: .nan) == 10.1, "内容时间戳：拿不到显示时间用拉帧时刻")
+    c.noteStill(at: 10.4)
+    let after = c.time(host: 10.47, item: 5.47, shown: 5.0)
+    vcheck(after > 10.4 && after <= 10.47, "内容时间戳：补过静止样本后不会倒回去（\(after)）")
+    var fuzz = MotionDisplayClock()
+    var ok = true
+    var prev = -Double.infinity
+    for k in 0..<500 {
+        let host = Double(k) * 0.07
+        let r = vsRandom()
+        let item = r < 0.05 ? Double.nan : host * (0.5 + vsRandom())
+        let shown = r < 0.1 ? Double.infinity : item - vsRandom() * 0.6
+        let t = fuzz.time(host: host, item: item, shown: shown)
+        if !t.isFinite || t > host || t < prev { ok = false }
+        prev = t
+    }
+    vcheck(ok && fuzz.rate >= 0.1 && fuzz.rate <= 8, "内容时间戳：随机 / NaN 输入下有限、单调、不晚于拉帧时刻")
+}
+
+do {
+    // 来源交接
+    var none = SourceHandover()
+    var same = true
+    for _ in 0..<2_000 {
+        let m = vsRandom() * 100
+        let c = vsRandom()
+        let sig = vsRandom() < 0.7
+        let r = none.blend(motion: m, confidence: c, motionSignal: sig, audio: vsRandom() * 100,
+                           audioSignal: vsRandom() < 0.5, dt: 0.3)
+        if r.value != (sig ? c * m : 0) || r.hasSignal != sig { same = false }
+    }
+    vcheck(same, "来源交接：没有交接时和原来逐位相同（2000 组随机）")
+    var h = SourceHandover()
+    h.begin(.motion)
+    let first = h.blend(motion: 40, confidence: 0, motionSignal: false, audio: 70, audioSignal: true, dt: 0.3)
+    vcheck(first.value == 70 && first.hasSignal, "来源交接：声音→画面第一拍画面还没热身时接着用声音")
+    var bounded = true
+    var ticks = 1
+    while h.isFading && ticks < 100 {
+        let m = vsRandom() * 100
+        let a = vsRandom() * 100
+        let r = h.blend(motion: m, confidence: vsRandom(), motionSignal: true, audio: a, audioSignal: true, dt: 0.3)
+        if r.value > max(m, a) + 1e-9 || r.value < 0 { bounded = false }
+        ticks += 1
+    }
+    vcheck(bounded, "来源交接：交接中不高于两个来源中较大的那个")
+    vcheck(!h.isFading && ticks <= 15, "来源交接：4 秒内淡出结束（\(ticks) 拍）")
+    var back = SourceHandover()
+    back.begin(.audio)
+    var n = 0
+    while back.isCatchingUp && n < 50 {
+        back.noteCatchUp(limited: [20, 20, 0, 0], direct: [60, 60, 0, 0])
+        n += 1
+    }
+    vcheck(n == SourceHandover.maxCatchUpTicks, "来源交接：画面→声音最多限速 10 拍")
+    back.begin(.audio)
+    back.noteCatchUp(limited: [60, 60, 0, 0], direct: [60, 60, 0, 0])
+    vcheck(!back.isCatchingUp, "来源交接：追上声音直出就结束")
+    // 限速追赶：每拍升幅 ≤ 20、不超过上限
+    var stage = SyncOutputStage()
+    stage.seed([10, 10, 0, 0])
+    let s60 = AudioSyncSettings(maxPercent: 60)
+    let r1 = stage.step(100, settings: s60, hasSignal: true)
+    let r2 = stage.step(100, settings: s60, hasSignal: true)
+    let r3 = stage.step(100, settings: s60, hasSignal: true)
+    vcheck(r1 == [30, 30, 0, 0] && r2 == [50, 50, 0, 0] && r3 == [60, 60, 0, 0], "来源交接：画面→声音追赶时每拍 +20、到上限为止")
+}
+
+// 轻柔声音：每段 4800 点 × 3（0.3 秒）的均匀噪声，振幅可按样本序号变
+func vsNoiseWindow(_ amp: (Int) -> Double) -> AudioWindow {
+    var acc = AudioWindowAccumulator()
+    for chunk in 0..<3 {
+        var st = AudioChannelStats()
+        for i in 0..<4_800 { st.add((vsRandom() * 2 - 1) * amp(chunk * 4_800 + i)) }
+        st.finish()
+        acc.add(peakToPeak: st.peakToPeak, meanSquare: st.meanSquare, frames: 4_800, blocks: st.blocks)
+    }
+    return acc.drain()
+}
+
+do {
+    var st = AudioChannelStats()
+    for i in 0..<1_224 { st.add(i < 512 ? 0.01 : 0.2 * (i % 2 == 0 ? 1 : -1)) }
+    st.finish()
+    vcheck(st.blocks.count == 3 && st.blocks.onsets == 1, "块电平：512 点一块、末尾 ≥ 128 点也算、跳高 ≥ 6 dB 记一次起音（\(st.blocks.count) / \(st.blocks.onsets)）")
+    var tiny = AudioChannelStats()
+    for _ in 0..<100 { tiny.add(0.5) }
+    tiny.finish()
+    vcheck(tiny.blocks.count == 0 && tiny.peakToPeak == 0 && tiny.meanSquare == 0.25, "块电平：不足 128 点不成块，峰峰值 / 均方照旧")
+    var silent = AudioChannelStats()
+    for _ in 0..<2_048 { silent.add(0) }
+    silent.finish()
+    vcheck(silent.blocks.count == 0, "块电平：静音块不进统计")
+}
+
+do {
+    let amp = pow(10, -30.0 / 20) * 3.0.squareRoot()  // 均匀噪声 RMS −30 dBFS
+    for auto in [false, true] {
+        var duck = AudioReactiveShaper()
+        var plain = AudioReactiveShaper()
+        let on = AudioSyncSettings(maxPercent: 100, autoGain: auto, softDuck: true)
+        let off = AudioSyncSettings(maxPercent: 100, autoGain: auto)
+        var d = 0
+        var p = 0
+        for _ in 0..<150 {
+            let w = vsNoiseWindow { _ in amp }
+            d = duck.step(w, settings: on, dt: 0.3).percent
+            p = plain.step(w, settings: off, dt: 0.3).percent
+        }
+        vcheck(p > 30 && Double(d) <= 0.75 * Double(p),
+               "轻柔声音：持续平稳的小声底噪输出明显变轻（\(auto ? "自动" : "手动")：\(p) → \(d)）")
+        var pd = AudioReactiveShaper()
+        var pp = AudioReactiveShaper()
+        for _ in 0..<150 {
+            let w = vsNoiseWindow { i in (i / 2_400) % 2 == 0 ? amp * 4 : amp * 0.25 }
+            d = pd.step(w, settings: on, dt: 0.3).percent
+            p = pp.step(w, settings: off, dt: 0.3).percent
+        }
+        vcheck(abs(d - p) <= 2, "轻柔声音：一阵一阵有起伏的声音不受影响（\(auto ? "自动" : "手动")：\(p) / \(d)）")
+    }
+    // 开关关着：块数据有没有都逐位相同；开着只会更轻；随机 / NaN 输入也在 0 ~ 上限
+    var a = AudioReactiveShaper()
+    var b = AudioReactiveShaper()
+    var on = AudioReactiveShaper()
+    var identical = true
+    var onlyLower = true
+    var bounded = true
+    for _ in 0..<2_000 {
+        let s = AudioSyncSettings(sensitivityDb: -20 + vsRandom() * 50, maxPercent: vsRandom() * 120,
+                                  minPercent: vsRandom() * 60, autoGain: vsRandom() < 0.5)
+        var sOn = s
+        sOn.softDuck = true
+        let r = vsRandom()
+        let w = AudioWindow(peakToPeak: r < 0.03 ? .nan : vsRandom() * 2.5, rms: r > 0.97 ? .infinity : vsRandom() * 0.5,
+                            frames: Int(vsRandom() * 3) * 1_000)
+        var wb = w
+        wb.blockCount = Int(vsRandom() * 40)
+        wb.blockDbMean = -60 + vsRandom() * 60
+        wb.blockDbStd = vsRandom() < 0.02 ? .nan : vsRandom() * 12
+        wb.onsets = Int(vsRandom() * 6)
+        let dt = vsRandom() < 0.02 ? Double.nan : vsRandom() * 1.5
+        let hasAudio = vsRandom() < 0.7
+        let x = a.step(w, settings: s, dt: dt, hasAudio: hasAudio)
+        let y = b.step(wb, settings: s, dt: dt, hasAudio: hasAudio)
+        let z = on.step(wb, settings: sOn, dt: dt, hasAudio: hasAudio)
+        if x != y { identical = false }
+        if z.percent > y.percent { onlyLower = false }
+        if z.percent < 0 || z.percent > Int(s.maxPercent.rounded(.down)) || !on.softness.isFinite
+            || !on.dynamics.isFinite || on.softness < 0 || on.softness > 1 { bounded = false }
+    }
+    vcheck(identical, "轻柔声音：开关关着时和以前逐位相同（块数据不影响输出，2000 组随机）")
+    vcheck(onlyLower, "轻柔声音：开着只会更轻、不会更强（同一串随机窗口）")
+    vcheck(bounded, "轻柔声音：随机 / NaN / 无穷输入下输出在 0 ~ 上限、内部状态有限")
+    vcheck(AudioSyncSettings().softDuck == false && AudioSyncSettings.defaultSoftDuck
+           && !AudioSyncSettings.Keys.softDuck.contains("."), "轻柔声音：init 默认关（老调用方不变）、App 默认开、键名不带点")
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)

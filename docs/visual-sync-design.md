@@ -562,6 +562,24 @@ xcrun swiftc \
 
 ---
 
+### algo-opt-1：联动算法优化（Notion AI，P1 之上的增量）
+
+只改纯逻辑和取帧 / 电平计的数据通路；`BLEManager.swift` / `SafetyLedger.swift` / `Protocol.swift` / `AIProgram.swift` 不动，
+输出仍只经 `VideoSyncPlayer.tick()` → `BLEManager.sendTick`，所有新项只会让输出更轻或更平滑。
+
+| 项 | 位置 | 做法 | 默认 |
+|---|---|---|---|
+| 稳健去均值 | `MotionAnalyzer.analyze` | 平移选择仍按均值去均值；能量 / 覆盖率改减「对齐后帧差的中位数」（511 档直方图），局部变暗不再把整幅算成在动 | 总是 |
+| 近场 / 遮挡分数 N | `MotionAnalyzer.updateNearField` → `MotionSample.nearField` → `MotionWindow.nearField` | 遮挡 = s(覆盖率) × max(s(直方图离背景), s(变糊))；贴脸晃动 = s(覆盖率) × s(平移采用率) × s(对齐残差)；背景 τ 4 s、近场时冻结 ≤ 6 s | 总是 |
+| 近场降权 | `MotionNormalizer.step` | ratio −= N·max(0, ratio − 0.6·固定尺度)；N ≥ 0.5 的窗口不学参考值 | 总是（只降不升） |
+| 内容时间戳 | `MotionDisplayClock` + `VideoMotionTap` | t = host − (播放头 − 帧显示时间)/速率（滞后 0~0.5 s 内），单调、间隔 ≥ 31 ms、不晚于 host；24 fps 片源能量不再一大一小 | 总是 |
+| 性能卫生 | `LumaDownscaler` / `MotionAnalyzer` | 裸指针读采样表、每帧临时数组复用、参考帧拷进已有存储；Instruments「Points of Interest」可看 `MotionDownscale` / `MotionAnalyze` | 总是 |
+| 轻柔声音降权 | `AudioChannelStats`（512 点块电平）→ `AudioWindow.block*` → `AudioReactiveShaper` | 起伏度 Dyn、轻柔度 S；电平 ×(1 − 0.4·S̄)，自动增益的放大部分 ×(0.3 + 0.7·Dyn̄) | 视频页开关「轻柔声音降权」，App 默认开；`AudioSyncSettings.init` 默认关（逐位不变） |
+| 来源交接 | `SourceHandover` + `VideoSyncPlayer` | 声音→画面：4 s 内用声音补画面热身空档并淡出（≤ max(两来源)）；画面→声音：先经 `SyncOutputStage` 限速追上直出（≤ 10 拍） | 播放中切换时 |
+
+没做（后续）：声音+画面可靠度混合（P2）、节奏 / 投影速度 + 自相关（P3）、亚像素 / 四象限相似变换平移、Vision（P4）。
+真机要验证：手贴镜头 / 遮挡片段的输出、24 / 25 fps 片源的平稳度、轻音乐 / 白噪声视频的力度、切换来源时的手感、Instruments 每帧耗时。
+
 ## 11. 风险与待定
 
 1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。
