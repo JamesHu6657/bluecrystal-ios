@@ -21,6 +21,8 @@
 		A1010023 /* PrivacyGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020033 /* PrivacyGate.swift */; };
 		A1010024 /* Favorites.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020034 /* Favorites.swift */; };
 		A1010025 /* AudioLevelTap.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020035 /* AudioLevelTap.swift */; };
+		A1010026 /* VisualSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020036 /* VisualSync.swift */; };
+		A1010027 /* VideoMotionTap.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1020037 /* VideoMotionTap.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -38,6 +40,8 @@
 		A1020033 /* PrivacyGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivacyGate.swift; sourceTree = "<group>"; };
 		A1020034 /* Favorites.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Favorites.swift; sourceTree = "<group>"; };
 		A1020035 /* AudioLevelTap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioLevelTap.swift; sourceTree = "<group>"; };
+		A1020036 /* VisualSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisualSync.swift; sourceTree = "<group>"; };
+		A1020037 /* VideoMotionTap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoMotionTap.swift; sourceTree = "<group>"; };
 		A1020008 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A1020009 /* BlueCrystalIOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = BlueCrystalIOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -78,6 +82,8 @@
 				A1020033 /* PrivacyGate.swift */,
 				A1020034 /* Favorites.swift */,
 				A1020035 /* AudioLevelTap.swift */,
+				A1020036 /* VisualSync.swift */,
+				A1020037 /* VideoMotionTap.swift */,
 				A1020008 /* Info.plist */,
 			);
 			path = BlueCrystalIOS;
@@ -172,6 +178,8 @@
 				A1010023 /* PrivacyGate.swift in Sources */,
 				A1010024 /* Favorites.swift in Sources */,
 				A1010025 /* AudioLevelTap.swift in Sources */,
+				A1010026 /* VisualSync.swift in Sources */,
+				A1010027 /* VideoMotionTap.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -216,14 +224,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 177;
+				CURRENT_PROJECT_VERSION = 178;
 				INFOPLIST_FILE = BlueCrystalIOS/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7.7;
+				MARKETING_VERSION = 1.7.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.bluecrystal.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -237,14 +245,14 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Manual;
 				CODE_SIGNING_ALLOWED = NO;
-				CURRENT_PROJECT_VERSION = 177;
+				CURRENT_PROJECT_VERSION = 178;
 				INFOPLIST_FILE = BlueCrystalIOS/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.7.7;
+				MARKETING_VERSION = 1.7.8;
 				PRODUCT_BUNDLE_IDENTIFIER = com.bluecrystal.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
