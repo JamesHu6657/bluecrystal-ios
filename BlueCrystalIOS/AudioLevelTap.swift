@@ -9,8 +9,8 @@ import os
 final class AudioLevelMeter {
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private var accumulator = AudioWindowAccumulator()
+    /// prepare 回调记下的处理格式；nil = 还没 prepare / 系统给的格式认不出（此时不分析、不输出）
     private var format: AudioSampleFormat?
-    private var unsupported = false
 
     init() {
         lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
@@ -36,19 +36,11 @@ final class AudioLevelMeter {
         os_unfair_lock_unlock(lock)
     }
 
-    /// 系统给的处理格式认不出：不分析，设备不输出
-    var formatUnsupported: Bool {
-        os_unfair_lock_lock(lock)
-        defer { os_unfair_lock_unlock(lock) }
-        return unsupported
-    }
-
     fileprivate func prepare(_ asbd: AudioStreamBasicDescription) {
         let f = AudioSampleFormat.resolve(formatID: UInt32(asbd.mFormatID), flags: UInt32(asbd.mFormatFlags),
                                           bitsPerChannel: UInt32(asbd.mBitsPerChannel))
         os_unfair_lock_lock(lock)
         format = f
-        unsupported = f == nil
         accumulator = AudioWindowAccumulator()
         os_unfair_lock_unlock(lock)
     }
