@@ -251,6 +251,20 @@ struct MotionAnalyzer {
         return MotionSample(time: time, energy: out, coverage: coverage, isCut: isCut, isHeld: held)
     }
 
+    /// 没有新帧但播放头在走（VFR 静止段）：当作一帧完全没动的画面，刷新参考时间，记零能量
+    mutating func still(at time: Double) -> MotionSample? {
+        guard let last = previousTime, time.isFinite, Self.gapRange.contains(time - last) else { return nil }
+        previousTime = time
+        let held = holdRemaining > 0
+        if held {
+            holdRemaining -= 1
+        } else {
+            record(0, at: time)
+        }
+        let out = held ? median(within: Self.substituteWindow, now: time) : 0
+        return MotionSample(time: time, energy: out, coverage: 0, isCut: false, isHeld: held)
+    }
+
     private mutating func remember(_ pixels: [UInt8], width: Int, height: Int, mean: Double,
                                    histogram: [Double], time: Double) {
         previous = pixels

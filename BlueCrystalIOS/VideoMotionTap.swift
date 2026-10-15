@@ -60,20 +60,27 @@ final class VideoMotionTap {
         case ready
         case noVideo
         case failed(String)
-        /// 发热降频 / 暂停（文字是界面提示）
+        /// 发热降频（文字是界面提示）
         case degraded(String)
+        /// 发热过高，画面分析暂停：不算在分析，最低强度立刻撤（不等新鲜度超时）
+        case thermalPaused(String)
 
         /// 分析器在跑（降频也算）；暂停时有没有新鲜样本由 VM 的 MotionFlowWatch 判断
         var isAnalyzing: Bool {
             switch self {
             case .ready, .degraded: return true
-            case .none, .loading, .noVideo, .failed: return false
+            case .none, .loading, .noVideo, .failed, .thermalPaused: return false
             }
         }
     }
 
+    /// 没有新帧时补零样本的最短间隔（低于分析器 0.5 s 的断档上限）
+    static let stillFillInterval: CFTimeInterval = 0.25
+
     private static var pixelAttributes: [String: Any] {
-        [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        // 两种 420 都接受：多数片源是 video range，只要 full range 会每帧多一次格式转换
+        [kCVPixelBufferPixelFormatTypeKey as String: [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                                      kCVPixelFormatType_420YpCbCr8BiPlanarFullRange],
          kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any]()]
     }
 
@@ -92,11 +99,16 @@ final class VideoMotionTap {
     private var inFlight = false
     private var paused = false
     private var cancelled = false
+    /// VM 没在联动时（暂停 / 离开页面 / 后台）不拉帧，省电
+    private var active = false
     // 下面只在 workQueue 上用
     private var downscaler = LumaDownscaler()
     private var analyzer = MotionAnalyzer()
     private var frame = LumaFrame()
     private var analyzedGeneration = -1
+    /// 上一拍的播放位置、上一次出样本的 host 时间：VFR 静止段（没有新帧但播放头在走）补零能量样本
+    private var lastItemSeconds: Double = .nan
+    private var lastSampleHost: CFTimeInterval = 0
 
     private init(item: AVPlayerItem, meter: VideoMotionMeter, completion: @escaping (Status) -> Void) {
         self.item = item
@@ -135,6 +147,13 @@ final class VideoMotionTap {
         }
         output = nil
         completion = nil
+    }
+
+    /// 主线程：VM 开始 / 停止联动时开关拉帧
+    func setActive(_ on: Bool) {
+        os_unfair_lock_lock(flagLock)
+        active = on
+        os_unfair_lock_unlock(flagLock)
     }
 
     private var isCancelled: Bool {
@@ -198,13 +217,14 @@ final class VideoMotionTap {
             timerRate = tickRate
             t.schedule(deadline: .now(), repeating: 1.0 / tickRate, leeway: .milliseconds(10))
         }
-        report(MotionThermalPolicy.note(for: state).map { Status.degraded($0) } ?? .ready)
+        let note = MotionThermalPolicy.note(for: state)
+        report(note.map { rate > 0 ? Status.degraded($0) : Status.thermalPaused($0) } ?? .ready)
     }
 
     /// timerQueue：上一帧还在算 / 暂停 / 已拆掉就丢掉这一拍
     private func fire(output: AVPlayerItemVideoOutput) {
         os_unfair_lock_lock(flagLock)
-        let skip = cancelled || paused || inFlight
+        let skip = cancelled || paused || inFlight || !active
         if !skip { inFlight = true }
         os_unfair_lock_unlock(flagLock)
         guard !skip else { return }
@@ -227,8 +247,21 @@ final class VideoMotionTap {
             analyzedGeneration = generation
         }
         let itemTime = output.itemTime(forHostTime: hostTime)
-        guard itemTime.isValid, output.hasNewPixelBuffer(forItemTime: itemTime),
-              let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else { return }
+        guard itemTime.isValid else { return }
+        let itemSeconds = itemTime.seconds
+        let advancing = itemSeconds.isFinite && lastItemSeconds.isFinite && itemSeconds > lastItemSeconds + 0.001
+        lastItemSeconds = itemSeconds
+        guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
+            // 录屏 / 幻灯片这类 VFR 片源静止时没有新帧：播放头在走、超过 0.25 s 没出样本，就补一个零能量样本，
+            // 保住参考帧和「安静时不归零」。暂停时播放头不走，不会误补
+            if advancing, hostTime - lastSampleHost >= Self.stillFillInterval,
+               let still = analyzer.still(at: hostTime) {
+                lastSampleHost = hostTime
+                meter.add(still, generation: generation)
+            }
+            return
+        }
+        guard let buffer = output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: nil) else { return }
         guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { return }
         defer { _ = CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let format = CVPixelBufferGetPixelFormatType(buffer)
@@ -243,6 +276,7 @@ final class VideoMotionTap {
         let luma = UnsafeRawBufferPointer(start: UnsafeRawPointer(base), count: rowBytes * height)
         guard downscaler.downscale(luma, width: width, height: height, bytesPerRow: rowBytes, into: &frame),
               let sample = analyzer.analyze(frame, time: hostTime) else { return }
+        lastSampleHost = hostTime
         meter.add(sample, generation: generation)
     }
 }

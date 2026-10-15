@@ -115,6 +115,19 @@ vcheck(vsDownscale(flatSource, width: 1280, height: 720, bytesPerRow: 100) == ni
 
 // MARK: - 帧差
 
+// VFR 静止段：没有新帧但播放头在走 → 零能量样本，参考帧保住
+do {
+    var an = MotionAnalyzer()
+    vcheck(an.still(at: 0) == nil, "静止补样：没有参考帧时不补")
+    _ = an.analyze(vsBlock(20), time: 0)
+    let s1 = an.still(at: 0.3)
+    vcheck(s1?.energy == 0 && s1?.isCut == false, "静止补样：0.3 s 没新帧 → 零能量样本")
+    let s2 = an.still(at: 0.6)
+    vcheck(s2 != nil && an.hasReference, "静止补样：连续补样不断档（参考时间跟着刷新）")
+    vcheck(an.analyze(vsBlock(24), time: 0.7) != nil, "静止补样：之后的新帧直接出样本，不再当参考帧")
+    vcheck(an.still(at: 2.0) == nil, "静止补样：断档超过 0.5 s 不补")
+}
+
 do {
     var an = MotionAnalyzer()
     vcheck(an.analyze(vsBlock(20), time: 0) == nil, "帧差：第一帧只当参考帧，没有样本")
@@ -469,9 +482,11 @@ do {
     var riseOK = true
     let specials: [Double] = [.nan, .infinity, -Double.infinity, -50, 1e9]
     for i in 0..<5_000 {
-        let s = AudioSyncSettings(maxPercent: -20 + vsRandom() * 170,
+        var s = AudioSyncSettings(maxPercent: -20 + vsRandom() * 170,
                                   channels: AudioSyncChannels(rawValue: Int(vsRandom() * 3)) ?? .both,
                                   minPercent: vsRandom() * 60)
+        // init 会把上限夹回 10~100：直接写越界值 / NaN，真正覆盖 hardCap 的防御分支
+        if i % 11 == 0 { s.maxPercent = [Double.nan, .infinity, -5, 500][i % 4] }
         let r = vsRandom()
         if r < 0.03 {
             st.reset()
@@ -483,7 +498,7 @@ do {
         }
         let v = i % 7 == 0 ? specials[i % specials.count] : vsRandom() * 120 - 10
         let out = st.step(v, settings: s, hasSignal: vsRandom() < 0.6)
-        let cap = min(Int(s.maxPercent.rounded(.down)), 99)
+        let cap = SyncOutputStage.hardCap(s)
         let frame = [UInt8](BCProtocol.videoFrame(levels: out))
         if out.count != 4 || out[2] != 0 || out[3] != 0 || frame[5] != 0 || frame[6] != 0 { withinCap = false }
         for ch in 0..<2 where out[ch] < 0 || out[ch] > cap { withinCap = false }

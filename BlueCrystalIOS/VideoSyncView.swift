@@ -454,12 +454,14 @@ final class VideoSyncPlayer: ObservableObject {
                 self.statusLine = "视频没有画面轨，画面联动没有输出"
             case .failed(let why):
                 self.statusLine = "画面分析不可用（\(why)），联动没有输出"
-            case .degraded(let why):
+            case .degraded(let why), .thermalPaused(let why):
                 self.statusLine = why
             case .none, .loading:
                 break
             }
         }
+        // 正在联动时切到画面：立刻开始拉帧
+        motionTap?.setActive(timer != nil)
     }
 
     /// 拆掉取帧（停定时器、item.remove(output)），智晚到的回调按代次作废
@@ -654,11 +656,13 @@ final class VideoSyncPlayer: ObservableObject {
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        motionTap?.setActive(true)
     }
 
     private func stopTimer(sendZero: Bool) {
         timer?.invalidate()
         timer = nil
+        motionTap?.setActive(false)
         lastTickAt = nil
         if sendZero {
             ble?.sendStop()
@@ -1440,7 +1444,7 @@ struct VideoSyncView: View {
                 return ("这个视频没有画面轨，画面联动没有输出", "video.slash")
             case .failed:
                 return ("画面分析不可用，联动没有输出", "exclamationmark.triangle")
-            case .degraded(let why):
+            case .degraded(let why), .thermalPaused(let why):
                 return (why, "thermometer.sun")
             case .none, .loading, .ready:
                 return nil
