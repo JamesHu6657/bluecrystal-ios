@@ -146,7 +146,8 @@ final class VideoSyncPlayer: ObservableObject {
                 // seek 进行中：seek 自己先暂停了播放器；之后系统控件先播再停 = 用户的暂停，不能被吞掉，
                 // 否则 seek 完成回调会 p.play() 把输出恢复
                 if self.isSeeking {
-                    if status != .paused {
+                    // 现查播放器：receive(on:) 送来的可能是上一次 seek 续播时排队的旧状态
+                    if p.timeControlStatus != .paused || p.rate > 0 {
                         self.seekSawPlay = true
                     } else if self.seekSawPlay, self.isPlaying {
                         self.seekSawPlay = false
@@ -686,6 +687,10 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         var isCovered: () -> Bool = { false }
         /// 自己监听的退后台：系统全屏盖着时页面未必刷新，多任务截图前必须把画面撤掉
         private var inBackground = false
+        /// AVKit 弹出的全屏 VC（只关它，不关别的弹层）
+        weak var fullScreenVC: UIViewController?
+        /// 页面最近一次给的「设备需要处理」
+        var attentionNeeded = false
 
         init(onFullScreenChange: @escaping (Bool) -> Void) {
             self.onFullScreenChange = onFullScreenChange
@@ -716,26 +721,45 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         func playerViewController(_ playerViewController: AVPlayerViewController,
                                   willBeginFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
             onFullScreenChange(true)
+            let target = coordinator.viewController(forKey: .to)
             coordinator.animate(alongsideTransition: nil) { [weak self] ctx in
+                guard let self = self else { return }
                 // 捏合进全屏中途松手 = 取消：不会再有 willEnd，必须在这里把标志改回来，
                 // 否则离开页面时 onDisappear 会把它当成全屏而不停机
-                if ctx.isCancelled { self?.onFullScreenChange(false) }
+                if ctx.isCancelled {
+                    self.fullScreenVC = nil
+                    self.onFullScreenChange(false)
+                    return
+                }
+                self.fullScreenVC = target
+                // 进全屏时设备已经需要处理：弹出动画中 dismiss 会被忽略，动画结束后补一次
+                self.exitFullScreenIfNeeded(self.attentionNeeded)
             }
         }
 
         /// 设备需要处理（停止未确认 / 要物理关机 / 断开后可能仍在输出）时退出系统全屏：
         /// 全屏盖在设备卡片和隐私层之上，警告和「解除锁定 / 强制断开」必须看得见
         func exitFullScreenIfNeeded(_ needed: Bool) {
-            guard needed, let vc = playerViewController, let presented = vc.presentedViewController,
-                  !presented.isBeingDismissed else { return }
-            presented.dismiss(animated: true)
+            attentionNeeded = needed
+            // 只关 AVKit 自己的全屏：presentedViewController 也可能是页面上的 sheet / 确认框，不能误关
+            guard needed, let vc = playerViewController, let fs = fullScreenVC,
+                  let presented = vc.presentedViewController, presented === fs,
+                  !presented.isBeingPresented, !presented.isBeingDismissed else { return }
+            presented.dismiss(animated: true) { [weak self] in
+                // 程序化关闭不保证回调 willEnd：这里也把标志落回，离开页面时照常停机
+                self?.fullScreenVC = nil
+                self?.onFullScreenChange(false)
+            }
         }
 
         func playerViewController(_ playerViewController: AVPlayerViewController,
                                   willEndFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
             coordinator.animate(alongsideTransition: nil) { [weak self] ctx in
                 // 取消了退出全屏就还在全屏
-                if !ctx.isCancelled { self?.onFullScreenChange(false) }
+                if !ctx.isCancelled {
+                    self?.fullScreenVC = nil
+                    self?.onFullScreenChange(false)
+                }
             }
         }
     }
@@ -1128,7 +1152,10 @@ struct VideoSyncView: View {
     }
 
     private var sensitivityText: String {
-        String(format: "×%.1f", pow(10, sensitivityDb / 20))
+        // 自动模式下手动灵敏度只做 ±6 dB 微调：读数显示实际生效的倍数
+        let r = AudioReactiveShaper.autoTrimRange
+        let db = autoGain ? min(r.upperBound, max(r.lowerBound, sensitivityDb)) : sensitivityDb
+        return String(format: autoGain ? "微调 ×%.1f" : "×%.1f", pow(10, db / 20))
     }
 
     /// 播放控制

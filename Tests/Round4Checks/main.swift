@@ -370,7 +370,7 @@ do {
     var gated = AudioReactiveShaper()
     var g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3)
     for _ in 0..<60 { g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3) }
-    for _ in 0..<20 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
+    for _ in 0..<200 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
     r4check(g.percent == 10, "自动灵敏度：安静段底噪不被放大，只保持最低强度（得到 \(g.percent)）")
     quietVideo.resetAdaptation()
     r4check(quietVideo.refDb == AudioReactiveShaper.autoInitialRefDb, "换视频重新学习响度")
