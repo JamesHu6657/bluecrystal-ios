@@ -294,10 +294,11 @@ final class VideoMotionTap {
         let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
         guard width > 0, height > 0, rowBytes >= width else { return }
         let luma = UnsafeRawBufferPointer(start: UnsafeRawPointer(base), count: rowBytes * height)
-        guard downscaler.downscale(luma, width: width, height: height, bytesPerRow: rowBytes, into: &frame),
-              let sample = analyzer.analyze(frame, time: hostTime) else { return }
-        lastSampleHost = hostTime
+        guard downscaler.downscale(luma, width: width, height: height, bytesPerRow: rowBytes, into: &frame) else { return }
+        // 真实帧（含开播 / seek 后的参考帧）都算：之后的静止段照常补零
         lastRealFrameHost = hostTime
+        guard let sample = analyzer.analyze(frame, time: hostTime) else { return }
+        lastSampleHost = hostTime
         meter.add(sample, generation: generation)
     }
 }
