@@ -200,6 +200,143 @@ let landing = tl(80, 0.05)
 r4check(!skipped.isCovered(at: 80.1, previous: 80, fromPlaybackStart: true), "seek：落点前跳过的命令不补发")
 r4check(landing.isCovered(at: 80.1, previous: 80, fromPlaybackStart: true), "seek：恢复首个采样仍覆盖落点的短命令")
 
+// MARK: - 声音联动：采样格式、窗口电平、灵敏度 / 噪声门 / 平滑 / 上限
+
+let lpcm = AudioSampleFormat.linearPCM
+r4check(AudioSampleFormat.resolve(formatID: lpcm, flags: 1 | 8 | 32, bitsPerChannel: 32) == .float32,
+        "声音：Float32 非交错可分析")
+r4check(AudioSampleFormat.resolve(formatID: lpcm, flags: 1 | 8, bitsPerChannel: 64) == .float64, "声音：Float64 可分析")
+r4check(AudioSampleFormat.resolve(formatID: lpcm, flags: 4 | 8, bitsPerChannel: 16) == .int16, "声音：Int16 可分析")
+r4check(AudioSampleFormat.resolve(formatID: lpcm, flags: 4 | 8, bitsPerChannel: 32) == .int32, "声音：Int32 可分析")
+r4check(AudioSampleFormat.resolve(formatID: lpcm, flags: 1 | 2, bitsPerChannel: 32) == nil, "声音：大端不分析")
+r4check(AudioSampleFormat.resolve(formatID: lpcm, flags: 4, bitsPerChannel: 24) == nil, "声音：24 位打包不分析")
+r4check(AudioSampleFormat.resolve(formatID: lpcm, flags: 8, bitsPerChannel: 16) == nil, "声音：无符号整数不分析")
+r4check(AudioSampleFormat.resolve(formatID: 0x6161_6320, flags: 0, bitsPerChannel: 0) == nil, "声音：压缩格式不分析")
+r4check(AudioSampleFormat.int16.scale * 32_768 == 1 && AudioSampleFormat.int16.bytesPerSample == 2, "声音：Int16 归一化")
+
+var chStats = AudioChannelStats()
+for v in [0.5, -0.5, 0.5, -0.5, .nan, .infinity] { chStats.add(v) }
+r4check(chStats.count == 4 && chStats.peakToPeak == 1 && chStats.meanSquare == 0.25, "声音：峰峰值 / 均方，非有限值跳过")
+r4check(AudioChannelStats().peakToPeak == 0 && AudioChannelStats().meanSquare == 0, "声音：空段为 0")
+
+var acc = AudioWindowAccumulator()
+acc.add(peakToPeak: 1, meanSquare: 0.25, frames: 100)
+acc.add(peakToPeak: 0.2, meanSquare: 0.01, frames: 300)
+acc.add(peakToPeak: .nan, meanSquare: 1, frames: 100)
+acc.add(peakToPeak: 5, meanSquare: 1, frames: 0)
+let win = acc.drain()
+r4check(win.peakToPeak == 1 && win.frames == 400 && abs(win.rms - 0.07.squareRoot()) < 1e-9,
+        "声音：窗口取最大峰峰值、按帧数加权 RMS，坏数据不进窗口")
+r4check(acc.drain() == .silent, "声音：取走后清零")
+
+/// 幅度为 10^(dB/20) 的正弦窗口：峰值与 RMS 归一后都等于幅度，电平正好是 dB
+func sineWindow(_ db: Double) -> AudioWindow {
+    let a = pow(10, db / 20)
+    return AudioWindow(peakToPeak: 2 * a, rms: a / 2.0.squareRoot(), frames: 4_800)
+}
+r4check(abs(AudioReactiveShaper.loudnessDb(sineWindow(0))) < 1e-9, "声音：满幅正弦 0 dB")
+r4check(AudioReactiveShaper.loudnessDb(.silent) == -.infinity, "声音：没有音频 = 静音")
+r4check(AudioReactiveShaper.loudnessDb(AudioWindow(peakToPeak: 0, rms: 0, frames: 100)) == -.infinity, "声音：全零 = 静音")
+r4check(AudioReactiveShaper.targetPercent(loudnessDb: -3, sensitivityDb: 0) == 100, "声音：-3 dB 映射 100")
+r4check(AudioReactiveShaper.targetPercent(loudnessDb: -45, sensitivityDb: 0) == 0, "声音：-45 dB 映射 0")
+r4check(abs(AudioReactiveShaper.targetPercent(loudnessDb: -24, sensitivityDb: 0) - 50) < 1e-9, "声音：-24 dB 映射 50")
+r4check(abs(AudioReactiveShaper.targetPercent(loudnessDb: -30, sensitivityDb: 6) - 50) < 1e-9, "声音：灵敏度 +6 dB 等于电平 +6 dB")
+r4check(AudioReactiveShaper.targetPercent(loudnessDb: 0, sensitivityDb: -12) < 100, "声音：灵敏度调低后响的视频不再顶满")
+r4check(AudioReactiveShaper.targetPercent(loudnessDb: -61, sensitivityDb: 18) == 0, "声音：底噪在增益前就归零，灵敏度最大也不放大")
+r4check(AudioReactiveShaper.targetPercent(loudnessDb: .nan, sensitivityDb: 0) == 0, "声音：NaN 电平按 0")
+
+let cautious = AudioSyncSettings()
+r4check(cautious.enabled && cautious.maxPercent == 60 && cautious.sensitivityDb == 0 && cautious.channels == .both,
+        "声音：默认设置保守（上限 60%）")
+var shaper = AudioReactiveShaper()
+let gateLow = shaper.step(sineWindow(-45 + 0.06 * 42), settings: cautious, dt: 0.3)
+r4check(gateLow.percent == 0 && !shaper.gateOpen && abs(gateLow.level - 6) < 1e-6, "声音：门槛以下的小声音输出 0（电平条仍显示）")
+let loud1 = shaper.step(sineWindow(-3), settings: cautious, dt: 0.3)
+r4check(shaper.gateOpen && loud1.percent >= 55 && loud1.percent <= 60, "声音：变响一步就跟上（攻击快），不超过上限")
+for _ in 0..<5 { _ = shaper.step(sineWindow(-3), settings: cautious, dt: 0.3) }
+let loudHold = shaper.step(sineWindow(0), settings: cautious, dt: 0.3)
+r4check(loudHold.percent == 60, "声音：持续最响 = 强度上限（60），不会更高")
+let quiet1 = shaper.step(.silent, settings: cautious, dt: 0.3)
+r4check(quiet1.percent > 30 && quiet1.percent < 60 && !shaper.gateOpen, "声音：变静慢慢落（释放慢），门已关")
+var released = quiet1
+for _ in 0..<20 { released = shaper.step(.silent, settings: cautious, dt: 0.3) }
+r4check(released.percent == 0, "声音：持续安静 6 秒内落到 0")
+
+shaper.reset()
+_ = shaper.step(sineWindow(-24), settings: cautious, dt: 0.3)
+_ = shaper.step(sineWindow(-45 + 0.06 * 42), settings: cautious, dt: 0.3)
+r4check(shaper.gateOpen, "声音：噪声门回差——门槛之间不关门")
+_ = shaper.step(sineWindow(-45 + 0.03 * 42), settings: cautious, dt: 0.3)
+r4check(!shaper.gateOpen, "声音：低于关门值才关")
+
+shaper.reset()
+let full = AudioSyncSettings(maxPercent: 100)
+var fullOut = shaper.step(sineWindow(0), settings: full, dt: 0.3)
+for _ in 0..<10 { fullOut = shaper.step(sineWindow(0), settings: full, dt: 0.3) }
+r4check(fullOut.percent == 100 && AudioSyncChannels.both.levels(percent: fullOut.percent) == [99, 99, 0, 0],
+        "声音：上限 100% 时最高 99 档（0x08 帧上限）")
+
+shaper.reset()
+let weird = shaper.step(AudioWindow(peakToPeak: .infinity, rms: .nan, frames: 10), settings: cautious, dt: .nan)
+r4check(weird.percent == 0 && shaper.smoothed.isFinite, "声音：坏数据 / NaN 步长不产生输出")
+_ = shaper.step(sineWindow(-3), settings: cautious, dt: 1_000)
+r4check(shaper.smoothed <= 100, "声音：超长步长也夹在 0~100")
+
+// 随机输入：任何时候都不超过上限，吮吸 / 未使用通道恒 0
+var seed: UInt64 = 0x5EED
+func nextRandom() -> Double {
+    seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+    return Double(seed >> 11) / Double(1 << 53)
+}
+var withinCap = true
+var randomShaper = AudioReactiveShaper()
+for _ in 0..<2_000 {
+    let s = AudioSyncSettings(sensitivityDb: -20 + nextRandom() * 50, maxPercent: nextRandom() * 120,
+                              channels: AudioSyncChannels(rawValue: Int(nextRandom() * 3)) ?? .both)
+    let w = AudioWindow(peakToPeak: nextRandom() * 2.5, rms: nextRandom(), frames: Int(nextRandom() * 3) * 1_000)
+    let out = randomShaper.step(w, settings: s, dt: nextRandom() * 1.5)
+    let levels = s.channels.levels(percent: out.percent)
+    let frame = [UInt8](BCProtocol.videoFrame(levels: levels))
+    if out.percent < 0 || out.percent > Int(s.maxPercent) || levels[2] != 0 || levels[3] != 0
+        || frame[5] != 0 || frame[6] != 0 || levels.contains(where: { $0 > 99 }) {
+        withinCap = false
+    }
+}
+r4check(withinCap, "声音：2000 次随机输入都不超过上限，通道 2 / 3 恒 0")
+
+r4check(AudioSyncChannels.thrust.levels(percent: 40) == [40, 0, 0, 0], "声音：仅伸缩")
+r4check(AudioSyncChannels.vibration.levels(percent: 40) == [0, 40, 0, 0], "声音：仅震动")
+r4check(AudioSyncChannels.both.levels(percent: -5) == [0, 0, 0, 0], "声音：负值按 0")
+let audioFrame = [UInt8](BCProtocol.videoFrame(levels: AudioSyncChannels.both.levels(percent: 60)))
+r4check(audioFrame[1] == 0x08 && audioFrame[3] == 60 && audioFrame[4] == 60 && audioFrame[5] == 0 && audioFrame[6] == 0
+        && audioFrame[7] == 0 && audioFrame[8] == 0, "声音：0x08 帧伸缩 / 震动同值、吮吸 0、尾部 00 00")
+
+let clamped = AudioSyncSettings(sensitivityDb: 99, maxPercent: 500)
+r4check(clamped.sensitivityDb == 18 && clamped.maxPercent == 100, "声音设置：超范围夹回")
+let clampedLow = AudioSyncSettings(sensitivityDb: -99, maxPercent: 1)
+r4check(clampedLow.sensitivityDb == -12 && clampedLow.maxPercent == 10, "声音设置：过低夹回")
+let nanSettings = AudioSyncSettings(sensitivityDb: .nan, maxPercent: .infinity)
+r4check(nanSettings.sensitivityDb == 0 && nanSettings.maxPercent == 60, "声音设置：NaN / 无穷按默认")
+r4check(abs(AudioSyncSettings(sensitivityDb: 6).gainMultiplier - 1.9953) < 1e-3, "声音设置：+6 dB ≈ ×2")
+let suite = "bc.round4.audiosync"
+if let defaults = UserDefaults(suiteName: suite) {
+    defaults.removePersistentDomain(forName: suite)
+    r4check(AudioSyncSettings.load(from: defaults) == AudioSyncSettings(), "声音设置：没存过用默认")
+    defaults.set("abc", forKey: AudioSyncSettings.Keys.maxPercent)
+    defaults.set(9, forKey: AudioSyncSettings.Keys.channels)
+    defaults.set(400.0, forKey: AudioSyncSettings.Keys.sensitivityDb)
+    defaults.set(false, forKey: AudioSyncSettings.Keys.enabled)
+    let loaded = AudioSyncSettings.load(from: defaults)
+    r4check(loaded.maxPercent == 60 && loaded.channels == .both && loaded.sensitivityDb == 18 && !loaded.enabled,
+            "声音设置：存储里的坏值不放大输出")
+    defaults.removePersistentDomain(forName: suite)
+} else {
+    r4check(false, "声音设置：创建测试用 UserDefaults")
+}
+r4check(!AudioSyncSettings.Keys.enabled.contains(".") && !AudioSyncSettings.Keys.sensitivityDb.contains(".")
+        && !AudioSyncSettings.Keys.maxPercent.contains(".") && !AudioSyncSettings.Keys.channels.contains("."),
+        "声音设置：@AppStorage 键名不带点")
+
 if r4Failures > 0 {
     print("Round4Checks: \(r4Failures) FAIL")
     exit(1)

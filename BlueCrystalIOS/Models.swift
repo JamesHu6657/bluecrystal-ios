@@ -490,3 +490,252 @@ enum AIQuickReplies {
         isRunning ? Self.running : Self.idle
     }
 }
+// MARK: - 声音联动（视频页）：纯计算，Round4Checks 覆盖。
+// 实时线程只做 AudioChannelStats / AudioWindowAccumulator 这种不分配内存的累加；
+// 灵敏度、噪声门、平滑、上限都在主线程每 0.3 秒算一次（AudioReactiveShaper），结果走 BLEManager.sendTick。
+
+/// 音轨采样格式（MTAudioProcessingTap prepare 回调里的 ASBD）。
+/// 常量照 CoreAudioBaseTypes.h 抄过来：这个文件只依赖 Foundation，测试才能直接编译
+enum AudioSampleFormat: Equatable {
+    case float32, float64, int16, int32
+
+    static let linearPCM: UInt32 = 0x6C70_636D // 'lpcm'
+    static let flagIsFloat: UInt32 = 1 << 0
+    static let flagIsBigEndian: UInt32 = 1 << 1
+    static let flagIsSignedInteger: UInt32 = 1 << 2
+
+    /// 认不出的格式（压缩、大端、24 位打包、无符号整数等）返回 nil：不分析，设备不输出
+    static func resolve(formatID: UInt32, flags: UInt32, bitsPerChannel: UInt32) -> AudioSampleFormat? {
+        guard formatID == linearPCM, flags & flagIsBigEndian == 0 else { return nil }
+        if flags & flagIsFloat != 0 {
+            switch bitsPerChannel {
+            case 32: return .float32
+            case 64: return .float64
+            default: return nil
+            }
+        }
+        guard flags & flagIsSignedInteger != 0 else { return nil }
+        switch bitsPerChannel {
+        case 16: return .int16
+        case 32: return .int32
+        default: return nil
+        }
+    }
+
+    var bytesPerSample: Int {
+        switch self {
+        case .float32, .int32: return 4
+        case .float64: return 8
+        case .int16: return 2
+        }
+    }
+
+    /// 整数样本归一化到 ±1 的系数
+    var scale: Double {
+        switch self {
+        case .float32, .float64: return 1
+        case .int16: return 1.0 / 32_768
+        case .int32: return 1.0 / 2_147_483_648
+        }
+    }
+}
+
+/// 一个声道一段样本的峰峰值和均方（非有限值跳过）
+struct AudioChannelStats {
+    private(set) var minimum = Double.infinity
+    private(set) var maximum = -Double.infinity
+    private(set) var sumSquares: Double = 0
+    private(set) var count = 0
+
+    @inline(__always)
+    mutating func add(_ v: Double) {
+        guard v.isFinite else { return }
+        if v < minimum { minimum = v }
+        if v > maximum { maximum = v }
+        sumSquares += v * v
+        count += 1
+    }
+
+    var peakToPeak: Double { count > 0 ? maximum - minimum : 0 }
+    var meanSquare: Double { count > 0 ? sumSquares / Double(count) : 0 }
+}
+
+/// 一个分析窗口（约 0.3 秒）的结果。frames == 0 表示这段时间没有音频经过（暂停 / 缓冲 / 没有音轨）
+struct AudioWindow: Equatable {
+    var peakToPeak: Double = 0
+    var rms: Double = 0
+    var frames: Int = 0
+
+    static let silent = AudioWindow()
+}
+
+/// 窗口累加：每次 tap 回调交来"最响那个声道"的峰峰值 / 均方，多声道不相加（反相声道不会互相抵消）
+struct AudioWindowAccumulator {
+    private(set) var peakToPeak: Double = 0
+    private var weightedMeanSquare: Double = 0
+    private(set) var frames = 0
+
+    mutating func add(peakToPeak p2p: Double, meanSquare: Double, frames n: Int) {
+        guard n > 0, p2p.isFinite, meanSquare.isFinite, p2p >= 0, meanSquare >= 0 else { return }
+        peakToPeak = max(peakToPeak, p2p)
+        weightedMeanSquare += meanSquare * Double(n)
+        frames += n
+    }
+
+    /// 取走本窗口的结果并清零
+    mutating func drain() -> AudioWindow {
+        let window = frames > 0
+            ? AudioWindow(peakToPeak: peakToPeak, rms: (weightedMeanSquare / Double(frames)).squareRoot(), frames: frames)
+            : .silent
+        self = AudioWindowAccumulator()
+        return window
+    }
+}
+
+/// 声音联动输出到哪个通道。设备只有伸缩 / 震动：吮吸（索引 2）和索引 3 恒为 0
+enum AudioSyncChannels: Int, CaseIterable, Identifiable {
+    case both = 0
+    case thrust = 1
+    case vibration = 2
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .both: return "伸缩 + 震动"
+        case .thrust: return "仅伸缩"
+        case .vibration: return "仅震动"
+        }
+    }
+
+    /// 0~100 的强度换成 0x08 帧四通道（0~99）
+    func levels(percent: Int) -> [Int] {
+        let v = max(0, min(BCProtocol.maxManualLevel, percent))
+        switch self {
+        case .both: return [v, v, 0, 0]
+        case .thrust: return [v, 0, 0, 0]
+        case .vibration: return [0, v, 0, 0]
+        }
+    }
+}
+
+/// 声音联动设置（视频页 @AppStorage 持久化）。取值一律夹回范围，存储里的坏值不会放大输出
+struct AudioSyncSettings: Equatable {
+    /// 键名不带点：@AppStorage 走 KVO，点会被当成路径
+    enum Keys {
+        static let enabled = "bcAudioSyncEnabled"
+        static let sensitivityDb = "bcAudioSyncSensitivityDb"
+        static let maxPercent = "bcAudioSyncMaxPercent"
+        static let channels = "bcAudioSyncChannels"
+    }
+
+    static let defaultEnabled = true
+    /// 灵敏度 = 增益（dB）：-12 dB（×0.25）~ +18 dB（约 ×7.9）
+    static let sensitivityRange: ClosedRange<Double> = -12...18
+    static let defaultSensitivityDb: Double = 0
+    /// 强度上限（%）：最响的时候到这里
+    static let maxPercentRange: ClosedRange<Double> = 10...100
+    static let defaultMaxPercent: Double = 60
+    static let defaultChannels = AudioSyncChannels.both
+
+    var enabled: Bool
+    var sensitivityDb: Double
+    var maxPercent: Double
+    var channels: AudioSyncChannels
+
+    init(enabled: Bool = defaultEnabled, sensitivityDb: Double = defaultSensitivityDb,
+         maxPercent: Double = defaultMaxPercent, channels: AudioSyncChannels = defaultChannels) {
+        self.enabled = enabled
+        self.sensitivityDb = Self.clamp(sensitivityDb, to: Self.sensitivityRange, fallback: Self.defaultSensitivityDb)
+        self.maxPercent = Self.clamp(maxPercent, to: Self.maxPercentRange, fallback: Self.defaultMaxPercent)
+        self.channels = channels
+    }
+
+    static func load(from defaults: UserDefaults) -> AudioSyncSettings {
+        let channels = (defaults.object(forKey: Keys.channels) as? Int).flatMap(AudioSyncChannels.init(rawValue:))
+        return AudioSyncSettings(
+            enabled: defaults.object(forKey: Keys.enabled) as? Bool ?? defaultEnabled,
+            sensitivityDb: defaults.object(forKey: Keys.sensitivityDb) as? Double ?? defaultSensitivityDb,
+            maxPercent: defaults.object(forKey: Keys.maxPercent) as? Double ?? defaultMaxPercent,
+            channels: channels ?? defaultChannels)
+    }
+
+    /// 灵敏度的倍数写法（界面显示）
+    var gainMultiplier: Double { pow(10, sensitivityDb / 20) }
+
+    private static func clamp(_ v: Double, to range: ClosedRange<Double>, fallback: Double) -> Double {
+        guard v.isFinite else { return fallback }
+        return min(range.upperBound, max(range.lowerBound, v))
+    }
+}
+
+/// 响度 → 设备强度（0~100）。官方「赛博联动」只取 300 ms 窗口里的峰峰值 ×100、不钳位不平滑；
+/// 这里改成：RMS 为主、峰值补瞬态的 dB 电平 → 灵敏度（增益）→ 映射到 0~100 → 噪声门（带回差）
+/// → 攻击快 / 释放慢的平滑 → 按强度上限等比缩放 → 钳位
+struct AudioReactiveShaper {
+    /// 采样间隔（约 3.3 Hz，低于 BLE 写入合并器的吞吐）
+    static let interval: TimeInterval = 0.3
+    /// 增益之后，这个电平映射为 0%、这个电平映射为 100%
+    static let floorDb: Double = -45
+    static let ceilingDb: Double = -3
+    /// 增益之前低于这个电平一律当静音（灵敏度开到最大也不放大底噪）
+    static let absoluteGateDb: Double = -60
+    /// 噪声门：映射值到这么高才打开，低于关闭值才关上（回差避免在门槛附近反复启停）
+    static let gateOpenPercent: Double = 8
+    static let gateClosePercent: Double = 4
+    /// 平滑时间常数：变响几乎立刻跟上，变轻慢慢落下
+    static let attackSeconds: TimeInterval = 0.08
+    static let releaseSeconds: TimeInterval = 0.8
+    /// dB 加权里 RMS 的比重（其余给峰值）
+    static let rmsWeight: Double = 0.7
+
+    struct Output: Equatable {
+        /// 灵敏度之后、噪声门之前的电平（0~100），界面电平条用
+        var level: Double
+        /// 最终强度（0 ~ 强度上限）
+        var percent: Int
+    }
+
+    private(set) var smoothed: Double = 0
+    private(set) var gateOpen = false
+
+    mutating func reset() {
+        smoothed = 0
+        gateOpen = false
+    }
+
+    /// 增益前的电平（dBFS 量级）。满幅正弦 ≈ 0 dB；没有音频或全静音返回 -inf
+    static func loudnessDb(_ w: AudioWindow) -> Double {
+        guard w.frames > 0, w.peakToPeak.isFinite, w.rms.isFinite else { return -.infinity }
+        let peak = min(1, max(0, w.peakToPeak / 2))
+        let rms = min(1, max(0, w.rms * 2.0.squareRoot()))
+        guard peak > 0, rms > 0 else { return -.infinity }
+        return rmsWeight * 20 * log10(rms) + (1 - rmsWeight) * 20 * log10(peak)
+    }
+
+    /// 电平加上灵敏度后映射到 0~100
+    static func targetPercent(loudnessDb db: Double, sensitivityDb: Double) -> Double {
+        guard db.isFinite, db > absoluteGateDb, sensitivityDb.isFinite else { return 0 }
+        let frac = (db + sensitivityDb - floorDb) / (ceilingDb - floorDb)
+        return min(100, max(0, frac * 100))
+    }
+
+    mutating func step(_ w: AudioWindow, settings: AudioSyncSettings, dt: TimeInterval) -> Output {
+        let level = Self.targetPercent(loudnessDb: Self.loudnessDb(w), sensitivityDb: settings.sensitivityDb)
+        if gateOpen {
+            if level < Self.gateClosePercent { gateOpen = false }
+        } else if level >= Self.gateOpenPercent {
+            gateOpen = true
+        }
+        let target = gateOpen ? level : 0
+        // 计时抖动 / 主线程卡顿：步长夹在 10 ms ~ 1 s
+        let step = dt.isFinite ? min(1, max(0.01, dt)) : Self.interval
+        let tau = target > smoothed ? Self.attackSeconds : Self.releaseSeconds
+        smoothed += (target - smoothed) * (1 - exp(-step / tau))
+        smoothed = smoothed.isFinite ? min(100, max(0, smoothed)) : 0
+        let cap = settings.maxPercent
+        let scaled = smoothed * cap / 100
+        let percent = scaled < 1 ? 0 : min(Int(cap.rounded(.down)), Int(scaled.rounded()))
+        return Output(level: level, percent: max(0, min(100, percent)))
+    }
+}
