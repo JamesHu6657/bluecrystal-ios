@@ -45,6 +45,19 @@ jobs:
             -o "$RUNNER_TEMP/protocol-checks" 2>&1 | tee tests.log
           "$RUNNER_TEMP/protocol-checks" 2>&1 | tee -a tests.log
 
+      # 第四轮修复的回归检查（同样只编译纯类型）：全角 / 零宽指令、收藏逐条解码与撤销顺序、时间轴校验
+      - name: Round 4 checks
+        run: |
+          set -euo pipefail
+          xcrun swiftc \
+            BlueCrystalIOS/Protocol.swift \
+            BlueCrystalIOS/Models.swift \
+            BlueCrystalIOS/SafetyLedger.swift \
+            BlueCrystalIOS/AIProgram.swift \
+            Tests/Round4Checks/main.swift \
+            -o "$RUNNER_TEMP/round4-checks" 2>&1 | tee -a tests.log
+          "$RUNNER_TEMP/round4-checks" 2>&1 | tee -a tests.log
+
       # 只编译（BLEManager / 各 View 只有这里能验证），不打包、不上传
       - name: Compile app (no signing, no IPA)
         run: |
