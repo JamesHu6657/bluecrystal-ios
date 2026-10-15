@@ -212,7 +212,7 @@ extension BCProtocol {
 /// 输出准入中和停止帧对有关的纯决策（BLEManager.submitOutput 用，ProtocolChecks 覆盖）。
 ///
 /// 全零输出不当普通帧发：at([0,0,0,0],0) 在真机上只是"强度 0"，设备不停（见 manualZeroFrame）。
-/// - 设备没在输出：直接丢掉，不开始一次运行（不占额度、不产生冷却）；
+/// - 设备没在输出：直接丢掉，不开始一次运行（不占额度）；
 /// - 设备在输出：发完整停止帧对 at(0,255) → 100ms → Tt(0)，运行保持（不结束记账、不锁闸），
 ///   之后的非零帧照常经过准入继续输出；
 /// - 已经为这次全零发过停止帧对、之后还没有非零帧：重复的全零帧不再发。
@@ -285,7 +285,7 @@ enum OutputAdmission {
         case skipIdleZero
         case alreadyZeroed
         case zeroStopPair
-        /// 写入；startsRun 为 true 时先过冷却/额度并开始一次运行
+        /// 写入；startsRun 为 true 时先过额度并开始一次运行
         case write(startsRun: Bool)
     }
 

@@ -7,6 +7,66 @@ enum PlaybackCompletion {
     }
 }
 
+/// 拖动时只更新预览，松手才交给播放器；旁白的离散调整没有拖动回调，直接 seek。
+struct PlaybackScrubber {
+    private(set) var isEditing = false
+    private(set) var position: Double?
+
+    mutating func begin(at current: Double) {
+        isEditing = true
+        position = current
+    }
+
+    mutating func update(to seconds: Double) -> Double? {
+        guard isEditing else { return seconds }
+        position = seconds
+        return nil
+    }
+
+    mutating func end() -> Double? {
+        let target = position
+        cancel()
+        return target
+    }
+
+    mutating func cancel() {
+        isEditing = false
+        position = nil
+    }
+}
+
+/// seek / seek 后缓冲期间设备保持 0，等播放头真正前进才恢复采样和 1.5 秒卡住检测。
+struct PlaybackProgressWatch {
+    static let stallLimit: TimeInterval = 1.5
+    enum Observation { case moving, waitingAfterSeek, stalled }
+    private var position: Double = .nan
+    private var progressedAt: TimeInterval = 0
+    private(set) var awaitingSeekProgress = false
+
+    mutating func reset(now: TimeInterval) {
+        position = .nan
+        progressedAt = now
+        awaitingSeekProgress = false
+    }
+
+    mutating func awaitSeekProgress(from seconds: Double, now: TimeInterval) {
+        reset(now: now)
+        position = seconds
+        awaitingSeekProgress = true
+    }
+
+    mutating func observe(at seconds: Double, now: TimeInterval) -> Observation {
+        if seconds.isFinite, position.isNaN || abs(seconds - position) > 0.01 {
+            position = seconds
+            progressedAt = now
+            awaitingSeekProgress = false
+            return .moving
+        }
+        if awaitingSeekProgress { return .waitingAfterSeek }
+        return now - progressedAt > Self.stallLimit ? .stalled : .moving
+    }
+}
+
 /// 时间轴脚本的合理范围（第四轮）：宁可整份拒绝，也不按坏数据输出、不把界面卡死。
 /// 强度本来就在 officialScriptLevel 里夹到 0~99，这里只管时间和规模
 enum TimelineLimits {
@@ -162,7 +222,7 @@ struct ActiveChannels: Equatable {
 
 // MARK: - 我的收藏（手感页）：纯数据和换算，ProtocolChecks 覆盖。
 // 只是"记住滑杆位置"：召回时走手动页同一条发送路径（ManualControlVM → BLEManager.send / sendThrottled），
-// 准入、冷却、额度、看门狗、单次上限一个不少；这里只负责把存下来的值夹回各自模式的范围。
+// 准入、额度、看门狗、单次上限一个不少；这里只负责把存下来的值夹回各自模式的范围。
 
 /// 一条收藏：控制方式（变频 / 手动）+ 三个通道的强度
 struct FavoriteSetting: Codable, Identifiable, Equatable {
@@ -346,12 +406,12 @@ struct FavoriteRecallRules {
     let levels: [Int]
     /// 已连接且安全规则允许输出
     let canOutput: Bool
-    /// 不能输出的原因（未连接 / 冷却 / 额度 / 锁存）；canOutput 为 true 时为 nil
+    /// 不能输出的原因（未连接 / 额度 / 锁存）；canOutput 为 true 时为 nil
     let blockReason: String?
     /// 本次运行还开着（runRemaining != nil）
     let running: Bool
 
-    /// 正在运行时别的模式的收藏：切模式要先停机，停机后还要冷却，点了也只会停下，所以先锁住
+    /// 正在运行时别的模式的收藏：切模式要先确认停机，所以先锁住
     func locked(_ fav: FavoriteSetting) -> Bool {
         running && fav.mode != mode
     }
@@ -363,7 +423,7 @@ struct FavoriteRecallRules {
     /// 一张卡片的旁白提示
     func hint(for fav: FavoriteSetting) -> String {
         if let r = blockReason { return r }
-        if locked(fav) { return "正在输出，切换模式要先停止并冷却" }
+        if locked(fav) { return "正在输出，切换模式要先停止并等确认" }
         if let m = fav.mode, m != mode { return "切到\(m.title)，再缓缓推到这组强度" }
         return "缓缓推到这组强度"
     }
@@ -374,9 +434,9 @@ struct FavoriteRecallRules {
         guard running, items.contains(where: { $0.mode != mode }) else { return nil }
         // 滑杆都拉到 0 时运行仍在计时（设备停在 0）：别说"正在输出"，说清楚要先点停止
         if !levels.contains(where: { $0 > 0 }) {
-            return "本次运行仍在计时：先点停止，冷却结束后再点其他模式的收藏"
+            return "本次运行仍在计时：先点停止，确认后再点其他模式的收藏"
         }
-        return "正在输出：其他模式的收藏要先停止，冷却结束后再点"
+        return "正在输出：其他模式的收藏要先停止，确认后再点"
     }
 }
 

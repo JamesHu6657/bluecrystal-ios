@@ -93,6 +93,39 @@ let many = Array(repeating: tl(0, 1), count: TimelineLimits.maxCommands + 1)
 r4check(TimelineScript.validationError(many) != nil, "时间轴：命令数超过上限拒绝")
 r4check(TimelineScript.validationError(Array(many.dropLast())) == nil, "时间轴：命令数正好等于上限通过")
 
+// MARK: - 第五轮：拖动预览独立于播放时间，松手 / 旁白才提交 seek
+
+var scrubber = PlaybackScrubber()
+scrubber.begin(at: 12)
+r4check(scrubber.update(to: 80) == nil, "seek：拖动不提交 seek")
+r4check(scrubber.position == 80 && scrubber.isEditing, "seek：拖动位置保持 80，不被旧播放时间覆盖")
+r4check(scrubber.end() == 80 && scrubber.position == nil && !scrubber.isEditing, "seek：松手提交最后拖动位置并结束预览")
+r4check(scrubber.update(to: 90) == 90, "seek：旁白离散调整立即提交")
+scrubber.begin(at: 90)
+_ = scrubber.update(to: 30)
+scrubber.cancel()
+r4check(scrubber.end() == nil, "seek：控件离开屏幕后不再提交取消的拖动")
+
+// seek 后零输出等待前进，不把 seek / 缓冲算成卡住；前进后恢复原来的 1.5 秒看门狗。
+var watch = PlaybackProgressWatch()
+watch.reset(now: 100)
+r4check(watch.observe(at: 12, now: 100) == .moving, "卡住：初次采样启动监视")
+r4check(watch.observe(at: 12, now: 101.4) == .moving, "卡住：未超过 1.5 秒不停止")
+r4check(watch.observe(at: 12, now: 101.6) == .stalled, "卡住：超过 1.5 秒停止")
+watch.awaitSeekProgress(from: 80, now: 105)
+r4check(watch.observe(at: 80, now: 110) == .waitingAfterSeek, "seek：跳转后的长缓冲不触发卡住（设备保持 0）")
+r4check(watch.observe(at: .nan, now: 115) == .waitingAfterSeek, "seek：缓冲时无有效位置仍保持零输出")
+r4check(watch.observe(at: 80.1, now: 116) == .moving && !watch.awaitingSeekProgress, "seek：前进后恢复采样和监视")
+r4check(watch.observe(at: 80.1, now: 117.6) == .stalled, "seek：恢复后真正卡住仍在 1.5 秒停止")
+watch.awaitSeekProgress(from: 20, now: 120)
+r4check(watch.observe(at: 20, now: 125) == .waitingAfterSeek, "seek：向后跳转也等待新落点前进")
+r4check(watch.observe(at: 20.1, now: 126) == .moving, "seek：向后跳转后照常恢复")
+
+let skipped = tl(30, 0.05)
+let landing = tl(80, 0.05)
+r4check(!skipped.isCovered(at: 80.1, previous: 80, fromPlaybackStart: true), "seek：落点前跳过的命令不补发")
+r4check(landing.isCovered(at: 80.1, previous: 80, fromPlaybackStart: true), "seek：恢复首个采样仍覆盖落点的短命令")
+
 if r4Failures > 0 {
     print("Round4Checks: \(r4Failures) FAIL")
     exit(1)

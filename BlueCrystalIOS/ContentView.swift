@@ -65,7 +65,7 @@ private extension View {
     }
 }
 
-/// 三个 Tab 共用的"设备"卡片：连接状态、红字、安全状态（单次上限 / 冷却 / 额度）、锁存解除、强制断开
+/// 三个 Tab 共用的"设备"卡片：连接状态、红字、安全状态（单次上限 / 额度）、锁存解除、强制断开
 struct DeviceStatusCard: View {
     @EnvironmentObject var ble: BLEManager
     var allowDisconnect: Bool
@@ -212,7 +212,7 @@ struct DeviceStatusCard: View {
         }
     }
 
-    /// 修 M2/M3：单次上限、冷却、30 分钟额度
+    /// 修 M2/M3：单次上限、30 分钟额度
     private var safetySummary: some View {
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: ble.safety.blockReason == nil ? "hourglass" : "lock.fill")

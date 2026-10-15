@@ -329,7 +329,7 @@ final class AIControlVM: ObservableObject {
     func attach(ble: BLEManager) {
         cancellables.removeAll()
         self.ble = ble
-        // 被动停机（看门狗/单次上限/冷却/输出被拒/退后台）：BLEManager 已经发了停止，这里停程序并作废待执行的回复。
+        // 被动停机（看门狗/单次上限/输出被拒/退后台）：BLEManager 已经发了停止，这里停程序并作废待执行的回复。
         // 第二轮审查 M1：不再 receive(on: DispatchQueue.main)。BLEManager 在主线程上、和 gateEpoch 同一个 block 里 send，
         // 直接订阅时 terminalStop 在同一个 block 里同步执行；多跳一次主队列的话，中间排着的回复会读到新代次、
         // 授权却还没作废，照样开闸（M5 的代次核对被绕过）。万一不在主线程就退回主队列

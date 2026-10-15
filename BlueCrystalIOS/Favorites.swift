@@ -3,7 +3,7 @@ import UIKit
 
 // MARK: - 我的收藏：记住喜欢的变频 / 手动强度，下次一点就缓缓回到那里。
 // 只存 UserDefaults 里的几组数字；召回交给 ManualControlVM.applyFavorite，走手动页同一条发送路径，
-// 不新增任何发帧方式，也不碰准入 / 冷却 / 额度 / 看门狗。存取时都按各模式范围夹紧（FavoriteSetting.clamp）。
+// 不新增任何发帧方式，也不碰准入 / 额度 / 看门狗。存取时都按各模式范围夹紧（FavoriteSetting.clamp）。
 // 收藏区不弹任何 alert / sheet：重命名是卡片里的输入框、删除可撤销，底部停止键始终在键盘上面可点。
 // 界面只有一块：滑杆下面的「我的收藏」——一排卡片点了就回去，行尾「收藏此刻」，「整理」就地重命名 / 删除。
 
@@ -188,7 +188,7 @@ struct FavoritesSection: View {
         if store.isFull { return "已满 \(FavoriteSetting.maxCount) 组" }
         if !isConnected { return "连上设备后可收藏" }
         if isGliding { return "缓推完成后再收藏" }
-        // 冷却 / 锁存等暂时不许输出时滑杆是灰的：不叫人去推一根推不动的滑杆
+        // 额度 / 锁存等暂时不许输出时滑杆是灰的：不叫人去推一根推不动的滑杆
         if !hasOutputToSave { return rules.canOutput ? "先推滑杆" : "安全限制解除后再收藏" }
         return "存下这一刻"
     }

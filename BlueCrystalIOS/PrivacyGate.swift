@@ -4,7 +4,7 @@ import Combine
 import LocalAuthentication
 
 // MARK: - 18+ 入口、面容 ID 解锁、后台隐私遮罩
-// 只是外观和隐私包装：不改 BLEManager 的任何状态，唯一发出去的是解锁页 / 入口页上的停止
+// 只是外观和隐私包装：不改 BLEManager 的任何状态，唯一发出去的是解锁页上的停止
 // （和各页停止键同一个 sendStop，并通知各页 VM 走自己的 stopAll）。
 // 退后台的停止仍由 BlueCrystalIOSApp 的 scenePhase 处理。
 // 设备可能仍在输出 / 停止未确认 / 连接或断开进行中 / 正在运行时，入口页和系统验证框一律不出现，
@@ -47,7 +47,7 @@ final class PrivacyLock: ObservableObject {
     /// 本机可用的生物识别（名称和图标）；没有时为 nil。回到前台时重查（用户可能刚在系统设置里录入或删掉）
     @Published private(set) var biometry: Biometry? = PrivacyLock.currentBiometry()
 
-    /// 解锁页 / 入口页上的停止：除了 sendStop，各页 VM 收到后走自己的 stopAll（停 AI 计时和授权、停视频播放）
+    /// 解锁页上的停止：除了 sendStop，各页 VM 收到后走自己的 stopAll（停 AI 计时和授权、停视频播放）
     let stopAllRequested = PassthroughSubject<Void, Never>()
 
     struct Biometry: Equatable {
@@ -100,7 +100,7 @@ final class PrivacyLock: ObservableObject {
         (consented && locked) || (!consented && !ble.privacyCoverBlocked)
     }
 
-    /// 解锁页 / 入口页上的停止
+    /// 解锁页上的停止
     func requestStopAll() {
         stopAllRequested.send()
     }
@@ -233,11 +233,7 @@ struct PrivacyCover: ViewModifier {
                 .accessibilityHidden(covered)
 
             if showGate {
-                // 入口页底部也常驻停止键（第四轮）：它盖住了各页的停止键，状态万一没刷新也能一下停
-                AgeGateView(lock: lock, onStop: {
-                    ble.sendStop()
-                    lock.requestStopAll()
-                })
+                AgeGateView(lock: lock)
                 .accessibilityElement(children: .contain)
                 .accessibilityAddTraits(.isModal)
                 .transition(.opacity)
@@ -295,11 +291,9 @@ struct PrivacyVeil: View {
     }
 }
 
-/// 18+ 确认（只出现一次）。第四轮：底部常驻停止键，设备需要处理时顶上带紧凑设备卡片（同解锁页）
+/// 18+ 确认（只出现一次）：确认前无法开始输出，不显示设备卡片或停止键。
 struct AgeGateView: View {
-    @EnvironmentObject var ble: BLEManager
     @ObservedObject var lock: PrivacyLock
-    let onStop: () -> Void
     @State private var useBiometric = false
     @State private var glow = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -309,10 +303,6 @@ struct AgeGateView: View {
             VelvetBackground(glow: 0.35).ignoresSafeArea()
             ScrollView {
                 VStack(spacing: 26) {
-                    if ble.needsAttentionCard {
-                        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
-                            .padding(.top, 8)
-                    }
                     Spacer(minLength: 40)
                     ZStack {
                         Circle()
@@ -385,9 +375,6 @@ struct AgeGateView: View {
                 }
                 .padding(.horizontal, 24)
             }
-        }
-        .safeAreaInset(edge: .bottom) {
-            StopDockBar(action: onStop)
         }
         .onAppear { startGlow() }
         // 中途打开减弱动态效果：正在循环的光晕立刻停下；关掉时再亮起来
