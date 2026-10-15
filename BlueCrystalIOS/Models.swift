@@ -7,6 +7,23 @@ enum PlaybackCompletion {
     }
 }
 
+/// 时间轴脚本的合理范围（第四轮）：宁可整份拒绝，也不按坏数据输出、不把界面卡死。
+/// 强度本来就在 officialScriptLevel 里夹到 0~99，这里只管时间和规模
+enum TimelineLimits {
+    /// 脚本文件最大字节数（读文件前先查，超了不读）
+    static let maxFileBytes = 10 * 1024 * 1024
+    /// 最多命令数：每次采样都要扫一遍命令，这个量级在手机上仍是毫秒级
+    static let maxCommands = 50_000
+    /// 开始时间 / 时长 / 结束时间都不能超过 24 小时
+    static let maxSeconds: Double = 24 * 3600
+}
+
+/// 脚本内容不合理：界面直接显示 message
+struct TimelineScriptError: LocalizedError, Equatable {
+    let message: String
+    var errorDescription: String? { message }
+}
+
 /// 时间轴脚本里的一条命令（字段对应官方 video.js 的 commandType / intensity / duration）
 struct TimelineCommand: Decodable {
     /// Thrust / Vibration / Suction / Rotation（大小写不敏感）
@@ -56,6 +73,8 @@ struct TimelineScript: Decodable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         commands = try c.decode([TimelineCommand].self, forKey: .commands)
+        // 第四轮：时间和规模不合理的脚本整份拒绝（负的开始时间 + 超长时长会从第 0 秒一直覆盖到结束）
+        if let why = Self.validationError(commands) { throw TimelineScriptError(message: why) }
         intensityScale = try c.decodeIfPresent(String.self, forKey: .intensityScale)
         let declared = intensityScale?.lowercased()
         if declared == "ten" {
@@ -72,6 +91,33 @@ struct TimelineScript: Decodable {
             scaleFallback = declared != nil
             scaleAmbiguous = commands.allSatisfy { $0.intensityLevel <= 10 }
         }
+    }
+
+    /// 第四轮：脚本不合理的原因（第一处）；nil 表示可以用
+    static func validationError(_ commands: [TimelineCommand]) -> String? {
+        if commands.count > TimelineLimits.maxCommands {
+            return "脚本命令太多（\(commands.count) 条，最多 \(TimelineLimits.maxCommands) 条）"
+        }
+        let maxSeconds = TimelineLimits.maxSeconds
+        let hours = Int(maxSeconds / 3600)
+        for (i, cmd) in commands.enumerated() {
+            let n = i + 1
+            let start = cmd.startTimeSeconds
+            let duration = cmd.durationSeconds
+            guard start.isFinite, start >= 0, start <= maxSeconds else {
+                return "第 \(n) 条命令的开始时间不对（要在 0 秒到 \(hours) 小时之间）"
+            }
+            guard duration.isFinite, duration >= 0, duration <= maxSeconds else {
+                return "第 \(n) 条命令的时长不对（要在 0 秒到 \(hours) 小时之间）"
+            }
+            guard cmd.endTime <= maxSeconds else {
+                return "第 \(n) 条命令的结束时间超过 \(hours) 小时"
+            }
+            guard cmd.intensityLevel.isFinite else {
+                return "第 \(n) 条命令的强度不是有效数字"
+            }
+        }
+        return nil
     }
 
     /// 命令强度换算成 0x08 帧强度 0~99（修 N2），照官方 video.js executeIntensityCommand：
@@ -186,15 +232,54 @@ struct FavoriteSetting: Codable, Identifiable, Equatable {
 }
 
 enum FavoriteCodec {
-    /// 解不出来就当没有；无效条目（技能 / 全零 / 未知模式）丢掉，最多 maxCount 条
+    /// 逐条解码用的外壳：解不出来的那一条变成 nil，不连累整个数组
+    private struct Lossy: Decodable {
+        let value: FavoriteSetting?
+        init(from decoder: Decoder) throws {
+            value = try? FavoriteSetting(from: decoder)
+        }
+    }
+
+    struct Decoded: Equatable {
+        /// 读出来的有效收藏（最多 maxCount 条）
+        var items: [FavoriteSetting]
+        /// 读不出来的记录数（整体不是数组时算 1）；技能 / 全零 / 未知模式这类有意丢掉的不算
+        var unreadable: Int
+    }
+
+    /// 第四轮：逐条解码。一条坏记录（字段缺失 / 类型不对 / 以后的新格式）只丢那一条，其余照常保留
+    /// （之前整个数组一起解，一条坏了全部收藏都没了）。无效条目（技能 / 全零 / 未知模式）丢掉，最多 maxCount 条
+    static func decodeReport(_ data: Data?) -> Decoded {
+        guard let d = data else { return Decoded(items: [], unreadable: 0) }
+        guard let rows = try? JSONDecoder().decode([Lossy].self, from: d) else {
+            return Decoded(items: [], unreadable: 1)
+        }
+        let read = rows.compactMap { $0.value }
+        let valid = read.filter { $0.clampedLevels != nil }
+        return Decoded(items: Array(valid.prefix(FavoriteSetting.maxCount)), unreadable: rows.count - read.count)
+    }
+
+    /// 解不出来就当没有；见 decodeReport
     static func decode(_ data: Data?) -> [FavoriteSetting] {
-        guard let d = data, let items = try? JSONDecoder().decode([FavoriteSetting].self, from: d) else { return [] }
-        let valid = items.filter { $0.clampedLevels != nil }
-        return Array(valid.prefix(FavoriteSetting.maxCount))
+        decodeReport(data).items
     }
 
     static func encode(_ items: [FavoriteSetting]) -> Data? {
         try? JSONEncoder().encode(Array(items.prefix(FavoriteSetting.maxCount)))
+    }
+}
+
+/// 撤销删除时放回的位置（第四轮，ProtocolChecks / Round4Checks 覆盖）。
+/// 之前只记了原下标：连续删 B、A 后先撤销 B 会插到 C 后面，全部撤销得到 [A, C, B]。
+/// 现在按删除那一刻的顺序快照放：放在快照里排在它前面、现在还在的最后一条之后；前面的都不在了就放最前。
+/// 快照里没有它（旧数据）时退回原下标，夹到范围内
+enum FavoriteRestore {
+    static func insertionIndex(of id: UUID, order: [UUID], current: [UUID], fallback: Int) -> Int {
+        guard let pos = order.firstIndex(of: id) else { return min(max(0, fallback), current.count) }
+        for pred in order[..<pos].reversed() {
+            if let i = current.firstIndex(of: pred) { return i + 1 }
+        }
+        return 0
     }
 }
 
