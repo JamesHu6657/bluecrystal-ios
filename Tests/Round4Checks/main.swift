@@ -37,6 +37,53 @@ let normal = AIReply.parse("[CH 30 0 0 0]\n[HOLD 1000]")
 r4check(normal.rejection == nil && !normal.steps.isEmpty, "M2 标准 CH/HOLD 照常解析")
 r4check(AIReply.parse("【注意节奏】慢慢来").rejection == nil, "M2 没有指令时中文括号文字不影响")
 
+// MARK: - 设备只有伸缩 / 震动：旧通道仍兼容，但源值和输出都归零
+
+for mode in BCProtocol.Mode.allCases {
+    let data = mode.frame(channels: [4, 6, 99, 0])
+    let bytes = [UInt8](data)
+    r4check(bytes[5] == 0 && bytes[6] == 0, "\(mode.title)：未使用通道恒 0")
+    r4check(bytes.count == (mode == .manual ? 10 : 9), "\(mode.title)：仍保留四通道帧长度")
+}
+let legacyCH = AIReply.parse("[CH 30 20 99 0]\n[HOLD 1000]\n[STOP]")
+r4check(legacyCH.rejection == nil && legacyCH.stop
+        && legacyCH.steps == [AIStep(levels: [30, 20, 0, 0], duration: 1)],
+        "AI：旧四值 CH 兼容，清除通道 2，保持 HOLD / STOP")
+for raw in ["[CH 30 20 100 0]", "[CH 30 20 bad 0]", "引用 [CH 30 20 99 0]", "[STOP]\n[CH 30 20 99 0]"] {
+    let reply = AIReply.parse(raw)
+    r4check(reply.rejection != nil && reply.steps.isEmpty && !reply.stop, "AI：未使用通道不绕过严格解析 / STOP")
+}
+for types in [["Suction"], ["Suction", "Rotation"], ["Suction", "Thrust", "Vibration"]] {
+    let commands = types.map {
+        ["commandType": $0, "startTimeSeconds": 0, "durationSeconds": 1, "intensityLevel": 5] as [String: Any]
+    }
+    if let data = try? JSONSerialization.data(withJSONObject: ["intensityScale": "ten", "commands": commands]),
+       let script = try? JSONDecoder().decode(TimelineScript.self, from: data) {
+        let expected = types.contains("Thrust") ? [60, 60, 0, 0] : [0, 0, 0, 0]
+        r4check(script.levels(at: 0.5, previous: nil) == expected, "脚本 \(types)：Suction 接受但无输出")
+        r4check(script.levels(at: 2, previous: 0, fromPlaybackStart: true) == expected, "脚本 \(types)：跨越命令也忽略 Suction")
+        r4check((script.ignoredOnlyNote != nil) == !types.contains("Thrust"), "脚本 \(types)：仅忽略通道有简短提示")
+        r4check([UInt8](BCProtocol.videoFrame(levels: script.levels(at: 0.5, previous: nil)))[5] == 0,
+                "脚本 \(types)：视频帧通道 2 为 0")
+    } else { r4check(false, "旧脚本 \(types) 加载") }
+}
+// 直接构造旧存储 JSON，不经过新建收藏的归零逻辑。
+let legacyFavoriteID = UUID()
+let legacyFavoritesJSON = """
+[{"id":"\(legacyFavoriteID.uuidString)","name":"旧","modeRaw":3,"levels":[30,20,99,0]},
+ {"id":"\(UUID().uuidString)","name":"仅旧通道","modeRaw":3,"levels":[0,0,99,0]}]
+"""
+let legacyFavorites = FavoriteCodec.decodeReport(Data(legacyFavoritesJSON.utf8))
+r4check(legacyFavorites.unreadable == 0 && legacyFavorites.items.map(\.id) == [legacyFavoriteID],
+        "旧收藏：混合值仍加载，只有未使用通道的收藏忽略，不算坏记录")
+r4check(legacyFavorites.items.first?.levels == [30, 20, 0, 0], "旧收藏：加载时就清除通道 2 源值")
+if let favorite = legacyFavorites.items.first, let mode = favorite.mode {
+    r4check([UInt8](mode.frame(channels: favorite.levels))[5] == 0, "旧收藏：召回帧通道 2 恒 0")
+}
+let legacyGlide = FavoriteGlide.plan(from: [0, 50, 99, 0], to: [60, 10, 99, 0], maxLevel: 99)
+r4check(legacyGlide.allSatisfy { $0[2] == 0 && [UInt8](BCProtocol.manualFrame(channels: $0))[5] == 0 },
+        "旧收藏缓推：所有源值和帧的通道 2 恒 0")
+
 // MARK: - 收藏：逐条解码，一条坏记录不清空全部
 
 let goodFav = FavoriteSetting(id: UUID(), name: "好", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [30, 0, 0, 0])

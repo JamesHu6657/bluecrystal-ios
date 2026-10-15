@@ -9,7 +9,7 @@ enum WireProtocol {
     case responses // OpenAI /responses
 }
 
-// MARK: - 指令格式：[CH c0 c1 c2 c3] / [HOLD 毫秒] / [STOP]（提示词里约定，控制器解析）
+// MARK: - 指令格式：[CH 伸缩 震动 0 0] / [HOLD 毫秒] / [STOP]（旧四值格式仍接受，后两位归零）
 
 /// 一步：设置强度（nil = 不改强度，只等待）+ 持续秒数
 struct AIStep: Equatable {
@@ -20,7 +20,7 @@ struct AIStep: Equatable {
 
     var summary: String {
         guard let lv = levels else { return "保持 \(Self.fmt(duration)) 秒" }
-        return "伸缩 \(lv[0]) · 震动 \(lv[1]) · 吮吸 \(lv[2])" + (duration > 0 ? " · \(Self.fmt(duration)) 秒" : "")
+        return "伸缩 \(lv[0]) · 震动 \(lv[1])" + (duration > 0 ? " · \(Self.fmt(duration)) 秒" : "")
     }
 
     static func fmt(_ d: Double) -> String {
@@ -46,7 +46,7 @@ struct AIStep: Equatable {
 ///   （［STOP］、【STOP】、[ＳＴＯＰ]、[ST​OP]）也算格式错，整条作废。之前它们被当成普通文字放过，
 ///   模型想停却继续保持最后的强度。
 /// - CH 任何一个值超过 BCProtocol.maxManualLevel（99）都算格式错，整条作废（不夹紧）。
-/// - 合法时 c3（旋转）恒为 0，HOLD 夹到 500~60000 毫秒。
+/// - 合法时 c2 / c3 恒为 0，HOLD 夹到 500~60000 毫秒。
 ///   AI 强度上限 70、每秒每通道最多 +20、从 0 爬升、总时长上限由执行前的 AISafety 处理。
 struct AIReply {
     /// 去掉合法指令行之后给用户看的文字
@@ -119,7 +119,8 @@ struct AIReply {
                 guard let v = Int(a), v <= BCProtocol.maxManualLevel else { return nil }
                 lv.append(v)
             }
-            // 第 4 通道（旋转）这台设备不用，恒 0
+            // 四值写法兼容旧回复，但设备只使用前两个通道；仍先严格校验全部参数。
+            lv[2] = 0
             lv[3] = 0
             return .ch(lv)
         case "HOLD":
@@ -364,7 +365,9 @@ enum AISafety {
 
     static func enforce(_ steps: [AIStep], from start: [Int],
                         secondsSinceRise: TimeInterval = .infinity) -> Program {
-        var cur = (0..<4).map { i in i < start.count ? max(0, min(maxLevel, start[i])) : 0 }
+        var cur = (0..<4).map { i in
+            BCProtocol.Channel(rawValue: i)?.isUsed == true && i < start.count ? max(0, min(maxLevel, start[i])) : 0
+        }
         // 距上一次升高（那一步开始的时刻）过了多久
         var sinceRise = secondsSinceRise
         var out: [AIStep] = []
@@ -379,7 +382,9 @@ enum AISafety {
                 sinceRise += s.duration
                 continue
             }
-            var target = (0..<4).map { i in i < lv.count ? max(0, lv[i]) : 0 }
+            var target = (0..<4).map { i in
+                BCProtocol.Channel(rawValue: i)?.isUsed == true && i < lv.count ? max(0, lv[i]) : 0
+            }
             for i in target.indices where target[i] > maxLevel {
                 target[i] = maxLevel
                 clamped += 1

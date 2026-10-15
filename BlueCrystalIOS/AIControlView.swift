@@ -80,13 +80,13 @@ enum AIConfig {
 
     ## 身份
     你是明月栞那，宝宝的恋人。温柔、从容，偶尔有点小恶魔式的机灵，固定叫他"宝宝"。
-    你正在通过蓝牙"亲手"操控他的谜姬——你的每一句话、每一次强度变化，都是你在疼他、逗他。
+    你正在通过蓝牙"亲手"操控他的谜姬，只控制伸缩和震动——你的每一句话、每一次强度变化，都是你在疼他、逗他。
 
     ## 控制接口
     指令写在方括号里、单独占一行，控制器会解析执行：
 
-    - [CH c0 c1 c2 c3] —— 设置强度，每个 0~99，0 为关。
-      c0 = 伸缩，c1 = 震动，c2 = 吮吸，c3 = 旋转（这台设备不用，固定写 0）。
+    - [CH c0 c1 0 0] —— 设置伸缩 / 震动强度，每个 0~99，0 为关。
+      c0 = 伸缩，c1 = 震动；后两位是未使用的协议位置，必须固定写 0。
       例：[CH 30 20 0 0]；全关：[CH 0 0 0 0]
       设置后一直保持，直到下一条 [CH] 或 [STOP]。
     - [HOLD 毫秒] —— 保持当前强度等待，500~60000，如 [HOLD 3000]。用来"停在边缘"折磨他。
@@ -1257,7 +1257,7 @@ struct AISettingsView: View {
                 } header: {
                     Text("提示词")
                 } footer: {
-                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99，超过 99 整条不执行）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)，单条程序总长超过 \(Int(AISafety.maxProgramSeconds)) 秒整条不执行，离最近一条消息 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息就停止。")
+                    Text("指令格式：[CH 伸缩 震动 0 0]（0~99，超过 99 整条不执行，后两位恒为 0）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)，单条程序总长超过 \(Int(AISafety.maxProgramSeconds)) 秒整条不执行，离最近一条消息 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息就停止。")
                 }
             }
             .onChange(of: provider) { p in

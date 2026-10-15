@@ -26,16 +26,47 @@ func hex(_ d: Data) -> String { BCProtocol.hex(d) }
 
 // 实抓（legacy research/protocol.md）
 check(hex(BCProtocol.stopFrame) == "AA06050000000000B5", "停止帧 = 实抓暂停帧")
-check(hex(BCProtocol.officialStartFrame) == "AA06050406050000C4", "如影随形 = 实抓启动帧")
+check(hex(BCProtocol.officialStartFrame) == "AA06050406000000BF", "如影随形保留伸缩 / 震动、清除旧启动帧的通道 2")
 // 官方源码 at([0,0,0,0], 255)（迷姬专用停止，video.js handleSlide；L7：之前注释误写成 at(…, 0)）
 check(hex(BCProtocol.manualZeroFrame) == "AA08060000000000FFB7", "0x08 停止帧 at([0,0,0,0],255)")
 check(hex(BCProtocol.manualFrame(channels: [0, 0, 0, 0])) == "AA0806000000000000B8", "0x08 强度 0 帧")
-// 旋转通道恒为 0（N5），0x06 夹到 9，0x08 夹到 99
-check(hex(BCProtocol.modeFrame(channels: [1, 2, 3, 9])) == "AA06050102030000BB", "0x06 帧旋转恒 0")
+// 未使用通道恒为 0，0x06 夹到 9，0x08 夹到 99
+check(hex(BCProtocol.modeFrame(channels: [1, 2, 3, 9])) == "AA06050102000000B8", "0x06 帧后两通道恒 0")
 check(hex(BCProtocol.modeFrame(channels: [12, -3, 0, 0])) == "AA06050900000000BE", "0x06 帧夹到 0~9")
 check(hex(BCProtocol.manualFrame(channels: [99, 50, 0, 7])) == "AA08066332000000004D", "0x08 帧旋转恒 0、尾部 00 00")
 check(hex(BCProtocol.videoFrame(levels: [60, 0, 0, 0])) == "AA08063C0000000000F4", "视频帧走 0x08")
-check(BCProtocol.Channel.uiChannels == [.thrust, .vibration, .suction], "界面不显示旋转")
+check(BCProtocol.Channel.uiChannels == [.thrust, .vibration], "界面只显示伸缩 / 震动")
+check(BCProtocol.presets.map(\.channels) == [[4, 6, 0, 0], [8, 9, 0, 0], [6, 6, 0, 0], [2, 2, 0, 0], [3, 9, 0, 0]],
+      "五个技能预设只保留原有伸缩 / 震动值")
+
+func checkOutputFrame(_ data: Data, cmd: UInt8, name: String) {
+    let b = [UInt8](data)
+    let size = cmd == BCProtocol.modeCmd ? 9 : 10
+    guard b.count == size else { check(false, "\(name)：帧长度不变"); return }
+    check(b[0] == 0xAA && b[1] == cmd && Int(b[2]) == size - 4, "\(name)：四通道线格式不变")
+    check(b[5] == 0, "\(name)：通道索引 2 恒为 0")
+    check(Int(b.last!) == b.dropLast().reduce(0) { ($0 + Int($1)) & 0xFF }, "\(name)：归零后校验和正确")
+}
+for channels in [[1, 2, 99, 0], [0, 0, 99, 0], [Int.max, Int.min, Int.max, 99], [3, 4, -1], [1], []] {
+    checkOutputFrame(BCProtocol.modeFrame(channels: channels), cmd: BCProtocol.modeCmd, name: "变频 \(channels)")
+    checkOutputFrame(BCProtocol.manualFrame(channels: channels), cmd: BCProtocol.manualCmd, name: "手动 \(channels)")
+    checkOutputFrame(BCProtocol.videoFrame(levels: channels), cmd: BCProtocol.manualCmd, name: "视频 \(channels)")
+    for mode in BCProtocol.Mode.allCases {
+        checkOutputFrame(mode.frame(channels: channels), cmd: mode == .manual ? BCProtocol.manualCmd : BCProtocol.modeCmd,
+                         name: "\(mode.title)统一出口 \(channels)")
+    }
+}
+for preset in BCProtocol.presets {
+    checkOutputFrame(BCProtocol.modeFrame(channels: preset.channels), cmd: BCProtocol.modeCmd, name: "技能 \(preset.key)")
+}
+let directMode = BCProtocol.frame(cmd: BCProtocol.modeCmd, payload: [4, 6, 255, 0, 0])
+let directManual = BCProtocol.frame(cmd: BCProtocol.manualCmd, payload: [30, 20, 255, 0, 0x12, 0x34])
+checkOutputFrame(directMode, cmd: BCProtocol.modeCmd, name: "直接调用模式组帧")
+checkOutputFrame(directManual, cmd: BCProtocol.manualCmd, name: "直接调用手动组帧")
+check(Array(Array(directManual)[3...8]) == [30, 20, 0, 0, 0x12, 0x34], "组帧兜底保留前两通道和尾部")
+check(BCProtocol.isAllZeroOutput(BCProtocol.manualFrame(channels: [0, 0, 99, 0])), "只有旧通道 2 非零时走原有全零停止逻辑")
+checkOutputFrame(BCProtocol.stopFrame, cmd: BCProtocol.modeCmd, name: "停止模式帧")
+checkOutputFrame(BCProtocol.manualZeroFrame, cmd: BCProtocol.manualCmd, name: "停止手动帧")
 
 // F1：纯状态重现 t=10ms 首帧错误，100ms 仍发第二帧；调度由 BLEManager 执行。
 var earlyErrorPair = StopPairAttempt()
@@ -217,11 +248,26 @@ if let s = script("{\"intensityScale\":\"percent\",\"commands\":[\(cmd("Thrust",
 if let s = script("{\"commands\":[\(cmd("Thrust", 5)),\(cmd("Rotation", 3))]}") {
     check(s.scaleAmbiguous && !s.useTenScale, "未声明且 ≤10：按较弱的百分制并提示（L9）")
     check(s.deviceLevel(for: s.commands[0]) == 15, "未声明 5 → 15")
-    check(s.ignoredRotationCount == 1, "旋转命令计数")
+    check(s.ignoredChannelCount == 1, "未使用通道命令计数")
     check(s.commands[1].channel?.isUsed == false, "旋转命令不发")
 } else {
     check(false, "未声明刻度脚本解析")
 }
+for type in ["Suction", "suction", "SUCTION", "Sucking", "Rotation"] {
+    if let s = script("{\"intensityScale\":\"ten\",\"commands\":[\(cmd(type, 10))]}") {
+        check(s.commands.count == 1 && s.commands[0].channel?.isUsed == false, "\(type)：旧文件可加载，通道不启用")
+        check(s.deviceLevel(for: s.commands[0]) == 0, "\(type)：源强度为 0")
+        check(s.levels(at: 0.5, previous: nil) == [0, 0, 0, 0], "\(type)：当前激活无输出")
+        check(s.levels(at: 2, previous: 0, fromPlaybackStart: true) == [0, 0, 0, 0], "\(type)：跨越短命令也无输出")
+        check(s.ignoredChannelCount == 1 && s.ignoredOnlyNote != nil, "\(type)：只有忽略通道时有提示")
+    } else { check(false, "\(type)：旧脚本解析") }
+}
+if let s = script("{\"intensityScale\":\"ten\",\"commands\":[\(cmd("Thrust", 5)),\(cmd("Vibration", 7)),\(cmd("Suction", 10)),\(cmd("Rotation", 9))]}") {
+    check(s.levels(at: 0.5, previous: nil) == [60, 80, 0, 0], "混合脚本保留伸缩 / 震动，忽略旧通道")
+    check(s.ignoredChannelCount == 2 && s.ignoredOnlyNote == nil, "混合脚本不提示只有忽略通道")
+    checkOutputFrame(BCProtocol.videoFrame(levels: s.levels(at: 0.5, previous: nil)), cmd: BCProtocol.manualCmd, name: "混合时间轴输出")
+} else { check(false, "混合旧通道脚本解析") }
+check(script("{\"commands\":[]}")?.ignoredOnlyNote == nil, "空脚本不误提示只有忽略通道")
 if let s = script("{\"commands\":[\(cmd("Thrust", 50)),\(cmd("Thrust", 5))]}") {
     check(!s.scaleAmbiguous && !s.useTenScale, "未声明但有 >10：确定是百分制")
 } else {
@@ -238,7 +284,7 @@ check(!firstShort.isCovered(at: 0.1, previous: 0),
 let delayedShort = TimelineCommand(commandType: "Vibration", startTimeSeconds: 0.2,
                                    durationSeconds: 0.05, intensityLevel: 5)
 check(delayedShort.isCovered(at: 1, previous: 0.1), "连续播放延迟 >0.5s 仍覆盖短命令")
-let overlappingShort = TimelineCommand(commandType: "Suction", startTimeSeconds: 0.05,
+let overlappingShort = TimelineCommand(commandType: "Thrust", startTimeSeconds: 0.05,
                                        durationSeconds: 0.1, intensityLevel: 5)
 check(overlappingShort.isCovered(at: 0.2, previous: 0.1, fromPlaybackStart: true),
       "恢复播放后的首个采样覆盖播放起点已经激活的短命令")
@@ -600,7 +646,7 @@ func executable(_ r: AIReply) -> Bool { r.rejection == nil && (!r.steps.isEmpty 
 
 let okReply = AIReply.parse("宝宝，开始了哦\n[CH 30 20 10 0]\n  [HOLD 3000]  \n[CH 0 0 0 0]\n[STOP]")
 check(okReply.rejection == nil && okReply.stop, "合法程序：独占一行（允许前后空白）")
-check(okReply.steps == [AIStep(levels: [30, 20, 10, 0], duration: 3), AIStep(levels: [0, 0, 0, 0], duration: 1.5)],
+check(okReply.steps == [AIStep(levels: [30, 20, 0, 0], duration: 3), AIStep(levels: [0, 0, 0, 0], duration: 1.5)],
       "CH + HOLD 合并、默认间隔 1.5 秒")
 check(okReply.text == "宝宝，开始了哦", "显示文字去掉指令行")
 
@@ -609,9 +655,14 @@ check(persist.rejection == nil && persist.steps == [AIStep(levels: [40, 0, 0, 0]
       "没有 STOP 时最后一步保持（duration 0）")
 
 let clamped = AIReply.parse("[ch 99 0 0 77]\n[HOLD 100]\n[CH 5 5 5 5]\n[HOLD 999999]")
-check(clamped.steps.first?.levels == [99, 0, 0, 0], "强度 99 原样保留（上限 70 由 AISafety 处理），c3 恒 0，关键字不分大小写")
+check(clamped.steps.first?.levels == [99, 0, 0, 0], "强度 99 原样保留（上限 70 由 AISafety 处理），c2 / c3 恒 0，关键字不分大小写")
 check(clamped.steps.first?.duration == 0.5, "HOLD 夹到最少 500 毫秒")
-check(clamped.steps.last?.levels == [5, 5, 5, 0] && clamped.steps.last?.duration == 60, "HOLD 夹到最多 60000 毫秒")
+check(clamped.steps.last?.levels == [5, 5, 0, 0] && clamped.steps.last?.duration == 60, "旧四值 CH 后两位归零，HOLD 夹到最多 60000 毫秒")
+let legacyZeroAI = AIReply.parse("[CH 0 0 99 0]")
+check(legacyZeroAI.rejection == nil && legacyZeroAI.steps.first?.isZero == true
+      && ReplyAuthorization.programEndIsTerminal(steps: legacyZeroAI.steps, endWithStop: false),
+      "旧 AI 只开通道 2：兼容解析、转为全零并结束停止")
+check(AIStep(levels: [10, 20, 99, 0], duration: 0).summary == "伸缩 10 · 震动 20", "AI 程序展示只有两个通道")
 
 // 只有独占一行才算指令；行内、引用、代码块里的指令样式文字让整条作废
 for (raw, name) in [
@@ -733,6 +784,7 @@ check(AIReply.parse("[笑] 宝宝乖").rejection == nil, "非指令的方括号�
 for (raw, name) in [
     ("[CH 150 0 0 0]", "伸缩 150"),
     ("[CH 30 0 0 100]", "旋转位 100"),
+    ("[CH 30 0 100 0]", "未使用位 100 仍拒绝"),
     ("宝宝\n[CH 30 0 0 0]\n[CH 100 0 0 0]\n[STOP]", "后面一步 100"),
 ] {
     let r = AIReply.parse(raw)
@@ -749,14 +801,26 @@ check(fromIdle.steps == [AIStep(levels: [20, 0, 0, 0], duration: 1), AIStep(leve
       "从空闲开始：第一步每秒 +20 从 0 爬到目标，目标步保持原时长")
 check(fromIdle.rampSteps == 2 && fromIdle.clampedValues == 0, "爬升步计数")
 let overCap = AISafety.enforce([AIStep(levels: [99, 80, 10, 0], duration: 2)], from: [70, 70, 0, 0])
-check(overCap.steps == [AIStep(levels: [70, 70, 10, 0], duration: 2)] && overCap.clampedValues == 2,
+check(overCap.steps == [AIStep(levels: [70, 70, 0, 0], duration: 2)] && overCap.clampedValues == 2,
       "超过 70 的值压到 70")
-check(overCap.displaySteps == [AIStep(levels: [70, 70, 10, 0], duration: 2)], "界面显示压低后的值")
+check(overCap.displaySteps == [AIStep(levels: [70, 70, 0, 0], duration: 2)], "界面显示压低后的值，通道 2 归零")
 check(AISafety.describe(overCap, stop: false).contains("已压到 70"), "程序说明标出压到 70")
 let fullIdle = AISafety.enforce(AIReply.parse("[CH 99 99 99 0]").steps, from: [0, 0, 0, 0])
-check(fullIdle.steps.first == AIStep(levels: [20, 20, 20, 0], duration: 1)
-      && fullIdle.steps.last == AIStep(levels: [70, 70, 70, 0], duration: 0) && fullIdle.rampSteps == 3,
+check(fullIdle.steps.first == AIStep(levels: [20, 20, 0, 0], duration: 1)
+      && fullIdle.steps.last == AIStep(levels: [70, 70, 0, 0], duration: 0) && fullIdle.rampSteps == 3,
       "开场拉满：压到 70，从 0 每秒 +20 爬上去")
+let legacyAIRamp = AISafety.enforce([AIStep(levels: [70, 40, 99, 99], duration: 0)], from: [10, 60, 99, 99],
+                                     secondsSinceRise: 0.5)
+check(legacyAIRamp.rampSteps > 0 && legacyAIRamp.waitSteps > 0
+      && (legacyAIRamp.steps + legacyAIRamp.displaySteps).allSatisfy { $0.levels.map { $0[2] == 0 && $0[3] == 0 } ?? true },
+      "AI 旧起点 / 目标在爬升和等待源值中都清除未使用通道")
+for step in legacyAIRamp.steps {
+    if let levels = step.levels {
+        checkOutputFrame(BCProtocol.manualFrame(channels: levels), cmd: BCProtocol.manualCmd, name: "AI 爬升 / 等待帧")
+        checkOutputFrame(OutputWriteCoalescer.limitRise(BCProtocol.manualFrame(channels: levels), from: [0, 0, 99, 0], maxRise: 20),
+                         cmd: BCProtocol.manualCmd, name: "AI 出口限升幅帧")
+    }
+}
 let goingDown = AISafety.enforce([AIStep(levels: [10, 0, 0, 0], duration: 1.5)], from: [70, 60, 0, 0])
 check(goingDown.steps == [AIStep(levels: [10, 0, 0, 0], duration: 1.5)] && goingDown.rampSteps == 0,
       "降低立刻生效，不插爬升步")
@@ -1011,7 +1075,7 @@ check(capCo.submit(BCProtocol.manualFrame(channels: [99, 65, 0, 0]), maxRise: 20
       == .write(BCProtocol.manualFrame(channels: [70, 65, 0, 0])), "AI 帧出口兜底压到 70（VM 漏压也到不了设备）")
 _ = capCo.writeFinished(canSend: true, now: 20.1)
 check(capCo.submit(BCProtocol.manualFrame(channels: [99, 99, 99, 0]), maxRise: 20, now: 40)
-      == .write(BCProtocol.manualFrame(channels: [70, 70, 20, 0])), "已在 70：再要 99 也停在 70")
+      == .write(BCProtocol.manualFrame(channels: [70, 70, 0, 0])), "已在 70：再要 99 也停在 70，未使用通道恒 0")
 _ = capCo.writeFinished(canSend: true, now: 40.1)
 check(capCo.submit(manual99) == .write(manual99), "手动帧（不带 maxRise）不受 70 限制")
 capCo.resetBaseline()
@@ -1180,7 +1244,7 @@ check(!PhysicalAck.shouldResendStop(abandonedStop: true, linkWritable: false), "
 // MARK: - 我的收藏（界面功能，不改任何安全规则）：存下来的值召回时必须夹回各模式的范围
 
 let favManual = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [150, -5, 40, 77])
-check(favManual.clampedLevels == [99, 0, 40, 0], "收藏召回：手动夹到 0~99、负数归 0、旋转恒 0")
+check(favManual.clampedLevels == [99, 0, 0, 0], "收藏召回：手动夹到 0~99、负数归 0、后两通道恒 0")
 let favFreq = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.frequency.rawValue, levels: [12, 3])
 check(favFreq.clampedLevels == [9, 3, 0, 0], "收藏召回：变频夹到 0~9、缺的通道补 0")
 let favSkill = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.skill.rawValue, levels: [4, 6, 5, 0])
@@ -1190,6 +1254,8 @@ check(favUnknown.clampedLevels == nil, "未知模式：召回无效")
 let favZero = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [0, 0, 0, 9])
 check(favZero.clampedLevels == nil, "全零（旋转不算）：召回无效")
 check(FavoriteSetting.make(name: "a", mode: .manual, levels: [0, 0, 0, 0]) == nil, "全零不能存")
+check(FavoriteSetting.make(name: "a", mode: .manual, levels: [0, 0, 99, 0]) == nil, "只有未使用通道的收藏不能存")
+check(FavoriteSetting(id: UUID(), name: "旧", modeRaw: 3, levels: [0, 0, 99, 0]).clampedLevels == nil, "旧收藏只有未使用通道不能召回")
 check(FavoriteSetting.make(name: "a", mode: .skill, levels: [4, 6, 5, 0]) == nil, "技能模式不能存")
 check(FavoriteSetting.make(name: "a", mode: .frequency, levels: [20, 1, 0, 5])?.levels == [9, 1, 0, 0], "存的时候就夹好")
 check(FavoriteSetting.sanitizedName("  \n ", fallback: "心动") == "心动", "空名字用默认名")
@@ -1200,13 +1266,24 @@ check(!FavoriteSetting.nextName(existing: FavoriteSetting.suggestedNames).isEmpt
 let encodedFavs = FavoriteCodec.encode([favManual, favSkill, favZero, favFreq])
 let decodedFavs = FavoriteCodec.decode(encodedFavs)
 check(decodedFavs.map { $0.id } == [favManual.id, favFreq.id], "读取时丢掉无效收藏")
+check(decodedFavs.allSatisfy { $0.levels[2] == 0 && $0.levels[3] == 0 }, "旧收藏加载后源数据已清除未使用通道")
+for fav in decodedFavs {
+    if let mode = fav.mode {
+        checkOutputFrame(mode.frame(channels: fav.levels), cmd: mode == .manual ? BCProtocol.manualCmd : BCProtocol.modeCmd,
+                         name: "旧收藏输出")
+    }
+}
 check(FavoriteCodec.decode(Data("garbage".utf8)).isEmpty && FavoriteCodec.decode(nil).isEmpty, "坏数据当没有收藏")
 let manyFavs = (0..<20).compactMap { FavoriteSetting.make(name: "\($0)", mode: .manual, levels: [$0 + 1, 0, 0, 0]) }
 check(FavoriteCodec.decode(FavoriteCodec.encode(manyFavs)).count == FavoriteSetting.maxCount, "最多 8 条")
 
 // 召回时缓缓推上去：升高分步、降低第一步就到位、最后一步恰好是目标，每一步都不超过目标
 let glide = FavoriteGlide.plan(from: [0, 50, 9, 0], to: [60, 10, 9, 0], maxLevel: BCProtocol.maxManualLevel)
-check(glide.last == [60, 10, 9, 0], "缓推：最后一步是目标")
+check(glide.last == [60, 10, 0, 0], "缓推：最后一步是目标，清除旧通道")
+check(glide.allSatisfy { $0[2] == 0 && $0[3] == 0 }, "缓推：每一步源值都清除未使用通道")
+for levels in glide {
+    checkOutputFrame(BCProtocol.manualFrame(channels: levels), cmd: BCProtocol.manualCmd, name: "收藏缓推帧")
+}
 check(glide.allSatisfy { $0[1] == 10 }, "缓推：降低的通道第一步就到位")
 check(glide.first.map { $0[0] > 0 && $0[0] < 60 } ?? false, "缓推：升高的通道从中间值开始")
 let glideTarget: [Int] = [60, 10, 9, 0]
@@ -1217,7 +1294,9 @@ check(glidePairs.allSatisfy { (pair: ([Int], [Int])) -> Bool in
 check(glide.allSatisfy { (s: [Int]) -> Bool in
     (0..<4).allSatisfy { s[$0] <= glideTarget[$0] }
 }, "缓推：不超过目标")
-check(FavoriteGlide.plan(from: [3, 3, 3, 0], to: [3, 3, 3, 0], maxLevel: BCProtocol.maxManualLevel) == [[3, 3, 3, 0]], "已经在目标：只发一次")
+check(FavoriteGlide.plan(from: [3, 3, 3, 0], to: [3, 3, 3, 0], maxLevel: BCProtocol.maxManualLevel) == [[3, 3, 0, 0]], "已经在目标：只发一次，旧通道归零")
+check(FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [1, 0, 99, 0], maxLevel: 99)
+      == FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [1, 0, 0, 0], maxLevel: 99), "旧通道值不增加缓推用时")
 let smallGlide = FavoriteGlide.plan(from: [0, 0, 0, 0], to: [2, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel)
 check(smallGlide.count == FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [2, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel),
       "缓推：重复档位也保留计时步骤")

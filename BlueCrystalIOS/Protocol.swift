@@ -6,9 +6,9 @@ import Foundation
 /// checksum = 前面所有字节相加取低 8 位
 /// 写特征值 FFA1，Write With Response
 ///
-/// - 0x06 模式帧（官方 Tt()，技能 / 变频 tab）：AA 06 05 <伸缩> <震动> <吮吸> <旋转> 00 <cs>
+/// - 0x06 模式帧（官方 Tt()，技能 / 变频 tab）：AA 06 05 <伸缩> <震动> 00 00 00 <cs>
 ///   变频滑杆官方默认范围 0~9；技能预设最高也是 9
-/// - 0x08 帧（官方 at(arr, t)）：AA 08 06 <伸缩> <震动> <吮吸> <旋转> <t 高字节> <t 低字节> <cs>
+/// - 0x08 帧（官方 at(arr, t)）：AA 08 06 <伸缩> <震动> 00 00 <t 高字节> <t 低字节> <cs>
 ///   手动 tab、全屏视频页、video.js 脚本指令都用 t = 0；手动滑杆官方范围 0~99
 /// - 停止：照官方迷姬专用停止（video.js handleSlide）先发 0x08 停止帧 at([0,0,0,0],255)，100ms 后再发 0x06 停止帧 Tt([0,0,0,0])
 enum BCProtocol {
@@ -17,25 +17,24 @@ enum BCProtocol {
     static let modeCmd: UInt8 = 0x06
     static let manualCmd: UInt8 = 0x08
 
-    /// 四通道索引（官方 getSlideProtocolIndex：伸缩 0 / 震动 1 / 吮吸 2 / 旋转 3）
+    /// 保留四通道线格式；mizzzee_0032 只使用伸缩 0 / 震动 1，索引 2 / 3 恒为 0。
     enum Channel: Int, CaseIterable {
         case thrust = 0    // 伸缩
         case vibration = 1 // 震动
-        case suction = 2   // 吮吸
+        case suction = 2   // 仅用于识别并忽略旧脚本，厂家确认设备不支持
         case rotation = 3  // 旋转
 
         var displayName: String {
             switch self {
             case .thrust: return "伸缩"
             case .vibration: return "震动"
-            case .suction: return "吮吸"
+            case .suction: return "未使用"
             case .rotation: return "旋转"
             }
         }
 
-        /// 旋转通道只留在协议里、恒发 0（修 N5）：官方面板默认滑杆只有伸缩/震动/吮吸，
-        /// 内置的 mizzzee 配置和五个技能预设都没用到它，0032 的服务端配置也没拿到
-        var isUsed: Bool { self != .rotation }
+        /// 旧通道只留作兼容标识，不显示、不参与输出。
+        var isUsed: Bool { self == .thrust || self == .vibration }
 
         /// 界面上显示的通道
         static var uiChannels: [Channel] { allCases.filter { $0.isUsed } }
@@ -80,7 +79,7 @@ enum BCProtocol {
         }
     }
 
-    /// 官方技能预设（ts / n_ 表，原值）
+    /// 官方技能预设（ts / n_ 表），保留伸缩 / 震动，未使用通道归零。
     struct Preset: Identifiable {
         let key: String
         let title: String
@@ -89,11 +88,11 @@ enum BCProtocol {
     }
 
     static let presets: [Preset] = [
-        Preset(key: "shadow_follow", title: "如影随形", channels: [4, 6, 5, 0]),
-        Preset(key: "wind_spin", title: "疾风旋舞", channels: [8, 9, 9, 0]),
-        Preset(key: "phantom_follow", title: "幻影随行", channels: [6, 6, 8, 0]),
-        Preset(key: "water_ring", title: "水光环绕", channels: [2, 2, 3, 0]),
-        Preset(key: "dragon_tail", title: "神龙摆尾", channels: [3, 9, 3, 0]),
+        Preset(key: "shadow_follow", title: "如影随形", channels: [4, 6, 0, 0]),
+        Preset(key: "wind_spin", title: "疾风旋舞", channels: [8, 9, 0, 0]),
+        Preset(key: "phantom_follow", title: "幻影随行", channels: [6, 6, 0, 0]),
+        Preset(key: "water_ring", title: "水光环绕", channels: [2, 2, 0, 0]),
+        Preset(key: "dragon_tail", title: "神龙摆尾", channels: [3, 9, 0, 0]),
     ]
 
     /// 0x06 帧每通道上限（官方变频滑杆默认 [0, 9]）
@@ -105,6 +104,11 @@ enum BCProtocol {
 
     /// 官方 be(cmd, arr)：AA cmd len payload checksum
     static func frame(cmd: UInt8, payload: [UInt8]) -> Data {
+        var payload = payload
+        // 唯一组帧出口兜底：即使调用方传入旧数据，输出帧的第 3 通道也必须为 0；长度、尾部和停止格式不变。
+        if (cmd == modeCmd || cmd == manualCmd), payload.count > Channel.suction.rawValue {
+            payload[Channel.suction.rawValue] = 0
+        }
         var bytes: [UInt8] = [header, cmd, UInt8(payload.count)]
         bytes.append(contentsOf: payload)
         let checksum = bytes.reduce(0) { ($0 + Int($1)) & 0xFF }
@@ -114,8 +118,7 @@ enum BCProtocol {
 
     private static func clampChannels(_ channels: [Int], max maxV: Int) -> [UInt8] {
         (0..<4).map { (i: Int) -> UInt8 in
-            // 修 N5：旋转通道恒为 0
-            guard i != Channel.rotation.rawValue else { return 0 }
+            guard Channel(rawValue: i)?.isUsed == true else { return 0 }
             let v = i < channels.count ? channels[i] : 0
             return UInt8(Swift.max(0, Swift.min(maxV, v)))
         }
@@ -156,7 +159,7 @@ enum BCProtocol {
     /// 1.7.4 起改用它：at([0,0,0,0], 0) 只是"强度 0"，真机上点停止后设备不停。
     static var manualZeroFrame: Data { manualFrame(channels: [0, 0, 0, 0], tail: 0x00FF) }
 
-    /// 官方默认技能"如影随形"：AA 06 05 04 06 05 00 00 C4（与实抓的官方启动帧一致）
+    /// 默认技能"如影随形"：AA 06 05 04 06 00 00 00 BF（未使用通道已归零，不再照发旧实抓值）。
     static var officialStartFrame: Data { modeFrame(channels: presets[0].channels) }
 
     /// 调试用：Data 转 HEX 字符串

@@ -84,7 +84,7 @@ final class ManualControlVM: ObservableObject {
     }
 
     func setChannel(_ index: Int, _ value: Double) {
-        guard mode != .skill else { return }
+        guard mode != .skill, BCProtocol.Channel(rawValue: index)?.isUsed == true else { return }
         // 用户亲手拖滑杆：缓推让位，以手上的为准
         cancelGlide()
         noteInteraction()
@@ -230,7 +230,7 @@ final class ManualControlVM: ObservableObject {
     }
 }
 
-/// 手感：三通道强度滑杆 / 技能 / 变频 + 常驻停止
+/// 手感：两通道强度滑杆 / 技能 / 变频 + 常驻停止
 struct ManualControlView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var privacy: PrivacyLock
@@ -393,7 +393,7 @@ struct ManualControlView: View {
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: vm.mode)
     }
 
-    /// 技能卡片，或三个通道的滑杆
+    /// 技能卡片，或两个通道的滑杆
     @ViewBuilder private var controlsSection: some View {
         if vm.mode == .skill {
             VStack(alignment: .leading, spacing: 12) {
@@ -875,7 +875,7 @@ private struct ChannelControl: View {
     }
 }
 
-/// 技能卡片：名字、三通道的小柱、原始档位
+/// 技能卡片：名字、两通道的小柱、档位
 private struct PresetTile: View {
     let preset: BCProtocol.Preset
     let selected: Bool
@@ -892,7 +892,7 @@ private struct PresetTile: View {
         }
     }
 
-    /// 和小柱一样只列界面上的三个通道（旋转恒为 0，不显示）
+    /// 和小柱一样只列界面上的两个通道
     private var levelsText: String {
         let parts: [String] = BCProtocol.Channel.uiChannels.map { (ch: BCProtocol.Channel) -> String in
             let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0
@@ -901,7 +901,7 @@ private struct PresetTile: View {
         return parts.joined(separator: " ")
     }
 
-    /// 旁白：名字和三个通道各自的档位（同收藏卡片），不只读一串数字
+    /// 旁白：名字和两个通道各自的档位（同收藏卡片），不只读一串数字
     private var a11yLabel: String {
         let parts: [String] = BCProtocol.Channel.uiChannels.map { (ch: BCProtocol.Channel) -> String in
             let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0

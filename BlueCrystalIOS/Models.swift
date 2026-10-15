@@ -196,6 +196,7 @@ struct TimelineScript: Decodable {
     /// 命令强度换算成 0x08 帧强度 0~99（修 N2），照官方 video.js executeIntensityCommand：
     /// 十档值 × 10（百分制直接用）→ 取整 → 非零 +10 → 最高 99
     func deviceLevel(for cmd: TimelineCommand) -> Int {
+        guard cmd.channel?.isUsed == true else { return 0 }
         let raw = cmd.intensityLevel
         let status = useTenScale ? raw * 10 : raw
         return BCProtocol.officialScriptLevel(status: status)
@@ -212,9 +213,14 @@ struct TimelineScript: Decodable {
         return vals
     }
 
-    /// 脚本里旋转通道的命令数（旋转恒为 0，这些命令会被忽略，修 N5）
-    var ignoredRotationCount: Int {
-        commands.filter { $0.channel == .rotation }.count
+    /// 未使用或无法识别的通道只兼容加载，不参与输出。
+    var ignoredChannelCount: Int {
+        commands.filter { $0.channel?.isUsed != true }.count
+    }
+
+    var ignoredOnlyNote: String? {
+        !commands.isEmpty && ignoredChannelCount == commands.count
+            ? "脚本只有未使用通道，设备不会输出" : nil
     }
 
     var scaleDescription: String {
@@ -224,7 +230,7 @@ struct TimelineScript: Decodable {
 
 /// 播放中的激活命令集合（用于判断是否需要重发）
 struct ActiveChannels: Equatable {
-    var values: [Int] // [ch0, ch1, ch2, ch3]，0x08 帧强度 0~99（ch3 旋转恒为 0）
+    var values: [Int] // [ch0, ch1, ch2, ch3]，0x08 帧强度 0~99（ch2 / ch3 恒为 0）
 
     static var zero: ActiveChannels { ActiveChannels(values: [0, 0, 0, 0]) }
 
@@ -237,7 +243,7 @@ struct ActiveChannels: Equatable {
 // 只是"记住滑杆位置"：召回时走手动页同一条发送路径（ManualControlVM → BLEManager.send / sendThrottled），
 // 准入、额度、看门狗、单次上限一个不少；这里只负责把存下来的值夹回各自模式的范围。
 
-/// 一条收藏：控制方式（变频 / 手动）+ 三个通道的强度
+/// 一条收藏：控制方式（变频 / 手动）+ 两个通道的强度，存储数组仍保留四个位置。
 struct FavoriteSetting: Codable, Identifiable, Equatable {
     static let maxCount = 8
     static let maxNameLength = 12
@@ -259,7 +265,7 @@ struct FavoriteSetting: Codable, Identifiable, Equatable {
         return m
     }
 
-    /// 召回用的强度：补齐 4 个通道、夹到该模式的 0~maxLevel、旋转恒 0；
+    /// 召回用的强度：补齐 4 个通道、夹到该模式的 0~maxLevel、未使用通道恒 0；
     /// 模式无效或全为 0 时为 nil（全零收藏没有意义，也不会被存下来）
     var clampedLevels: [Int]? {
         guard let m = mode else { return nil }
@@ -328,7 +334,12 @@ enum FavoriteCodec {
             return Decoded(items: [], unreadable: 1)
         }
         let read = rows.compactMap { $0.value }
-        let valid = read.filter { $0.clampedLevels != nil }
+        let valid = read.compactMap { item -> FavoriteSetting? in
+            guard let levels = item.clampedLevels else { return nil }
+            var clean = item
+            clean.levels = levels
+            return clean
+        }
         return Decoded(items: Array(valid.prefix(FavoriteSetting.maxCount)), unreadable: rows.count - read.count)
     }
 
@@ -370,6 +381,7 @@ enum FavoriteGlide {
     /// 按最大升幅占量程的比例决定步数（只升不降、或不变时取 minSteps）
     static func stepCount(from: [Int], to: [Int], maxLevel: Int) -> Int {
         let rises: [Int] = (0..<4).map { (i: Int) -> Int in
+            guard BCProtocol.Channel(rawValue: i)?.isUsed == true else { return 0 }
             let a: Int = i < from.count ? max(0, from[i]) : 0
             let b: Int = i < to.count ? max(0, to[i]) : 0
             return max(0, b - a)
@@ -391,8 +403,8 @@ enum FavoriteGlide {
     /// 没有升高时只有一步（降低立即生效，或重新发一次目标值）
     static func plan(from: [Int], to: [Int], steps: Int) -> [[Int]] {
         let n = max(1, steps)
-        let start = (0..<4).map { $0 < from.count ? max(0, from[$0]) : 0 }
-        let target = (0..<4).map { $0 < to.count ? max(0, to[$0]) : 0 }
+        let start = (0..<4).map { BCProtocol.Channel(rawValue: $0)?.isUsed == true && $0 < from.count ? max(0, from[$0]) : 0 }
+        let target = (0..<4).map { BCProtocol.Channel(rawValue: $0)?.isUsed == true && $0 < to.count ? max(0, to[$0]) : 0 }
         guard (0..<4).contains(where: { target[$0] > start[$0] }) else { return [target] }
         var out: [[Int]] = []
         for k in 1...n {

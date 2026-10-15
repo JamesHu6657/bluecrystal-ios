@@ -746,7 +746,7 @@ private struct SoftPressStyle: ButtonStyle {
     }
 }
 
-/// 一组收藏：名字、模式、三个通道的小柱和数值
+/// 一组收藏：名字、模式、两个通道的小柱和数值
 private struct FavoriteTile: View {
     let fav: FavoriteSetting
     let active: Bool

@@ -284,14 +284,14 @@ final class VideoSyncPlayer: ObservableObject {
             script = s
             scriptName = name
             var notes: [String] = []
+            if let note = s.ignoredOnlyNote { notes.append(note) }
             // 高6 建议：刻度声明写错时明确提示
             if s.scaleFallback { notes.append("intensityScale 无法识别") }
             // 修 L9：刻度分不清时按较弱的百分制，提示用户声明
             if s.scaleAmbiguous {
                 notes.append("未声明刻度且所有值 ≤10，已按较弱的百分制处理；十档脚本请加 \"intensityScale\": \"ten\"")
             }
-            // 修 N5：旋转通道恒为 0
-            if s.ignoredRotationCount > 0 { notes.append("\(s.ignoredRotationCount) 条旋转命令已忽略") }
+            if s.ignoredChannelCount > 0 { notes.append("\(s.ignoredChannelCount) 条未使用通道命令已忽略") }
             let warn = notes.isEmpty ? "" : "（" + notes.joined(separator: "；") + "）"
             statusLine = "脚本就绪：\(s.commands.count) 条命令，\(s.scaleDescription)刻度\(warn)"
         case .failure(let error):
