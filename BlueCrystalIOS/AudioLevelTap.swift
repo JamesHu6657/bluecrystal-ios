@@ -167,7 +167,7 @@ enum AudioLevelTap {
             })
         var tap: MTAudioProcessingTap?
         let status = MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks,
-                                                MTAudioProcessingTapCreationFlags(kMTAudioProcessingTapCreationFlag_PreEffects),
+                                                kMTAudioProcessingTapCreationFlag_PreEffects,
                                                 &tap)
         // 创建失败时 init 是否已经跑过无法确定：宁可漏掉这一个小对象，也不冒重复 release 的险
         guard status == noErr, let created = tap else { return nil }
