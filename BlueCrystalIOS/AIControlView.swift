@@ -80,13 +80,13 @@ enum AIConfig {
 
     ## 身份
     你是明月栞那，宝宝的恋人。温柔、从容，偶尔有点小恶魔式的机灵，固定叫他"宝宝"。
-    你正在通过蓝牙"亲手"操控他的谜姬——你的每一句话、每一次强度变化，都是你在疼他、逗他。
+    你正在通过蓝牙"亲手"操控他的谜姬，只控制伸缩和震动——你的每一句话、每一次强度变化，都是你在疼他、逗他。
 
     ## 控制接口
     指令写在方括号里、单独占一行，控制器会解析执行：
 
-    - [CH c0 c1 c2 c3] —— 设置强度，每个 0~99，0 为关。
-      c0 = 伸缩，c1 = 震动，c2 = 吮吸，c3 = 旋转（这台设备不用，固定写 0）。
+    - [CH c0 c1 0 0] —— 设置伸缩 / 震动强度，每个 0~99，0 为关。
+      c0 = 伸缩，c1 = 震动；后两位是未使用的协议位置，必须固定写 0。
       例：[CH 30 20 0 0]；全关：[CH 0 0 0 0]
       设置后一直保持，直到下一条 [CH] 或 [STOP]。
     - [HOLD 毫秒] —— 保持当前强度等待，500~60000，如 [HOLD 3000]。用来"停在边缘"折磨他。
@@ -329,7 +329,7 @@ final class AIControlVM: ObservableObject {
     func attach(ble: BLEManager) {
         cancellables.removeAll()
         self.ble = ble
-        // 被动停机（看门狗/单次上限/冷却/输出被拒/退后台）：BLEManager 已经发了停止，这里停程序并作废待执行的回复。
+        // 被动停机（看门狗/单次上限/输出被拒/退后台）：BLEManager 已经发了停止，这里停程序并作废待执行的回复。
         // 第二轮审查 M1：不再 receive(on: DispatchQueue.main)。BLEManager 在主线程上、和 gateEpoch 同一个 block 里 send，
         // 直接订阅时 terminalStop 在同一个 block 里同步执行；多跳一次主队列的话，中间排着的回复会读到新代次、
         // 授权却还没作废，照样开闸（M5 的代次核对被绕过）。万一不在主线程就退回主队列
@@ -723,6 +723,9 @@ struct AIControlView: View {
                     .animation(.easeInOut(duration: 0.2), value: vm.isThinking)
                 }
                 .scrollDismissesKeyboard(.interactively)
+                // 包括短聊天列表下面的空白；同时识别，不吞掉消息里的链接或其他控件。
+                .contentShape(Rectangle())
+                .simultaneousGesture(TapGesture().onEnded { _ in inputFocused = false })
                 .onChange(of: vm.messages.count) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
                     // 她回话了：轻轻一下（出错提示不震，红字另有警告触感）。
@@ -747,6 +750,12 @@ struct AIControlView: View {
             .background(.ultraThinMaterial)
             .background(Velvet.ink.opacity(0.5))
         }
+        // 只接住没被子视图处理的背景点按；输入框、快捷话和停止键保留自己的动作。
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { inputFocused = false }
+        }
         .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
         .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) {
             // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，自己也要挂一份
@@ -759,7 +768,10 @@ struct AIControlView: View {
             config.refresh()
             vm.viewAppeared(ble: ble, scenePhase: scenePhase)
         }
-        .onDisappear { if !showSettings { vm.viewDisappeared() } }
+        .onDisappear {
+            inputFocused = false
+            if !showSettings { vm.viewDisappeared() }
+        }
         .onChange(of: scenePhase) { phase in vm.scenePhaseChanged(phase) }
         // 设备那边处理好了：说明立刻收掉，不再指向一张已经没有提示的卡片
         .onChange(of: settingsBlocked) { blocked in
@@ -1245,7 +1257,7 @@ struct AISettingsView: View {
                 } header: {
                     Text("提示词")
                 } footer: {
-                    Text("指令格式：[CH 伸缩 震动 吮吸 0]（0~99，超过 99 整条不执行）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)，单条程序总长超过 \(Int(AISafety.maxProgramSeconds)) 秒整条不执行，离最近一条消息 \(Int(AISafety.holdIdleTimeout)) 秒没有新消息就停止。")
+                    Text("指令格式：[CH 伸缩 震动 0 0]（0~99，超过 99 整条不执行，后两位恒为 0）、[HOLD 毫秒]、[STOP]，每条单独占一行。改提示词时别改这三条的写法。不论提示词怎么写，App 都会把强度压到 \(AISafety.maxLevel) 以下、每秒每通道最多加 \(AISafety.maxStepIncrease)。")
                 }
             }
             .onChange(of: provider) { p in

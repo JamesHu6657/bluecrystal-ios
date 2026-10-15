@@ -44,13 +44,12 @@ enum Velvet {
     static let stopGradient = LinearGradient(colors: [Color(hex: 0xE8344A), Color(hex: 0xD3172C)],
                                              startPoint: .top, endPoint: .bottom)
 
-    /// 通道颜色（伸缩 玫瑰 / 震动 琥珀 / 吮吸 紫罗兰）：深色底上做过色觉辨识校验，各处统一
+    /// 通道颜色（伸缩 玫瑰 / 震动 琥珀）：深色底上做过色觉辨识校验，各处统一
     static func channel(_ ch: BCProtocol.Channel) -> Color {
         switch ch {
         case .thrust: return Color(hex: 0xF0507E)
         case .vibration: return Color(hex: 0xC08428)
-        case .suction: return Color(hex: 0x9575F0)
-        case .rotation: return textMuted
+        case .suction, .rotation: return textMuted
         }
     }
 

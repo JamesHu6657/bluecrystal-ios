@@ -26,16 +26,47 @@ func hex(_ d: Data) -> String { BCProtocol.hex(d) }
 
 // 实抓（legacy research/protocol.md）
 check(hex(BCProtocol.stopFrame) == "AA06050000000000B5", "停止帧 = 实抓暂停帧")
-check(hex(BCProtocol.officialStartFrame) == "AA06050406050000C4", "如影随形 = 实抓启动帧")
+check(hex(BCProtocol.officialStartFrame) == "AA06050406000000BF", "如影随形保留伸缩 / 震动、清除旧启动帧的通道 2")
 // 官方源码 at([0,0,0,0], 255)（迷姬专用停止，video.js handleSlide；L7：之前注释误写成 at(…, 0)）
 check(hex(BCProtocol.manualZeroFrame) == "AA08060000000000FFB7", "0x08 停止帧 at([0,0,0,0],255)")
 check(hex(BCProtocol.manualFrame(channels: [0, 0, 0, 0])) == "AA0806000000000000B8", "0x08 强度 0 帧")
-// 旋转通道恒为 0（N5），0x06 夹到 9，0x08 夹到 99
-check(hex(BCProtocol.modeFrame(channels: [1, 2, 3, 9])) == "AA06050102030000BB", "0x06 帧旋转恒 0")
+// 未使用通道恒为 0，0x06 夹到 9，0x08 夹到 99
+check(hex(BCProtocol.modeFrame(channels: [1, 2, 3, 9])) == "AA06050102000000B8", "0x06 帧后两通道恒 0")
 check(hex(BCProtocol.modeFrame(channels: [12, -3, 0, 0])) == "AA06050900000000BE", "0x06 帧夹到 0~9")
 check(hex(BCProtocol.manualFrame(channels: [99, 50, 0, 7])) == "AA08066332000000004D", "0x08 帧旋转恒 0、尾部 00 00")
 check(hex(BCProtocol.videoFrame(levels: [60, 0, 0, 0])) == "AA08063C0000000000F4", "视频帧走 0x08")
-check(BCProtocol.Channel.uiChannels == [.thrust, .vibration, .suction], "界面不显示旋转")
+check(BCProtocol.Channel.uiChannels == [.thrust, .vibration], "界面只显示伸缩 / 震动")
+check(BCProtocol.presets.map(\.channels) == [[4, 6, 0, 0], [8, 9, 0, 0], [6, 6, 0, 0], [2, 2, 0, 0], [3, 9, 0, 0]],
+      "五个技能预设只保留原有伸缩 / 震动值")
+
+func checkOutputFrame(_ data: Data, cmd: UInt8, name: String) {
+    let b = [UInt8](data)
+    let size = cmd == BCProtocol.modeCmd ? 9 : 10
+    guard b.count == size else { check(false, "\(name)：帧长度不变"); return }
+    check(b[0] == 0xAA && b[1] == cmd && Int(b[2]) == size - 4, "\(name)：四通道线格式不变")
+    check(b[5] == 0, "\(name)：通道索引 2 恒为 0")
+    check(Int(b.last!) == b.dropLast().reduce(0) { ($0 + Int($1)) & 0xFF }, "\(name)：归零后校验和正确")
+}
+for channels in [[1, 2, 99, 0], [0, 0, 99, 0], [Int.max, Int.min, Int.max, 99], [3, 4, -1], [1], []] {
+    checkOutputFrame(BCProtocol.modeFrame(channels: channels), cmd: BCProtocol.modeCmd, name: "变频 \(channels)")
+    checkOutputFrame(BCProtocol.manualFrame(channels: channels), cmd: BCProtocol.manualCmd, name: "手动 \(channels)")
+    checkOutputFrame(BCProtocol.videoFrame(levels: channels), cmd: BCProtocol.manualCmd, name: "视频 \(channels)")
+    for mode in BCProtocol.Mode.allCases {
+        checkOutputFrame(mode.frame(channels: channels), cmd: mode == .manual ? BCProtocol.manualCmd : BCProtocol.modeCmd,
+                         name: "\(mode.title)统一出口 \(channels)")
+    }
+}
+for preset in BCProtocol.presets {
+    checkOutputFrame(BCProtocol.modeFrame(channels: preset.channels), cmd: BCProtocol.modeCmd, name: "技能 \(preset.key)")
+}
+let directMode = BCProtocol.frame(cmd: BCProtocol.modeCmd, payload: [4, 6, 255, 0, 0])
+let directManual = BCProtocol.frame(cmd: BCProtocol.manualCmd, payload: [30, 20, 255, 0, 0x12, 0x34])
+checkOutputFrame(directMode, cmd: BCProtocol.modeCmd, name: "直接调用模式组帧")
+checkOutputFrame(directManual, cmd: BCProtocol.manualCmd, name: "直接调用手动组帧")
+check(Array(Array(directManual)[3...8]) == [30, 20, 0, 0, 0x12, 0x34], "组帧兜底保留前两通道和尾部")
+check(BCProtocol.isAllZeroOutput(BCProtocol.manualFrame(channels: [0, 0, 99, 0])), "只有旧通道 2 非零时走原有全零停止逻辑")
+checkOutputFrame(BCProtocol.stopFrame, cmd: BCProtocol.modeCmd, name: "停止模式帧")
+checkOutputFrame(BCProtocol.manualZeroFrame, cmd: BCProtocol.manualCmd, name: "停止手动帧")
 
 // F1：纯状态重现 t=10ms 首帧错误，100ms 仍发第二帧；调度由 BLEManager 执行。
 var earlyErrorPair = StopPairAttempt()
@@ -152,14 +183,14 @@ check(OutputAdmission.decide(.init(stopInProgress: true, stopFailed: true)) == .
 check(OutputAdmission.decide(.init(allZero: true, isActive: true)) == .zeroStopPair, "运行中全零：完整停止帧对")
 check(OutputAdmission.decide(.init(allZero: true, isActive: true, zeroHeld: true)) == .alreadyZeroed, "重复全零不再发")
 check(OutputAdmission.decide(.init(allZero: true)) == .skipIdleZero, "空闲全零：丢掉，不开始运行")
-check(OutputAdmission.decide(.init()) == .write(startsRun: true), "空闲时的非零帧：先过冷却/额度再开始运行")
+check(OutputAdmission.decide(.init()) == .write(startsRun: true), "空闲时的非零帧：先过额度再开始运行")
 check(OutputAdmission.decide(.init(isActive: true)) == .write(startsRun: false), "运行中的非零帧：直接写")
 
 // MARK: - Brain 审查 M5：开闸核对被动停机代次
 
 check(OutputGate.mayOpen(requestEpoch: nil, currentEpoch: 7), "用户直接操作（手动拖动、视频页播放）不比代次")
 check(OutputGate.mayOpen(requestEpoch: 7, currentEpoch: 7), "执行前读到的代次仍是最新：可以开闸")
-check(!OutputGate.mayOpen(requestEpoch: 6, currentEpoch: 7), "执行前检查之后发生过被动停机：不开闸，不再只靠冷却兜底")
+check(!OutputGate.mayOpen(requestEpoch: 6, currentEpoch: 7), "执行前检查之后发生过被动停机：不开闸")
 
 // MARK: - Brain 审查 L1：回执 FIFO 重新对齐
 
@@ -217,11 +248,26 @@ if let s = script("{\"intensityScale\":\"percent\",\"commands\":[\(cmd("Thrust",
 if let s = script("{\"commands\":[\(cmd("Thrust", 5)),\(cmd("Rotation", 3))]}") {
     check(s.scaleAmbiguous && !s.useTenScale, "未声明且 ≤10：按较弱的百分制并提示（L9）")
     check(s.deviceLevel(for: s.commands[0]) == 15, "未声明 5 → 15")
-    check(s.ignoredRotationCount == 1, "旋转命令计数")
+    check(s.ignoredChannelCount == 1, "未使用通道命令计数")
     check(s.commands[1].channel?.isUsed == false, "旋转命令不发")
 } else {
     check(false, "未声明刻度脚本解析")
 }
+for type in ["Suction", "suction", "SUCTION", "Sucking", "Rotation"] {
+    if let s = script("{\"intensityScale\":\"ten\",\"commands\":[\(cmd(type, 10))]}") {
+        check(s.commands.count == 1 && s.commands[0].channel?.isUsed == false, "\(type)：旧文件可加载，通道不启用")
+        check(s.deviceLevel(for: s.commands[0]) == 0, "\(type)：源强度为 0")
+        check(s.levels(at: 0.5, previous: nil) == [0, 0, 0, 0], "\(type)：当前激活无输出")
+        check(s.levels(at: 2, previous: 0, fromPlaybackStart: true) == [0, 0, 0, 0], "\(type)：跨越短命令也无输出")
+        check(s.ignoredChannelCount == 1 && s.ignoredOnlyNote != nil, "\(type)：只有忽略通道时有提示")
+    } else { check(false, "\(type)：旧脚本解析") }
+}
+if let s = script("{\"intensityScale\":\"ten\",\"commands\":[\(cmd("Thrust", 5)),\(cmd("Vibration", 7)),\(cmd("Suction", 10)),\(cmd("Rotation", 9))]}") {
+    check(s.levels(at: 0.5, previous: nil) == [60, 80, 0, 0], "混合脚本保留伸缩 / 震动，忽略旧通道")
+    check(s.ignoredChannelCount == 2 && s.ignoredOnlyNote == nil, "混合脚本不提示只有忽略通道")
+    checkOutputFrame(BCProtocol.videoFrame(levels: s.levels(at: 0.5, previous: nil)), cmd: BCProtocol.manualCmd, name: "混合时间轴输出")
+} else { check(false, "混合旧通道脚本解析") }
+check(script("{\"commands\":[]}")?.ignoredOnlyNote == nil, "空脚本不误提示只有忽略通道")
 if let s = script("{\"commands\":[\(cmd("Thrust", 50)),\(cmd("Thrust", 5))]}") {
     check(!s.scaleAmbiguous && !s.useTenScale, "未声明但有 >10：确定是百分制")
 } else {
@@ -238,7 +284,7 @@ check(!firstShort.isCovered(at: 0.1, previous: 0),
 let delayedShort = TimelineCommand(commandType: "Vibration", startTimeSeconds: 0.2,
                                    durationSeconds: 0.05, intensityLevel: 5)
 check(delayedShort.isCovered(at: 1, previous: 0.1), "连续播放延迟 >0.5s 仍覆盖短命令")
-let overlappingShort = TimelineCommand(commandType: "Suction", startTimeSeconds: 0.05,
+let overlappingShort = TimelineCommand(commandType: "Thrust", startTimeSeconds: 0.05,
                                        durationSeconds: 0.1, intensityLevel: 5)
 check(overlappingShort.isCovered(at: 0.2, previous: 0.1, fromPlaybackStart: true),
       "恢复播放后的首个采样覆盖播放起点已经激活的短命令")
@@ -282,11 +328,25 @@ func makeLedger() -> DutyCycleLedger {
     DutyCycleLedger(clock: { fc.t }, wallClock: { fc.wall }, bootIdentity: { fc.boot })
 }
 
+// 2026-10-15 用户要求关闭时间上限：默认关闭时额度永远满、单次不会到点、遗留运行也不封锁
+check(!SafetyLimits.timeLimitsEnabled, "时间上限默认关闭")
+do {
+    let free = makeLedger()
+    check(free.checkAdmissible() == nil, "关闭上限：可以开始")
+    let allowed = free.begin() ?? 0
+    check(allowed >= SafetyLimits.unlimitedSeconds - 1, "关闭上限：本次上限为无限大")
+    fc.advance(3 * 3600)
+    check((free.runRemaining() ?? 0) > 0, "关闭上限：连续 3 小时也不到点")
+    free.end()
+    check(free.checkAdmissible() == nil && free.secondsUntilBudget() == 0, "关闭上限：停下立刻能再开始，不用等额度")
+    check(near(free.remainingBudget(), SafetyLimits.unlimitedSeconds), "关闭上限：额度不减少")
+    check(Int(SafetyLimits.maxRunSeconds) > 0 && Int(SafetyLimits.dutyBudgetSeconds) > 0, "无限值可以安全转 Int")
+}
+// 以下保留原有账本测试：打开时间上限后验证原逻辑没被改坏
+SafetyLimits.timeLimitsEnabled = true
 check(SafetyLimits.maxRunSeconds == 1200, "单次上限 20 分钟")
 check(SafetyLimits.dutyWindowSeconds == 1800 && SafetyLimits.dutyBudgetSeconds == 1200, "30 分钟 1200 秒")
-check(SafetyLimits.minCooldownSeconds == 60 && SafetyLimits.cooldownRatio == 0.5, "冷却 max(60, 0.5×时长)")
-check(SafetyLimits.unknownElapsedCooldownSeconds == 600 && SafetyLimits.checkpointIntervalSeconds == 5,
-      "未知时长最大额度冷却 600 秒，每 5 秒保存下界")
+check(SafetyLimits.checkpointIntervalSeconds == 5, "每 5 秒保存时长下界")
 
 let ledger = makeLedger()
 check(ledger.checkAdmissible() == nil, "初始可以开始")
@@ -295,12 +355,7 @@ check(ledger.checkAdmissible() == .openRun, "运行中不能再开一次")
 fc.advance(1200)
 check((ledger.runRemaining() ?? 1) <= 0, "1200 秒到点")
 ledger.end()
-check(near(ledger.cooldownRemaining(), 600), "跑满 1200 秒后冷却 600 秒")
-if case .cooldown(let s)? = ledger.checkAdmissible() {
-    check(near(s, 600), "冷却中拒绝开始")
-} else {
-    check(false, "冷却中拒绝开始")
-}
+check(ledger.checkAdmissible() == .budget(1800), "跑满 1200 秒后只按滚动额度拒绝开始")
 fc.advance(600)
 if case .budget(let wait)? = ledger.checkAdmissible() {
     check(near(wait, 1200), "1200 秒额度用完，等这一笔滑出窗口（1200 秒）")
@@ -312,15 +367,16 @@ check(ledger.checkAdmissible() == nil, "滑出窗口后可以开始")
 check(near(ledger.begin(), 1200), "滑出窗口后可再跑 1200 秒")
 fc.advance(10)
 ledger.end()
-check(near(ledger.cooldownRemaining(), 60), "短运行冷却下限 60 秒")
+check(ledger.checkAdmissible() == nil && near(ledger.begin(), 1190), "短运行停止后可以立即开始，保留额度扣账")
+ledger.end()
 
-// M1：断链很久才确认停止（同进程、时长已知）：冷却封顶 600 秒，额度照实际时长记账
+// 断链很久才确认停止（同进程、时长已知）：额度照实际时长记账。
 let longLink = makeLedger()
 longLink.begin()
 fc.advance(5000)
 longLink.end()
-check(near(longLink.cooldownRemaining(), 600), "运行 5000 秒后确认停止：冷却封顶 600 秒")
-check(near(longLink.remainingBudget(), 0), "冷却封顶不减少记账：5000 秒仍耗尽额度")
+check(longLink.checkAdmissible() == .budget(1800), "运行 5000 秒后确认停止：只受完整额度窗口限制")
+check(near(longLink.remainingBudget(), 0), "5000 秒仍耗尽额度")
 fc.advance(1800)
 
 // 只剩部分额度时本次上限更短
@@ -337,7 +393,7 @@ check(near(short.remainingBudget(), 10) && near(short.begin(), 10), "额度只�
 fc.advance(10)
 short.end()
 
-// 持久化：重启 App 后冷却继续
+// 持久化：重启 App 后额度继续，仍可立即开始。
 let persisted = makeLedger()
 persisted.begin()
 fc.advance(100)
@@ -346,7 +402,7 @@ let data = persisted.snapshotData()
 fc.advance(30)
 let restored = makeLedger()
 if let d = data { restored.restore(from: d) }
-check(near(restored.cooldownRemaining(), 30), "重启后冷却继续计时")
+check(restored.checkAdmissible() == nil, "短运行停止后重启可以立即开始")
 check(near(restored.remainingBudget(), 1100), "重启后额度保留")
 
 // F2：进程不在时不能执行软件截止停机，直到确认停止都记账，不限于单次上限。
@@ -360,10 +416,10 @@ check(orphanRestored.hasOpenRun && orphanRestored.openOrphaned, "未结束的运
 check(!orphanRestored.openElapsedUnknown, "同 boot 遗留运行使用可验证的 uptime，不标记未知")
 fc.advance(20)
 orphanRestored.end()
-check(near(orphanRestored.cooldownRemaining(), 600), "遗留运行 1520 秒含确认前等待，冷却封顶 600 秒（M1）")
+check(orphanRestored.checkAdmissible() == .budget(1800), "遗留运行含确认前等待，耗尽完整额度窗口")
 check(near(orphanRestored.remainingBudget(), 0), "遗留运行超过 1200 秒耗尽额度，不按单次上限封顶")
 
-// 同 boot 墙钟被往回调：仍按 uptime，冷却不缩短。
+// 同 boot 墙钟被往回调：仍按 uptime，记账不变。
 let wallBack = makeLedger()
 wallBack.begin()
 fc.advance(100)
@@ -372,10 +428,10 @@ let wallData = wallBack.snapshotData()
 fc.wall -= 3600
 let wallRestored = makeLedger()
 if let d = wallData { wallRestored.restore(from: d) }
-check(near(wallRestored.cooldownRemaining(), 60), "墙钟回拨后冷却不缩短")
+check(near(wallRestored.remainingBudget(), 1100) && wallRestored.checkAdmissible() == nil, "墙钟回拨后额度不变，可以立即开始")
 fc.wall += 3600
 
-// F3：同 boot 跨 relaunch 只使用单调时间，前拨墙钟不能清掉预算或冷却。
+// F3：同 boot 跨 relaunch 只使用单调时间，前拨墙钟不能清掉预算。
 let wallForward = makeLedger()
 wallForward.begin()
 fc.advance(300)
@@ -385,12 +441,12 @@ fc.advance(5)
 fc.wall += 3600
 let forwardRestored = makeLedger()
 if let d = forwardData { forwardRestored.restore(from: d) }
-check(near(forwardRestored.cooldownRemaining(), 145), "同 boot 前拨一小时后冷却只流逝 5 秒")
+check(forwardRestored.checkAdmissible() == nil, "同 boot 前拨后剩余额度仍允许立即开始")
 check(near(forwardRestored.remainingBudget(), 900), "同 boot 前拨一小时不清掉记账")
 fc.wall -= 7200
 let backwardRestored = makeLedger()
 if let d = forwardData { backwardRestored.restore(from: d) }
-check(near(backwardRestored.cooldownRemaining(), 145), "同 boot 后拨墙钟也只用 uptime")
+check(near(backwardRestored.remainingBudget(), 900), "同 boot 后拨墙钟也只用 uptime 记账")
 fc.wall += 3600
 
 // 同 boot 的 future openStart 墙钟值不会变成零时长。
@@ -402,24 +458,24 @@ fc.wall -= 3600
 let futureRestored = makeLedger()
 if let d = futureData { futureRestored.restore(from: d) }
 futureRestored.end()
-check(near(futureRestored.cooldownRemaining(), 500), "墙钟回拨的未结束运行仍按 uptime 计 1000 秒")
+check(near(futureRestored.remainingBudget(), 200), "墙钟回拨的未结束运行仍按 uptime 计 1000 秒")
 fc.wall += 3600
 
-// 重启/uptime 倒退：不信任前拨墙钟，完整保留记账和冷却。
+// 重启/uptime 倒退：不信任前拨墙钟，完整保留记账。
 fc.boot = "boot-b"
 fc.t = 10
 fc.wall += 86400
 let rebootRestored = makeLedger()
 if let d = forwardData { rebootRestored.restore(from: d) }
 check(near(rebootRestored.remainingBudget(), 900), "reboot 加前拨一天不剪掉记账")
-check(near(rebootRestored.cooldownRemaining(), 150), "reboot 加前拨一天不缩短冷却")
+check(rebootRestored.checkAdmissible() == nil, "reboot 后有剩余额度就可立即开始")
 // 保存保守恢复的新锚点后再次 relaunch，仍只流逝实际 uptime。
 let rebasedData = rebootRestored.snapshotData()
 fc.advance(5)
 fc.wall += 86400
 let rebasedRestored = makeLedger()
 if let d = rebasedData { rebasedRestored.restore(from: d) }
-check(near(rebasedRestored.cooldownRemaining(), 145), "保守恢复后再次 relaunch 不丢掉冷却")
+check(rebasedRestored.checkAdmissible() == nil, "保守恢复后再次 relaunch 仍可立即开始")
 check(near(rebasedRestored.remainingBudget(), 900), "保守恢复后的记账继续保留")
 
 // 启动 UUID 即使相同，uptime 倒退也必须保守恢复。
@@ -427,7 +483,7 @@ let rollbackData = rebasedRestored.snapshotData()
 fc.t = 1
 let rollbackRestored = makeLedger()
 if let d = rollbackData { rollbackRestored.restore(from: d) }
-check(near(rollbackRestored.cooldownRemaining(), 150), "uptime 倒退不缩短冷却")
+check(rollbackRestored.checkAdmissible() == nil, "uptime 倒退不额外阻止开始")
 check(near(rollbackRestored.remainingBudget(), 900), "uptime 倒退不清掉记账")
 
 // 兼容旧墙钟账本；缺少启动锚点时必须保持未知，而非估成 300 秒。
@@ -440,7 +496,7 @@ legacyRestored.restore(from: legacyFuture)
 check(legacyRestored.openElapsedUnknown && legacyRestored.checkAdmissible() == .openRun,
       "旧账本缺锚点保持未知、拒绝新运行")
 legacyRestored.end()
-check(near(legacyRestored.cooldownRemaining(), 600), "旧账本未知运行按全部额度应用最大冷却")
+check(legacyRestored.checkAdmissible() == .budget(1800), "旧账本未知运行仅应用完整额度限制")
 check(near(legacyRestored.remainingBudget(), 0), "旧账本未知运行停止后耗尽全部 1200 秒额度")
 let legacyCompleted = Data("""
 {"completed":[{"end":\(fc.wall - 86400),"charge":1200}],"openStart":null,
@@ -449,7 +505,23 @@ let legacyCompleted = Data("""
 let legacyCompletedRestored = makeLedger()
 legacyCompletedRestored.restore(from: legacyCompleted)
 check(near(legacyCompletedRestored.remainingBudget(), 0), "旧墙钟账本的前拨不能抹掉 1200 秒记账")
-check(near(legacyCompletedRestored.cooldownRemaining(), 600), "旧墙钟账本的前拨不能清掉冷却")
+check(legacyCompletedRestored.checkAdmissible() == .budget(1800), "旧墙钟账本仍按额度限制开始")
+
+// 旧版保存的停止等待字段直接忽略，不影响恢复记账或短运行后立即开始。
+let legacyShortStop = Data("""
+{"completed":[{"end":\(fc.wall),"charge":10}],"openStart":null,
+ "openAllowed":0,"lastEnd":\(fc.wall),"appliedCooldown":600}
+""".utf8)
+let legacyShortRestored = makeLedger()
+legacyShortRestored.restore(from: legacyShortStop)
+check(near(legacyShortRestored.begin(), 1190), "旧快照保存 600 秒等待也不阻止立即开始")
+if let snapshot = legacyShortRestored.snapshotData(),
+   let fields = (try? JSONSerialization.jsonObject(with: snapshot)) as? [String: Any] {
+    check(fields["appliedCooldown"] == nil && fields["lastEnd"] == nil, "新快照不再保存停止等待字段")
+} else {
+    check(false, "新版停止快照编码")
+}
+legacyShortRestored.end()
 
 // 重启且墙钟回拨：保留快照前已知 1500 秒，不能把 future openStart 改成现在。
 fc.boot = "boot-c"
@@ -466,7 +538,7 @@ if let d = rebootOpenData { rebootOpenRestored.restore(from: d) }
 check(rebootOpenRestored.openElapsedUnknown, "reboot 后未知区间不能靠已知下界变成可信完整时长")
 fc.advance(20)
 rebootOpenRestored.end()
-check(near(rebootOpenRestored.cooldownRemaining(), 600), "reboot 回拨的未知运行冷却封顶 600 秒（M1）")
+check(rebootOpenRestored.checkAdmissible() == .budget(1800), "reboot 回拨的未知运行仅应用额度窗口")
 check(near(rebootOpenRestored.remainingBudget(), 0), "reboot 回拨的遗留运行不按软件上限封顶")
 
 // 审查重现：begin 快照后失联 1000 秒，reboot 且墙钟回拨，确认前又等 20 秒。
@@ -501,15 +573,14 @@ check(unknownRelaunched.openElapsedUnknown, "重存同 boot 锚点再 relaunch �
 fc.advance(15)
 unknownRelaunched.end() // BLEManager 的确认停止/物理停机路径；物理锁存由 BLEManager 保留。
 check(!unknownRelaunched.hasOpenRun && !unknownRelaunched.openElapsedUnknown, "确认停止结束未知运行")
-check(near(unknownRelaunched.cooldownRemaining(), 600), "未知运行停止后至少冷却 600 秒")
+check(unknownRelaunched.checkAdmissible() == .budget(1800), "未知运行停止后仅因耗尽额度拒绝开始")
 check(near(unknownRelaunched.remainingBudget(), 0) && near(unknownRelaunched.secondsUntilBudget(), 1800),
       "未知运行恢复后完整 30 分钟没有新额度")
 let unknownStoppedData = unknownRelaunched.snapshotData()
 fc.advance(600)
 let unknownStoppedRestored = makeLedger()
 if let d = unknownStoppedData { unknownStoppedRestored.restore(from: d) }
-check(near(unknownStoppedRestored.cooldownRemaining(), 0), "未知运行最大额度冷却计时跨进程保留")
-check(unknownStoppedRestored.checkAdmissible() == .budget(1200), "冷却后仍须等满额度窗口")
+check(unknownStoppedRestored.checkAdmissible() == .budget(1200), "重启后仍须等满额度窗口")
 fc.advance(1199)
 check(near(unknownStoppedRestored.remainingBudget(), 0), "确认停止后 1799 秒仍无额度")
 fc.advance(1)
@@ -519,12 +590,11 @@ fc.t = 5
 fc.wall += 86400
 let unknownStopRebootRestored = makeLedger()
 if let d = unknownStoppedData { unknownStopRebootRestored.restore(from: d) }
-check(near(unknownStopRebootRestored.cooldownRemaining(), 600)
-      && near(unknownStopRebootRestored.remainingBudget(), 0)
+check(near(unknownStopRebootRestored.remainingBudget(), 0)
       && near(unknownStopRebootRestored.secondsUntilBudget(), 1800),
-      "恢复后的完整预算禁用和最大冷却跨 reboot/前拨继续保守保留")
+      "恢复后的完整预算禁用跨 reboot/前拨继续保守保留")
 
-// 每 5 秒持久化 checkpoint，停止/断链前的已验证时长跨 reboot 成为冷却下界。
+// 每 5 秒持久化 checkpoint，停止/断链前的已验证时长跨 reboot 成为记账下界。
 fc.boot = "checkpoint-a"
 fc.t = 100
 let checkpointRun = makeLedger()
@@ -558,9 +628,9 @@ if let d = preRebootCheckpointData { checkpointRestored.restore(from: d) }
 check(checkpointRestored.openElapsedUnknown, "checkpoint 不会掩盖 reboot 的未知区间")
 fc.advance(20)
 checkpointRestored.end()
-check(near(checkpointRestored.cooldownRemaining(), 600),
-      "reboot 后 checkpoint 下界 1525 秒的未知运行冷却封顶 600 秒（M1）")
-check(near(checkpointRestored.remainingBudget(), 0), "冷却封顶不减少保守记账：额度仍耗尽")
+check(checkpointRestored.checkAdmissible() == .budget(1800),
+      "reboot 后 checkpoint 下界 1525 秒的未知运行仍耗尽完整额度窗口")
+check(near(checkpointRestored.remainingBudget(), 0), "保守记账：额度仍耗尽")
 // 启动标识缺失、uptime 倒退或坏的开始锚点都必须显式未知。
 fc.boot = "anchors-a"
 fc.t = 100
@@ -592,7 +662,7 @@ func executable(_ r: AIReply) -> Bool { r.rejection == nil && (!r.steps.isEmpty 
 
 let okReply = AIReply.parse("宝宝，开始了哦\n[CH 30 20 10 0]\n  [HOLD 3000]  \n[CH 0 0 0 0]\n[STOP]")
 check(okReply.rejection == nil && okReply.stop, "合法程序：独占一行（允许前后空白）")
-check(okReply.steps == [AIStep(levels: [30, 20, 10, 0], duration: 3), AIStep(levels: [0, 0, 0, 0], duration: 1.5)],
+check(okReply.steps == [AIStep(levels: [30, 20, 0, 0], duration: 3), AIStep(levels: [0, 0, 0, 0], duration: 1.5)],
       "CH + HOLD 合并、默认间隔 1.5 秒")
 check(okReply.text == "宝宝，开始了哦", "显示文字去掉指令行")
 
@@ -601,9 +671,14 @@ check(persist.rejection == nil && persist.steps == [AIStep(levels: [40, 0, 0, 0]
       "没有 STOP 时最后一步保持（duration 0）")
 
 let clamped = AIReply.parse("[ch 99 0 0 77]\n[HOLD 100]\n[CH 5 5 5 5]\n[HOLD 999999]")
-check(clamped.steps.first?.levels == [99, 0, 0, 0], "强度 99 原样保留（上限 70 由 AISafety 处理），c3 恒 0，关键字不分大小写")
+check(clamped.steps.first?.levels == [99, 0, 0, 0], "强度 99 原样保留（上限 70 由 AISafety 处理），c2 / c3 恒 0，关键字不分大小写")
 check(clamped.steps.first?.duration == 0.5, "HOLD 夹到最少 500 毫秒")
-check(clamped.steps.last?.levels == [5, 5, 5, 0] && clamped.steps.last?.duration == 60, "HOLD 夹到最多 60000 毫秒")
+check(clamped.steps.last?.levels == [5, 5, 0, 0] && clamped.steps.last?.duration == 60, "旧四值 CH 后两位归零，HOLD 夹到最多 60000 毫秒")
+let legacyZeroAI = AIReply.parse("[CH 0 0 99 0]")
+check(legacyZeroAI.rejection == nil && legacyZeroAI.steps.first?.isZero == true
+      && ReplyAuthorization.programEndIsTerminal(steps: legacyZeroAI.steps, endWithStop: false),
+      "旧 AI 只开通道 2：兼容解析、转为全零并结束停止")
+check(AIStep(levels: [10, 20, 99, 0], duration: 0).summary == "伸缩 10 · 震动 20", "AI 程序展示只有两个通道")
 
 // 只有独占一行才算指令；行内、引用、代码块里的指令样式文字让整条作废
 for (raw, name) in [
@@ -725,6 +800,7 @@ check(AIReply.parse("[笑] 宝宝乖").rejection == nil, "非指令的方括号�
 for (raw, name) in [
     ("[CH 150 0 0 0]", "伸缩 150"),
     ("[CH 30 0 0 100]", "旋转位 100"),
+    ("[CH 30 0 100 0]", "未使用位 100 仍拒绝"),
     ("宝宝\n[CH 30 0 0 0]\n[CH 100 0 0 0]\n[STOP]", "后面一步 100"),
 ] {
     let r = AIReply.parse(raw)
@@ -741,14 +817,26 @@ check(fromIdle.steps == [AIStep(levels: [20, 0, 0, 0], duration: 1), AIStep(leve
       "从空闲开始：第一步每秒 +20 从 0 爬到目标，目标步保持原时长")
 check(fromIdle.rampSteps == 2 && fromIdle.clampedValues == 0, "爬升步计数")
 let overCap = AISafety.enforce([AIStep(levels: [99, 80, 10, 0], duration: 2)], from: [70, 70, 0, 0])
-check(overCap.steps == [AIStep(levels: [70, 70, 10, 0], duration: 2)] && overCap.clampedValues == 2,
+check(overCap.steps == [AIStep(levels: [70, 70, 0, 0], duration: 2)] && overCap.clampedValues == 2,
       "超过 70 的值压到 70")
-check(overCap.displaySteps == [AIStep(levels: [70, 70, 10, 0], duration: 2)], "界面显示压低后的值")
+check(overCap.displaySteps == [AIStep(levels: [70, 70, 0, 0], duration: 2)], "界面显示压低后的值，通道 2 归零")
 check(AISafety.describe(overCap, stop: false).contains("已压到 70"), "程序说明标出压到 70")
 let fullIdle = AISafety.enforce(AIReply.parse("[CH 99 99 99 0]").steps, from: [0, 0, 0, 0])
-check(fullIdle.steps.first == AIStep(levels: [20, 20, 20, 0], duration: 1)
-      && fullIdle.steps.last == AIStep(levels: [70, 70, 70, 0], duration: 0) && fullIdle.rampSteps == 3,
+check(fullIdle.steps.first == AIStep(levels: [20, 20, 0, 0], duration: 1)
+      && fullIdle.steps.last == AIStep(levels: [70, 70, 0, 0], duration: 0) && fullIdle.rampSteps == 3,
       "开场拉满：压到 70，从 0 每秒 +20 爬上去")
+let legacyAIRamp = AISafety.enforce([AIStep(levels: [70, 40, 99, 99], duration: 0)], from: [10, 60, 99, 99],
+                                     secondsSinceRise: 0.5)
+check(legacyAIRamp.rampSteps > 0 && legacyAIRamp.waitSteps > 0
+      && (legacyAIRamp.steps + legacyAIRamp.displaySteps).allSatisfy { $0.levels.map { $0[2] == 0 && $0[3] == 0 } ?? true },
+      "AI 旧起点 / 目标在爬升和等待源值中都清除未使用通道")
+for step in legacyAIRamp.steps {
+    if let levels = step.levels {
+        checkOutputFrame(BCProtocol.manualFrame(channels: levels), cmd: BCProtocol.manualCmd, name: "AI 爬升 / 等待帧")
+        checkOutputFrame(OutputWriteCoalescer.limitRise(BCProtocol.manualFrame(channels: levels), from: [0, 0, 99, 0], maxRise: 20),
+                         cmd: BCProtocol.manualCmd, name: "AI 出口限升幅帧")
+    }
+}
 let goingDown = AISafety.enforce([AIStep(levels: [10, 0, 0, 0], duration: 1.5)], from: [70, 60, 0, 0])
 check(goingDown.steps == [AIStep(levels: [10, 0, 0, 0], duration: 1.5)] && goingDown.rampSteps == 0,
       "降低立刻生效，不插爬升步")
@@ -836,6 +924,17 @@ for _ in 0..<300 {
 }
 check(fuzzOK, "随机 300 段程序：每次升高 ≤20、两次升高至少隔 1 秒、强度 ≤70（M2）")
 
+// Brain 审查 H1：在场超时覆盖整个运行（执行程序期间也算），单条程序总时长 ≤120 秒
+// 2026-10-15 用户要求关闭在场超时和程序时长上限：默认关闭
+check(!AISafety.presenceTimeoutEnabled, "在场超时默认关闭")
+check(!AISafety.presenceExpired(now: 99999, lastUserMessageAt: 1000, runStartedAt: 1010), "关闭后很久没消息也不停")
+check(!AISafety.holdIdleExpired(now: 99999, holdStartedAt: 1000, lastUserMessageAt: nil), "关闭后保持不超时")
+do {
+    let longP = AISafety.enforce(AIReply.parse((0..<AIReply.maxSteps).map { _ in "[CH 20 0 0 0]\n[HOLD 60000]" }.joined(separator: "\n")).steps, from: [0, 0, 0, 0])
+    check(AISafety.programTooLong(longP) == nil, "关闭后长程序也执行")
+}
+// 以下原有测试：打开开关验证原逻辑
+AISafety.presenceTimeoutEnabled = true
 // H2：保持最后强度时，120 秒没有新的用户消息就停止
 check(!AISafety.holdIdleExpired(now: 5000, holdStartedAt: nil, lastUserMessageAt: 0), "没在保持时不计时")
 check(!AISafety.holdIdleExpired(now: 1119, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 119 秒未超时")
@@ -844,7 +943,6 @@ check(!AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageA
 check(AISafety.holdIdleExpired(now: 1170, holdStartedAt: 1000, lastUserMessageAt: 1050), "新消息之后 120 秒仍没有回应就停止")
 check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: nil), "没有用户消息记录时从保持开始算")
 
-// Brain 审查 H1：在场超时覆盖整个运行（执行程序期间也算），单条程序总时长 ≤120 秒
 check(!AISafety.presenceExpired(now: 1119, lastUserMessageAt: 1000, runStartedAt: 1010), "最近一条消息后 119 秒：继续")
 check(AISafety.presenceExpired(now: 1120, lastUserMessageAt: 1000, runStartedAt: 1010),
       "程序还在执行，离最近一条消息 120 秒也停止")
@@ -1003,7 +1101,7 @@ check(capCo.submit(BCProtocol.manualFrame(channels: [99, 65, 0, 0]), maxRise: 20
       == .write(BCProtocol.manualFrame(channels: [70, 65, 0, 0])), "AI 帧出口兜底压到 70（VM 漏压也到不了设备）")
 _ = capCo.writeFinished(canSend: true, now: 20.1)
 check(capCo.submit(BCProtocol.manualFrame(channels: [99, 99, 99, 0]), maxRise: 20, now: 40)
-      == .write(BCProtocol.manualFrame(channels: [70, 70, 20, 0])), "已在 70：再要 99 也停在 70")
+      == .write(BCProtocol.manualFrame(channels: [70, 70, 0, 0])), "已在 70：再要 99 也停在 70，未使用通道恒 0")
 _ = capCo.writeFinished(canSend: true, now: 40.1)
 check(capCo.submit(manual99) == .write(manual99), "手动帧（不带 maxRise）不受 70 限制")
 capCo.resetBaseline()
@@ -1078,7 +1176,7 @@ fc.t = 500
 let clockRun = makeLedger()
 clockRun.begin()
 fc.advance(100)
-clockRun.end() // 冷却 60 秒、记账 100 秒
+clockRun.end() // 记账 100 秒
 let taggedData = clockRun.snapshotData()
 var untaggedData: Data?
 if let d0 = taggedData, var obj = (try? JSONSerialization.jsonObject(with: d0)) as? [String: Any] {
@@ -1091,12 +1189,13 @@ if let d0 = taggedData, var obj = (try? JSONSerialization.jsonObject(with: d0)) 
 fc.advance(70)
 let taggedRestored = makeLedger()
 if let d0 = taggedData { taggedRestored.restore(from: d0) }
-check(near(taggedRestored.cooldownRemaining(), 0), "同一时钟的快照：照常对齐锚点，冷却已过")
+check(near(taggedRestored.remainingBudget(), 1100) && taggedRestored.checkAdmissible() == nil,
+      "同一时钟的快照：照常对齐锚点，剩余额度可立即使用")
 let untaggedRestored = makeLedger()
 if let d0 = untaggedData { untaggedRestored.restore(from: d0) }
-check(untaggedData != nil && near(untaggedRestored.cooldownRemaining(), 60)
-      && near(untaggedRestored.remainingBudget(), 1100),
-      "旧版（systemUptime 时间轴、没有时钟标记）的快照不按锚点对齐：冷却和记账保守保留")
+check(untaggedData != nil && near(untaggedRestored.remainingBudget(), 1100)
+      && untaggedRestored.checkAdmissible() == nil,
+      "旧版（systemUptime 时间轴、没有时钟标记）的快照不按锚点对齐：记账保守保留")
 
 // MARK: - 第二轮审查 M1：被动停机通知必须在发送的同一个主线程 block 里生效
 // AIControlVM 依赖 UIKit，这里编不到；钉住修法依赖的 Combine 语义：直接订阅在 send 里同步执行，
@@ -1171,7 +1270,7 @@ check(!PhysicalAck.shouldResendStop(abandonedStop: true, linkWritable: false), "
 // MARK: - 我的收藏（界面功能，不改任何安全规则）：存下来的值召回时必须夹回各模式的范围
 
 let favManual = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [150, -5, 40, 77])
-check(favManual.clampedLevels == [99, 0, 40, 0], "收藏召回：手动夹到 0~99、负数归 0、旋转恒 0")
+check(favManual.clampedLevels == [99, 0, 0, 0], "收藏召回：手动夹到 0~99、负数归 0、后两通道恒 0")
 let favFreq = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.frequency.rawValue, levels: [12, 3])
 check(favFreq.clampedLevels == [9, 3, 0, 0], "收藏召回：变频夹到 0~9、缺的通道补 0")
 let favSkill = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.skill.rawValue, levels: [4, 6, 5, 0])
@@ -1181,6 +1280,8 @@ check(favUnknown.clampedLevels == nil, "未知模式：召回无效")
 let favZero = FavoriteSetting(id: UUID(), name: "x", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [0, 0, 0, 9])
 check(favZero.clampedLevels == nil, "全零（旋转不算）：召回无效")
 check(FavoriteSetting.make(name: "a", mode: .manual, levels: [0, 0, 0, 0]) == nil, "全零不能存")
+check(FavoriteSetting.make(name: "a", mode: .manual, levels: [0, 0, 99, 0]) == nil, "只有未使用通道的收藏不能存")
+check(FavoriteSetting(id: UUID(), name: "旧", modeRaw: 3, levels: [0, 0, 99, 0]).clampedLevels == nil, "旧收藏只有未使用通道不能召回")
 check(FavoriteSetting.make(name: "a", mode: .skill, levels: [4, 6, 5, 0]) == nil, "技能模式不能存")
 check(FavoriteSetting.make(name: "a", mode: .frequency, levels: [20, 1, 0, 5])?.levels == [9, 1, 0, 0], "存的时候就夹好")
 check(FavoriteSetting.sanitizedName("  \n ", fallback: "心动") == "心动", "空名字用默认名")
@@ -1191,13 +1292,24 @@ check(!FavoriteSetting.nextName(existing: FavoriteSetting.suggestedNames).isEmpt
 let encodedFavs = FavoriteCodec.encode([favManual, favSkill, favZero, favFreq])
 let decodedFavs = FavoriteCodec.decode(encodedFavs)
 check(decodedFavs.map { $0.id } == [favManual.id, favFreq.id], "读取时丢掉无效收藏")
+check(decodedFavs.allSatisfy { $0.levels[2] == 0 && $0.levels[3] == 0 }, "旧收藏加载后源数据已清除未使用通道")
+for fav in decodedFavs {
+    if let mode = fav.mode {
+        checkOutputFrame(mode.frame(channels: fav.levels), cmd: mode == .manual ? BCProtocol.manualCmd : BCProtocol.modeCmd,
+                         name: "旧收藏输出")
+    }
+}
 check(FavoriteCodec.decode(Data("garbage".utf8)).isEmpty && FavoriteCodec.decode(nil).isEmpty, "坏数据当没有收藏")
 let manyFavs = (0..<20).compactMap { FavoriteSetting.make(name: "\($0)", mode: .manual, levels: [$0 + 1, 0, 0, 0]) }
 check(FavoriteCodec.decode(FavoriteCodec.encode(manyFavs)).count == FavoriteSetting.maxCount, "最多 8 条")
 
 // 召回时缓缓推上去：升高分步、降低第一步就到位、最后一步恰好是目标，每一步都不超过目标
 let glide = FavoriteGlide.plan(from: [0, 50, 9, 0], to: [60, 10, 9, 0], maxLevel: BCProtocol.maxManualLevel)
-check(glide.last == [60, 10, 9, 0], "缓推：最后一步是目标")
+check(glide.last == [60, 10, 0, 0], "缓推：最后一步是目标，清除旧通道")
+check(glide.allSatisfy { $0[2] == 0 && $0[3] == 0 }, "缓推：每一步源值都清除未使用通道")
+for levels in glide {
+    checkOutputFrame(BCProtocol.manualFrame(channels: levels), cmd: BCProtocol.manualCmd, name: "收藏缓推帧")
+}
 check(glide.allSatisfy { $0[1] == 10 }, "缓推：降低的通道第一步就到位")
 check(glide.first.map { $0[0] > 0 && $0[0] < 60 } ?? false, "缓推：升高的通道从中间值开始")
 let glideTarget: [Int] = [60, 10, 9, 0]
@@ -1208,7 +1320,9 @@ check(glidePairs.allSatisfy { (pair: ([Int], [Int])) -> Bool in
 check(glide.allSatisfy { (s: [Int]) -> Bool in
     (0..<4).allSatisfy { s[$0] <= glideTarget[$0] }
 }, "缓推：不超过目标")
-check(FavoriteGlide.plan(from: [3, 3, 3, 0], to: [3, 3, 3, 0], maxLevel: BCProtocol.maxManualLevel) == [[3, 3, 3, 0]], "已经在目标：只发一次")
+check(FavoriteGlide.plan(from: [3, 3, 3, 0], to: [3, 3, 3, 0], maxLevel: BCProtocol.maxManualLevel) == [[3, 3, 0, 0]], "已经在目标：只发一次，旧通道归零")
+check(FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [1, 0, 99, 0], maxLevel: 99)
+      == FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [1, 0, 0, 0], maxLevel: 99), "旧通道值不增加缓推用时")
 let smallGlide = FavoriteGlide.plan(from: [0, 0, 0, 0], to: [2, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel)
 check(smallGlide.count == FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [2, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel),
       "缓推：重复档位也保留计时步骤")
@@ -1241,8 +1355,8 @@ check(FavoriteGlide.stepCount(from: [60, 60, 0, 0], to: [10, 0, 0, 0], maxLevel:
 let freqFav = FavoriteSetting(id: UUID(), name: "f", modeRaw: BCProtocol.Mode.frequency.rawValue, levels: [3, 3, 3, 0])
 let manFav = FavoriteSetting(id: UUID(), name: "m", modeRaw: BCProtocol.Mode.manual.rawValue, levels: [30, 0, 0, 0])
 let rulesBlocked = FavoriteRecallRules(mode: .frequency, levels: [0, 0, 0, 0], canOutput: false,
-                                       blockReason: "冷却中", running: false)
-check(!rulesBlocked.usable(freqFav) && !rulesBlocked.usable(manFav) && rulesBlocked.status(for: [freqFav]) == "冷却中",
+                                       blockReason: "额度已用完", running: false)
+check(!rulesBlocked.usable(freqFav) && !rulesBlocked.usable(manFav) && rulesBlocked.status(for: [freqFav]) == "额度已用完",
       "收藏：不许输出时全部点不了，并说原因")
 let rulesIdle = FavoriteRecallRules(mode: .frequency, levels: [0, 0, 0, 0], canOutput: true,
                                     blockReason: nil, running: false)

@@ -84,7 +84,7 @@ final class ManualControlVM: ObservableObject {
     }
 
     func setChannel(_ index: Int, _ value: Double) {
-        guard mode != .skill else { return }
+        guard mode != .skill, BCProtocol.Channel(rawValue: index)?.isUsed == true else { return }
         // 用户亲手拖滑杆：缓推让位，以手上的为准
         cancelGlide()
         noteInteraction()
@@ -138,12 +138,12 @@ final class ManualControlVM: ObservableObject {
     }
 
     /// 召回收藏：需要时先切模式（和点模式胶囊一样先停机），再从当前值缓缓推到收藏的强度。
-    /// 第一步是这次点按（send：用户操作，会开闸，照常过准入 / 冷却 / 额度）；后面的步骤走 sendThrottled，不开闸：
+    /// 第一步是这次点按（send：用户操作，会开闸，照常过准入 / 额度）；后面的步骤走 sendThrottled，不开闸：
     /// 中途任何停止（用户停止、看门狗、上限、输出被拒、断开、退后台）锁了闸，后面的步骤都会被 BLEManager 丢掉，
     /// 而且 stopAll / reset 会立刻作废缓推。强度已经按模式范围夹过（FavoriteSetting.clampedLevels）
     func applyFavorite(_ fav: FavoriteSetting) {
         guard let target = fav.clampedLevels, let favMode = fav.mode else { return }
-        // 正在输出时召回别的模式：切模式要先停机，停机后的冷却会让这次召回被拒（只剩一条红字）。
+        // 正在输出时召回别的模式：切模式要先停机并等确认。
         // 界面上这类收藏已锁住，这里再兜一次底：什么也不做（不发任何帧，也不停机）
         if favMode != mode, ble?.safety.runRemaining != nil { return }
         noteInteraction()
@@ -230,7 +230,7 @@ final class ManualControlVM: ObservableObject {
     }
 }
 
-/// 手感：三通道强度滑杆 / 技能 / 变频 + 常驻停止
+/// 手感：两通道强度滑杆 / 技能 / 变频 + 常驻停止
 struct ManualControlView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var privacy: PrivacyLock
@@ -285,7 +285,7 @@ struct ManualControlView: View {
         ble.state == .disconnecting || ble.forceDisconnectOffered
     }
 
-    /// 连上了且现在允许开始/继续输出（冷却、额度、锁存、停止未确认时禁用；停止按钮不受影响）
+    /// 连上了且现在允许开始/继续输出（额度、锁存、停止未确认时禁用；停止按钮不受影响）
     private var canOutput: Bool {
         ble.state == .ready && ble.safety.blockReason == nil
     }
@@ -393,7 +393,7 @@ struct ManualControlView: View {
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: vm.mode)
     }
 
-    /// 技能卡片，或三个通道的滑杆
+    /// 技能卡片，或两个通道的滑杆
     @ViewBuilder private var controlsSection: some View {
         if vm.mode == .skill {
             VStack(alignment: .leading, spacing: 12) {
@@ -875,7 +875,7 @@ private struct ChannelControl: View {
     }
 }
 
-/// 技能卡片：名字、三通道的小柱、原始档位
+/// 技能卡片：名字、两通道的小柱、档位
 private struct PresetTile: View {
     let preset: BCProtocol.Preset
     let selected: Bool
@@ -892,7 +892,7 @@ private struct PresetTile: View {
         }
     }
 
-    /// 和小柱一样只列界面上的三个通道（旋转恒为 0，不显示）
+    /// 和小柱一样只列界面上的两个通道
     private var levelsText: String {
         let parts: [String] = BCProtocol.Channel.uiChannels.map { (ch: BCProtocol.Channel) -> String in
             let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0
@@ -901,7 +901,7 @@ private struct PresetTile: View {
         return parts.joined(separator: " ")
     }
 
-    /// 旁白：名字和三个通道各自的档位（同收藏卡片），不只读一串数字
+    /// 旁白：名字和两个通道各自的档位（同收藏卡片），不只读一串数字
     private var a11yLabel: String {
         let parts: [String] = BCProtocol.Channel.uiChannels.map { (ch: BCProtocol.Channel) -> String in
             let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0

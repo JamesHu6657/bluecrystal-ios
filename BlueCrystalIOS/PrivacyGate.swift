@@ -3,8 +3,8 @@ import UIKit
 import Combine
 import LocalAuthentication
 
-// MARK: - 18+ 入口、面容 ID 解锁、后台隐私遮罩
-// 只是外观和隐私包装：不改 BLEManager 的任何状态，唯一发出去的是解锁页 / 入口页上的停止
+// MARK: - 面容 ID 解锁、后台隐私遮罩（18+ 确认页已删除）
+// 只是外观和隐私包装：不改 BLEManager 的任何状态，唯一发出去的是解锁页上的停止
 // （和各页停止键同一个 sendStop，并通知各页 VM 走自己的 stopAll）。
 // 退后台的停止仍由 BlueCrystalIOSApp 的 scenePhase 处理。
 // 设备可能仍在输出 / 停止未确认 / 连接或断开进行中 / 正在运行时，入口页和系统验证框一律不出现，
@@ -47,7 +47,7 @@ final class PrivacyLock: ObservableObject {
     /// 本机可用的生物识别（名称和图标）；没有时为 nil。回到前台时重查（用户可能刚在系统设置里录入或删掉）
     @Published private(set) var biometry: Biometry? = PrivacyLock.currentBiometry()
 
-    /// 解锁页 / 入口页上的停止：除了 sendStop，各页 VM 收到后走自己的 stopAll（停 AI 计时和授权、停视频播放）
+    /// 解锁页上的停止：除了 sendStop，各页 VM 收到后走自己的 stopAll（停 AI 计时和授权、停视频播放）
     let stopAllRequested = PassthroughSubject<Void, Never>()
 
     struct Biometry: Equatable {
@@ -60,11 +60,11 @@ final class PrivacyLock: ObservableObject {
 
     init() {
         let d = UserDefaults.standard
-        let consent = d.bool(forKey: Self.consentKey)
+        // 18+ 确认页已删除（自用）：一律视为已确认
         let bio = d.bool(forKey: Self.biometricKey)
-        consented = consent
+        consented = true
         biometricEnabled = bio
-        locked = consent && bio
+        locked = bio
     }
 
     /// 查一次本机的生物识别。暂时被锁（失败太多次）也算有：验证时会退到锁屏密码
@@ -100,7 +100,7 @@ final class PrivacyLock: ObservableObject {
         (consented && locked) || (!consented && !ble.privacyCoverBlocked)
     }
 
-    /// 解锁页 / 入口页上的停止
+    /// 解锁页上的停止
     func requestStopAll() {
         stopAllRequested.send()
     }
@@ -212,7 +212,6 @@ struct PrivacyCover: ViewModifier {
     @EnvironmentObject var lock: PrivacyLock
     @Environment(\.scenePhase) private var scenePhase
 
-    private var showGate: Bool { !ble.privacyCoverBlocked && !lock.consented }
     /// 第四轮 M3：锁着就盖。设备需要处理时 LockScreenView 自己换成设备卡片 + 停止键、不给解锁
     private var showLock: Bool { lock.consented && lock.locked }
     private var covered: Bool { lock.isCovering(ble) }
@@ -232,17 +231,7 @@ struct PrivacyCover: ViewModifier {
                 .allowsHitTesting(!covered)
                 .accessibilityHidden(covered)
 
-            if showGate {
-                // 入口页底部也常驻停止键（第四轮）：它盖住了各页的停止键，状态万一没刷新也能一下停
-                AgeGateView(lock: lock, onStop: {
-                    ble.sendStop()
-                    lock.requestStopAll()
-                })
-                .accessibilityElement(children: .contain)
-                .accessibilityAddTraits(.isModal)
-                .transition(.opacity)
-                .zIndex(2)
-            } else if showLock {
+            if showLock {
                 // 底部常驻停止键；设备需要处理时只显示设备卡片和停止键，不给解锁
                 LockScreenView(lock: lock, onStop: {
                     ble.sendStop()
@@ -295,118 +284,6 @@ struct PrivacyVeil: View {
     }
 }
 
-/// 18+ 确认（只出现一次）。第四轮：底部常驻停止键，设备需要处理时顶上带紧凑设备卡片（同解锁页）
-struct AgeGateView: View {
-    @EnvironmentObject var ble: BLEManager
-    @ObservedObject var lock: PrivacyLock
-    let onStop: () -> Void
-    @State private var useBiometric = false
-    @State private var glow = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        ZStack {
-            VelvetBackground(glow: 0.35).ignoresSafeArea()
-            ScrollView {
-                VStack(spacing: 26) {
-                    if ble.needsAttentionCard {
-                        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
-                            .padding(.top, 8)
-                    }
-                    Spacer(minLength: 40)
-                    ZStack {
-                        Circle()
-                            .fill(RadialGradient(colors: [Velvet.rose.opacity(0.55), .clear],
-                                                 center: .center, startRadius: 0, endRadius: 90))
-                            .frame(width: 180, height: 180)
-                            .scaleEffect(glow ? 1.08 : 0.92)
-                        Text("18+")
-                            .font(Velvet.serif(46, .semibold))
-                            .foregroundStyle(LinearGradient(colors: [Velvet.text, Velvet.blush],
-                                                            startPoint: .top, endPoint: .bottom))
-                    }
-                    .velvetAppear()
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("仅限 18 岁以上")
-                    VStack(spacing: 10) {
-                        Text("只属于成年人的夜晚")
-                            .font(Velvet.display(.title2))
-                            .foregroundColor(Velvet.text)
-                            .multilineTextAlignment(.center)
-                            .accessibilityAddTraits(.isHeader)
-                        Text("你的节奏，由你做主")
-                            .font(.subheadline.weight(.medium))
-                            .foregroundColor(Velvet.blush)
-                        Text("BlueCrystal 用来控制成人亲密用品，内容仅面向年满 18 周岁的成年人。请在私密、安全、随手能关掉设备电源的环境里使用。")
-                            .font(.subheadline)
-                            .foregroundColor(Velvet.textSecondary)
-                            .multilineTextAlignment(.center)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .velvetAppear(delay: 0.08)
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("点红色「停止」（「她」页面也可以输入“停”）会立刻发送停止，设备确认后才算停下", systemImage: "stop.circle.fill")
-                        Label("第一次使用前，先在不接触身体时试一次停止", systemImage: "hand.raised.fill")
-                        Label("切到后台时设备自动停止，画面也会被模糊", systemImage: "eye.slash.fill")
-                    }
-                    .font(.footnote)
-                    .foregroundColor(Velvet.textSecondary)
-                    .velvetCard()
-                    .velvetAppear(delay: 0.14)
-
-                    if let name = lock.biometry?.name {
-                        Toggle(isOn: $useBiometric) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("用\(name)解锁").foregroundColor(Velvet.text)
-                                Text("可选：每次打开都需要验证").font(.caption).foregroundColor(Velvet.textMuted)
-                            }
-                        }
-                        .tint(Velvet.rose)
-                        .velvetCard()
-                        // 入场动画只给装饰和文案：开关是能点的东西，不淡入（淡入中也能点到看不见的控件）
-                    }
-
-                    VStack(spacing: 12) {
-                        Button {
-                            Haptics.soft()
-                            lock.accept(enableBiometric: useBiometric)
-                        } label: {
-                            Text("我已年满 18 岁，进入")
-                                .font(.headline)
-                                .frame(maxWidth: .infinity, minHeight: 54)
-                        }
-                        .buttonStyle(PillButtonStyle(kind: .primary))
-                        Text("未满 18 岁请关闭本应用")
-                            .font(.caption)
-                            .foregroundColor(Velvet.textMuted)
-                    }
-                    // 同上：「我已年满 18 岁，进入」不加入场动画，一出现就看得见、点得到
-                    Spacer(minLength: 20)
-                }
-                .padding(.horizontal, 24)
-            }
-        }
-        .safeAreaInset(edge: .bottom) {
-            StopDockBar(action: onStop)
-        }
-        .onAppear { startGlow() }
-        // 中途打开减弱动态效果：正在循环的光晕立刻停下；关掉时再亮起来
-        .onChange(of: reduceMotion) { rm in
-            if rm {
-                var t = Transaction()
-                t.disablesAnimations = true
-                withTransaction(t) { glow = false }
-            } else {
-                startGlow()
-            }
-        }
-    }
-
-    private func startGlow() {
-        guard !reduceMotion, !glow else { return }
-        withAnimation(.easeInOut(duration: 2.6).repeatForever(autoreverses: true)) { glow = true }
-    }
-}
 
 /// 面容 ID 解锁页：不自动弹验证，点「解锁」才弹；底部常驻停止键。
 /// 设备需要处理时（同 needsAttentionCard），上面钉一张紧凑设备卡片（平常没有连接键）。

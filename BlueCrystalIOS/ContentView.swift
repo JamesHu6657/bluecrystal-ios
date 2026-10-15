@@ -65,7 +65,7 @@ private extension View {
     }
 }
 
-/// 三个 Tab 共用的"设备"卡片：连接状态、红字、安全状态（单次上限 / 冷却 / 额度）、锁存解除、强制断开
+/// 三个 Tab 共用的"设备"卡片：连接状态、红字、安全状态（单次上限 / 额度）、锁存解除、强制断开
 struct DeviceStatusCard: View {
     @EnvironmentObject var ble: BLEManager
     var allowDisconnect: Bool
@@ -190,7 +190,7 @@ struct DeviceStatusCard: View {
 
     /// 正在输出时：本次还剩多少的细条（纯展示；文字说明在 safetySummary 里，旁白读那一行）
     @ViewBuilder private var runMeter: some View {
-        if let remaining = ble.safety.runRemaining, ble.safety.runAllowed > 0 {
+        if SafetyLimits.timeLimitsEnabled, let remaining = ble.safety.runRemaining, ble.safety.runAllowed > 0 {
             let total: Double = Double(ble.safety.runAllowed)
             let left: Double = Double(max(0, remaining))
             let frac: CGFloat = CGFloat(min(1.0, left / total))
@@ -212,7 +212,7 @@ struct DeviceStatusCard: View {
         }
     }
 
-    /// 修 M2/M3：单次上限、冷却、30 分钟额度
+    /// 修 M2/M3：单次上限、30 分钟额度
     private var safetySummary: some View {
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: ble.safety.blockReason == nil ? "hourglass" : "lock.fill")

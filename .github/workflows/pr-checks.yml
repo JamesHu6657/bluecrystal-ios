@@ -85,7 +85,10 @@ jobs:
             echo
             echo '```'
             grep -E "FAIL|error:" tests.log | head -n 60 || true
-            grep -E "error:" build.log | head -n 60 || true
+            grep -E "error:" build.log | sort -u | head -n 60 || true
             echo '```'
           } > report.md
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file report.md || true
+          # 让没有日志权限的工具也能从 PR 描述里读到错误摘要
+          { gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json body -q .body | sed '/^<!-- ci-report -->/,$d'; echo "<!-- ci-report -->"; cat report.md; } > body.md
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --body-file body.md || true

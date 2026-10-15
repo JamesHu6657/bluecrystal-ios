@@ -29,7 +29,7 @@ enum SafetyClock {
 
     /// 安全计时用的单调时钟（秒，自本次开机起）：手机睡眠期间继续走（Darwin CLOCK_MONOTONIC = mach_continuous_time）。
     /// 第二轮审查 M3：之前用 systemUptime，它在睡眠时停走。锁屏睡着、设备却可能还在输出（停止没确认 / 断链 / 进程被杀
-    /// 后同一次开机内重启）时，运行时长少算，确认停止后的冷却和记账跟着变少
+    /// 后同一次开机内重启）时，运行时长少算，确认停止后的记账跟着变少
     static func continuousSeconds() -> TimeInterval {
         #if canImport(Darwin)
         return TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000_000
@@ -43,26 +43,28 @@ enum SafetyClock {
 }
 
 /// 安全上限（结构沿用 legacy src/safety/limits.py；1.7.4 起按用户要求把单次上限调到 20 分钟，不可在 App 内配置）
+/// 2026-10-15 用户明确要求关闭时间上限（单次 20 分钟 + 30 分钟额度）：timeLimitsEnabled = false。
+/// 关闭后单次上限 / 额度都等于 unlimitedSeconds（实际不会到点），其余安全逻辑（STOP、停止确认、锁存、
+/// 心跳看门狗、断链 / 后台停机）不变。账本逻辑保留，测试把开关打开后照旧验证原有行为。
 enum SafetyLimits {
-    /// 单次连续输出上限：20 分钟（legacy 原值 300 秒）
-    static let maxRunSeconds: TimeInterval = 20 * 60
+    /// 时间上限开关（var 只为测试能打开它；App 内不可配置）
+    static var timeLimitsEnabled = false
+    /// "无上限"用的大有限值（一年）：转 Int / 做加减不会溢出
+    static let unlimitedSeconds: TimeInterval = 365 * 24 * 3600
+    /// 单次连续输出上限：20 分钟（legacy 原值 300 秒）；关闭时间上限时为 unlimitedSeconds
+    static var maxRunSeconds: TimeInterval { timeLimitsEnabled ? 20 * 60 : unlimitedSeconds }
     /// 一次运行至少要能跑 1 秒才允许开始（validate_duration 下限 1）
     static let minRunSeconds: TimeInterval = 1
     /// 滚动 30 分钟内最多输出 1200 秒（与单次上限相同，保证能跑满一次 20 分钟；legacy 原值 600 秒）
     static let dutyWindowSeconds: TimeInterval = 30 * 60
-    static let dutyBudgetSeconds: TimeInterval = 20 * 60
-    /// 每次确认停止后的冷却 = max(60 秒, 本次运行时长 × 0.5)（MIN_COOLDOWN_SECONDS / COOLDOWN_RATIO）
-    static let minCooldownSeconds: TimeInterval = 60
-    static let cooldownRatio: Double = 0.5
-    /// 未知时长恢复：耗尽完整窗口额度，冷却按全部 1200 秒额度计算；也是任何一次冷却的上限（M1）。
-    static let unknownElapsedCooldownSeconds = dutyBudgetSeconds * cooldownRatio
+    static var dutyBudgetSeconds: TimeInterval { timeLimitsEnabled ? 20 * 60 : unlimitedSeconds }
     static let checkpointIntervalSeconds: TimeInterval = 5
 }
 
 /// 滚动窗口占空比账本（移植 legacy src/safety/duty_cycle.py 的 DutyCycleLedger）。
 ///
 /// iOS 的一次"运行"：从停机状态下第一帧输出开始，到停止帧对确认（或用户确认已物理关机）为止。
-/// 开始时预留 min(1200 秒, 剩余额度) 作为本次上限；结束时按实际时长记账，并开始冷却。
+/// 开始时预留 min(1200 秒, 剩余额度) 作为本次上限；结束时按实际时长记账。
 /// 记账条目在结束后保留整整一个窗口（与 legacy 一样偏保守）。
 ///
 /// 不是线程安全的：BLEManager 只在 bleQueue 上用它。
@@ -71,8 +73,6 @@ enum SafetyLimits {
 final class DutyCycleLedger {
 
     enum Denial: Equatable {
-        /// 冷却中，还剩多少秒
-        case cooldown(TimeInterval)
         /// 额度不够，还要等多少秒
         case budget(TimeInterval)
         /// 上一次运行还没确认停止
@@ -89,8 +89,6 @@ final class DutyCycleLedger {
         var completed: [Entry]
         var openStart: TimeInterval?
         var openAllowed: TimeInterval
-        var lastEnd: TimeInterval?
-        var appliedCooldown: TimeInterval
         var savedWall: TimeInterval?
         var savedUptime: TimeInterval?
         var bootIdentity: String?
@@ -114,8 +112,6 @@ final class DutyCycleLedger {
     /// true 时 openStart 只表示已验证时长的下界，绝不当成完整运行时长。
     private(set) var openElapsedUnknown = false
     private var lastCheckpointUptime: TimeInterval?
-    private var lastEnd: TimeInterval?
-    private(set) var appliedCooldown: TimeInterval = 0
 
     /// 状态变化回调（BLEManager 用来持久化）
     var onChange: (() -> Void)?
@@ -132,23 +128,17 @@ final class DutyCycleLedger {
 
     var hasOpenRun: Bool { openStart != nil }
 
-    /// 冷却剩余秒数（legacy cooldown_remaining_seconds）
-    func cooldownRemaining() -> TimeInterval {
-        guard let end = lastEnd else { return 0 }
-        return max(0, end + appliedCooldown - clock())
-    }
-
     /// 剩余额度，含进行中运行的整段预留（legacy remaining_budget_seconds）
     func remainingBudget() -> TimeInterval {
         prune()
+        // 时间上限关闭：额度永远是满的（也不受遗留运行的整窗记账影响）
+        guard SafetyLimits.timeLimitsEnabled else { return SafetyLimits.unlimitedSeconds }
         return max(0, SafetyLimits.dutyBudgetSeconds - usedSeconds())
     }
 
     /// 能否开始新一次运行；nil = 可以（legacy check_admissible）
     func checkAdmissible() -> Denial? {
         prune()
-        let cd = cooldownRemaining()
-        if cd > 0 { return .cooldown(cd) }
         if openStart != nil { return .openRun }
         if remainingBudget() < SafetyLimits.minRunSeconds { return .budget(secondsUntilBudget()) }
         return nil
@@ -185,10 +175,7 @@ final class DutyCycleLedger {
         onChange?()
     }
 
-    /// 确认停止后记账/冷却；未知时长至少耗尽完整窗口额度，已验证下界更长则保留。
-    /// 冷却最多 unknownElapsedCooldownSeconds（M1）：正常运行不超过 1200 秒，冷却本来就 ≤600 秒；
-    /// 超过的只会是恢复出来的 / 未知的 / 断链期间的时长，被杀 10 小时后再确认停止不能因此锁 5 小时。
-    /// 额度照实际推断时长保守记账，不封顶
+    /// 确认停止后记账；未知时长至少耗尽完整窗口额度，已验证下界更长则保留，不封顶。
     func end() {
         guard let start = openStart else { return }
         let now = clock()
@@ -196,22 +183,17 @@ final class DutyCycleLedger {
         let elapsed = max(0, now - start)
         let charge = openElapsedUnknown ? max(SafetyLimits.dutyBudgetSeconds, elapsed) : elapsed
         completed.append(Entry(end: now, charge: charge))
-        let cooldown = openElapsedUnknown
-            ? SafetyLimits.unknownElapsedCooldownSeconds
-            : min(SafetyLimits.unknownElapsedCooldownSeconds,
-                  max(SafetyLimits.minCooldownSeconds, elapsed * SafetyLimits.cooldownRatio))
         openStart = nil
         openAllowed = 0
         openOrphaned = false
         openElapsedUnknown = false
         lastCheckpointUptime = nil
-        lastEnd = now
-        appliedCooldown = cooldown
         onChange?()
     }
 
     /// 额度不够时，还要等多久才有至少 minRunSeconds 的额度
     func secondsUntilBudget() -> TimeInterval {
+        guard SafetyLimits.timeLimitsEnabled else { return 0 }
         let now = clock()
         var used = usedSeconds()
         for e in completed.sorted(by: { $0.end < $1.end }) {
@@ -233,8 +215,6 @@ final class DutyCycleLedger {
             completed: completed.map { Entry(end: toWall($0.end), charge: $0.charge) },
             openStart: openStart.map(toWall),
             openAllowed: openAllowed,
-            lastEnd: lastEnd.map(toWall),
-            appliedCooldown: appliedCooldown,
             savedWall: wall,
             savedUptime: now,
             bootIdentity: bootIdentity(),
@@ -262,7 +242,7 @@ final class DutyCycleLedger {
         }
         func toUptime(_ w: TimeInterval) -> TimeInterval {
             if let a = anchor { return a.uptime - (a.wall - w) }
-            // 启动标识不明/重启/uptime 倒退/换了时钟：不能让前拨墙钟清掉记账或冷却。
+            // 启动标识不明/重启/uptime 倒退/换了时钟：不能让前拨墙钟清掉记账。
             return now
         }
         func valid(_ v: TimeInterval) -> Bool { v.isFinite && v >= 0 }
@@ -298,10 +278,6 @@ final class DutyCycleLedger {
             openAllowed = valid(s.openAllowed) ? min(s.openAllowed, SafetyLimits.maxRunSeconds) : 0
             openOrphaned = true
             lastCheckpointUptime = now
-        }
-        if let end = s.lastEnd, end.isFinite, valid(s.appliedCooldown) {
-            lastEnd = toUptime(end)
-            appliedCooldown = min(s.appliedCooldown, SafetyLimits.unknownElapsedCooldownSeconds)
         }
         prune()
     }

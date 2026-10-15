@@ -9,7 +9,7 @@ enum WireProtocol {
     case responses // OpenAI /responses
 }
 
-// MARK: - 指令格式：[CH c0 c1 c2 c3] / [HOLD 毫秒] / [STOP]（提示词里约定，控制器解析）
+// MARK: - 指令格式：[CH 伸缩 震动 0 0] / [HOLD 毫秒] / [STOP]（旧四值格式仍接受，后两位归零）
 
 /// 一步：设置强度（nil = 不改强度，只等待）+ 持续秒数
 struct AIStep: Equatable {
@@ -20,7 +20,7 @@ struct AIStep: Equatable {
 
     var summary: String {
         guard let lv = levels else { return "保持 \(Self.fmt(duration)) 秒" }
-        return "伸缩 \(lv[0]) · 震动 \(lv[1]) · 吮吸 \(lv[2])" + (duration > 0 ? " · \(Self.fmt(duration)) 秒" : "")
+        return "伸缩 \(lv[0]) · 震动 \(lv[1])" + (duration > 0 ? " · \(Self.fmt(duration)) 秒" : "")
     }
 
     static func fmt(_ d: Double) -> String {
@@ -46,7 +46,7 @@ struct AIStep: Equatable {
 ///   （［STOP］、【STOP】、[ＳＴＯＰ]、[ST​OP]）也算格式错，整条作废。之前它们被当成普通文字放过，
 ///   模型想停却继续保持最后的强度。
 /// - CH 任何一个值超过 BCProtocol.maxManualLevel（99）都算格式错，整条作废（不夹紧）。
-/// - 合法时 c3（旋转）恒为 0，HOLD 夹到 500~60000 毫秒。
+/// - 合法时 c2 / c3 恒为 0，HOLD 夹到 500~60000 毫秒。
 ///   AI 强度上限 70、每秒每通道最多 +20、从 0 爬升、总时长上限由执行前的 AISafety 处理。
 struct AIReply {
     /// 去掉合法指令行之后给用户看的文字
@@ -119,7 +119,8 @@ struct AIReply {
                 guard let v = Int(a), v <= BCProtocol.maxManualLevel else { return nil }
                 lv.append(v)
             }
-            // 第 4 通道（旋转）这台设备不用，恒 0
+            // 四值写法兼容旧回复，但设备只使用前两个通道；仍先严格校验全部参数。
+            lv[2] = 0
             lv[3] = 0
             return .ch(lv)
         case "HOLD":
@@ -298,7 +299,7 @@ struct AIReply {
 /// 回复授权的生命周期（纯状态，只在主线程用）：
 /// - 发消息时 issue() 领一张票（停止词那句在本地停止之前领，所以它的回复也会被作废）；
 /// - 任何真正的停止都 revoke()：用户停止、本地停止词、程序以 [STOP] / 全零自动结束、被动停机
-///   （看门狗/上限/冷却/输出被拒）、退后台、连接离开 ready、离开 AI 页面。之前领的票全部失效；
+///   （看门狗/上限/输出被拒）、退后台、连接离开 ready、离开 AI 页面。之前领的票全部失效；
 /// - 执行前在主线程用 block(_:) 验票：票失效的回复只显示文字，绝不启动设备。
 struct ReplyAuthorization {
     struct Ticket: Equatable {
@@ -345,6 +346,9 @@ enum AISafety {
     static let holdIdleTimeout: TimeInterval = 120
     /// 单条程序（含插入的爬升/等待步）总时长上限（H1）：超过的回复整条不执行
     static let maxProgramSeconds: TimeInterval = holdIdleTimeout
+    /// 2026-10-15 用户明确要求关闭：在场超时（120 秒没新消息停止）和单条程序总时长上限都不生效。
+    /// 强度上限、爬升限制、STOP、BLE 看门狗不变。var 只为测试能打开它；App 内不可配置
+    static var presenceTimeoutEnabled = false
 
     struct Program: Equatable {
         /// 实际执行的步骤（含插入的爬升步、等待步）
@@ -364,7 +368,9 @@ enum AISafety {
 
     static func enforce(_ steps: [AIStep], from start: [Int],
                         secondsSinceRise: TimeInterval = .infinity) -> Program {
-        var cur = (0..<4).map { i in i < start.count ? max(0, min(maxLevel, start[i])) : 0 }
+        var cur = (0..<4).map { i in
+            BCProtocol.Channel(rawValue: i)?.isUsed == true && i < start.count ? max(0, min(maxLevel, start[i])) : 0
+        }
         // 距上一次升高（那一步开始的时刻）过了多久
         var sinceRise = secondsSinceRise
         var out: [AIStep] = []
@@ -379,7 +385,9 @@ enum AISafety {
                 sinceRise += s.duration
                 continue
             }
-            var target = (0..<4).map { i in i < lv.count ? max(0, lv[i]) : 0 }
+            var target = (0..<4).map { i in
+                BCProtocol.Channel(rawValue: i)?.isUsed == true && i < lv.count ? max(0, lv[i]) : 0
+            }
             for i in target.indices where target[i] > maxLevel {
                 target[i] = maxLevel
                 clamped += 1
@@ -417,7 +425,7 @@ enum AISafety {
 
     /// 程序总时长超过上限时返回作废原因（H1）
     static func programTooLong(_ p: Program) -> String? {
-        guard p.totalSeconds > maxProgramSeconds else { return nil }
+        guard presenceTimeoutEnabled, p.totalSeconds > maxProgramSeconds else { return nil }
         return "程序总时长 \(Int(p.totalSeconds.rounded(.up))) 秒，超过上限 \(Int(maxProgramSeconds)) 秒，整条不执行"
     }
 
@@ -439,7 +447,7 @@ enum AISafety {
     /// 保持中是否已经超过空闲时限；holdStartedAt 为 nil 表示没在保持
     static func holdIdleExpired(now: TimeInterval, holdStartedAt: TimeInterval?,
                                 lastUserMessageAt: TimeInterval?) -> Bool {
-        guard let h = holdStartedAt else { return false }
+        guard presenceTimeoutEnabled, let h = holdStartedAt else { return false }
         return now - max(h, lastUserMessageAt ?? h) >= holdIdleTimeout
     }
 
@@ -447,7 +455,7 @@ enum AISafety {
     /// 没有用户消息记录时从开始运行算；两个都没有表示没在运行
     static func presenceExpired(now: TimeInterval, lastUserMessageAt: TimeInterval?,
                                 runStartedAt: TimeInterval?) -> Bool {
-        guard let ref = lastUserMessageAt ?? runStartedAt else { return false }
+        guard presenceTimeoutEnabled, let ref = lastUserMessageAt ?? runStartedAt else { return false }
         return now - ref >= holdIdleTimeout
     }
 }

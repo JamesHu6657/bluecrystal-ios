@@ -21,7 +21,7 @@ import os
 /// 写入超时后链路卡死（那笔写一直没有回执，排在后面的停止帧对发不出去）时主动断开、走同一条自动重连去发停止（第四轮 M1）。
 ///
 /// 输出准入（修 M2/M3/L5）：手动、技能、视频的每一帧非停止帧都只经过 submitOutput：
-/// 锁存/设备可能仍在输出时拒绝；停机状态下开始新一次运行要过冷却和 30 分钟额度检查，
+/// 锁存/设备可能仍在输出时拒绝；停机状态下开始新一次运行要过 30 分钟额度检查，
 /// 本次最长 min(1200 秒, 剩余额度)，到点自动停止（结构同 legacy limits.py / duty_cycle.py）。
 /// 准入顺序是纯决策 OutputAdmission（ProtocolChecks 覆盖，Brain 审查 M3）。
 final class BLEManager: NSObject, ObservableObject {
@@ -72,8 +72,6 @@ final class BLEManager: NSObject, ObservableObject {
         var runRemaining: Int?
         /// 本次运行上限（≤1200 秒，30 分钟额度不够时更短）
         var runAllowed = 0
-        /// 冷却剩余秒数
-        var cooldownRemaining = 0
         /// 30 分钟滚动窗口剩余额度（秒）
         var budgetRemaining = Int(SafetyLimits.dutyBudgetSeconds)
         /// 额度不够开始新运行时，还要等多久
@@ -88,7 +86,6 @@ final class BLEManager: NSObject, ObservableObject {
             if needsPhysicalAck { return "设备可能仍在输出：先停止并等确认，或关闭设备电源后点「已物理关机，解除锁定」" }
             if stopRetrying { return "停止尚未得到设备确认，暂不能输出" }
             if runRemaining != nil { return nil }
-            if cooldownRemaining > 0 { return "冷却中，还需 \(cooldownRemaining) 秒才能再次输出" }
             if budgetRemaining < Int(SafetyLimits.minRunSeconds) {
                 return "30 分钟内累计输出已达 \(Int(SafetyLimits.dutyBudgetSeconds)) 秒上限，还需 \(budgetWait) 秒才能再次输出"
             }
@@ -97,6 +94,10 @@ final class BLEManager: NSObject, ObservableObject {
 
         /// 设备区块里的一行说明
         var summary: String {
+            if !SafetyLimits.timeLimitsEnabled {
+                if let reason = blockReason { return reason }
+                return runRemaining != nil ? "正在输出（无时间上限，随时可按停止）" : "无时间上限"
+            }
             if let r = runRemaining { return "本次输出剩余 \(r) 秒（本次上限 \(runAllowed) 秒）" }
             if let reason = blockReason { return reason }
             let maxRun = min(Int(SafetyLimits.maxRunSeconds), budgetRemaining)
@@ -109,7 +110,7 @@ final class BLEManager: NSObject, ObservableObject {
     @Published var lastSentHex: String = "—"
     /// FFA2 最近一条通知的 HEX（修 L1）
     @Published var lastNotifyHex: String = "—"
-    /// 单次上限 / 冷却 / 额度 / 停止确认 / 锁存，看门狗每秒刷新
+    /// 单次上限 / 额度 / 停止确认 / 锁存，看门狗每秒刷新
     @Published var safety = SafetyStatus()
     /// 断开时停止迟迟未确认：界面显示"强制断开"（修 M5）
     @Published var forceDisconnectOffered = false
@@ -187,7 +188,7 @@ final class BLEManager: NSObject, ObservableObject {
         let startedAt: TimeInterval
         /// 请求时设备可能在输出（或断开流程要求必须确认）；false 时失败不报警、不重试（修 L4）
         var needed: Bool
-        /// 全零输出触发的停止：确认后设备停了，但本次运行不结束（不记账、不冷却、不锁闸）。
+        /// 全零输出触发的停止：确认后设备停了，但本次运行不结束（不记账、不锁闸）。
         /// 任何真正的停止请求并入时置为 false；输出被拒、拉起锁存（被动停机）时同样置为 false（第二轮审查 L1）
         var keepRun: Bool
         var completions: [(StopResult) -> Void]
@@ -241,7 +242,7 @@ final class BLEManager: NSObject, ObservableObject {
     }
     /// 当前红字是不是停止相关的提示：之后停止确认成功时自动清掉
     private var stopErrorShown = false
-    /// 当前红字是冷却/额度提示：条件解除后自动清掉
+    /// 当前红字是额度提示：条件解除后自动清掉
     private var lastLimitText: String?
     /// 修 Factory H1：上次连接结束时设备可能还在输出（断链 / 蓝牙关闭 / 强制断开 / 进程被杀）。
     /// 跨连接、跨进程保留；重新连上后停止帧对确认成功，或用户确认已物理关机才清除。
@@ -614,7 +615,7 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// 用户在视频页点了"播放"、或 AI 开始执行一条回复：显式打开输出闸门（修 C）。
-    /// AI 带 epoch：执行前检查之后发生过被动停机就不开（M5，不再只靠冷却兜底）。
+    /// AI 带 epoch：执行前检查之后发生过被动停机就不开（M5）。
     /// 第三轮 L2：和 submitOutput 同一个开闸前提（OutputGate.mayResume），链路不可写（断链 / 断开中 / 后台）时不开，
     /// 闸门不会带着"开"跨过重连 / 回到前台
     func userResumeOutput(epoch: Int? = nil) {
@@ -693,7 +694,7 @@ final class BLEManager: NSObject, ObservableObject {
             requestStop(needed: true, keepRun: true)
         case .write(let startsRun):
             if startsRun {
-                // 修 M2/M3：停机状态下开始新一次运行：冷却 + 30 分钟额度，本次最长 min(1200 秒, 剩余额度)
+                // 修 M2/M3：停机状态下开始新一次运行：30 分钟额度，本次最长 min(1200 秒, 剩余额度)
                 if let denial = ledger.checkAdmissible() {
                     rejectOutput(Self.denialText(denial))
                     return
@@ -731,8 +732,6 @@ final class BLEManager: NSObject, ObservableObject {
 
     private static func denialText(_ denial: DutyCycleLedger.Denial) -> String {
         switch denial {
-        case .cooldown(let s):
-            return "冷却中，还需 \(Int(s.rounded(.up))) 秒才能再次输出（每次停止后至少休息 \(Int(SafetyLimits.minCooldownSeconds)) 秒，且不少于上次输出时长的一半）"
         case .budget(let s):
             return "30 分钟内累计输出已达 \(Int(SafetyLimits.dutyBudgetSeconds)) 秒上限，还需 \(Int(s.rounded(.up))) 秒才能再次输出"
         case .openRun:
@@ -742,8 +741,8 @@ final class BLEManager: NSObject, ObservableObject {
 
     /// 输出请求被拒：锁闸、界面归零并说明原因。
     /// 第二轮审查 L1：被拒也是被动停机（VM 收到 forceZero 就当已停止）。进行中的全零停止（keepRun）要升级成真正的停止：
-    /// 确认后结束本次运行、记账并冷却，不再留下"设备在 0、运行还开着、闸门锁着"的半截状态
-    /// （之前下一条 AI 回复还能不经冷却接着输出，或者心跳停了之后报一条误导的"看门狗"）
+    /// 确认后结束本次运行、记账，不再留下"设备在 0、运行还开着、闸门锁着"的半截状态
+    /// （之前下一条 AI 回复还能接着旧运行输出，或者心跳停了之后报一条误导的"看门狗"）
     private func rejectOutput(_ msg: String) {
         outputLocked = true
         deferredFrame = nil
@@ -930,7 +929,7 @@ final class BLEManager: NSObject, ObservableObject {
         zeroHeld = false
         stopUnconfirmed = false
         runGen += 1 // 作废本次运行的到点定时器
-        ledger.end() // 修 M3：按实际时长记账并开始冷却
+        ledger.end() // 修 M3：按实际时长记账
         clearMayBeActive()
         // M1：设备在 0，之后的升幅限速从 0 算
         outputWrites.resetBaseline()
@@ -1002,7 +1001,7 @@ final class BLEManager: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in self?.lastError = msg }
     }
 
-    /// 冷却/额度/上限提示：条件解除后由看门狗自动清掉；调用方保证在 bleQueue 上
+    /// 额度/上限提示：条件解除后由看门狗自动清掉；调用方保证在 bleQueue 上
     private func showLimitError(_ msg: String) {
         stopErrorShown = false
         let text = deviceMayBeActive ? "\(msg)\n\(Self.mayBeActiveMsg)" : msg
@@ -1010,7 +1009,7 @@ final class BLEManager: NSObject, ObservableObject {
         DispatchQueue.main.async { [weak self] in self?.lastError = text }
     }
 
-    /// 冷却结束、额度恢复后清掉之前的冷却/额度红字（只清自己那条）
+    /// 额度恢复后清掉之前的额度红字（只清自己那条）
     private func clearLimitErrorIfExpired() {
         guard let text = lastLimitText, !isActive, ledger.checkAdmissible() == nil,
               !physicalAckRequired, !deviceMayBeActive else { return }
@@ -1237,7 +1236,7 @@ final class BLEManager: NSObject, ObservableObject {
         let msg = fullRun
             ? "单次连续输出已达 \(Int(SafetyLimits.maxRunSeconds)) 秒上限，已自动停止"
             : "30 分钟内累计输出已达 \(Int(SafetyLimits.dutyBudgetSeconds)) 秒上限，已自动停止"
-        autoStop(msg + "；冷却结束前不能再次输出", isLimit: true)
+        autoStop(msg, isLimit: true)
     }
 
     /// 被动停机：锁闸、界面归零、发停止帧对
@@ -1256,7 +1255,6 @@ final class BLEManager: NSObject, ObservableObject {
             s.runRemaining = max(0, Int(rem.rounded(.up)))
             s.runAllowed = Int(ledger.openAllowed.rounded(.down))
         }
-        s.cooldownRemaining = Int(ledger.cooldownRemaining().rounded(.up))
         let budget = ledger.remainingBudget()
         s.budgetRemaining = Int(budget.rounded(.down))
         s.budgetWait = budget < SafetyLimits.minRunSeconds ? Int(ledger.secondsUntilBudget().rounded(.up)) : 0
