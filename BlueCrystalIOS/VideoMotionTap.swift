@@ -76,6 +76,8 @@ final class VideoMotionTap {
 
     /// 没有新帧时补零样本的最短间隔（低于分析器 0.5 s 的断档上限）
     static let stillFillInterval: CFTimeInterval = 0.25
+    /// 距上一帧真实画面最多补这么久：视频轨比音轨短、空段、解码冻住时，之后照常 1 s 撤最低强度
+    static let stillFillLimit: CFTimeInterval = 10
 
     private static var pixelAttributes: [String: Any] {
         // 两种 420 都接受：多数片源是 video range，只要 full range 会每帧多一次格式转换
@@ -109,6 +111,7 @@ final class VideoMotionTap {
     /// 上一拍的播放位置、上一次出样本的 host 时间：VFR 静止段（没有新帧但播放头在走）补零能量样本
     private var lastItemSeconds: Double = .nan
     private var lastSampleHost: CFTimeInterval = 0
+    private var lastRealFrameHost: CFTimeInterval = 0
 
     private init(item: AVPlayerItem, meter: VideoMotionMeter, completion: @escaping (Status) -> Void) {
         self.item = item
@@ -152,8 +155,24 @@ final class VideoMotionTap {
     /// 主线程：VM 开始 / 停止联动时开关拉帧
     func setActive(_ on: Bool) {
         os_unfair_lock_lock(flagLock)
+        let changed = active != on
         active = on
         os_unfair_lock_unlock(flagLock)
+        guard changed else { return }
+        reschedule()
+    }
+
+    /// 主线程：不联动时定时器停在远期（不用 suspend，cancel 挂起的 source 会崩），联动时按当前频率跑
+    private func reschedule() {
+        guard let t = timer, timerRate > 0 else { return }
+        os_unfair_lock_lock(flagLock)
+        let on = active
+        os_unfair_lock_unlock(flagLock)
+        if on {
+            t.schedule(deadline: .now(), repeating: 1.0 / timerRate, leeway: .milliseconds(10))
+        } else {
+            t.schedule(deadline: .distantFuture, repeating: .never)
+        }
     }
 
     private var isCancelled: Bool {
@@ -201,13 +220,13 @@ final class VideoMotionTap {
         t.setEventHandler { [weak self] in self?.fire(output: output) }
         timer = t
         timerRate = MotionThermalPolicy.normalRate
-        t.schedule(deadline: .now(), repeating: 1.0 / timerRate, leeway: .milliseconds(10))
+        reschedule()
         t.resume()
     }
 
     /// 主线程：按发热状态调拉帧频率；.critical 时暂停分析（定时器 1 Hz 空转，只查标志）
     private func applyThermal(_ state: ProcessInfo.ThermalState) {
-        guard !isCancelled, let t = timer else { return }
+        guard !isCancelled, timer != nil else { return }
         let rate = MotionThermalPolicy.frameRate(for: state)
         os_unfair_lock_lock(flagLock)
         paused = rate <= 0
@@ -215,7 +234,7 @@ final class VideoMotionTap {
         let tickRate = rate > 0 ? rate : 1
         if tickRate != timerRate {
             timerRate = tickRate
-            t.schedule(deadline: .now(), repeating: 1.0 / tickRate, leeway: .milliseconds(10))
+            reschedule()
         }
         let note = MotionThermalPolicy.note(for: state)
         report(note.map { rate > 0 ? Status.degraded($0) : Status.thermalPaused($0) } ?? .ready)
@@ -255,6 +274,7 @@ final class VideoMotionTap {
             // 录屏 / 幻灯片这类 VFR 片源静止时没有新帧：播放头在走、超过 0.25 s 没出样本，就补一个零能量样本，
             // 保住参考帧和「安静时不归零」。暂停时播放头不走，不会误补
             if advancing, hostTime - lastSampleHost >= Self.stillFillInterval,
+               hostTime - lastRealFrameHost <= Self.stillFillLimit,
                let still = analyzer.still(at: hostTime) {
                 lastSampleHost = hostTime
                 meter.add(still, generation: generation)
@@ -277,6 +297,7 @@ final class VideoMotionTap {
         guard downscaler.downscale(luma, width: width, height: height, bytesPerRow: rowBytes, into: &frame),
               let sample = analyzer.analyze(frame, time: hostTime) else { return }
         lastSampleHost = hostTime
+        lastRealFrameHost = hostTime
         meter.add(sample, generation: generation)
     }
 }

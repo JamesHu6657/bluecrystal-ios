@@ -498,7 +498,8 @@ do {
         }
         let v = i % 7 == 0 ? specials[i % specials.count] : vsRandom() * 120 - 10
         let out = st.step(v, settings: s, hasSignal: vsRandom() < 0.6)
-        let cap = SyncOutputStage.hardCap(s)
+        // 独立判据，不拿被测的 hardCap 当标准
+        let cap = s.maxPercent.isFinite ? max(0, min(Int(s.maxPercent.rounded(.down)), 99)) : 0
         let frame = [UInt8](BCProtocol.videoFrame(levels: out))
         if out.count != 4 || out[2] != 0 || out[3] != 0 || frame[5] != 0 || frame[6] != 0 { withinCap = false }
         for ch in 0..<2 where out[ch] < 0 || out[ch] > cap { withinCap = false }
@@ -507,6 +508,11 @@ do {
     }
     vcheck(withinCap, "出口：5000 组随机（含 NaN / ∞ / 越界上限）都不超过 min(上限, 99)，通道 2 / 3 恒 0")
     vcheck(riseOK, "出口：任意相邻两拍每通道升高 ≤ 20")
+    var bad = AudioSyncSettings()
+    for (v, want) in [(Double.nan, 0), (.infinity, 0), (-5, 0), (500, 99)] {
+        bad.maxPercent = v
+        vcheck(SyncOutputStage.hardCap(bad) == want, "出口：hardCap(\(v)) == \(want)")
+    }
 }
 
 // MARK: - 设置
