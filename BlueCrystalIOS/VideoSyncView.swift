@@ -1269,6 +1269,24 @@ struct FullScreenVideoView: View {
                         }
                         .scrollDisabled(fits)
                         .frame(height: bandHeight)
+                        // 放不下时（横屏常见）底边淡出并挂一个向下的小箭头：iOS 的滚动条不动时不显示，
+                        // 不提示的话「解除锁定」露半截也看不出能往上滑。只是提示，不拦点击
+                        .overlay(alignment: .bottom) {
+                            if !fits && measured > 0 {
+                                ZStack(alignment: .bottom) {
+                                    LinearGradient(colors: [.clear, .black.opacity(0.55)],
+                                                   startPoint: .top, endPoint: .bottom)
+                                        .frame(height: 28)
+                                    Image(systemName: "chevron.compact.down")
+                                        .font(.system(size: 18, weight: .semibold))
+                                        .foregroundColor(.white.opacity(0.85))
+                                        .padding(.bottom, 2)
+                                }
+                                .padding(.horizontal, 16)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
+                            }
+                        }
                         Spacer(minLength: 0)
                     }
                     .padding(.top, Self.warningTop)

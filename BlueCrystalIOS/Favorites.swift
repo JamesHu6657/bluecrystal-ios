@@ -111,8 +111,8 @@ final class FavoriteStore: ObservableObject {
 // MARK: - 我的收藏（滑杆下面）：一排卡片 + 行尾「收藏此刻」，整理就地展开
 
 /// 手感页唯一的收藏区：点卡片召回、点行尾的加号卡片收藏此刻、「整理」就地重命名 / 删除（可撤销）。
-/// 卡片能不能点由 FavoriteRecallRules 决定；最下面最多一行字：刚做完的事 > 撤销 > 为什么点不了
-/// （提示只显示一小会儿，收掉后剩下的撤销条会自己回来）
+/// 卡片能不能点由 FavoriteRecallRules 决定；最下面一行字：刚做完的事 > 等空位的那条 > 撤销 > 为什么点不了
+/// （提示只显示一小会儿，收掉后剩下的撤销条会自己回来；等空位的那条常驻，下面照常写为什么点不了）
 struct FavoritesSection: View {
     @ObservedObject var store: FavoriteStore
     let rules: FavoriteRecallRules
@@ -130,11 +130,9 @@ struct FavoritesSection: View {
     @State private var noticeGen = 0
     /// 撤销条整组收起的代次（和提示分开计时：显示提示不再清空撤销栈）
     @State private var undoGen = 0
-    /// 因为收藏已满没能放回的那条：用户删掉一组腾出位置后，它要排到撤销条最上面，
-    /// 下一次"撤销"放回的是它，而不是刚为它腾位置删掉的那组
-    @State private var blockedRestore: FavoriteStore.Removed?
-    /// 为放回 blockedRestore 而删掉的那几组：放回后收藏又满了，它们再点撤销只会碰上"已满"，直接收起并说一声
-    @State private var gaveWay: [FavoriteStore.Removed] = []
+    /// 点了撤销、但收藏已满没能放回的那条：移出撤销栈单独放着，撤销条优先显示它、常驻不自动收走，
+    /// 放回或点"算了"才收。等它的时候再删的几组照常进撤销栈（放回它之后还能撤销）
+    @State private var waiting: FavoriteStore.Removed?
     /// 缓推中点亮的是召回的那张（缓推会路过别的收藏的档位，别让高亮中途跳到别人身上）
     @State private var glidingTarget: UUID?
     @FocusState private var focusedName: UUID?
@@ -216,6 +214,8 @@ struct FavoritesSection: View {
         }
         .animation(listAnimation, value: store.items.map { $0.id })
         .animation(editAnimation, value: editing)
+        // 等着放回的那条，同样的手感又收藏进来了：不用再等空位，收起并说一声
+        .onChange(of: store.items.map { $0.id }) { _ in dropWaitingIfDuplicate() }
         // 整理到一半切走：名字照样收好（不留空名字）
         .onDisappear { endEditing() }
     }
@@ -386,8 +386,8 @@ struct FavoritesSection: View {
         }
     }
 
-    /// 最多一行：刚做完的事 > 撤销 > 为什么点不了 > 空列表时怎么开始
-    /// （提示只显示一小会儿，收掉后剩下的撤销条会自己回来）
+    /// 刚做完的事 > 等着放回的那条（常驻，下面照常写卡片为什么点不了）> 撤销 > 为什么点不了
+    /// （提示只显示一小会儿，收掉后撤销条会自己回来）
     @ViewBuilder private var footnote: some View {
         if let n = notice {
             Label(n, systemImage: "checkmark.seal.fill")
@@ -395,49 +395,76 @@ struct FavoritesSection: View {
                 .foregroundColor(Velvet.blush)
                 .fixedSize(horizontal: false, vertical: true)
                 .transition(.opacity)
+        } else if let w = waiting {
+            // 常驻、不自动收走，所以不能把"为什么点不了"那行一直挤掉：两行都留
+            VStack(alignment: .leading, spacing: 2) {
+                waitingBar(w)
+                statusLine
+            }
+            .transition(.opacity)
         } else if let u = undo {
-            // 等着放回的那条（收藏已满时没放回去）：常驻写明现在该做什么，不自动收走；不想要了点"算了"
-            let pending: Bool = u == blockedRestore
-            let full: Bool = store.isFull
-            let title: String = pending
-                ? (full ? "已满：删掉一组，就能放回「\(u.item.name)」" : "空出一格了，放回「\(u.item.name)」")
-                : "已删除「\(u.item.name)」"
-            let icon: String = pending ? (full ? "tray.full" : "arrow.uturn.backward") : "trash"
             HStack(spacing: 8) {
-                Label(title, systemImage: icon)
+                Label("已删除「\(u.item.name)」", systemImage: "trash")
                     .font(.caption)
                     .foregroundColor(Velvet.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 4)
-                if pending {
-                    Button {
-                        dismissPending(u)
-                    } label: {
-                        Text("算了")
-                            .font(.footnote)
-                            .foregroundColor(Velvet.textSecondary)
-                            .frame(minWidth: 44, minHeight: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("不放回\(u.item.name)")
-                }
-                Button {
-                    undoDelete(u)
-                } label: {
-                    Text("撤销")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundColor(Velvet.gold)
-                        .frame(minWidth: 44, minHeight: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint("把\(u.item.name)放回收藏")
+                barAction("撤销", hint: "把\(u.item.name)放回收藏") { undoDelete(u) }
             }
             .transition(.opacity)
-        } else if !editing, !store.items.isEmpty, let status = rules.status(for: store.items) {
-            // 说的是"卡片为什么点不了"：还没有收藏时不说（空卡片上已经写了为什么现在收不了，不再重复一遍）。
-            // 真被安全规则挡住才用锁；没连上只是还没开始，用连接的图标
+        } else {
+            statusLine
+        }
+    }
+
+    /// 等着放回的那条：满着时说"删掉一组"并给「去整理」（这时点撤销只会再碰一次"已满"）；
+    /// 空出一格后才给「撤销」。不想要了点「算了」
+    private func waitingBar(_ w: FavoriteStore.Removed) -> some View {
+        let full: Bool = store.isFull
+        let title: String = full ? "已满：删掉一组，就能放回「\(w.item.name)」" : "空出一格了，放回「\(w.item.name)」"
+        return HStack(spacing: 8) {
+            Label(title, systemImage: full ? "tray.full" : "arrow.uturn.backward")
+                .font(.caption)
+                .foregroundColor(Velvet.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 4)
+            Button {
+                dismissWaiting(w)
+            } label: {
+                Text("算了")
+                    .font(.footnote)
+                    .foregroundColor(Velvet.textSecondary)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("不放回\(w.item.name)")
+            if !full {
+                barAction("撤销", hint: "把\(w.item.name)放回收藏") { undoDelete(w) }
+            } else if !editing {
+                // 整理中删除键就在眼前，不再给这个键
+                barAction("去整理", hint: "删掉一组，给\(w.item.name)空出位置") { toggleEditing() }
+            }
+        }
+    }
+
+    /// 撤销条上的金色动作键
+    private func barAction(_ title: String, hint: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.footnote.weight(.semibold))
+                .foregroundColor(Velvet.gold)
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityHint(hint)
+    }
+
+    /// 卡片为什么点不了：还没有收藏时不说（空卡片上已经写了为什么现在收不了，不再重复一遍）。
+    /// 真被安全规则挡住才用锁；没连上只是还没开始，用连接的图标
+    @ViewBuilder private var statusLine: some View {
+        if !editing, !store.items.isEmpty, let status = rules.status(for: store.items) {
             Label(status, systemImage: isConnected ? "lock.fill" : "dot.radiowaves.left.and.right")
                 .font(.caption)
                 .foregroundColor(Velvet.textSecondary)
@@ -477,22 +504,16 @@ struct FavoritesSection: View {
         }
         // 新的撤销条顶掉可能还在显示的提示（提示的定时器一并作废）
         noticeGen += 1
-        // 之前因为已满没放回的那条（用户正是为它腾的位置）排回最上面：下一次"撤销"放回它
-        let waiting: FavoriteStore.Removed? = blockedRestore.flatMap { b in undoStack.contains(b) ? b : nil }
-        if waiting != nil { gaveWay.append(removed) }
         withAnimation(settleAnimation()) {
             notice = nil
             undoStack.append(removed)
-            if let b = waiting, let i = undoStack.firstIndex(of: b) {
-                undoStack.remove(at: i)
-                undoStack.append(b)
-            }
             // 撤销条只有一行：栈太深也摆不下，留最近 3 条
             if undoStack.count > 3 { undoStack.removeFirst(undoStack.count - 3) }
         }
-        if let b = waiting {
+        // 有一条在等空位时撤销条先给它（用户正是为它腾的位置）；刚删的这组放回它之后照常可撤销
+        if let w = waiting {
             UIAccessibility.post(notification: .announcement,
-                                 argument: "已删除\(removed.item.name)，空出一格了，点撤销就能放回\(b.item.name)")
+                                 argument: "已删除\(removed.item.name)，空出一格了，点撤销就能放回\(w.item.name)")
         } else {
             UIAccessibility.post(notification: .announcement, argument: "已删除\(removed.item.name)，可以撤销")
         }
@@ -502,72 +523,62 @@ struct FavoritesSection: View {
     /// 撤销条整组收起的计时：删除和撤销各重新计一次，
     /// 撤销一条后剩下的条目还有完整的可撤销时间（提示的显示不清空撤销栈）。
     /// delay：跟着提示重新计的窗口把提示顶掉撤销条的那几秒让出去——提示还盖着"撤销"键时窗口不该走。
-    /// 整理中、或有一条等着放回时不悄悄收走：整理完成后重新计时；等着放回的那条由用户放回或点"算了"
+    /// 整理中、或有一条等着放回时不悄悄收走：整理完成 / 等的那条有了结果后重新计时
+    /// （等的时候再删的几组藏在它后面，不能在看不见时把它们的撤销收走）
     private func armUndoDismissal(after delay: Double = 0) {
         undoGen += 1
         let gen = undoGen
         let settle: Animation? = settleAnimation()
         DispatchQueue.main.asyncAfter(deadline: .now() + delay + undoSeconds) {
-            guard gen == undoGen, !editing else { return }
-            let pending: Bool = blockedRestore.map { undoStack.contains($0) } ?? false
-            guard !pending else { return }
+            guard gen == undoGen, !editing, waiting == nil else { return }
             withAnimation(settle) { undoStack = [] }
-            blockedRestore = nil
-            gaveWay = []
         }
     }
 
-    /// 等着放回的那条不要了：只收起它，别的撤销照旧
-    private func dismissPending(_ r: FavoriteStore.Removed) {
-        withAnimation(settleAnimation()) { undoStack.removeAll { $0 == r } }
-        blockedRestore = nil
-        gaveWay = []
+    /// 等着放回的那条不要了：只收起它；等的时候删掉的几组照常可撤销
+    private func dismissWaiting(_ w: FavoriteStore.Removed) {
+        withAnimation(settleAnimation()) { waiting = nil }
         Haptics.select()
-        UIAccessibility.post(notification: .announcement, argument: "不再放回\(r.item.name)")
+        UIAccessibility.post(notification: .announcement, argument: "不再放回\(w.item.name)")
         if !undoStack.isEmpty { armUndoDismissal() }
     }
 
+    /// 等着放回的那条，同样的手感已经又在收藏里了：再删一组也放不回，别让人白删
+    private func dropWaitingIfDuplicate() {
+        guard let w = waiting, store.items.contains(where: { $0.sameSetting(as: w.item) }) else { return }
+        waiting = nil
+        if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
+        flash("同样的手感已经在收藏里了，「\(w.item.name)」不用再放回")
+    }
+
+    /// 一个模型：撤销栈（定时收起）+ 最多一条等空位的（常驻）。
+    /// 放回成功 / 同样的手感已在：这条撤销用掉了；已满：它改为等空位，栈里更早删的几组一并收起
+    /// （满着时它们点了也只会碰上"已满"，不再一条条冒出来）
     private func undoDelete(_ r: FavoriteStore.Removed) {
         switch store.restore(r) {
         case .restored:
-            // 放回成功才消费这条撤销；还有别的可撤销的：窗口重新计（提示会顶掉撤销条几秒，从提示收走后再算）
-            undoStack.removeAll { $0 == r }
-            if blockedRestore == r { blockedRestore = nil }
-            gaveWay.removeAll { $0 == r }
-            // 放回后又满了：为它让位删掉的那几组再点撤销只会碰上"已满"，直接收起，在提示里说一声
-            var gave: [FavoriteStore.Removed] = []
-            if store.isFull, !gaveWay.isEmpty {
-                gave = undoStack.filter { gaveWay.contains($0) }
-                undoStack.removeAll { gaveWay.contains($0) }
-                gaveWay = []
-            }
-            if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
+            consumeUndo(r)
             Haptics.select()
-            if gave.isEmpty {
-                flash("已放回「\(r.item.name)」")
-            } else {
-                let names: String = gave.map { "「\($0.item.name)」" }.joined(separator: "、")
-                flash("已放回「\(r.item.name)」，\(names)为它让出了位置")
-            }
+            flash("已放回「\(r.item.name)」")
         case .duplicate:
-            // 同样的手感已经在收藏里（满不满都一样）：这条撤销没有意义了，
-            // 别让用户再点进同一个失败，更别叫人为它删掉一组
-            undoStack.removeAll { $0 == r }
-            if blockedRestore == r {
-                blockedRestore = nil
-                gaveWay = []
-            }
-            if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
+            consumeUndo(r)
             Haptics.warning()
             flash("同样的手感已经在收藏里了")
         case .full:
-            // 满了放不回去：撤销条留着，记下这条，并常驻写明"删掉一组就能放回"（不自动收走）。
-            // 用户删掉一组腾出位置时，delete() 把它排回撤销条最上面，下一次"撤销"放回的就是它
-            blockedRestore = r
-            armUndoDismissal(after: Self.noticeSeconds)
+            withAnimation(settleAnimation()) {
+                if waiting != r { undoStack = [] }
+                waiting = r
+            }
             Haptics.warning()
-            flash("收藏已满 \(FavoriteSetting.maxCount) 组：删掉一组空出位置，再点撤销就能放回「\(r.item.name)」")
+            flash("收藏已满 \(FavoriteSetting.maxCount) 组：删掉一组，就能放回「\(r.item.name)」")
         }
+    }
+
+    /// 用掉一条撤销（等空位的那条或栈里的）；还有别的可撤销：窗口重新计（提示会顶掉撤销条几秒，从提示收走后再算）
+    private func consumeUndo(_ r: FavoriteStore.Removed) {
+        if waiting == r { waiting = nil }
+        undoStack.removeAll { $0 == r }
+        if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
     }
 
     private func save() {

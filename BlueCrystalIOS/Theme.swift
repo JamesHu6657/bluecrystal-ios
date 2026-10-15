@@ -89,15 +89,16 @@ enum Velvet {
             }
         }
 
-        /// 连接卡片的标题：紧挨着页头，和问候互相接话，不重复它的开头
+        /// 连接卡片的标题：紧挨着页头，和问候互相接话，不重复它的字眼，每个时段各有一句收尾
+        /// （怎么连写在下面那行说明和连接键上，标题只负责邀请）
         var connectInvite: String {
             switch self {
             case .lateNight: return "轻轻唤醒它，就从连接开始"
-            case .morning: return "晨光正好，先把它连上"
-            case .afternoon: return "午后时光，先把它连上"
-            case .evening: return "灯光调暗，先把它连上"
+            case .morning: return "晨光微暖，让它来到你身边"
+            case .afternoon: return "午后的光正软，让它靠近一点"
+            case .evening: return "灯光调暗，把它唤到身边"
             // 不说"一切就绪"：蓝牙关着、设备没开机时这张卡片也在
-            case .night: return "此刻只属于你，先把它连上"
+            case .night: return "此刻只属于你，与它相连"
             }
         }
     }
