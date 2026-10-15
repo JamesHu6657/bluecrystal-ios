@@ -101,11 +101,6 @@ enum Velvet {
             }
         }
     }
-
-    /// 按时间说一句话（手感页页头）：深夜、清晨、午后、傍晚各一句
-    static func greeting(hour: Int = Calendar.current.component(.hour, from: Date())) -> String {
-        Daypart(hour: hour).greeting
-    }
 }
 
 // MARK: - 触感

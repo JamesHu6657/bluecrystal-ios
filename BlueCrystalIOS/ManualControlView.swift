@@ -308,9 +308,11 @@ struct ManualControlView: View {
     }
 
     var body: some View {
+        // 页头问候和连接卡片的邀请用同一次取到的时段：跨过整点时两句不会一个说午后、一个说傍晚
+        let daypart = Velvet.Daypart()
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                PageHeader(title: "手感", subtitle: Velvet.greeting())
+                PageHeader(title: "手感", subtitle: daypart.greeting)
 
                 // 连接键在下面的邀请卡片上（未连接时）；设备卡片只管状态、红字、解除锁定和断开
                 if showsDeviceStatus {
@@ -323,7 +325,7 @@ struct ManualControlView: View {
                         connectedContent
                             .transition(.opacity)
                     } else {
-                        ConnectHero(favoriteCount: favorites.items.count)
+                        ConnectHero(favoriteCount: favorites.items.count, daypart: daypart)
                             .transition(.opacity)
                     }
                 }
@@ -545,6 +547,8 @@ struct ManualControlView: View {
 private struct ConnectHero: View {
     @EnvironmentObject var ble: BLEManager
     let favoriteCount: Int
+    /// 页头那句问候用的同一个时段（由手感页传进来）
+    let daypart: Velvet.Daypart
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var glow = false
 
@@ -557,8 +561,8 @@ private struct ConnectHero: View {
         case .scanning, .connecting, .discovering: return "正在找你的它…"
         case .failed: return "这次没连上"
         case .disconnecting: return "正在断开…"
-        // 跟页头的问候同一套时段（Velvet.Daypart），但换一句接话，不重复页头的开头
-        case .idle, .ready: return Velvet.Daypart().connectInvite
+        // 跟页头的问候同一个时段（同一次取值），但换一句接话，不重复页头的开头
+        case .idle, .ready: return daypart.connectInvite
         }
     }
 
