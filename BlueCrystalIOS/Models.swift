@@ -813,13 +813,17 @@ struct AudioReactiveShaper {
     static let autoInitialRefDb: Double = -20
     static let autoRiseSeconds: TimeInterval = 1.5
     static let autoFallSeconds: TimeInterval = 20
-    static let autoTargetPercent: Double = 85
+    static let autoTargetPercent: Double = 75
+    /// 自动增益只补一半差距：小声的视频仍然偏轻，不把轻微的声音顶成强输出（真机反馈 2026-10-15）
+    static let autoCompensation: Double = 0.5
     /// 自动增益的范围（dB）：再安静的视频也最多放大这么多，避免把纯底噪放大成强输出
-    static let autoGainRange: ClosedRange<Double> = -12...24
+    static let autoGainRange: ClosedRange<Double> = -12...12
     /// 自动模式下手动灵敏度只做微调（±6 dB），总增益仍夹在 autoGainRange 内
     static let autoTrimRange: ClosedRange<Double> = -6...6
     /// 自动模式的相对噪声门：比参考响度低这么多以上算底噪，不放大成输出
     static let autoRelativeGateDb: Double = 24
+    /// 低于相对噪声门的样本学习得很慢（下降时间常数）
+    static let autoBelowGateFallSeconds: TimeInterval = 180
 
     struct Output: Equatable {
         /// 灵敏度之后、噪声门之前的电平（0~100），界面电平条用
@@ -832,6 +836,9 @@ struct AudioReactiveShaper {
     private(set) var gateOpen = false
     /// 自动灵敏度跟踪的参考响度（dB）；暂停 / 跳转不清零，换视频时 resetAdaptation()
     private(set) var refDb: Double = autoInitialRefDb
+    /// 这个视频是否已经出现过高于相对噪声门的声音；换视频时清掉
+    private(set) var heardAboveGate = false
+    private(set) var aboveGateSeconds: TimeInterval = 0
 
     mutating func reset() {
         smoothed = 0
@@ -842,12 +849,16 @@ struct AudioReactiveShaper {
     mutating func resetAdaptation() {
         reset()
         refDb = Self.autoInitialRefDb
+        heardAboveGate = false
+        aboveGateSeconds = 0
     }
 
     /// 当前自动增益（dB）：把参考响度放到 autoTargetPercent
     var autoGainDb: Double {
         let targetDb = Self.floorDb + Self.autoTargetPercent / 100 * (Self.ceilingDb - Self.floorDb)
-        let g = targetDb - refDb
+        let raw = targetDb - refDb
+        // 只减半「放大」；响的视频照常整段压低，不比以前更强
+        let g = raw > 0 ? raw * Self.autoCompensation : raw
         guard g.isFinite else { return 0 }
         return min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, g))
     }
@@ -855,7 +866,19 @@ struct AudioReactiveShaper {
     /// 跟踪参考响度：变响较快跟上，变轻很慢地落（一段安静不会立刻把增益拉满）
     private mutating func adapt(loudnessDb db: Double, dt: TimeInterval) {
         guard db.isFinite, db > Self.absoluteGateDb else { return }
-        let tau = db > refDb ? Self.autoRiseSeconds : Self.autoFallSeconds
+        // 远低于参考响度的（安静段底噪）只极慢地学：否则十几秒就把参考拉下来，相对噪声门失效。
+        // 整段都很安静的视频仍能在几分钟内学到自己的响度
+        let belowGate = db < refDb - Self.autoRelativeGateDb
+        // 听到过这个视频的「响段」之后，安静段底噪不再训练参考响度（否则几分钟的安静段后门会失效、底噪被顶满增益）。
+        // 从没听到过高于门的内容（整段都很安静的视频）才允许慢慢往下学
+        if belowGate && heardAboveGate { return }
+        if !belowGate {
+            // 要累计够一个下降时间常数的门上内容才算「听到过响段」：片头一声 / 关门声不能把安静视频锁死
+            aboveGateSeconds += dt
+            if aboveGateSeconds >= Self.autoFallSeconds { heardAboveGate = true }
+        }
+        let tau = db > refDb ? Self.autoRiseSeconds
+            : (belowGate ? Self.autoBelowGateFallSeconds : Self.autoFallSeconds)
         refDb += (db - refDb) * (1 - exp(-dt / tau))
         if !refDb.isFinite { refDb = Self.autoInitialRefDb }
     }

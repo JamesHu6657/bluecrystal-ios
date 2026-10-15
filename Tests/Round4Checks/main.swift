@@ -355,7 +355,7 @@ do {
     var manual = AudioReactiveShaper()
     var m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3)
     for _ in 0..<120 { m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3) }
-    r4check(q.percent >= 70 && q.percent > m.percent, "自动灵敏度：小声视频的响段也能到 70% 以上（手动只有 \(m.percent)）")
+    r4check(q.percent > m.percent && q.percent <= 60, "自动灵敏度：小声视频会被适度放大但不顶到很强（自动 \(q.percent)，手动 \(m.percent)）")
     var loudVideo = AudioReactiveShaper()
     var l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3)
     for _ in 0..<60 { l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3) }
@@ -369,9 +369,20 @@ do {
     let autoFloor = AudioSyncSettings(sensitivityDb: 18, maxPercent: 100, minPercent: 10, autoGain: true)
     var gated = AudioReactiveShaper()
     var g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3)
-    for _ in 0..<60 { g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3) }
-    for _ in 0..<20 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
+    for _ in 0..<80 { g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3) }
+    for _ in 0..<1_000 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
     r4check(g.percent == 10, "自动灵敏度：安静段底噪不被放大，只保持最低强度（得到 \(g.percent)）")
+    var allQuiet = AudioReactiveShaper()
+    for _ in 0..<1_000 { _ = allQuiet.step(sineWindow(-50), settings: auto, dt: 0.3) }
+    r4check(allQuiet.refDb < -40, "自动灵敏度：整段都很安静的视频几分钟内也能学会自己的响度（refDb \(allQuiet.refDb)）")
+    var intro = AudioReactiveShaper()
+    for _ in 0..<33 { _ = intro.step(sineWindow(-30), settings: auto, dt: 0.3) }
+    for _ in 0..<1_000 { _ = intro.step(sineWindow(-48), settings: auto, dt: 0.3) }
+    r4check(intro.refDb < -40, "自动灵敏度：10 秒片头之后的小声对白仍能学会（refDb \(intro.refDb)）")
+    var bang = AudioReactiveShaper()
+    _ = bang.step(sineWindow(-15), settings: auto, dt: 0.3)
+    for _ in 0..<1_000 { _ = bang.step(sineWindow(-50), settings: auto, dt: 0.3) }
+    r4check(bang.refDb < -40, "自动灵敏度：开头一声关门声不会把安静视频锁死（refDb \(bang.refDb)）")
     quietVideo.resetAdaptation()
     r4check(quietVideo.refDb == AudioReactiveShaper.autoInitialRefDb, "换视频重新学习响度")
     var learning = AudioReactiveShaper()
