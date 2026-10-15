@@ -48,6 +48,20 @@ jobs:
             -o "$RUNNER_TEMP/protocol-checks" 2>&1 | tee tests.log
           "$RUNNER_TEMP/protocol-checks" 2>&1 | tee -a tests.log
 
+      # 画面联动 P1 的纯逻辑检查（和 PR Checks 里同一条命令）：降采样、帧差、切换、归一化、出口、设置
+      - name: Visual sync checks
+        run: |
+          set -euo pipefail
+          xcrun swiftc \
+            BlueCrystalIOS/Protocol.swift \
+            BlueCrystalIOS/Models.swift \
+            BlueCrystalIOS/SafetyLedger.swift \
+            BlueCrystalIOS/AIProgram.swift \
+            BlueCrystalIOS/VisualSync.swift \
+            Tests/VisualSyncChecks/main.swift \
+            -o "$RUNNER_TEMP/visual-sync-checks" 2>&1 | tee -a tests.log
+          "$RUNNER_TEMP/visual-sync-checks" 2>&1 | tee -a tests.log
+
       - name: Build (Release, iphoneos, no signing)
         run: |
           set -euo pipefail

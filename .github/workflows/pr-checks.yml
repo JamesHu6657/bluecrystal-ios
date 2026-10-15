@@ -58,6 +58,20 @@ jobs:
             -o "$RUNNER_TEMP/round4-checks" 2>&1 | tee -a tests.log
           "$RUNNER_TEMP/round4-checks" 2>&1 | tee -a tests.log
 
+      # 画面联动 P1 的纯逻辑检查（纯类型 + VisualSync.swift）：降采样、帧差、切换、归一化、出口、设置
+      - name: Visual sync checks
+        run: |
+          set -euo pipefail
+          xcrun swiftc \
+            BlueCrystalIOS/Protocol.swift \
+            BlueCrystalIOS/Models.swift \
+            BlueCrystalIOS/SafetyLedger.swift \
+            BlueCrystalIOS/AIProgram.swift \
+            BlueCrystalIOS/VisualSync.swift \
+            Tests/VisualSyncChecks/main.swift \
+            -o "$RUNNER_TEMP/visual-sync-checks" 2>&1 | tee -a tests.log
+          "$RUNNER_TEMP/visual-sync-checks" 2>&1 | tee -a tests.log
+
       # 只编译（BLEManager / 各 View 只有这里能验证），不打包、不上传
       - name: Compile app (no signing, no IPA)
         run: |
