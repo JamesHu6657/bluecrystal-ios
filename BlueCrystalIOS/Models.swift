@@ -38,7 +38,7 @@ struct PlaybackScrubber {
 /// seek / seek 后缓冲期间设备保持 0，等播放头真正前进才恢复采样和 1.5 秒卡住检测。
 struct PlaybackProgressWatch {
     static let stallLimit: TimeInterval = 1.5
-    enum Observation { case moving, waitingAfterSeek, stalled }
+    enum Observation { case moving, waitingAfterSeek, stalled, paused }
     private var position: Double = .nan
     private var progressedAt: TimeInterval = 0
     private(set) var awaitingSeekProgress = false
@@ -49,13 +49,26 @@ struct PlaybackProgressWatch {
         awaitingSeekProgress = false
     }
 
+    /// 暂停中完成的 seek 也保留落点；点播放不能把第一次静止采样误认成前进。
+    mutating func startPlayback(at seconds: Double, now: TimeInterval) {
+        if awaitingSeekProgress {
+            // 等待中被外部暂停前可能已走过几帧；再次播放须从这次的停点重新等前进。
+            if seconds.isFinite { position = seconds }
+            progressedAt = now
+        } else {
+            reset(now: now)
+        }
+    }
+
     mutating func awaitSeekProgress(from seconds: Double, now: TimeInterval) {
         reset(now: now)
         position = seconds
         awaitingSeekProgress = true
     }
 
-    mutating func observe(at seconds: Double, now: TimeInterval) -> Observation {
+    mutating func observe(at seconds: Double, now: TimeInterval, isPaused: Bool = false) -> Observation {
+        // 外部暂停优先于位置变化和 seek 等待；绝不因暂停前走过几帧就恢复输出。
+        if isPaused { return .paused }
         if seconds.isFinite, position.isNaN || abs(seconds - position) > 0.01 {
             position = seconds
             progressedAt = now

@@ -121,6 +121,33 @@ watch.awaitSeekProgress(from: 20, now: 120)
 r4check(watch.observe(at: 20, now: 125) == .waitingAfterSeek, "seek：向后跳转也等待新落点前进")
 r4check(watch.observe(at: 20.1, now: 126) == .moving, "seek：向后跳转后照常恢复")
 
+// 暂停中完成 seek 后再点播放：落点不算前进，缓冲再久也不误发、不误停。
+watch.awaitSeekProgress(from: 60, now: 130)
+r4check(watch.observe(at: 60, now: 135, isPaused: true) == .paused && watch.awaitingSeekProgress,
+        "seek：暂停不清掉等待落点前进的状态")
+watch.startPlayback(at: 60, now: 140)
+r4check(watch.observe(at: 60, now: 145) == .waitingAfterSeek,
+        "seek：暂停→拖动→播放，长缓冲不发帧、不触发 1.5 秒停机")
+// 暂停前已走过几帧，但首次采样还没来：暂停必须压过位置变化。
+r4check(watch.observe(at: 60.1, now: 146, isPaused: true) == .paused && watch.awaitingSeekProgress,
+        "seek：等待期间外部暂停，位置变了也不恢复非零输出")
+watch.startPlayback(at: 60.1, now: 150)
+r4check(watch.observe(at: 60.1, now: 155) == .waitingAfterSeek,
+        "seek：外部暂停后再播放，从新的停点等待，不把暂停前的进度当成恢复")
+r4check(watch.observe(at: 60.2, now: 156) == .moving, "seek：用户再次播放、真正前进后才恢复")
+r4check(watch.observe(at: 60.3, now: 157, isPaused: true) == .paused,
+        "播放：普通外部暂停也不采样暂停前的进度")
+watch.startPlayback(at: 60.3, now: 160)
+r4check(watch.observe(at: 60.3, now: 160) == .moving
+        && watch.observe(at: 60.3, now: 161.6) == .stalled,
+        "播放：非 seek 的再次播放仍保留 1.5 秒卡住检测")
+watch.awaitSeekProgress(from: 0, now: 170)
+watch.reset(now: 171)
+watch.startPlayback(at: 0, now: 172)
+r4check(!watch.awaitingSeekProgress && watch.observe(at: 0, now: 172) == .moving
+        && watch.observe(at: 0, now: 173.6) == .stalled,
+        "换视频：不继承旧视频的 seek 等待，普通卡住仍停机")
+
 let skipped = tl(30, 0.05)
 let landing = tl(80, 0.05)
 r4check(!skipped.isCovered(at: 80.1, previous: 80, fromPlaybackStart: true), "seek：落点前跳过的命令不补发")

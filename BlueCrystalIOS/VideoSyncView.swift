@@ -99,9 +99,10 @@ final class VideoSyncPlayer: ObservableObject {
             .sink { [weak self, weak p] status in
                 guard let self = self, let p = p, p === self.player else { return }
                 // 外部把播放器停了，但 vm 还以为在播：同步停机
-                // seek 会主动暂停；队列里旧的 paused KVO 不能把已恢复的播放器停掉。
+                // 只豁免 seek 自己的暂停；恢复后读实际状态，旧 KVO 不会误停，
+                // 但等待落点前进期间发生的真正外部暂停仍然立即停机。
                 if status == .paused, p.timeControlStatus == .paused, self.isPlaying,
-                   !self.isSeeking, !self.progressWatch.awaitingSeekProgress {
+                   !self.isSeeking {
                     self.handlePausedPlayer(p)
                 }
                 // 第四轮 M4：waitingToPlayAtSpecifiedRate（缓冲）不在这里单独处理：
@@ -110,7 +111,7 @@ final class VideoSyncPlayer: ObservableObject {
             .store(in: &playerCancellables)
     }
 
-    /// KVO/Timer 可能比播完通知先到：读实际位置，先覆盖终点再停采样。
+    /// KVO/Timer 可能比播完通知先到：读实际位置识别终点，再停止设备。
     private func handlePausedPlayer(_ p: AVPlayer) {
         let duration = p.currentItem?.duration.seconds ?? durationSeconds
         if PlaybackCompletion.reachedEnd(position: p.currentTime().seconds, duration: duration) {
@@ -136,14 +137,11 @@ final class VideoSyncPlayer: ObservableObject {
         statusLine = "视频卡住了（缓冲或读取变慢），设备已停止；准备好后再点播放"
     }
 
-    /// 播放头前进监视从头开始算（开始播放、seek 完成时）
-    private func resetProgressWatch() {
-        progressWatch.reset(now: Self.now())
-    }
-
     private func handleNaturalCompletion(_ p: AVPlayer) {
         guard p === player, isPlaying, !isSeeking else { return }
         let end = p.currentTime().seconds
+        if end.isFinite { currentSeconds = end }
+        // 若播放器已经暂停，sample 不补发非零终点帧；停止优先于补采。
         if end.isFinite { sample(at: end, force: true) }
         // sendTick 和 sendStop 按顺序进入 bleQueue，停止帧对仍由 BLEManager 原样发送。
         isPlaying = false
@@ -159,6 +157,7 @@ final class VideoSyncPlayer: ObservableObject {
         // 修 CC r2 L4：旧播放器未完成的 seek 回调作废
         seekGen += 1
         isSeeking = false
+        progressWatch.reset(now: Self.now())
         cancelScrubbing()
         // 换视频：先把上一个视频的时长/进度清掉，新时长回来前不显示旧值
         durationSeconds = 0
@@ -328,7 +327,7 @@ final class VideoSyncPlayer: ObservableObject {
                 seek(to: 0)
             } else {
                 p.play()
-                startTimer(resetProgress: !progressWatch.awaitingSeekProgress)
+                startTimer()
             }
         }
     }
@@ -364,16 +363,17 @@ final class VideoSyncPlayer: ObservableObject {
                     self.statusLine = "跳转未完成，设备已停止；请重试"
                     return
                 }
-                // 停止 / 暂停 / 断开 / 被动停机期间回调不得复活输出。
-                guard self.isPlaying else { return }
                 // 只覆盖落点之后的连续播放，绝不把 seek 跳过的命令当成漏采样。
+                // 即使此刻暂停，也先保存等待状态，之后点播放仍须等真正前进。
                 self.lastSampleTime = landed
                 self.samplingFromPlaybackStart = true
                 self.needsResync = true
                 self.progressWatch.awaitSeekProgress(from: landed, now: Self.now())
+                // 停止 / 暂停 / 断开 / 被动停机期间回调不得复活输出。
+                guard self.isPlaying else { return }
                 self.statusLine = "等待视频继续，设备暂停输出"
                 p.play()
-                self.startTimer(resetProgress: false)
+                self.startTimer()
                 self.tick(force: true)
             }
         }
@@ -412,10 +412,10 @@ final class VideoSyncPlayer: ObservableObject {
 
     // MARK: - 内部
 
-    private func startTimer(resetProgress: Bool = true) {
+    private func startTimer() {
         stopTimer(sendZero: false)
-        // 第四轮 M4：开始播放时播放头前进监视从头计时
-        if resetProgress { resetProgressWatch() }
+        // 普通播放从头监视；seek 等待不因点播放或重建 Timer 被清掉。
+        progressWatch.startPlayback(at: player?.currentTime().seconds ?? .nan, now: Self.now())
         // N5：用 common modes，滚动 Form 时 tick 不暂停
         let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             self?.tick()
@@ -441,18 +441,19 @@ final class VideoSyncPlayer: ObservableObject {
         guard !isSeeking, isPlaying else { return }
         // 修 CC r3 L3：心跳只证明 Timer 活着；播放器已停而 vm 仍以为在播时立即停机，
         // 不让心跳替一个不动的画面续命
-        if p.timeControlStatus == .paused, !progressWatch.awaitingSeekProgress {
+        let t = p.currentTime().seconds
+        let observation = progressWatch.observe(at: t, now: Self.now(), isPaused: p.timeControlStatus == .paused)
+        if observation == .paused {
             handlePausedPlayer(p)
             return
         }
-        let t = p.currentTime().seconds
         let duration = p.currentItem?.duration.seconds ?? durationSeconds
         if PlaybackCompletion.reachedEnd(position: t, duration: duration) {
             handleNaturalCompletion(p)
             return
         }
         // 第四轮 M4：播放器没停、播放头却不走（缓冲 / 解码卡住 / 时间读不出来）：超过 stallLimit 就停机
-        switch progressWatch.observe(at: t, now: Self.now()) {
+        switch observation {
         case .waitingAfterSeek:
             return
         case .stalled:
@@ -460,13 +461,17 @@ final class VideoSyncPlayer: ObservableObject {
             return
         case .moving:
             break
+        case .paused:
+            return
         }
         guard t.isFinite else { return }
         sample(at: t, force: force)
     }
 
     private func sample(at t: Double, force: Bool = false) {
-        guard let s = script, let ble = ble else { return }
+        guard let s = script, let ble = ble, let p = player,
+              isPlaying, !isSeeking, p.timeControlStatus != .paused,
+              !progressWatch.awaitingSeekProgress else { return }
         // 单次上限（SafetyLimits.maxRunSeconds）、30 分钟额度由 BLEManager 统一执行（修 M2/M3），这里不再单独计时
 
         currentSeconds = t

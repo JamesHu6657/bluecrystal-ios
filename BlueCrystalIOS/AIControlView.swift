@@ -723,6 +723,9 @@ struct AIControlView: View {
                     .animation(.easeInOut(duration: 0.2), value: vm.isThinking)
                 }
                 .scrollDismissesKeyboard(.interactively)
+                // 包括短聊天列表下面的空白；同时识别，不吞掉消息里的链接或其他控件。
+                .contentShape(Rectangle())
+                .simultaneousGesture(TapGesture().onEnded { _ in inputFocused = false })
                 .onChange(of: vm.messages.count) { _ in
                     withAnimation(.easeOut(duration: 0.3)) { proxy.scrollTo(Self.bottomID, anchor: .bottom) }
                     // 她回话了：轻轻一下（出错提示不震，红字另有警告触感）。
@@ -747,6 +750,12 @@ struct AIControlView: View {
             .background(.ultraThinMaterial)
             .background(Velvet.ink.opacity(0.5))
         }
+        // 只接住没被子视图处理的背景点按；输入框、快捷话和停止键保留自己的动作。
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture { inputFocused = false }
+        }
         .background(VelvetBackground(glow: vm.running ? 0.55 : (vm.isThinking ? 0.3 : 0.12)).ignoresSafeArea())
         .sheet(isPresented: $showSettings, onDismiss: { config.refresh() }) {
             // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，自己也要挂一份
@@ -759,7 +768,10 @@ struct AIControlView: View {
             config.refresh()
             vm.viewAppeared(ble: ble, scenePhase: scenePhase)
         }
-        .onDisappear { if !showSettings { vm.viewDisappeared() } }
+        .onDisappear {
+            inputFocused = false
+            if !showSettings { vm.viewDisappeared() }
+        }
         .onChange(of: scenePhase) { phase in vm.scenePhaseChanged(phase) }
         // 设备那边处理好了：说明立刻收掉，不再指向一张已经没有提示的卡片
         .onChange(of: settingsBlocked) { blocked in
