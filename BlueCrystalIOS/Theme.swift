@@ -96,7 +96,8 @@ enum Velvet {
             case .morning: return "晨光正好，先把它连上"
             case .afternoon: return "午后时光，先把它连上"
             case .evening: return "灯光调暗，先把它连上"
-            case .night: return "一切就绪，只差连上它"
+            // 不说"一切就绪"：蓝牙关着、设备没开机时这张卡片也在
+            case .night: return "此刻只属于你，先把它连上"
             }
         }
     }

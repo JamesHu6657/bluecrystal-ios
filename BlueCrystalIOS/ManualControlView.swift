@@ -897,6 +897,15 @@ private struct PresetTile: View {
         return parts.joined(separator: " ")
     }
 
+    /// 旁白：名字和三个通道各自的档位（同收藏卡片），不只读一串数字
+    private var a11yLabel: String {
+        let parts: [String] = BCProtocol.Channel.uiChannels.map { (ch: BCProtocol.Channel) -> String in
+            let v: Int = preset.channels.indices.contains(ch.rawValue) ? preset.channels[ch.rawValue] : 0
+            return "\(ch.displayName) \(v)"
+        }
+        return "\(preset.title)，" + parts.joined(separator: "，")
+    }
+
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 12) {
@@ -940,6 +949,7 @@ private struct PresetTile: View {
             .shadow(color: selected ? Velvet.rose.opacity(0.45) : .clear, radius: 14)
         }
         .buttonStyle(PressableStyle())
+        .accessibilityLabel(a11yLabel)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

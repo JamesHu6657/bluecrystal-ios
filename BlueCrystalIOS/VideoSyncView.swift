@@ -1143,6 +1143,14 @@ struct DocumentPicker: UIViewControllerRepresentable {
     }
 }
 
+/// 全屏里设备卡片的高度（纯布局）
+private struct WarningCardHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 /// 全屏播放：黑底铺满，点画面显示/隐藏控制条；所有控制都走 VideoSyncPlayer，
 /// 不用系统播放控件（会绕过联动和安全逻辑）。
 /// 停止键只有一个、永远在右下角同一个位置：控制条显示或收起（含 4 秒自动收起）都不挪地方，
@@ -1156,6 +1164,8 @@ struct FullScreenVideoView: View {
     @State private var hideGen = 0
     /// 正在拖进度条：拖动期间不收起
     @State private var scrubbing = false
+    /// 设备卡片的实际高度（量出来之前为 0）：滚动区只占这么高，不多拦一块点击
+    @State private var warningCardHeight: CGFloat = 0
 
     /// 停止键直径、离边缘的距离；控制条右侧给它让出的宽度（控制条的内容不压到停止键下面）
     private static let stopSize: CGFloat = 60
@@ -1216,17 +1226,29 @@ struct FullScreenVideoView: View {
                 }
                 // 独立于控制条的淡入淡出：警告不动画、不自动收起。长红字 / 大字号可滚动，
                 // 上方留出退出键，下方的固定停止键仍最后绘制、始终可点。
-                // 卡片多高就占多高（横屏时不再整块盖住下面的进度条和曲线）；放不下才滚动，最多 warningHeight
+                // 卡片多高就占多高、贴着顶部（横屏时不再整块盖住下面的进度条和曲线）；放不下才滚动，最多 warningHeight。
+                // 始终只有这一张卡片：高度变化时「解除锁定 / 强制断开」的确认框不会因为换了一份卡片而被收掉
                 if needsDeviceAttention {
-                    VStack {
-                        ViewThatFits(in: .vertical) {
+                    let measured: CGFloat = warningCardHeight
+                    let fits: Bool = measured > 0 && measured <= warningHeight
+                    let bandHeight: CGFloat = measured > 0 ? min(measured, warningHeight) : warningHeight
+                    VStack(spacing: 0) {
+                        ScrollView {
                             warningCard
-                            ScrollView { warningCard }
+                                .background(
+                                    GeometryReader { g in
+                                        Color.clear.preference(key: WarningCardHeightKey.self, value: g.size.height)
+                                    }
+                                )
                         }
-                        .frame(maxHeight: warningHeight)
+                        .scrollDisabled(fits)
+                        .frame(height: bandHeight)
                         Spacer(minLength: 0)
                     }
                     .padding(.top, 60)
+                    .onPreferenceChange(WarningCardHeightKey.self) { h in
+                        if abs(h - warningCardHeight) > 0.5 { warningCardHeight = h }
+                    }
                 }
                 // 最后画：永远在最上层、永远在同一个位置
                 stopButton

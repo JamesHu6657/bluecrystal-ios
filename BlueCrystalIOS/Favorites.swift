@@ -52,14 +52,22 @@ final class FavoriteStore: ObservableObject {
         return removed
     }
 
-    /// 撤销删除：放回原位；满了、已经在了、或同样的手感又收藏过一次就不放
+    enum RestoreResult {
+        case restored
+        /// 已经在了，或同样的手感又收藏过一次：腾出位置也放不回，先于"已满"判断
+        case duplicate
+        case full
+    }
+
+    /// 撤销删除：放回原位；已经在了 / 同样的手感又收藏过一次、或满了就不放
     @discardableResult
-    func restore(_ r: Removed) -> Bool {
-        guard !isFull, !items.contains(where: { $0.id == r.item.id || $0.sameSetting(as: r.item) }) else { return false }
+    func restore(_ r: Removed) -> RestoreResult {
+        if items.contains(where: { $0.id == r.item.id || $0.sameSetting(as: r.item) }) { return .duplicate }
+        guard !isFull else { return .full }
         let at: Int = min(max(0, r.index), items.count)
         items.insert(r.item, at: at)
         persist()
-        return true
+        return .restored
     }
 
     /// 打字过程中：只去掉换行，不截到 12 个字、不去首尾空格。
@@ -482,27 +490,28 @@ struct FavoritesSection: View {
     }
 
     private func undoDelete(_ r: FavoriteStore.Removed) {
-        let ok = store.restore(r)
-        if ok {
+        switch store.restore(r) {
+        case .restored:
             // 放回成功才消费这条撤销；还有别的可撤销的：窗口重新计（提示会顶掉撤销条几秒，从提示收走后再算）
             undoStack.removeAll { $0 == r }
             if blockedRestore == r { blockedRestore = nil }
             if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
             Haptics.select()
             flash("已放回「\(r.item.name)」")
-        } else if store.isFull {
+        case .duplicate:
+            // 同样的手感已经在收藏里（满不满都一样）：这条撤销没有意义了，
+            // 别让用户再点进同一个失败，更别叫人为它删掉一组
+            undoStack.removeAll { $0 == r }
+            if blockedRestore == r { blockedRestore = nil }
+            if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
+            flash("同样的手感已经在收藏里了")
+        case .full:
             // 满了放不回去：撤销条留着，记下这条。用户删掉一组腾出位置时，delete() 把它排回撤销条最上面，
             // 下一次"撤销"放回的就是它（不是刚删掉的那组）。
             // 提示这几秒盖着"撤销"键：窗口从提示收走后才开始，多一步也走得完
             blockedRestore = r
             armUndoDismissal(after: Self.noticeSeconds)
             flash("收藏已满 \(FavoriteSetting.maxCount) 组：删掉一组空出位置，再点撤销就能放回「\(r.item.name)」")
-        } else {
-            // 同样的手感已经在收藏里：这条撤销没有意义了，别让用户再点进同一个失败
-            undoStack.removeAll { $0 == r }
-            if blockedRestore == r { blockedRestore = nil }
-            if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
-            flash("同样的手感已经在收藏里了")
         }
     }
 

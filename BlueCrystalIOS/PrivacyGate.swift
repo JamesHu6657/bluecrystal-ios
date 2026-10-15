@@ -414,6 +414,9 @@ struct LockScreenView: View {
                 Text("验证一下，再回到只属于你的时光")
                     .font(.subheadline)
                     .foregroundColor(Velvet.textSecondary)
+                    // 大字号时会折行：折行后也居中，不整段压扁
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let m = lock.message {
                     Text(m).font(.caption).foregroundColor(Velvet.warning).multilineTextAlignment(.center)
                 }
