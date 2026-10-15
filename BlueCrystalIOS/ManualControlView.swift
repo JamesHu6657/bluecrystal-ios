@@ -27,6 +27,7 @@ final class ManualControlVM: ObservableObject {
     /// 召回收藏时的缓推（FavoriteGlide）：代次 +1 就作废后面的步骤
     private var glideGen = 0
     private var glideWork: DispatchWorkItem?
+    @Published private(set) var isGliding = false
 
     static let throttleInterval: TimeInterval = 0.12
     /// 手动页这么久没有任何操作就自动停止输出（L7）：心跳只证明界面活着，不证明有人在操作。
@@ -163,22 +164,28 @@ final class ManualControlVM: ObservableObject {
         glideGen += 1
         glideWork?.cancel()
         glideWork = nil
+        isGliding = false
     }
 
     private func runGlide(_ plan: [[Int]], index: Int, gen: Int, mode stepMode: BCProtocol.Mode) {
         guard gen == glideGen, stepMode == mode, index < plan.count else { return }
+        isGliding = true
         let lv = plan[index]
         channels = lv.map(Double.init)
-        lastSend = ProcessInfo.processInfo.systemUptime
-        let frame = stepMode.frame(channels: lv)
-        if index == 0 {
-            ble?.send(frame: frame)
-        } else {
-            ble?.sendThrottled(frame: frame)
+        // 重复档位只等待，不重复写入；计时步骤不合并，变频的小量程也保留缓推用时。
+        if index == 0 || lv != plan[index - 1] {
+            lastSend = ProcessInfo.processInfo.systemUptime
+            let frame = stepMode.frame(channels: lv)
+            if index == 0 {
+                ble?.send(frame: frame)
+            } else {
+                ble?.sendThrottled(frame: frame)
+            }
         }
         ble?.heartbeat()
         guard index + 1 < plan.count else {
             glideWork = nil
+            isGliding = false
             return
         }
         let work = DispatchWorkItem { [weak self] in
@@ -271,6 +278,13 @@ struct ManualControlView: View {
 
     private var isConnected: Bool { ble.state == .ready }
 
+    /// 普通未连接 / 扫描状态由邀请卡片说明；任何安全提示仍直接显示，不挂动画。
+    private var showsDeviceStatus: Bool {
+        isConnected || ble.lastError != nil || ble.safety.needsPhysicalAck ||
+        ble.safety.blockReason != nil || ble.safety.stopRetrying ||
+        ble.state == .disconnecting || ble.forceDisconnectOffered
+    }
+
     /// 连上了且现在允许开始/继续输出（冷却、额度、锁存、停止未确认时禁用；停止按钮不受影响）
     private var canOutput: Bool {
         ble.state == .ready && ble.safety.blockReason == nil
@@ -299,9 +313,11 @@ struct ManualControlView: View {
                 PageHeader(title: "手感", subtitle: Velvet.greeting())
 
                 // 连接键在下面的邀请卡片上（未连接时）；设备卡片只管状态、红字、解除锁定和断开
-                DeviceStatusCard(allowDisconnect: true, connectTitle: "连接设备", showsConnect: false)
+                if showsDeviceStatus {
+                    DeviceStatusCard(allowDisconnect: true, connectTitle: "连接设备", showsConnect: false)
+                }
 
-                // 连上之前不摆一墙灰掉的控件：一张邀请卡片 + 一个大大的连接键；连上后才是心、模式、滑杆和收藏
+                // 连上之前由邀请卡片负责连接；连上后才显示心、模式和滑杆
                 VStack(alignment: .leading, spacing: 18) {
                     if isConnected {
                         connectedContent
@@ -312,6 +328,11 @@ struct ManualControlView: View {
                     }
                 }
                 .animation(reduceMotion ? nil : .easeInOut(duration: 0.3), value: isConnected)
+
+                // 连接前也能查看、重命名、删除；召回仍由 rules 锁住。只保留一份收藏区。
+                FavoritesSection(store: favorites, rules: recallRules, isGliding: vm.isGliding) {
+                    vm.applyFavorite($0)
+                }
 
                 settingsCard
             }
@@ -335,7 +356,7 @@ struct ManualControlView: View {
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
 
-    /// 连上之后：心、模式、滑杆（主角，尽量不用滚动就够得着）、空闲说明、收藏
+    /// 连上之后：心、模式、滑杆（主角，尽量不用滚动就够得着）、空闲说明
     private var connectedContent: some View {
         VStack(alignment: .leading, spacing: 18) {
             HeatCore(heat: heat, active: true)
@@ -352,9 +373,6 @@ struct ManualControlView: View {
                 }
             }
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: showsIdleNote)
-
-            // 收藏在滑杆下面：滑杆是主角，先够得着；收藏一排卡片，点一下缓缓回到那里
-            FavoritesSection(store: favorites, rules: recallRules) { vm.applyFavorite($0) }
         }
     }
 
@@ -593,7 +611,7 @@ private struct ConnectHero: View {
                 .disabled(busy)
             }
             if favoriteCount > 0 {
-                Label("你收藏的 \(favoriteCount) 组手感，连上就能一点回到", systemImage: "heart.fill")
+                Label("你收藏的 \(favoriteCount) 组手感，连上后点一下就能回到", systemImage: "heart.fill")
                     .font(.caption)
                     .foregroundColor(Velvet.blush)
                     .multilineTextAlignment(.center)

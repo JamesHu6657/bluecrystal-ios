@@ -872,10 +872,10 @@ struct AIControlView: View {
         return move.combined(with: AnyTransition.opacity)
     }
 
-    /// 输入框空着时才出快捷话（不会盖掉自己打了一半的字）。
+    /// 输入框空着且设备允许输出时才出快捷话（不邀请尚不能开始的输出，也不盖掉输入）。
     /// 等回复期间不收起（之前每发一句都收起再弹出，聊天区跟着上下跳），只是暂时点不了
     private var showQuickReplies: Bool {
-        vm.input.isEmpty
+        vm.input.isEmpty && ble.state == .ready && ble.safety.blockReason == nil
     }
 
     /// 快捷话：一点就发，和自己打字回车完全同一条路径（submit → vm.send）。

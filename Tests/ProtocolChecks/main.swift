@@ -1209,7 +1209,11 @@ check(glide.allSatisfy { (s: [Int]) -> Bool in
     (0..<4).allSatisfy { s[$0] <= glideTarget[$0] }
 }, "缓推：不超过目标")
 check(FavoriteGlide.plan(from: [3, 3, 3, 0], to: [3, 3, 3, 0], maxLevel: BCProtocol.maxManualLevel) == [[3, 3, 3, 0]], "已经在目标：只发一次")
-check(FavoriteGlide.plan(from: [0, 0, 0, 0], to: [2, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel).count <= FavoriteGlide.maxSteps, "缓推：步数不超过上限、重复合并")
+let smallGlide = FavoriteGlide.plan(from: [0, 0, 0, 0], to: [2, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel)
+check(smallGlide.count == FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [2, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel),
+      "缓推：重复档位也保留计时步骤")
+check(FavoriteGlide.plan(from: [60, 50, 0, 0], to: [10, 20, 0, 0], maxLevel: BCProtocol.maxManualLevel) == [[10, 20, 0, 0]],
+      "缓推：只降不升立即完成")
 check(FavoriteGlide.plan(from: [0, 50, 0, 0], to: [3, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel).allSatisfy { (s: [Int]) -> Bool in s.contains { $0 > 0 } },
       "缓推：一边降一边升时中间步骤不会全零（全零会变成停止帧对）")
 
@@ -1218,8 +1222,16 @@ let fullManual: [[Int]] = FavoriteGlide.plan(from: [0, 0, 0, 0], to: [99, 99, 99
 let fullManualSeconds: Double = Double(fullManual.count - 1) * FavoriteGlide.stepInterval
 check(fullManual.count == FavoriteGlide.maxSteps && fullManualSeconds >= 2.9, "缓推：手动 0→99 至少约 3 秒")
 check((fullManual.first?.first ?? 99) <= 5, "缓推：满档召回的第一步很轻")
-check(FavoriteGlide.stepCount(from: [0, 0, 0, 0], to: [9, 0, 0, 0], maxLevel: BCProtocol.maxModeLevel) == FavoriteGlide.maxSteps,
+let fullFrequency = FavoriteGlide.plan(from: [0, 0, 0, 0], to: [9, 0, 0, 0], maxLevel: BCProtocol.maxModeLevel)
+let fullFrequencySeconds: Double = Double(fullFrequency.count - 1) * FavoriteGlide.stepInterval
+check(fullFrequency.count == FavoriteGlide.maxSteps && near(fullFrequencySeconds, 3.0),
       "缓推：变频 0→9 也是约 3 秒")
+check(fullFrequency.first == [1, 0, 0, 0] && fullFrequency.last == [9, 0, 0, 0],
+      "缓推：变频第一步只升一档，最后到目标")
+check(fullFrequency.dropLast().allSatisfy { $0[0] < 9 },
+      "缓推：变频不会在 3 秒前提前到满档")
+check(zip(fullFrequency, fullFrequency.dropFirst()).contains { $0.0 == $0.1 },
+      "缓推：变频相邻重复档位不会被合并加速")
 let smallSteps: Int = FavoriteGlide.stepCount(from: [40, 0, 0, 0], to: [45, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel)
 check(smallSteps >= FavoriteGlide.minSteps && smallSteps < FavoriteGlide.maxSteps, "缓推：小幅调整步数少")
 check(FavoriteGlide.stepCount(from: [60, 60, 0, 0], to: [10, 0, 0, 0], maxLevel: BCProtocol.maxManualLevel) == FavoriteGlide.minSteps,

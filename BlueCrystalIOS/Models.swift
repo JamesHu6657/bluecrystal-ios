@@ -228,23 +228,25 @@ enum FavoriteGlide {
         plan(from: from, to: to, steps: stepCount(from: from, to: to, maxLevel: maxLevel))
     }
 
-    /// 从 from 到 to 的每一步（不含起点，最后一步恰好是 to；相邻重复的步骤合并）。
-    /// from == to 时只有一步（重新发一次目标值）
+    /// 从 from 到 to 的每个计时步骤（不含起点，最后一步恰好是 to；重复值也保留等待时间）。
+    /// 没有升高时只有一步（降低立即生效，或重新发一次目标值）
     static func plan(from: [Int], to: [Int], steps: Int) -> [[Int]] {
         let n = max(1, steps)
         let start = (0..<4).map { $0 < from.count ? max(0, from[$0]) : 0 }
         let target = (0..<4).map { $0 < to.count ? max(0, to[$0]) : 0 }
+        guard (0..<4).contains(where: { target[$0] > start[$0] }) else { return [target] }
         var out: [[Int]] = []
         for k in 1...n {
             let step = (0..<4).map { (i: Int) -> Int in
                 let a = start[i]
                 let b = target[i]
                 guard b > a else { return b }
-                // 向上取整：升高的通道第一步至少 +1，中间步骤不会出现"全零"（全零会被当成停止帧对）
-                let rise = ((b - a) * k + n - 1) / n
+                // 第一档至少 +1，避免全零停止帧；之后向下取整，让满档在最后一个计时步骤才到位。
+                let scaledRise: Int = (b - a) * k
+                let rise: Int = max(1, scaledRise / n)
                 return a + rise
             }
-            if out.last != step { out.append(step) }
+            out.append(step)
         }
         return out
     }

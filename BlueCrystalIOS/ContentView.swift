@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var ble: BLEManager
+    @State private var previousError: String?
 
     var body: some View {
         PrivacyShell {
@@ -34,8 +35,12 @@ struct ContentView: View {
             if s == .failed { Haptics.warning() }
         }
         .onChange(of: ble.lastError) { err in
-            if err != nil { Haptics.warning() }
+            if let err = err, !err.isEmpty, !(previousError ?? "").contains(err) {
+                Haptics.warning()
+            }
+            previousError = err
         }
+        .onAppear { previousError = ble.lastError }
         // 发现未绑定过的设备时弹确认框（防连到别人的设备）。
         // 直接用 showDeviceConfirm 做 binding：点"连接"和点"取消"走各自的方法，
         // 不会像之前那样在 set(false) 里误调 cancel 把 confirm 的设备抢掉（修 N7）。

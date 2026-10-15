@@ -107,6 +107,7 @@ final class FavoriteStore: ObservableObject {
 struct FavoritesSection: View {
     @ObservedObject var store: FavoriteStore
     let rules: FavoriteRecallRules
+    let isGliding: Bool
     let onRecall: (FavoriteSetting) -> Void
 
     @State private var editing = false
@@ -127,19 +128,21 @@ struct FavoritesSection: View {
         return clamped.contains { $0 > 0 }
     }
 
-    private var canSave: Bool { hasOutputToSave && !store.isFull && !editing }
+    private var canSave: Bool { hasOutputToSave && !store.isFull && !editing && !isGliding }
 
     private var activeID: UUID? { store.match(mode: mode, levels: rules.levels)?.id }
 
     /// 加号卡片上的小字：能收藏时说收什么，不能时说为什么
     private var saveCaption: String {
         if store.isFull { return "已满 \(FavoriteSetting.maxCount) 组" }
+        if isGliding { return "缓推完成后再收藏" }
         if !hasOutputToSave { return "先推滑杆" }
         return "存下这一刻"
     }
 
     private var saveHint: String {
         if store.isFull { return "最多收藏 \(FavoriteSetting.maxCount) 组，先整理掉不常用的" }
+        if isGliding { return "等强度缓缓推到目标后，再收藏" }
         if !hasOutputToSave { return "先把滑杆推到喜欢的位置，再收藏" }
         return "收藏后点一下就回来：强度会缓缓推上去"
     }
@@ -430,6 +433,7 @@ struct FavoritesSection: View {
     }
 
     private func save() {
+        guard canSave else { return }
         switch store.add(mode: mode, levels: rules.levels) {
         case .added(let fav):
             Haptics.success()
@@ -522,7 +526,7 @@ private struct FavoriteTile: View {
             .shadow(color: active ? Velvet.rose.opacity(0.4) : .clear, radius: 10)
             .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
-        .buttonStyle(PressableStyle())
+        .buttonStyle(SoftPressStyle())
         .accessibilityLabel(a11yLabel)
         .accessibilityHint(hint)
         .accessibilityAddTraits(active ? .isSelected : [])

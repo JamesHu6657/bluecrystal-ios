@@ -1001,12 +1001,13 @@ private struct ReadinessChip: View {
         return HStack(spacing: 5) {
             Image(systemName: done ? "checkmark.circle.fill" : icon)
             Text(title)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .font(.caption.weight(.semibold))
         .foregroundColor(done ? Velvet.ok : Velvet.text)
         .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, minHeight: 44)
         .background(Capsule().fill(fill))
         .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
@@ -1055,6 +1056,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
 /// 停止键只有一个、永远在右下角同一个位置：控制条显示或收起（含 4 秒自动收起）都不挪地方，
 /// 伸手去点的那一下不会因为控制条刚好收起而落空
 struct FullScreenVideoView: View {
+    @EnvironmentObject var ble: BLEManager
     @ObservedObject var vm: VideoSyncPlayer
     let onClose: () -> Void
     @State private var showControls = true
@@ -1068,6 +1070,11 @@ struct FullScreenVideoView: View {
     private static let stopInset: CGFloat = 20
     private static let stopReserve: CGFloat = stopSize + stopInset + 8
 
+    private var needsDeviceAttention: Bool {
+        ble.lastError != nil || ble.safety.needsPhysicalAck ||
+        ble.safety.stopRetrying || ble.forceDisconnectOffered
+    }
+
     /// 旁白、切换控制开着时不自动收起（找不到控件）。全键盘控制系统没有公开的检测接口，
     /// 点任何地方都会把控制条叫回来，停止键也一直在
     private static var assistiveTechRunning: Bool {
@@ -1078,45 +1085,79 @@ struct FullScreenVideoView: View {
     private func scheduleAutoHide() {
         hideGen += 1
         let gen = hideGen
+        if needsDeviceAttention {
+            showControls = true
+            return
+        }
         guard vm.isPlaying, !scrubbing, !Self.assistiveTechRunning else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            guard gen == hideGen, vm.isPlaying, !scrubbing, !Self.assistiveTechRunning else { return }
+            guard gen == hideGen, vm.isPlaying, !scrubbing,
+                  !Self.assistiveTechRunning, !needsDeviceAttention else { return }
             withAnimation(.easeInOut(duration: 0.3)) { showControls = false }
         }
     }
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            if let p = vm.player {
-                NoControlsPlayerView(player: p)
-                    .ignoresSafeArea()
-            }
-            // 透明点击层：切换控制条
-            Color.clear
-                .contentShape(Rectangle())
-                .ignoresSafeArea()
-                .onTapGesture {
-                    withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
-                    if showControls { scheduleAutoHide() }
+        GeometryReader { geo in
+            let warningHeight: CGFloat = min(260, geo.size.height * 0.5)
+            ZStack {
+                Color.black.ignoresSafeArea()
+                if let p = vm.player {
+                    NoControlsPlayerView(player: p)
+                        .ignoresSafeArea()
                 }
-            if showControls {
-                controls
-                    .transition(.opacity)
+                // 透明点击层：切换控制条
+                Color.clear
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        guard !needsDeviceAttention else {
+                            showControls = true
+                            return
+                        }
+                        withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
+                        if showControls { scheduleAutoHide() }
+                    }
+                if showControls || needsDeviceAttention {
+                    controls
+                        .transition(.opacity)
+                }
+                // 独立于控制条的淡入淡出：警告不动画、不自动收起。长红字 / 大字号可滚动，
+                // 上方留出退出键，下方的固定停止键仍最后绘制、始终可点。
+                if needsDeviceAttention {
+                    VStack {
+                        ScrollView {
+                            DeviceStatusCard(allowDisconnect: false, connectTitle: "连接",
+                                             compact: true, showsConnect: false)
+                                .padding(.horizontal, 16)
+                        }
+                        .frame(height: warningHeight)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.top, 60)
+                }
+                // 最后画：永远在最上层、永远在同一个位置
+                stopButton
             }
-            // 最后画：永远在最上层、永远在同一个位置
-            stopButton
         }
-        .statusBarHidden(!showControls)
+        .statusBarHidden(!showControls && !needsDeviceAttention)
         .preferredColorScheme(.dark)
         .onAppear { scheduleAutoHide() }
+        .onChange(of: needsDeviceAttention) { _ in
+            // 作废已经排队的自动收起；有提示时不动画，提示消失后才重新计时。
+            scheduleAutoHide()
+        }
         // 开始播放后开始计时收起；停下（含被动停机）就把控制条和状态说明拿出来
         .onChange(of: vm.isPlaying) { playing in
             if playing {
                 scheduleAutoHide()
             } else {
                 hideGen += 1
-                withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
+                if needsDeviceAttention {
+                    showControls = true
+                } else {
+                    withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
+                }
             }
         }
     }
@@ -1226,6 +1267,7 @@ struct FullScreenVideoView: View {
                 .buttonStyle(.borderless)
                 .accessibilityLabel("停止")
                 .accessibilityHint("立即停止所有输出")
+                .accessibilitySortPriority(10)
                 // 字号固定（圆里放不下更大的字）：大字号用户长按能看到放大的"停止"（点按照常立刻停）
                 .accessibilityShowsLargeContentViewer()
             }
