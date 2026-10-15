@@ -38,6 +38,9 @@ struct PlaybackScrubber {
 /// seek / seek 后缓冲期间设备保持 0，等播放头真正前进才恢复采样和 1.5 秒卡住检测。
 struct PlaybackProgressWatch {
     static let stallLimit: TimeInterval = 1.5
+    /// 等待落点前进时，一次采样（约 0.3 秒，最快 2 倍速）里正常播放最多前进这么多秒；
+    /// 往回走或跳得更远都算又一次跳转，不算恢复
+    static let maxResumeStep: Double = 1.0
     enum Observation { case moving, waitingAfterSeek, stalled, paused }
     private var position: Double = .nan
     private var progressedAt: TimeInterval = 0
@@ -70,6 +73,14 @@ struct PlaybackProgressWatch {
         // 外部暂停优先于位置变化和 seek 等待；绝不因暂停前走过几帧就恢复输出。
         if isPaused { return .paused }
         if seconds.isFinite, position.isNaN || abs(seconds - position) > 0.01 {
+            let delta = seconds - position
+            if awaitingSeekProgress, !position.isNaN, !(delta > 0 && delta <= Self.maxResumeStep) {
+                // 等待期间又跳了（系统进度条连续拖动、再次快进 / 快退）或往回走：不是正常播放，
+                // 记下新落点继续等
+                position = seconds
+                progressedAt = now
+                return .waitingAfterSeek
+            }
             position = seconds
             progressedAt = now
             awaitingSeekProgress = false
@@ -77,6 +88,99 @@ struct PlaybackProgressWatch {
         }
         if awaitingSeekProgress { return .waitingAfterSeek }
         return now - progressedAt > Self.stallLimit ? .stalled : .moving
+    }
+}
+
+/// 最低强度只在"声音真的在流过 tap"时生效。tap 装好（.ready）不代表有样本：
+/// 开播首拍、缓冲、AirPlay 时窗口是空的，这时不加最低强度（没有信号就是 0）
+struct AudioFlowWatch {
+    /// 最近一次有样本的窗口离现在不超过这么久才算在流（约两拍，容一拍抖动）
+    static let freshSeconds: TimeInterval = 0.7
+    private(set) var lastFramesAt: TimeInterval?
+
+    /// 开播 / seek / 跳转：之前的样本不作数
+    mutating func reset() { lastFramesAt = nil }
+
+    mutating func note(_ w: AudioWindow, now: TimeInterval) {
+        if w.frames > 0, now.isFinite { lastFramesAt = now }
+    }
+
+    func isFlowing(now: TimeInterval) -> Bool {
+        guard let t = lastFramesAt, now.isFinite else { return false }
+        let age = now - t
+        return age >= 0 && age < Self.freshSeconds
+    }
+
+    /// tap 就绪、播放器确实在播（不是缓冲）、样本是新鲜的：三者都满足才允许最低强度
+    func allowsFloor(tapReady: Bool, playerPlaying: Bool, now: TimeInterval) -> Bool {
+        tapReady && playerPlaying && isFlowing(now: now)
+    }
+}
+
+/// 系统播放器控件开播的判定：只在"暂停 → 非暂停"的那一下接管（缓冲 / 跳转引起的
+/// 等待 ↔ 播放来回不算开播）。用户停止 / 被动停机后锁存一次：拖动进度条时停止、
+/// 松手后系统按拖动前的速率续播，这一下不能把输出复活，先拦下并说明
+struct ExternalPlayGate {
+    enum Decision: Equatable {
+        /// 不是开播边沿
+        case ignore
+        /// 按用户点了播放处理（仍要过设备 / 安全 / 隐私检查）
+        case takeOver
+        /// 停止后的第一次外部开播：把视频停住，要求再点一次
+        case rejectAfterStop
+    }
+
+    private var wasPaused = true
+    private(set) var stopLatched = false
+
+    mutating func latchStop() { stopLatched = true }
+    mutating func clearLatch() { stopLatched = false }
+
+    /// paused：播放器现在是不是停着（KVO 值为暂停或实际 rate 为 0）
+    mutating func observe(paused: Bool) -> Decision {
+        if paused {
+            wasPaused = true
+            return .ignore
+        }
+        guard wasPaused else { return .ignore }
+        wasPaused = false
+        if stopLatched {
+            stopLatched = false
+            return .rejectAfterStop
+        }
+        return .takeOver
+    }
+}
+
+/// App 自己 seek 也会发 timeJumped；通知和 seek 完成回调各自切回主线程，先后不定。
+/// 完成回调记下落点，紧随其后、落在落点附近的那一条通知当作回声忽略（只消费一次）
+struct OwnSeekEcho {
+    static let window: TimeInterval = 0.5
+    static let tolerance: Double = 0.05
+    /// 回声晚到时播放头可能已经走了一点（最快 2 倍速）
+    static let maxRate: Double = 2
+
+    private var landed: Double = .nan
+    private var at: TimeInterval = -.infinity
+
+    mutating func record(landed seconds: Double, now: TimeInterval) {
+        landed = seconds
+        at = now
+    }
+
+    mutating func clear() {
+        landed = .nan
+        at = -.infinity
+    }
+
+    mutating func consumeIfEcho(position: Double, now: TimeInterval) -> Bool {
+        let elapsed = now - at
+        guard landed.isFinite, position.isFinite, elapsed.isFinite,
+              elapsed >= 0, elapsed < Self.window else { return false }
+        let echo = position >= landed - Self.tolerance
+            && position <= landed + Self.tolerance + elapsed * Self.maxRate
+        if echo { clear() }
+        return echo
     }
 }
 
@@ -627,6 +731,8 @@ struct AudioSyncSettings: Equatable {
         static let sensitivityDb = "bcAudioSyncSensitivityDb"
         static let maxPercent = "bcAudioSyncMaxPercent"
         static let channels = "bcAudioSyncChannels"
+        static let minPercent = "bcAudioSyncMinPercent"
+        static let autoGain = "bcAudioSyncAutoGain"
     }
 
     static let defaultEnabled = true
@@ -637,18 +743,30 @@ struct AudioSyncSettings: Equatable {
     static let maxPercentRange: ClosedRange<Double> = 10...100
     static let defaultMaxPercent: Double = 60
     static let defaultChannels = AudioSyncChannels.both
+    /// 最低强度（%）：播放中安静片段也不归零，保持在这里（用户要求"不归零"）；0 = 允许归零
+    static let minPercentRange: ClosedRange<Double> = 0...50
+    /// App 里没存过时的默认值（init 参数默认 0，纯逻辑测试沿用原行为）
+    static let defaultMinPercent: Double = 10
+    /// 自动灵敏度：跟踪当前视频最近的响度，自动把它的响段映射到接近上限，安静的视频和响的视频都用满范围
+    static let defaultAutoGain = true
 
     var enabled: Bool
     var sensitivityDb: Double
     var maxPercent: Double
     var channels: AudioSyncChannels
+    var minPercent: Double
+    var autoGain: Bool
 
     init(enabled: Bool = defaultEnabled, sensitivityDb: Double = defaultSensitivityDb,
-         maxPercent: Double = defaultMaxPercent, channels: AudioSyncChannels = defaultChannels) {
+         maxPercent: Double = defaultMaxPercent, channels: AudioSyncChannels = defaultChannels,
+         minPercent: Double = 0, autoGain: Bool = false) {
         self.enabled = enabled
         self.sensitivityDb = Self.clamp(sensitivityDb, to: Self.sensitivityRange, fallback: Self.defaultSensitivityDb)
         self.maxPercent = Self.clamp(maxPercent, to: Self.maxPercentRange, fallback: Self.defaultMaxPercent)
         self.channels = channels
+        // 最低强度不超过上限
+        self.minPercent = min(self.maxPercent, Self.clamp(minPercent, to: Self.minPercentRange, fallback: 0))
+        self.autoGain = autoGain
     }
 
     static func load(from defaults: UserDefaults) -> AudioSyncSettings {
@@ -657,7 +775,9 @@ struct AudioSyncSettings: Equatable {
             enabled: defaults.object(forKey: Keys.enabled) as? Bool ?? defaultEnabled,
             sensitivityDb: defaults.object(forKey: Keys.sensitivityDb) as? Double ?? defaultSensitivityDb,
             maxPercent: defaults.object(forKey: Keys.maxPercent) as? Double ?? defaultMaxPercent,
-            channels: channels ?? defaultChannels)
+            channels: channels ?? defaultChannels,
+            minPercent: defaults.object(forKey: Keys.minPercent) as? Double ?? defaultMinPercent,
+            autoGain: defaults.object(forKey: Keys.autoGain) as? Bool ?? defaultAutoGain)
     }
 
     /// 灵敏度的倍数写法（界面显示）
@@ -688,6 +808,20 @@ struct AudioReactiveShaper {
     static let releaseSeconds: TimeInterval = 0.8
     /// dB 加权里 RMS 的比重（其余给峰值）
     static let rmsWeight: Double = 0.7
+    /// 自动灵敏度：参考响度（视频最近的"响段"电平）的起始值、上升 / 下降时间常数，
+    /// 以及参考响度要映射到的位置（0~100）
+    static let autoInitialRefDb: Double = -20
+    static let autoRiseSeconds: TimeInterval = 1.5
+    static let autoFallSeconds: TimeInterval = 20
+    static let autoTargetPercent: Double = 85
+    /// 自动增益的范围（dB）：再安静的视频也最多放大这么多，避免把纯底噪放大成强输出
+    static let autoGainRange: ClosedRange<Double> = -12...24
+    /// 自动模式下手动灵敏度只做微调（±6 dB），总增益仍夹在 autoGainRange 内
+    static let autoTrimRange: ClosedRange<Double> = -6...6
+    /// 自动模式的相对噪声门：比参考响度低这么多以上算底噪，不放大成输出
+    static let autoRelativeGateDb: Double = 24
+    /// 低于相对噪声门的样本学习得很慢（下降时间常数）
+    static let autoBelowGateFallSeconds: TimeInterval = 180
 
     struct Output: Equatable {
         /// 灵敏度之后、噪声门之前的电平（0~100），界面电平条用
@@ -698,10 +832,51 @@ struct AudioReactiveShaper {
 
     private(set) var smoothed: Double = 0
     private(set) var gateOpen = false
+    /// 自动灵敏度跟踪的参考响度（dB）；暂停 / 跳转不清零，换视频时 resetAdaptation()
+    private(set) var refDb: Double = autoInitialRefDb
+    /// 这个视频是否已经出现过高于相对噪声门的声音；换视频时清掉
+    private(set) var heardAboveGate = false
+    private(set) var aboveGateSeconds: TimeInterval = 0
 
     mutating func reset() {
         smoothed = 0
         gateOpen = false
+    }
+
+    /// 换视频：重新学习响度
+    mutating func resetAdaptation() {
+        reset()
+        refDb = Self.autoInitialRefDb
+        heardAboveGate = false
+        aboveGateSeconds = 0
+    }
+
+    /// 当前自动增益（dB）：把参考响度放到 autoTargetPercent
+    var autoGainDb: Double {
+        let targetDb = Self.floorDb + Self.autoTargetPercent / 100 * (Self.ceilingDb - Self.floorDb)
+        let g = targetDb - refDb
+        guard g.isFinite else { return 0 }
+        return min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, g))
+    }
+
+    /// 跟踪参考响度：变响较快跟上，变轻很慢地落（一段安静不会立刻把增益拉满）
+    private mutating func adapt(loudnessDb db: Double, dt: TimeInterval) {
+        guard db.isFinite, db > Self.absoluteGateDb else { return }
+        // 远低于参考响度的（安静段底噪）只极慢地学：否则十几秒就把参考拉下来，相对噪声门失效。
+        // 整段都很安静的视频仍能在几分钟内学到自己的响度
+        let belowGate = db < refDb - Self.autoRelativeGateDb
+        // 听到过这个视频的「响段」之后，安静段底噪不再训练参考响度（否则几分钟的安静段后门会失效、底噪被顶满增益）。
+        // 从没听到过高于门的内容（整段都很安静的视频）才允许慢慢往下学
+        if belowGate && heardAboveGate { return }
+        if !belowGate {
+            // 要累计够一个下降时间常数的门上内容才算「听到过响段」：片头一声 / 关门声不能把安静视频锁死
+            aboveGateSeconds += dt
+            if aboveGateSeconds >= Self.autoFallSeconds { heardAboveGate = true }
+        }
+        let tau = db > refDb ? Self.autoRiseSeconds
+            : (belowGate ? Self.autoBelowGateFallSeconds : Self.autoFallSeconds)
+        refDb += (db - refDb) * (1 - exp(-dt / tau))
+        if !refDb.isFinite { refDb = Self.autoInitialRefDb }
     }
 
     /// 增益前的电平（dBFS 量级）。满幅正弦 ≈ 0 dB；没有音频或全静音返回 -inf
@@ -720,22 +895,44 @@ struct AudioReactiveShaper {
         return min(100, max(0, frac * 100))
     }
 
-    mutating func step(_ w: AudioWindow, settings: AudioSyncSettings, dt: TimeInterval) -> Output {
-        let level = Self.targetPercent(loudnessDb: Self.loudnessDb(w), sensitivityDb: settings.sensitivityDb)
+    /// hasAudio = false（没有音轨 / 分析失败 / 还没就绪 / 缓冲中 / 没有新鲜样本，见 AudioFlowWatch）
+    /// 时不加最低强度：没有信号就不输出
+    mutating func step(_ w: AudioWindow, settings: AudioSyncSettings, dt: TimeInterval,
+                       hasAudio: Bool = true) -> Output {
+        // 计时抖动 / 主线程卡顿：步长夹在 10 ms ~ 1 s
+        let step = dt.isFinite ? min(1, max(0.01, dt)) : Self.interval
+        let db = Self.loudnessDb(w)
+        var gain = settings.sensitivityDb
+        // 开关关着也一直学：中途打开自动灵敏度时参考响度已经是这个视频的
+        adapt(loudnessDb: db, dt: step)
+        if settings.autoGain {
+            // 自动增益 + 手动灵敏度作微调
+            let trim = min(Self.autoTrimRange.upperBound, max(Self.autoTrimRange.lowerBound, settings.sensitivityDb))
+            gain = min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, autoGainDb + trim))
+        }
+        var level = Self.targetPercent(loudnessDb: db, sensitivityDb: gain)
+        // 自动模式：远低于这个视频响段的声音（安静段底噪）不输出，只剩最低强度
+        if settings.autoGain, db.isFinite, db < refDb - Self.autoRelativeGateDb { level = 0 }
         if gateOpen {
             if level < Self.gateClosePercent { gateOpen = false }
         } else if level >= Self.gateOpenPercent {
             gateOpen = true
         }
         let target = gateOpen ? level : 0
-        // 计时抖动 / 主线程卡顿：步长夹在 10 ms ~ 1 s
-        let step = dt.isFinite ? min(1, max(0.01, dt)) : Self.interval
         let tau = target > smoothed ? Self.attackSeconds : Self.releaseSeconds
         smoothed += (target - smoothed) * (1 - exp(-step / tau))
         smoothed = smoothed.isFinite ? min(100, max(0, smoothed)) : 0
         let cap = settings.maxPercent
-        let scaled = smoothed * cap / 100
-        let percent = scaled < 1 ? 0 : min(Int(cap.rounded(.down)), Int(scaled.rounded()))
+        let floor = hasAudio ? min(cap, settings.minPercent) : 0
+        let percent: Int
+        if floor >= 1 {
+            // 不归零：0~100 映射到 最低强度 ~ 上限
+            let scaled = floor + smoothed * (cap - floor) / 100
+            percent = min(Int(cap.rounded(.down)), max(Int(floor.rounded()), Int(scaled.rounded())))
+        } else {
+            let scaled = smoothed * cap / 100
+            percent = scaled < 1 ? 0 : min(Int(cap.rounded(.down)), Int(scaled.rounded()))
+        }
         return Output(level: level, percent: max(0, min(100, percent)))
     }
 }

@@ -318,10 +318,160 @@ r4check(clampedLow.sensitivityDb == -12 && clampedLow.maxPercent == 10, "声音�
 let nanSettings = AudioSyncSettings(sensitivityDb: .nan, maxPercent: .infinity)
 r4check(nanSettings.sensitivityDb == 0 && nanSettings.maxPercent == 60, "声音设置：NaN / 无穷按默认")
 r4check(abs(AudioSyncSettings(sensitivityDb: 6).gainMultiplier - 1.9953) < 1e-3, "声音设置：+6 dB ≈ ×2")
+// 不归零：播放中有音轨时安静片段保持最低强度；没有音轨不输出
+do {
+    let floorSettings = AudioSyncSettings(maxPercent: 60, minPercent: 10)
+    var fs = AudioReactiveShaper()
+    var o = fs.step(.silent, settings: floorSettings, dt: 0.3)
+    r4check(o.percent == 10, "不归零：一开始安静也保持 10%")
+    for _ in 0..<5 { o = fs.step(sineWindow(0), settings: floorSettings, dt: 0.3) }
+    r4check(o.percent == 60, "不归零：最响仍到上限 60")
+    for _ in 0..<40 { o = fs.step(.silent, settings: floorSettings, dt: 0.3) }
+    r4check(o.percent == 10, "不归零：持续安静落回 10%，不到 0")
+    fs.reset()
+    r4check(fs.step(.silent, settings: floorSettings, dt: 0.3, hasAudio: false).percent == 0, "不归零：没有音轨时输出 0")
+    r4check(AudioSyncSettings(maxPercent: 20, minPercent: 50).minPercent == 20, "最低强度不超过上限")
+    r4check(AudioSyncSettings(minPercent: .nan).minPercent == 0 && AudioSyncSettings(minPercent: 99).minPercent == 50,
+            "最低强度夹回 0~50")
+    var withinFloorCap = true
+    var rs = AudioReactiveShaper()
+    for _ in 0..<2_000 {
+        let s = AudioSyncSettings(sensitivityDb: -20 + nextRandom() * 50, maxPercent: nextRandom() * 120,
+                                  minPercent: nextRandom() * 60, autoGain: nextRandom() < 0.5)
+        let w = AudioWindow(peakToPeak: nextRandom() * 2.5, rms: nextRandom(), frames: Int(nextRandom() * 3) * 1_000)
+        let out = rs.step(w, settings: s, dt: nextRandom() * 1.5)
+        let lowest = s.minPercent >= 1 ? min(Int(s.minPercent.rounded()), Int(s.maxPercent.rounded(.down))) : 0
+        if out.percent < lowest || out.percent > Int(s.maxPercent) { withinFloorCap = false }
+    }
+    r4check(withinFloorCap, "不归零：随机输入始终在 最低强度 ~ 上限 之间")
+}
+
+// 自动灵敏度：安静的视频和响的视频都能用满范围
+do {
+    let auto = AudioSyncSettings(maxPercent: 100, autoGain: true)
+    var quietVideo = AudioReactiveShaper()
+    var q = quietVideo.step(sineWindow(-35), settings: auto, dt: 0.3)
+    for _ in 0..<120 { q = quietVideo.step(sineWindow(-35), settings: auto, dt: 0.3) }
+    var manual = AudioReactiveShaper()
+    var m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3)
+    for _ in 0..<120 { m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3) }
+    r4check(q.percent >= 70 && q.percent > m.percent, "自动灵敏度：小声视频的响段也能到 70% 以上（手动只有 \(m.percent)）")
+    var loudVideo = AudioReactiveShaper()
+    var l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3)
+    for _ in 0..<60 { l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3) }
+    r4check(l.percent >= 70 && l.percent <= 95, "自动灵敏度：大声视频不长期顶死在 100%")
+    r4check(quietVideo.autoGainDb <= AudioReactiveShaper.autoGainRange.upperBound, "自动增益有上限")
+    var silentAuto = AudioReactiveShaper()
+    var sOut = silentAuto.step(.silent, settings: auto, dt: 0.3)
+    for _ in 0..<100 { sOut = silentAuto.step(AudioWindow(peakToPeak: 0.0004, rms: 0.0001, frames: 1000), settings: auto, dt: 0.3) }
+    r4check(sOut.percent == 0, "自动灵敏度：纯底噪（低于 -60 dB）不会被放大")
+    // 自动模式：响视频里的安静段底噪（约 -55 dB）不放大，只剩最低强度
+    let autoFloor = AudioSyncSettings(sensitivityDb: 18, maxPercent: 100, minPercent: 10, autoGain: true)
+    var gated = AudioReactiveShaper()
+    var g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3)
+    for _ in 0..<80 { g = gated.step(sineWindow(-3), settings: autoFloor, dt: 0.3) }
+    for _ in 0..<1_000 { g = gated.step(sineWindow(-55), settings: autoFloor, dt: 0.3) }
+    r4check(g.percent == 10, "自动灵敏度：安静段底噪不被放大，只保持最低强度（得到 \(g.percent)）")
+    var allQuiet = AudioReactiveShaper()
+    for _ in 0..<1_000 { _ = allQuiet.step(sineWindow(-50), settings: auto, dt: 0.3) }
+    r4check(allQuiet.refDb < -40, "自动灵敏度：整段都很安静的视频几分钟内也能学会自己的响度（refDb \(allQuiet.refDb)）")
+    var intro = AudioReactiveShaper()
+    for _ in 0..<33 { _ = intro.step(sineWindow(-30), settings: auto, dt: 0.3) }
+    for _ in 0..<1_000 { _ = intro.step(sineWindow(-48), settings: auto, dt: 0.3) }
+    r4check(intro.refDb < -40, "自动灵敏度：10 秒片头之后的小声对白仍能学会（refDb \(intro.refDb)）")
+    var bang = AudioReactiveShaper()
+    _ = bang.step(sineWindow(-15), settings: auto, dt: 0.3)
+    for _ in 0..<1_000 { _ = bang.step(sineWindow(-50), settings: auto, dt: 0.3) }
+    r4check(bang.refDb < -40, "自动灵敏度：开头一声关门声不会把安静视频锁死（refDb \(bang.refDb)）")
+    quietVideo.resetAdaptation()
+    r4check(quietVideo.refDb == AudioReactiveShaper.autoInitialRefDb, "换视频重新学习响度")
+    var learning = AudioReactiveShaper()
+    var learnOut = learning.step(sineWindow(-40), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3)
+    for _ in 0..<60 { learnOut = learning.step(sineWindow(-40), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3) }
+    r4check(learning.refDb < -30 && learnOut.percent == 12,
+            "自动灵敏度：开关关着也在学响度（中途打开立刻合适），输出仍按手动灵敏度")
+}
+
+// 最低强度只在声音真的在流时生效：开播首拍、缓冲、AirPlay（窗口空）都不加
+do {
+    var flow = AudioFlowWatch()
+    r4check(!flow.allowsFloor(tapReady: true, playerPlaying: true, now: 10), "最低强度：开播首拍还没有样本时不加")
+    flow.note(.silent, now: 10)
+    r4check(!flow.isFlowing(now: 10), "最低强度：空窗口不算有声音")
+    flow.note(AudioWindow(peakToPeak: 0, rms: 0, frames: 4_800), now: 10.5)
+    r4check(flow.allowsFloor(tapReady: true, playerPlaying: true, now: 10.5), "最低强度：数字静音也算声音在流（不归零）")
+    r4check(!flow.allowsFloor(tapReady: true, playerPlaying: false, now: 10.5), "最低强度：缓冲中（播放器没在播）不加")
+    r4check(!flow.allowsFloor(tapReady: false, playerPlaying: true, now: 10.5), "最低强度：tap 没就绪不加")
+    flow.note(.silent, now: 10.75)
+    r4check(flow.isFlowing(now: 10.75), "最低强度：一拍空窗口容忍抖动")
+    flow.note(.silent, now: 11.5)
+    r4check(!flow.isFlowing(now: 11.5), "最低强度：连续没有样本就停（缓冲 / 外部播放）")
+    flow.note(sineWindow(-20), now: 12)
+    flow.reset()
+    r4check(!flow.isFlowing(now: 12), "最低强度：开播 / 跳转后旧样本不作数")
+    flow.note(sineWindow(-20), now: 13)
+    r4check(!flow.isFlowing(now: 12.5) && flow.isFlowing(now: 13.25), "最低强度：时间倒退不算新鲜")
+    // 和 shaper 连起来：没有新鲜样本时安静片段是 0，不是最低强度
+    var gated = AudioReactiveShaper()
+    let floorOn = AudioSyncSettings(maxPercent: 60, minPercent: 10)
+    r4check(gated.step(.silent, settings: floorOn, dt: 0.3,
+                       hasAudio: AudioFlowWatch().allowsFloor(tapReady: true, playerPlaying: true, now: 1)).percent == 0,
+            "最低强度：首拍空窗口输出 0")
+}
+
+// 跳转后等落点前进：往回走 / 跳太远都算又一次跳转（系统进度条连续拖动），只有正常播放的小步前进才恢复
+do {
+    var w = PlaybackProgressWatch()
+    w.awaitSeekProgress(from: 30, now: 0)
+    r4check(w.observe(at: 45, now: 0.25) == .waitingAfterSeek && w.awaitingSeekProgress, "跳转等待：又跳了 15 秒不算恢复")
+    r4check(w.observe(at: 40, now: 0.5) == .waitingAfterSeek && w.awaitingSeekProgress, "跳转等待：往回走不算恢复")
+    r4check(w.observe(at: 40.5, now: 0.75) == .moving && !w.awaitingSeekProgress, "跳转等待：2 倍速一拍的前进算恢复")
+    r4check(w.observe(at: 52, now: 1) == .moving, "跳转等待结束后：普通播放中的跳变照旧算前进")
+    w.awaitSeekProgress(from: 10, now: 2)
+    r4check(w.observe(at: 11, now: 2.25) == .moving, "跳转等待：正好 1 秒的前进仍算恢复")
+}
+
+// 系统控件开播：只认暂停 → 播放的边沿；停止后的第一次外部续播先拦下
+do {
+    var gate = ExternalPlayGate()
+    r4check(gate.observe(paused: true) == .ignore, "外部开播：初始暂停不是开播")
+    r4check(gate.observe(paused: false) == .takeOver, "外部开播：暂停 → 播放接管")
+    r4check(gate.observe(paused: false) == .ignore && gate.observe(paused: false) == .ignore,
+            "外部开播：等待 ↔ 播放来回不再接管（只放视频时连上设备也不会自动输出）")
+    _ = gate.observe(paused: true)
+    gate.latchStop()
+    r4check(gate.observe(paused: false) == .rejectAfterStop && !gate.stopLatched, "外部开播：停止后系统续播先拦下一次")
+    _ = gate.observe(paused: true)
+    r4check(gate.observe(paused: false) == .takeOver, "外部开播：拦下后再点播放照常接管")
+    gate.latchStop()
+    gate.clearLatch()
+    _ = gate.observe(paused: true)
+    r4check(gate.observe(paused: false) == .takeOver, "外部开播：本页播放键清掉锁存")
+    gate.latchStop()
+    r4check(gate.observe(paused: false) == .ignore && gate.stopLatched, "外部开播：不是边沿时锁存保留")
+}
+
+// App 自己 seek 的 timeJumped 回声：落点附近、0.5 秒内的那一条忽略，只消费一次
+do {
+    var echo = OwnSeekEcho()
+    r4check(!echo.consumeIfEcho(position: 30, now: 1), "seek 回声：没记录时不算")
+    echo.record(landed: 30, now: 1)
+    r4check(echo.consumeIfEcho(position: 30.25, now: 1.25), "seek 回声：落点附近、0.5 秒内的通知忽略")
+    r4check(!echo.consumeIfEcho(position: 30.25, now: 1.25), "seek 回声：只消费一次")
+    echo.record(landed: 30, now: 2)
+    r4check(!echo.consumeIfEcho(position: 40, now: 2.125), "seek 回声：紧接着的系统快进 10 秒照常处理")
+    r4check(!echo.consumeIfEcho(position: 30, now: 2.75), "seek 回声：超过 0.5 秒不再当回声")
+    echo.record(landed: 30, now: 3)
+    r4check(!echo.consumeIfEcho(position: 20, now: 3.125), "seek 回声：往回跳不是回声")
+    r4check(!echo.consumeIfEcho(position: .nan, now: 3.125), "seek 回声：位置读不出来不算")
+}
+
 let suite = "bc.round4.audiosync"
 if let defaults = UserDefaults(suiteName: suite) {
     defaults.removePersistentDomain(forName: suite)
-    r4check(AudioSyncSettings.load(from: defaults) == AudioSyncSettings(), "声音设置：没存过用默认")
+    r4check(AudioSyncSettings.load(from: defaults) == AudioSyncSettings(minPercent: AudioSyncSettings.defaultMinPercent,
+                                                                         autoGain: AudioSyncSettings.defaultAutoGain),
+            "声音设置：没存过用默认（最低强度 10%、自动灵敏度开）")
     defaults.set("abc", forKey: AudioSyncSettings.Keys.maxPercent)
     defaults.set(9, forKey: AudioSyncSettings.Keys.channels)
     defaults.set(400.0, forKey: AudioSyncSettings.Keys.sensitivityDb)

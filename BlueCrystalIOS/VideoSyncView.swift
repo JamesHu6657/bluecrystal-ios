@@ -62,8 +62,30 @@ final class VideoSyncPlayer: ObservableObject {
     private var settings = AudioSyncSettings()
     /// 上一次 tick 的单调时间：平滑步长按真实间隔算
     private var lastTickAt: TimeInterval?
+    /// 最低强度只在 tap 真的有新鲜样本、播放器真的在播时生效
+    private var audioFlow = AudioFlowWatch()
+    /// 系统控件开播：只认"暂停 → 播放"的边沿；停止后锁存一次
+    private var externalPlay = ExternalPlayGate()
+    /// App 自己 seek 引起的 timeJumped 回声
+    private var ownSeekEcho = OwnSeekEcho()
+    /// vm 停着是因为系统控件暂停（含拖进度条时的暂停）：这时停止 / 被动停机要锁存，松手续播不能复活输出
+    private var pausedByExternal = false
+    /// seek 进行中看到过系统控件开播（之后的暂停是用户的，不是 seek 自己的）
+    private var seekSawPlay = false
+    /// 隐私锁（页面出现时传进来）。系统全屏是 UIKit 弹出层，盖在隐私锁之上，只靠界面遮挡拦不住
+    private weak var privacy: PrivacyLock?
 
     private static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    func attachPrivacy(_ lock: PrivacyLock) { privacy = lock }
+
+    /// 系统控件开播的拦截原因：隐私锁盖着或 App 不在前台。开播那一刻现查，
+    /// 不依赖页面刷新（系统全屏盖着时下面的页面未必更新）
+    private var externalPlayBlockReason: String? {
+        if let lock = privacy, let ble = ble, lock.isCovering(ble) { return "App 已锁定：先解锁再播放" }
+        if UIApplication.shared.applicationState != .active { return "App 不在前台，不开始联动" }
+        return nil
+    }
 
     /// 界面设置变化（@AppStorage）。关掉联动立刻归零但视频继续播；其余变化下一拍生效
     func applySettings(_ s: AudioSyncSettings) {
@@ -90,7 +112,10 @@ final class VideoSyncPlayer: ObservableObject {
                 guard let self = self else { return }
                 if s == .ready {
                     self.needsResync = true
-                } else if self.isPlaying {
+                } else {
+                    // 断开时在联动（或正被系统控件暂停着）：重连后系统控件续播不能直接复活输出
+                    self.latchIfActive()
+                    guard self.isPlaying else { return }
                     self.player?.pause()
                     self.isPlaying = false
                     // 断开了，发也发不出去，直接停 Timer 不补发
@@ -118,6 +143,36 @@ final class VideoSyncPlayer: ObservableObject {
                    !self.isSeeking {
                     self.handlePausedPlayer(p)
                 }
+                // seek 进行中：seek 自己先暂停了播放器；之后系统控件先播再停 = 用户的暂停，不能被吞掉，
+                // 否则 seek 完成回调会 p.play() 把输出恢复
+                if self.isSeeking {
+                    // 现查播放器：receive(on:) 送来的可能是上一次 seek 续播时排队的旧状态
+                    if p.timeControlStatus != .paused || p.rate > 0 {
+                        self.seekSawPlay = true
+                    } else if self.seekSawPlay, self.isPlaying {
+                        self.seekSawPlay = false
+                        self.isPlaying = false
+                        self.pausedByExternal = false
+                        self.stopTimer(sendZero: true)
+                        self.zeroDisplay()
+                        self.statusLine = "已暂停"
+                    }
+                }
+                // 系统播放器控件（播放键 / 拖完自动续播 / 重播）把视频播起来了，vm 还没在联动：跟上。
+                // 只认暂停 → 播放的边沿：只放视频（设备没连）或 seek 中开播时边沿已用掉，
+                // 之后缓冲 / 跳转引起的等待 ↔ 播放来回不会在没人点播放时开始输出
+                let decision = self.externalPlay.observe(paused: status == .paused || p.rate <= 0)
+                guard decision != .ignore, !self.isPlaying else { return }
+                if decision == .rejectAfterStop {
+                    p.pause()
+                    self.statusLine = "已停止；要继续请再点一次播放"
+                    return
+                }
+                guard !self.isSeeking else {
+                    self.statusLine = "正在跳转；跳完后再点播放开始联动"
+                    return
+                }
+                self.handleExternalPlay(p)
                 // 缓冲（waitingToPlayAtSpecifiedRate）不在这里单独处理：tick 看播放头有没有前进
             }
             .store(in: &playerCancellables)
@@ -133,17 +188,82 @@ final class VideoSyncPlayer: ObservableObject {
         handleExternalPause()
     }
 
+    /// 系统控件开播：等同用户点了播放（同样先过准入 / 锁存检查，再显式开闸）。
+    /// 设备没连上时只放视频、不输出；被安全状态拦下时把视频也停住，让原因看得见
+    private func handleExternalPlay(_ p: AVPlayer) {
+        guard p === player else { return }
+        // 隐私锁盖着 / 不在前台：系统全屏盖在锁之上也不许开播
+        if let reason = externalPlayBlockReason {
+            p.pause()
+            statusLine = reason
+            return
+        }
+        guard ble?.state == .ready else {
+            // 边沿已用掉：连上设备后不会因缓冲 / 跳转自动开始输出，要再点播放
+            statusLine = "设备未连接，只播放视频（连上后点播放开始联动）"
+            return
+        }
+        if let reason = ble?.safety.blockReason {
+            p.pause()
+            statusLine = reason
+            return
+        }
+        isPlaying = true
+        pausedByExternal = false
+        externalPlay.clearLatch()
+        ble?.userResumeOutput()
+        meter?.reset()
+        shaper.reset()
+        lastActive = .zero
+        // 系统控件开播时播放器多半还在等（拖完续播 / 跳转 / 播完重播）：等播放头真正前进再输出
+        if p.timeControlStatus != .playing {
+            let t = p.currentTime().seconds
+            if t.isFinite { progressWatch.awaitSeekProgress(from: t, now: Self.now()) }
+        }
+        startTimer()
+        statusLine = "播放中"
+    }
+
+    /// 系统控件跳转（拖进度条、快进 / 快退 10 秒）：跳过的区间不分析，设备先归零，等播放头真正前进再恢复
+    private func handleTimeJump(_ p: AVPlayer) {
+        guard p === player, !isSeeking else { return }
+        let landed = p.currentTime().seconds
+        // App 自己 seek 的通知晚于完成回调到达：已经按落点处理过了
+        if ownSeekEcho.consumeIfEcho(position: landed, now: Self.now()) { return }
+        if landed.isFinite { currentSeconds = landed }
+        meter?.reset()
+        shaper.reset()
+        audioFlow.reset()
+        needsResync = true
+        // 暂停中跳转也记下落点（同 seek()）：之后不论哪个播放键开播，都等播放头真正前进
+        if landed.isFinite { progressWatch.awaitSeekProgress(from: landed, now: Self.now()) }
+        guard isPlaying else { return }
+        ble?.sendTick(levels: ActiveChannels.zero.values)
+        lastActive = .zero
+        intensity = 0
+        statusLine = "正在跳转，设备暂停输出"
+    }
+
     /// 外部暂停：只停止设备
     private func handleExternalPause() {
         isPlaying = false
+        pausedByExternal = true
         stopTimer(sendZero: true)
         zeroDisplay()
         statusLine = "外部暂停，设备已停止"
     }
 
+    /// 用户停止 / 被动停机 / 断开时还在联动（或正被系统控件暂停着）：锁存一次，
+    /// 系统控件随后的开播（拖动松手后的自动续播）先拦下
+    private func latchIfActive() {
+        if isPlaying || pausedByExternal { externalPlay.latchStop() }
+        pausedByExternal = false
+    }
+
     /// 播放中播放头卡住：画面不动时设备不能停在当前强度上
     private func handleStall() {
         isPlaying = false
+        pausedByExternal = false
         player?.pause()
         stopTimer(sendZero: true)
         zeroDisplay()
@@ -156,6 +276,7 @@ final class VideoSyncPlayer: ObservableObject {
         if end.isFinite { currentSeconds = end }
         // tap 已经把到终点为止的声音都分析完了，直接发停止帧对
         isPlaying = false
+        pausedByExternal = false
         stopTimer(sendZero: true)
         zeroDisplay()
         statusLine = "播放结束，设备已停止"
@@ -168,6 +289,12 @@ final class VideoSyncPlayer: ObservableObject {
         seekGen += 1
         isSeeking = false
         meterGen += 1
+        shaper.resetAdaptation()
+        audioFlow.reset()
+        // 新播放器从暂停开始；旧视频的停止锁存和 seek 回声不带过来
+        externalPlay = ExternalPlayGate()
+        ownSeekEcho.clear()
+        pausedByExternal = false
         progressWatch.reset(now: Self.now())
         cancelScrubbing()
         durationSeconds = 0
@@ -195,6 +322,8 @@ final class VideoSyncPlayer: ObservableObject {
         let asset = AVURLAsset(url: local)
         let item = AVPlayerItem(asset: asset)
         let p = AVPlayer(playerItem: item)
+        // 不走 AirPlay：外部播放时 tap 拿不到样本，遥控器 / 控制中心也成了绕过页面的入口
+        p.allowsExternalPlayback = false
         player = p
         // 声音联动：给第一条音轨挂只读 tap。回调到主线程时核对还是不是当前视频
         let gen = meterGen
@@ -221,6 +350,13 @@ final class VideoSyncPlayer: ObservableObject {
             .sink { [weak self, weak p] _ in
                 guard let self = self, let p = p else { return }
                 self.handleNaturalCompletion(p)
+            }
+            .store(in: &playerCancellables)
+        NotificationCenter.default.publisher(for: AVPlayerItem.timeJumpedNotification, object: item)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak p] _ in
+                guard let self = self, let p = p else { return }
+                self.handleTimeJump(p)
             }
             .store(in: &playerCancellables)
         item.publisher(for: \.duration)
@@ -275,6 +411,7 @@ final class VideoSyncPlayer: ObservableObject {
 
     func togglePlay() {
         guard let p = player, ble?.state == .ready else { return }
+        pausedByExternal = false
         if isPlaying {
             p.pause()
             isPlaying = false
@@ -290,6 +427,8 @@ final class VideoSyncPlayer: ObservableObject {
             let t = p.currentTime().seconds
             let needsRestart = durationSeconds > 0 && t.isFinite && t >= durationSeconds - 0.5
             isPlaying = true
+            // 本页播放键就是明确的重新开始：停止锁存作废
+            externalPlay.clearLatch()
             // 用户点"播放"才显式开闸；tick 自己不会开闸
             ble?.userResumeOutput()
             meter?.reset()
@@ -306,7 +445,7 @@ final class VideoSyncPlayer: ObservableObject {
         }
     }
 
-    /// 全屏 / 内嵌 / 播完重播共用。seek 和之后的缓冲保持设备为 0，不分析跳过的区间。
+    /// 本页进度条 / 播完重播共用。seek 和之后的缓冲保持设备为 0，不分析跳过的区间。
     func seek(to seconds: Double) {
         guard let p = player, seconds.isFinite else { return }
         let target = max(0, durationSeconds > 0 ? min(seconds, durationSeconds) : seconds)
@@ -317,6 +456,8 @@ final class VideoSyncPlayer: ObservableObject {
         // seek 造成采样不连续：旧位置还没取走的声音不能算进新窗口
         meter?.reset()
         shaper.reset()
+        audioFlow.reset()
+        seekSawPlay = false
         p.pause()
         if isPlaying {
             // 全零走完整停止帧对但保留本次运行和闸门；不改 STOP / 上限 / 额度语义
@@ -334,6 +475,7 @@ final class VideoSyncPlayer: ObservableObject {
                 if landed.isFinite { self.currentSeconds = landed }
                 guard finished, landed.isFinite else {
                     self.isPlaying = false
+                    self.pausedByExternal = false
                     p.pause()
                     self.stopTimer(sendZero: true)
                     self.zeroDisplay()
@@ -343,6 +485,8 @@ final class VideoSyncPlayer: ObservableObject {
                 self.meter?.reset()
                 self.needsResync = true
                 self.progressWatch.awaitSeekProgress(from: landed, now: Self.now())
+                // 这次 seek 的 timeJumped 若晚于本回调到达，按回声忽略
+                self.ownSeekEcho.record(landed: landed, now: Self.now())
                 // 停止 / 暂停 / 断开 / 被动停机期间回调不得复活输出
                 guard self.isPlaying else { return }
                 self.statusLine = "等待视频继续，设备暂停输出"
@@ -353,6 +497,7 @@ final class VideoSyncPlayer: ObservableObject {
     }
 
     func stopAll() {
+        latchIfActive()
         player?.pause()
         isPlaying = false
         stopTimer(sendZero: true)
@@ -370,6 +515,7 @@ final class VideoSyncPlayer: ObservableObject {
     /// 被动停机（看门狗/退后台/单次上限/输出被拒）：只归零 UI，不补发停止帧
     /// （需要的停止 BLEManager 已经发出去了）
     private func passiveStop(reason: String?) {
+        latchIfActive()
         player?.pause()
         isPlaying = false
         stopTimer(sendZero: false)
@@ -392,6 +538,8 @@ final class VideoSyncPlayer: ObservableObject {
 
     private func startTimer() {
         stopTimer(sendZero: false)
+        // 开播前的样本不作数：首拍还没有新鲜样本时不加最低强度
+        audioFlow.reset()
         // 普通播放从头监视；seek 等待不因点播放或重建 Timer 被清掉
         progressWatch.startPlayback(at: player?.currentTime().seconds ?? .nan, now: Self.now())
         // 用 common modes，滚动页面时 tick 不暂停
@@ -444,6 +592,20 @@ final class VideoSyncPlayer: ObservableObject {
         case .paused:
             return
         }
+        // 缓冲 / 等待中：立刻归零（不等平滑慢慢落下），丢掉这段样本；卡住计时照常由 progressWatch 算
+        if p.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+            _ = meter?.drain()
+            shaper.reset()
+            level = 0
+            intensity = 0
+            if lastActive != .zero, settings.enabled {
+                ble.sendTick(levels: ActiveChannels.zero.values)
+                lastActive = .zero
+                statusLine = "视频缓冲中，设备暂停输出"
+            }
+            needsResync = true
+            return
+        }
         guard t.isFinite else { return }
         currentSeconds = t
 
@@ -451,7 +613,11 @@ final class VideoSyncPlayer: ObservableObject {
         let dt = lastTickAt.map { now - $0 } ?? AudioReactiveShaper.interval
         lastTickAt = now
         let window = meter?.drain() ?? .silent
-        let out = shaper.step(window, settings: settings, dt: dt)
+        audioFlow.note(window, now: now)
+        // 最低强度：tap 就绪 + 播放器确实在播（缓冲中不算）+ 最近确实有样本流过
+        let floorAllowed = audioFlow.allowsFloor(tapReady: audioStatus == .ready,
+                                                 playerPlaying: p.timeControlStatus == .playing, now: now)
+        let out = shaper.step(window, settings: settings, dt: dt, hasAudio: floorAllowed)
         level = out.level
         intensity = out.percent
         guard settings.enabled else { return }
@@ -467,21 +633,148 @@ final class VideoSyncPlayer: ObservableObject {
     }
 }
 
-/// 无系统控件的视频预览（系统自带播放/暂停/拖动会绕过 vm，必须禁用）
-struct NoControlsPlayerView: UIViewControllerRepresentable {
+/// 苹果自带播放器（播放 / 暂停、快进快退、进度条、倍速、系统全屏）。
+/// 控件直接操作 AVPlayer，vm 通过 timeControlStatus / timeJumped / 播完通知跟随：
+/// 暂停 = 设备立刻停止，跳转 = 先归零再恢复，开播 = 先过安全 / 隐私检查。
+/// 关掉画中画、锁屏「正在播放」控件和 AirPlay（AVPlayer 上）：退到后台本来就会停机，不留一个绕过 vm 的入口
+struct SystemPlayerView: UIViewControllerRepresentable {
     let player: AVPlayer
+    /// 隐私锁盖着 / 退后台：系统全屏是 UIKit 弹出层，盖在隐私层之上，只能把画面撤掉（多任务截图是黑的）
+    var hidesVideo = false
+    /// 现查隐私锁是否盖着（回前台时页面未必已刷新，不能只信 hidesVideo）
+    var isCovered: () -> Bool = { false }
+    /// 设备需要用户处理：在系统全屏里就退出来，让设备卡片露出来
+    var attentionNeeded = false
+    /// 系统全屏进出（全屏弹出时 SwiftUI 页面可能收到 onDisappear，不能因此停机）
+    var onFullScreenChange: (Bool) -> Void = { _ in }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onFullScreenChange: onFullScreenChange) }
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         let vc = AVPlayerViewController()
-        vc.player = player
-        vc.showsPlaybackControls = false
+        vc.showsPlaybackControls = true
         vc.videoGravity = .resizeAspect
+        vc.allowsPictureInPicturePlayback = false
+        vc.updatesNowPlayingInfoCenter = false
+        vc.entersFullScreenWhenPlaybackBegins = false
+        vc.exitsFullScreenWhenPlaybackEnds = true
+        vc.delegate = context.coordinator
+        context.coordinator.playerViewController = vc
+        context.coordinator.player = player
+        context.coordinator.hidesVideo = hidesVideo
+        context.coordinator.isCovered = isCovered
+        context.coordinator.applyPlayer()
         return vc
     }
 
     func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {
-        // 换视频后预览也要换成新播放器
-        if uiViewController.player !== player { uiViewController.player = player }
+        context.coordinator.onFullScreenChange = onFullScreenChange
+        // 换视频后换成新播放器；需要遮挡时撤掉画面（AVPlayer 本身不受影响）
+        context.coordinator.playerViewController = uiViewController
+        context.coordinator.player = player
+        context.coordinator.hidesVideo = hidesVideo
+        context.coordinator.isCovered = isCovered
+        context.coordinator.applyPlayer()
+        context.coordinator.exitFullScreenIfNeeded(attentionNeeded)
+    }
+
+    final class Coordinator: NSObject, AVPlayerViewControllerDelegate {
+        var onFullScreenChange: (Bool) -> Void
+        weak var playerViewController: AVPlayerViewController?
+        weak var player: AVPlayer?
+        /// 页面给的遮挡要求
+        var hidesVideo = false
+        var isCovered: () -> Bool = { false }
+        /// 自己监听的退后台：系统全屏盖着时页面未必刷新，多任务截图前必须把画面撤掉
+        private var inBackground = false
+        /// AVKit 弹出的全屏 VC（只关它，不关别的弹层）
+        weak var fullScreenVC: UIViewController?
+        /// 页面最近一次给的「设备需要处理」
+        var attentionNeeded = false
+
+        init(onFullScreenChange: @escaping (Bool) -> Void) {
+            self.onFullScreenChange = onFullScreenChange
+            super.init()
+            NotificationCenter.default.addObserver(self, selector: #selector(didEnterBackground),
+                                                   name: UIApplication.didEnterBackgroundNotification, object: nil)
+            NotificationCenter.default.addObserver(self, selector: #selector(willEnterForeground),
+                                                   name: UIApplication.willEnterForegroundNotification, object: nil)
+        }
+
+        func applyPlayer() {
+            guard let vc = playerViewController else { return }
+            let shown: AVPlayer? = (hidesVideo || inBackground || isCovered()) ? nil : player
+            if vc.player !== shown { vc.player = shown }
+        }
+
+        @objc private func didEnterBackground() {
+            inBackground = true
+            applyPlayer()
+        }
+
+        @objc private func willEnterForeground() {
+            // 回前台时锁着（isCovered 现查）就继续撤着，解锁后页面刷新再放回来
+            inBackground = false
+            applyPlayer()
+        }
+
+        func playerViewController(_ playerViewController: AVPlayerViewController,
+                                  willBeginFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+            onFullScreenChange(true)
+            let target = coordinator.viewController(forKey: .to)
+            coordinator.animate(alongsideTransition: nil) { [weak self] ctx in
+                guard let self = self else { return }
+                // 捏合进全屏中途松手 = 取消：不会再有 willEnd，必须在这里把标志改回来，
+                // 否则离开页面时 onDisappear 会把它当成全屏而不停机
+                if ctx.isCancelled {
+                    self.fullScreenVC = nil
+                    self.onFullScreenChange(false)
+                    return
+                }
+                self.fullScreenVC = target
+                // 进全屏时设备已经需要处理：弹出动画中 dismiss 会被忽略，转场彻底结束后（下一轮主队列）补一次
+                self.retryExitSoon()
+            }
+        }
+
+        /// 设备需要处理（停止未确认 / 要物理关机 / 断开后可能仍在输出）时退出系统全屏：
+        /// 全屏盖在设备卡片和隐私层之上，警告和「解除锁定 / 强制断开」必须看得见
+        func retryExitSoon() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.exitFullScreenIfNeeded(self.attentionNeeded)
+            }
+        }
+
+        func exitFullScreenIfNeeded(_ needed: Bool) {
+            attentionNeeded = needed
+            // 只关 AVKit 自己的全屏：presentedViewController 也可能是页面上的 sheet / 确认框，不能误关
+            guard needed, let vc = playerViewController, let fs = fullScreenVC,
+                  let presented = vc.presentedViewController, presented === fs,
+                  !presented.isBeingPresented, !presented.isBeingDismissed else { return }
+            // 由弹出者关闭：全屏上面若还压着别的层，也连同全屏一起关掉
+            guard let presenter = fs.presentingViewController else { return }
+            presenter.dismiss(animated: true) { [weak self, weak fs] in
+                // 程序化关闭不保证回调 willEnd：真关掉了才把标志落回，离开页面时照常停机
+                guard fs?.presentingViewController == nil else { return }
+                self?.fullScreenVC = nil
+                self?.onFullScreenChange(false)
+            }
+        }
+
+        func playerViewController(_ playerViewController: AVPlayerViewController,
+                                  willEndFullScreenPresentationWithAnimationCoordinator coordinator: UIViewControllerTransitionCoordinator) {
+            coordinator.animate(alongsideTransition: nil) { [weak self] ctx in
+                // 取消了退出全屏就还在全屏
+                if !ctx.isCancelled {
+                    self?.fullScreenVC = nil
+                    self?.onFullScreenChange(false)
+                } else {
+                    // 下滑退出中途取消：退出过程中错过的「需要处理」在这里补上
+                    self?.retryExitSoon()
+                }
+            }
+        }
     }
 }
 
@@ -529,8 +822,9 @@ struct VideoSyncView: View {
     @StateObject private var vm = VideoSyncPlayer()
     /// 文件选择器（只有视频一种素材）
     @State private var showPicker = false
-    /// 全屏播放中：内嵌预览让出播放器，onDisappear 不把全屏误判成离开页面
-    @State private var isFullScreen = false
+    /// 苹果播放器自己的全屏：onDisappear 不把全屏误判成离开页面
+    @State private var systemFullScreen = false
+    @Environment(\.scenePhase) private var scenePhase
     /// 选择器被拦下的那句说明：钉在停止键上方一小会儿
     @State private var pickerNotice: String?
     /// 提示代次：重复点被拦下的入口时重新计时
@@ -542,11 +836,14 @@ struct VideoSyncView: View {
     @AppStorage(AudioSyncSettings.Keys.sensitivityDb) private var sensitivityDb = AudioSyncSettings.defaultSensitivityDb
     @AppStorage(AudioSyncSettings.Keys.maxPercent) private var maxPercent = AudioSyncSettings.defaultMaxPercent
     @AppStorage(AudioSyncSettings.Keys.channels) private var channelsRaw = AudioSyncSettings.defaultChannels.rawValue
+    @AppStorage(AudioSyncSettings.Keys.minPercent) private var minPercent = AudioSyncSettings.defaultMinPercent
+    @AppStorage(AudioSyncSettings.Keys.autoGain) private var autoGain = AudioSyncSettings.defaultAutoGain
 
     private var audioSettings: AudioSyncSettings {
         AudioSyncSettings(enabled: syncEnabled, sensitivityDb: sensitivityDb,
                           maxPercent: maxPercent,
-                          channels: AudioSyncChannels(rawValue: channelsRaw) ?? .both)
+                          channels: AudioSyncChannels(rawValue: channelsRaw) ?? .both,
+                          minPercent: minPercent, autoGain: autoGain)
     }
 
     /// 设备需要用户处理（停止重试中、需要确认物理关机、提供强制断开）时不弹选择器：
@@ -564,6 +861,13 @@ struct VideoSyncView: View {
 
     private var pickerBlockedMessage: String {
         "先处理上方设备卡片的提示，再选视频"
+    }
+
+    /// 和隐私遮罩（PrivacyCover）同一条规则撤掉画面：锁着、退后台、或暂时不活跃且设备不需要处理。
+    /// 系统全屏盖着时页面未必刷新，退后台那一下由 SystemPlayerView 自己监听补上
+    private var hidesVideo: Bool {
+        privacy.isCovering(ble) || scenePhase == .background
+            || (scenePhase == .inactive && !ble.privacyCoverBlocked)
     }
 
     /// 选择器弹出前先停（选择器会盖住页面底部的停止键；选择器里另有一个停止键）。
@@ -654,6 +958,7 @@ struct VideoSyncView: View {
         .onAppear {
             vm.attach(ble: ble)
             vm.applySettings(audioSettings)
+            vm.attachPrivacy(privacy)
         }
         // 设备那边处理好了：钉着的"先处理设备卡片"立刻收掉
         .onChange(of: pickerBlocked) { blocked in
@@ -667,6 +972,8 @@ struct VideoSyncView: View {
         .onChange(of: sensitivityDb) { _ in vm.applySettings(audioSettings) }
         .onChange(of: maxPercent) { _ in vm.applySettings(audioSettings) }
         .onChange(of: channelsRaw) { _ in vm.applySettings(audioSettings) }
+        .onChange(of: minPercent) { _ in vm.applySettings(audioSettings) }
+        .onChange(of: autoGain) { _ in vm.applySettings(audioSettings) }
         // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
         .sheet(isPresented: $showPicker) {
             // 选择器和底部停止条上下排：系统选择器是远程界面，未必让出底部标签栏
@@ -682,15 +989,8 @@ struct VideoSyncView: View {
             .environmentObject(privacy)
             .environmentObject(ble)
         }
-        // 全屏控制同样走 vm（播放/暂停/拖动/停止），设备联动不受影响
-        .fullScreenCover(isPresented: $isFullScreen) {
-            FullScreenVideoView(vm: vm) { isFullScreen = false }
-                .privacyCover()
-                .environmentObject(privacy)
-                .environmentObject(ble)
-        }
-        // 弹出全屏时部分系统版本也会触发 onDisappear：全屏中不停机
-        .onDisappear { if !isFullScreen { vm.stopAll() } }
+        // 系统全屏弹出时部分系统版本也会触发 onDisappear：全屏中不停机
+        .onDisappear { if !systemFullScreen { vm.stopAll() } }
         // 解锁页上的停止：和本页停止键同一个 stopAll
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
@@ -698,35 +998,19 @@ struct VideoSyncView: View {
     /// 预览画面：没有视频时是一块邀请选择的幕布
     @ViewBuilder private var stage: some View {
         if let p = vm.player {
-            ZStack(alignment: .topTrailing) {
-                if !isFullScreen {
-                    NoControlsPlayerView(player: p)
-                        .frame(height: 220)
-                        .frame(maxWidth: .infinity)
-                        .background(Color.black)
-                } else {
-                    Color.black.frame(height: 220)
-                }
-                Button {
-                    isFullScreen = true
-                } label: {
-                    Label("全屏播放", systemImage: "arrow.up.left.and.arrow.down.right")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .foregroundColor(.white)
-                        // 点击区域至少 44pt，外观不变
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(PressableStyle())
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Velvet.stroke, lineWidth: 1))
-            .shadow(color: Velvet.rose.opacity(vm.isPlaying ? 0.35 : 0.1), radius: 24)
+            // 苹果自带控件：播放 / 暂停、快进快退、进度条、倍速、全屏。
+            // 现查用的是对象本身（不在 body 之外读环境属性）
+            let lock: PrivacyLock = privacy
+            let manager: BLEManager = ble
+            SystemPlayerView(player: p, hidesVideo: hidesVideo,
+                             isCovered: { lock.isCovering(manager) },
+                             attentionNeeded: ble.needsAttentionCard || pickerBlocked) { systemFullScreen = $0 }
+                .frame(height: 240)
+                .frame(maxWidth: .infinity)
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Velvet.stroke, lineWidth: 1))
+                .shadow(color: Velvet.rose.opacity(vm.isPlaying ? 0.35 : 0.1), radius: 24)
         } else {
             // 幕布自己把被拦的原因写在上面（blockedReasonShown）：点它被拦下时不再往停止键上钉同一句
             Button { openPicker(blockedReasonShown: true) } label: {
@@ -824,6 +1108,35 @@ struct VideoSyncView: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("最低强度（安静时不归零）")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Spacer()
+                    Text("\(Int(min(minPercent, maxPercent)))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(Velvet.textSecondary)
+                }
+                Slider(value: $minPercent,
+                       in: AudioSyncSettings.minPercentRange, step: 1)
+                    .tint(Velvet.gold)
+                    .accessibilityLabel("最低强度")
+                    .accessibilityValue("\(Int(min(minPercent, maxPercent)))%")
+            }
+
+            Toggle(isOn: $autoGain) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自动灵敏度")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Text("按这个视频自己的音量自动调整，灵敏度滑块变成微调")
+                        .font(.caption2)
+                        .foregroundColor(Velvet.textMuted)
+                }
+            }
+            .tint(Velvet.gold)
+
+            VStack(alignment: .leading, spacing: 6) {
                 Text("输出到")
                     .font(.subheadline)
                     .foregroundColor(Velvet.text)
@@ -852,7 +1165,10 @@ struct VideoSyncView: View {
     }
 
     private var sensitivityText: String {
-        String(format: "×%.1f", pow(10, sensitivityDb / 20))
+        // 自动模式下手动灵敏度只做 ±6 dB 微调：读数显示实际生效的倍数
+        let r = AudioReactiveShaper.autoTrimRange
+        let db = autoGain ? min(r.upperBound, max(r.lowerBound, sensitivityDb)) : sensitivityDb
+        return String(format: autoGain ? "微调 ×%.1f" : "×%.1f", pow(10, db / 20))
     }
 
     /// 播放控制
@@ -898,7 +1214,7 @@ struct VideoSyncView: View {
                 .accessibilityLabel("停止")
                 .accessibilityHint("立即停止所有输出")
             }
-            // 拖动只预览，松手后精确 seek；与全屏共用同一条路径
+            // 拖动只预览，松手后精确 seek（系统播放器的进度条由 vm 的 timeJumped 跟随）
             if vm.durationSeconds > 0 {
                 PlaybackProgressSlider(vm: vm)
             }
@@ -990,28 +1306,21 @@ struct VideoSyncView: View {
     }
 }
 
-/// 两个播放界面共用：Timer / seek 回调不改拖动预览，旁白离散调整也能 seek。
+/// 本页进度条：Timer / seek 回调不改拖动预览，旁白离散调整也能 seek。
 private struct PlaybackProgressSlider: View {
     @ObservedObject var vm: VideoSyncPlayer
-    var onEditingChanged: (Bool) -> Void = { _ in }
 
     var body: some View {
         Slider(
             value: Binding(get: { vm.displaySeconds }, set: { vm.updateScrubPosition($0) }),
             in: 0...vm.durationSeconds,
-            onEditingChanged: { editing in
-                vm.setScrubbing(editing)
-                onEditingChanged(editing)
-            }
+            onEditingChanged: { editing in vm.setScrubbing(editing) }
         )
         .tint(Velvet.rose)
         .disabled(!vm.canPlay)
         .accessibilityLabel("播放进度")
         .accessibilityValue("\(formatTime(vm.displaySeconds))，共 \(formatTime(vm.durationSeconds))")
-        .onDisappear {
-            vm.cancelScrubbing()
-            onEditingChanged(false)
-        }
+        .onDisappear { vm.cancelScrubbing() }
     }
 
     private func formatTime(_ seconds: Double) -> String {
@@ -1104,316 +1413,5 @@ struct DocumentPicker: UIViewControllerRepresentable {
             guard let url = urls.first else { return }
             onPick(url)
         }
-    }
-}
-
-/// 全屏里设备卡片的高度（纯布局）
-private struct WarningCardHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-/// 全屏里设备卡片往上滚了多少（纯布局）：滚到底就收起"下面还有"的提示
-private struct WarningScrollOffsetKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-/// 全屏里底部控制条的高度（纯布局）：设备卡片最多长到它的上沿
-private struct BottomPanelHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
-
-/// 全屏播放：黑底铺满，点画面显示/隐藏控制条；所有控制都走 VideoSyncPlayer，
-/// 不用系统播放控件（会绕过联动和安全逻辑）。
-/// 停止键只有一个、永远在右下角同一个位置：控制条显示或收起（含 4 秒自动收起）都不挪地方，
-/// 伸手去点的那一下不会因为控制条刚好收起而落空
-struct FullScreenVideoView: View {
-    @EnvironmentObject var ble: BLEManager
-    @ObservedObject var vm: VideoSyncPlayer
-    let onClose: () -> Void
-    @State private var showControls = true
-    /// 自动收起控制条的代次：任何一次显示 / 播放状态变化都重新计时
-    @State private var hideGen = 0
-    /// 正在拖进度条：拖动期间不收起
-    @State private var scrubbing = false
-    /// 设备卡片的实际高度（量出来之前为 0）：滚动区只占这么高，不多拦一块点击
-    @State private var warningCardHeight: CGFloat = 0
-    /// 设备卡片往上滚了多少
-    @State private var warningScrollOffset: CGFloat = 0
-    /// 底部控制条的实际高度（量出来之前为 0）
-    @State private var bottomPanelHeight: CGFloat = 0
-
-    /// 设备卡片离顶部的距离（让出退出键）
-    private static let warningTop: CGFloat = 60
-    /// 控制条上沿以上实在没地方时，设备卡片至少留这么高（露出一两行红字，其余滚动）
-    private static let minWarningBand: CGFloat = 60
-    private static let warningScrollSpace = "fullscreen-warning-scroll"
-
-    /// 停止键直径、离边缘的距离；控制条右侧给它让出的宽度（控制条的内容不压到停止键下面）
-    private static let stopSize: CGFloat = 60
-    private static let stopInset: CGFloat = 20
-    private static let stopReserve: CGFloat = stopSize + stopInset + 8
-
-    private var needsDeviceAttention: Bool { ble.needsAttentionCard }
-
-    /// 旁白、切换控制开着时不自动收起（找不到控件）。全键盘控制系统没有公开的检测接口，
-    /// 点任何地方都会把控制条叫回来，停止键也一直在
-    private static var assistiveTechRunning: Bool {
-        UIAccessibility.isVoiceOverRunning || UIAccessibility.isSwitchControlRunning
-    }
-
-    /// 播放中 4 秒没碰屏幕就收起控制条（停止键不受影响）；暂停 / 被自动停止 / 拖动中不收
-    private func scheduleAutoHide() {
-        hideGen += 1
-        let gen = hideGen
-        if needsDeviceAttention {
-            showControls = true
-            return
-        }
-        guard vm.isPlaying, !scrubbing, !Self.assistiveTechRunning else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-            guard gen == hideGen, vm.isPlaying, !scrubbing,
-                  !Self.assistiveTechRunning, !needsDeviceAttention else { return }
-            withAnimation(.easeInOut(duration: 0.3)) { showControls = false }
-        }
-    }
-
-    var body: some View {
-        GeometryReader { geo in
-            let warningHeight: CGFloat = min(260, geo.size.height * 0.5)
-            ZStack {
-                Color.black.ignoresSafeArea()
-                if let p = vm.player {
-                    NoControlsPlayerView(player: p)
-                        .ignoresSafeArea()
-                }
-                // 透明点击层：切换控制条
-                Color.clear
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        guard !needsDeviceAttention else {
-                            showControls = true
-                            return
-                        }
-                        withAnimation(.easeInOut(duration: 0.2)) { showControls.toggle() }
-                        if showControls { scheduleAutoHide() }
-                    }
-                if showControls || needsDeviceAttention {
-                    controls
-                        .transition(.opacity)
-                }
-                // 独立于控制条的淡入淡出：警告不动画、不自动收起。长红字 / 大字号可滚动，
-                // 上方留出退出键，下方的固定停止键仍最后绘制、始终可点。
-                // 卡片多高就占多高、贴着顶部；最多 warningHeight，也最多长到底部控制条上沿
-                // （横屏 / 大字号时不盖住进度条和播放键），实在没地方也留 minWarningBand；放不下就滚动。
-                // 始终只有这一张卡片：高度变化时「解除锁定 / 强制断开」的确认框不会因为换了一份卡片而被收掉
-                if needsDeviceAttention {
-                    let measured: CGFloat = warningCardHeight
-                    let roomAbovePanel: CGFloat = bottomPanelHeight > 0
-                        ? geo.size.height - Self.warningTop - bottomPanelHeight - 8
-                        : warningHeight
-                    let floorHeight: CGFloat = min(Self.minWarningBand, warningHeight)
-                    let cap: CGFloat = max(floorHeight, min(warningHeight, roomAbovePanel))
-                    let fits: Bool = measured > 0 && measured <= cap
-                    let bandHeight: CGFloat = measured > 0 ? min(measured, cap) : cap
-                    let atEnd: Bool = warningScrollOffset + bandHeight >= measured - 4
-                    VStack(spacing: 0) {
-                        ScrollView {
-                            warningCard
-                                .background(
-                                    GeometryReader { g in
-                                        Color.clear
-                                            .preference(key: WarningCardHeightKey.self, value: g.size.height)
-                                            .preference(key: WarningScrollOffsetKey.self,
-                                                        value: -g.frame(in: .named(Self.warningScrollSpace)).minY)
-                                    }
-                                )
-                        }
-                        .coordinateSpace(name: Self.warningScrollSpace)
-                        .scrollDisabled(fits)
-                        .frame(height: bandHeight)
-                        // 放不下时（横屏常见）底边淡出并挂一个向下的小箭头：iOS 的滚动条不动时不显示，
-                        // 不提示的话「解除锁定」露半截也看不出能往上滑。滚到底就收起，不再盖着最后一个键。只是提示，不拦点击
-                        .overlay(alignment: .bottom) {
-                            if !fits && measured > 0 && !atEnd {
-                                ZStack(alignment: .bottom) {
-                                    LinearGradient(colors: [.clear, .black.opacity(0.55)],
-                                                   startPoint: .top, endPoint: .bottom)
-                                        .frame(height: 28)
-                                    Image(systemName: "chevron.compact.down")
-                                        .font(.system(size: 18, weight: .semibold))
-                                        .foregroundColor(.white.opacity(0.85))
-                                        .padding(.bottom, 2)
-                                }
-                                .padding(.horizontal, 16)
-                                .allowsHitTesting(false)
-                                .accessibilityHidden(true)
-                            }
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .padding(.top, Self.warningTop)
-                    .onPreferenceChange(WarningCardHeightKey.self) { h in
-                        if abs(h - warningCardHeight) > 0.5 { warningCardHeight = h }
-                    }
-                    .onPreferenceChange(WarningScrollOffsetKey.self) { y in
-                        if abs(y - warningScrollOffset) > 0.5 { warningScrollOffset = y }
-                    }
-                }
-                // 最后画：永远在最上层、永远在同一个位置
-                stopButton
-            }
-            // 控制条收起时量到 0：保留上一次的高度
-            .onPreferenceChange(BottomPanelHeightKey.self) { h in
-                if h > 0, abs(h - bottomPanelHeight) > 0.5 { bottomPanelHeight = h }
-            }
-        }
-        .statusBarHidden(!showControls && !needsDeviceAttention)
-        .preferredColorScheme(.dark)
-        .onAppear { scheduleAutoHide() }
-        .onChange(of: needsDeviceAttention) { _ in
-            // 作废已经排队的自动收起；有提示时不动画，提示消失后才重新计时。
-            scheduleAutoHide()
-        }
-        // 开始播放后开始计时收起；停下（含被动停机）就把控制条和状态说明拿出来
-        .onChange(of: vm.isPlaying) { playing in
-            if playing {
-                scheduleAutoHide()
-            } else {
-                hideGen += 1
-                if needsDeviceAttention {
-                    showControls = true
-                } else {
-                    withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
-                }
-            }
-        }
-    }
-
-    private var warningCard: some View {
-        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
-            .padding(.horizontal, 16)
-    }
-
-    private var controls: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(width: 44, height: 44)
-                        .background(.ultraThinMaterial, in: Circle())
-                }
-                .accessibilityLabel("退出全屏")
-                Spacer()
-                Text(vm.videoName).font(.footnote).lineLimit(1)
-            }
-            .padding(.horizontal)
-            .padding(.top, 8)
-            .padding(.bottom, 24)
-            .background(
-                LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom)
-                    .ignoresSafeArea()
-            )
-            Spacer()
-            bottomPanel
-        }
-        .foregroundColor(.white)
-        .buttonStyle(.borderless)
-    }
-
-    private var bottomPanel: some View {
-        VStack(spacing: 10) {
-            if vm.durationSeconds > 0 {
-                PlaybackProgressSlider(vm: vm) { editing in
-                    // 拖动期间不许自动收起；松手后重新计时。
-                    scrubbing = editing
-                    if !editing { scheduleAutoHide() }
-                }
-            }
-            HStack(spacing: 18) {
-                // 颜色写在标签上：.borderless 下按钮的 tint / 角色色会盖过外层的白色
-                Button { vm.togglePlay() } label: {
-                    Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 22, weight: .bold))
-                        .foregroundColor(.white)
-                        .frame(width: 50, height: 50)
-                        .background(Circle().fill(Velvet.roseGradient))
-                }
-                .disabled(!vm.canPlay)
-                .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
-                Text("\(Self.formatTime(vm.displaySeconds)) / \(Self.formatTime(vm.durationSeconds))")
-                    .font(.caption.monospacedDigit())
-                    // 上面滑杆的旁白值读的就是这两个时间，这行字不再让旁白单独停一次；
-                    // 时长还没读出来（滑杆还没出现）时这行字是旁白唯一的时间来源，不能藏
-                    .accessibilityHidden(vm.durationSeconds > 0)
-                Spacer()
-            }
-            Text(vm.statusLine)
-                .font(.caption2)
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.leading)
-        .padding(.vertical)
-        // 右边让给常驻的停止键
-        .padding(.trailing, Self.stopReserve)
-        .background(
-            GeometryReader { g in
-                Color.clear.preference(key: BottomPanelHeightKey.self, value: g.size.height)
-            }
-        )
-        .background(.ultraThinMaterial)
-        .background(Color.black.opacity(0.35))
-    }
-
-    /// 常驻停止键：带"停止"两个字，控制条收起时也一眼认得出
-    private var stopButton: some View {
-        VStack {
-            Spacer()
-            HStack {
-                Spacer()
-                Button(role: .destructive) {
-                    vm.stopAll()
-                    Haptics.stop()
-                } label: {
-                    VStack(spacing: 1) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 18, weight: .bold))
-                        Text("停止")
-                            .font(.system(size: 11, weight: .bold))
-                    }
-                    .foregroundColor(.white)
-                    .frame(width: Self.stopSize, height: Self.stopSize)
-                    .background(Circle().fill(Velvet.stopGradient))
-                    .overlay(Circle().strokeBorder(Color.white.opacity(0.25), lineWidth: 1))
-                    .shadow(color: Velvet.danger.opacity(0.5), radius: 10)
-                    .contentShape(Circle())
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("停止")
-                .accessibilityHint("立即停止所有输出")
-                .accessibilitySortPriority(10)
-                // 字号固定（圆里放不下更大的字）：大字号用户长按能看到放大的"停止"（点按照常立刻停）
-                .accessibilityShowsLargeContentViewer()
-            }
-        }
-        .padding(Self.stopInset)
-    }
-
-    private static func formatTime(_ s: Double) -> String {
-        guard s.isFinite else { return "--:--" }
-        let m = Int(s) / 60, sec = Int(s) % 60
-        return String(format: "%d:%02d", m, sec)
     }
 }
