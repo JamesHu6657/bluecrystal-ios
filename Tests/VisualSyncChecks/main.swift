@@ -666,6 +666,112 @@ do {
            "近场：大面积但同类纹理的动作基本不受影响（\(big.near)，\(Int(big.out)) vs \(Int(big.plain))）")
 }
 
+// 第二轮审查 M1：手在一帧内盖住镜头 → 被判成切镜 / 闪变；背景不能因此换成手本身
+func vsSoftBlob(_ x: Int, _ y: Int, edge: Int) -> UInt8 {
+    let ex = Double(x - edge + 48)
+    return UInt8(max(0, min(255, 35 + 20 * sin(ex / 4) + 10 * cos(Double(y) / 5))))
+}
+
+func vsBeforeCut(_ i: Int) -> LumaFrame {
+    let bx = 10 + (i % 2) * 4
+    return vsFrame { x, y in (x >= bx && x < bx + 8 && y >= 14 && y < 22) ? 220 : vsNoise(x, y) }
+}
+
+/// 跑 frames 帧（第 30 帧起换成 after），返回每帧样本（没有样本为 nil）和每帧之后背景是否待定
+func vsRunCut(_ frames: Int, after: (Int) -> LumaFrame) -> (samples: [MotionSample?], pending: [Bool]) {
+    var an = MotionAnalyzer()
+    var samples: [MotionSample?] = []
+    var pending: [Bool] = []
+    for i in 0..<frames {
+        samples.append(an.analyze(i < 30 ? vsBeforeCut(i) : after(i), time: Double(i) * vsDt))
+        pending.append(an.isBackgroundPending)
+    }
+    return (samples, pending)
+}
+
+do {
+    let sudden = vsRunCut(90) { i in
+        let edge = 48 + (i % 2 == 0 ? 0 : 5)
+        return vsFrame { x, y in x < edge ? vsSoftBlob(x, y, edge: edge) : vsNoise(x, y) }
+    }
+    let cutIndex = (30..<40).first { sudden.samples[$0]?.isCut == true }
+    vcheck(cutIndex != nil, "近场 / 切镜：手一帧内盖住 75% → 被判为切镜 / 闪变（前提）")
+    let start = (cutIndex ?? 30) + MotionAnalyzer.holdSamples + 1
+    let afterHold = sudden.samples[start..<min(sudden.samples.count, start + 30)].compactMap { $0 }
+    let near = afterHold.map(\.nearField).reduce(0, +) / Double(max(1, afterHold.count))
+    vcheck(afterHold.count >= 20 && near > 0.6 && afterHold.allSatisfy { !$0.isCut && !$0.isHeld },
+           "近场 / 切镜：保持期之后手在晃 → 近场分数仍高（\(near)），背景没换成手")
+    vcheck(sudden.pending[start + 20], "近场 / 切镜：手一直晃时保持切镜前的背景（待定中）")
+    // 同一段画面进归一化：近场窗口不降权就会被学成「这个视频平时动这么大」
+    var norm = MotionNormalizer()
+    var plainNorm = MotionNormalizer()
+    var acc = MotionWindowAccumulator()
+    var out = 0.0
+    var plain = 0.0
+    for (i, s) in sudden.samples.enumerated() {
+        if let s = s { acc.add(s) }
+        if i % 5 == 4 {
+            let w = acc.drain()
+            var w0 = w
+            w0.nearField = 0
+            out = norm.step(w, gainDb: 0, auto: true, dt: 1.0 / 3)
+            plain = plainNorm.step(w0, gainDb: 0, auto: true, dt: 1.0 / 3)
+        }
+    }
+    vcheck(plain > 50 && out <= 0.75 * plain && norm.refHigh < plainNorm.refHigh,
+           "近场 / 切镜：手突然盖住后的晃动降权且不学参考值（\(Int(out)) vs \(Int(plain))）")
+
+    // 真实切镜到清晰、高动态的新场景：很快（远早于 nearFreezeLimit）采用新背景，近场分数回落
+    let realCut = vsRunCut(90) { i in
+        let o = (i % 2) * 3
+        return vsFrame { x, y in
+            let v = Int(vsNoise((x > 8 && x < 56) ? x + o : x, y + 50))
+            return UInt8(min(255, 90 + v))
+        }
+    }
+    let realCutIndex = (30..<40).first { realCut.samples[$0]?.isCut == true }
+    let adoptIndex = (30..<90).first { $0 > (realCutIndex ?? 30) && !realCut.pending[$0] }
+    let adoptSeconds = Double((adoptIndex ?? 999) - (realCutIndex ?? 30)) * vsDt
+    let realTail = realCut.samples.suffix(30).compactMap { $0 }.map(\.nearField)
+    vcheck(realCutIndex != nil && adoptSeconds <= 1.5 && adoptSeconds < MotionAnalyzer.nearFreezeLimit,
+           "近场 / 切镜：真实切到清晰的高动态场景 → \(String(format: "%.2f", adoptSeconds)) 秒内采用新背景")
+    vcheck((realTail.max() ?? 1) < 0.2, "近场 / 切镜：采用新背景后近场分数回落（最大 \(realTail.max() ?? -1)）")
+
+    // 一直分不清（手盖住后持续晃）：最多冻结 nearFreezeLimit，之后采用新背景，近场分数不再判为近场（≤ 0.5，恢复学习）
+    let limitFrames = Int((MotionAnalyzer.nearFreezeLimit / vsDt).rounded(.up))
+    let long = vsRunCut(30 + limitFrames + 45) { i in
+        let edge = 48 + (i % 2 == 0 ? 0 : 5)
+        return vsFrame { x, y in x < edge ? vsSoftBlob(x, y, edge: edge) : vsNoise(x, y) }
+    }
+    let longCut = (30..<40).first { long.samples[$0]?.isCut == true } ?? 30
+    let longAdopt = (longCut + 1..<long.pending.count).first { !long.pending[$0] }
+    let longSeconds = Double((longAdopt ?? 9_999) - longCut) * vsDt
+    let longTail = long.samples.suffix(20).compactMap { $0 }.map(\.nearField)
+    vcheck(longAdopt != nil && longSeconds >= MotionAnalyzer.nearFreezeLimit - 0.5
+           && longSeconds <= MotionAnalyzer.nearFreezeLimit + 0.2,
+           "近场 / 切镜：一直分不清时最多冻结 nearFreezeLimit（\(String(format: "%.2f", longSeconds)) 秒后采用新背景）")
+    vcheck((longTail.max() ?? 1) <= 0.5, "近场 / 切镜：冻结结束后不再判为近场（最大 \(longTail.max() ?? -1)）")
+
+    // 切到本身就糊、整幅在动的新场景：同样在 nearFreezeLimit 内采用新背景并恢复
+    let blurry = vsRunCut(30 + limitFrames + 45) { i in
+        vsFrame { x, y in vsSoftBlob(x, y, edge: 64 + (i % 2 == 0 ? 0 : 5)) }
+    }
+    let blurCut = (30..<40).first { blurry.samples[$0]?.isCut == true } ?? 30
+    let blurAdopt = (blurCut + 1..<blurry.pending.count).first { !blurry.pending[$0] }
+    let blurSeconds = Double((blurAdopt ?? 9_999) - blurCut) * vsDt
+    let blurTail = blurry.samples.suffix(20).compactMap { $0 }.map(\.nearField)
+    vcheck(blurAdopt != nil && blurSeconds <= MotionAnalyzer.nearFreezeLimit + 0.2,
+           "近场 / 切镜：切到偏糊的新场景也在 nearFreezeLimit 内采用新背景（\(String(format: "%.2f", blurSeconds)) 秒）")
+    vcheck((blurTail.max() ?? 1) < 0.2, "近场 / 切镜：偏糊的新场景采用后近场分数回落（最大 \(blurTail.max() ?? -1)）")
+    var resetAn = MotionAnalyzer()
+    _ = resetAn.analyze(vsBeforeCut(0), time: 0)
+    _ = resetAn.analyze(vsBeforeCut(1), time: vsDt)
+    _ = resetAn.analyze(vsFrame { x, y in vsSoftBlob(x, y, edge: 48) }, time: 2 * vsDt)
+    let pendingBefore = resetAn.isBackgroundPending
+    resetAn.reset()
+    vcheck(pendingBefore && !resetAn.isBackgroundPending, "近场 / 切镜：reset() 清掉待定状态")
+}
+
 do {
     // 近场窗口不训练参考值；近场只降不升
     var learn = MotionNormalizer()

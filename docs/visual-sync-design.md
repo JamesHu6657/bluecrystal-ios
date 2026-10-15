@@ -572,7 +572,7 @@ xcrun swiftc \
 | 项 | 位置 | 做法 | 默认 |
 |---|---|---|---|
 | 稳健去均值 | `MotionAnalyzer.analyze` | 平移选择仍按均值去均值；能量 / 覆盖率改减「对齐后帧差的中位数」（511 档直方图），局部变暗不再把整幅算成在动 | 总是 |
-| 近场 / 遮挡分数 N | `MotionAnalyzer.updateNearField` → `MotionSample.nearField` → `MotionWindow.nearField` | 遮挡 = s(覆盖率) × max(s(直方图离背景), s(变糊))；贴脸晃动 = s(覆盖率) × s(平移采用率) × s(对齐残差)；背景 τ 4 s、近场时冻结 ≤ 6 s | 总是 |
+| 近场 / 遮挡分数 N | `MotionAnalyzer.updateNearField` → `MotionSample.nearField` → `MotionWindow.nearField` | 遮挡 = s(覆盖率) × max(s(直方图离背景), s(变糊))；贴脸晃动 = s(覆盖率) × s(平移采用率) × s(对齐残差)；背景 τ 4 s、近场时冻结 ≤ 6 s；切镜 / 闪变（含手一下盖住镜头）不立刻换背景，保留切镜前背景待定，新画面连续 0.5 s 安静（近场 ≤ 0.5 或覆盖率 < 0.35）或满 6 s 才采用；待定期间直方图项需同时变糊 | 总是 |
 | 近场降权 | `MotionNormalizer.step` | ratio −= N·max(0, ratio − 0.6·固定尺度)；N ≥ 0.5 的窗口不学参考值 | 总是（单拍只降不升） |
 | 内容时间戳 | `MotionDisplayClock` + `VideoMotionTap` | t = host − (播放头 − 帧显示时间)/速率（滞后 0~0.5 s 内），单调、间隔 ≥ min(31 ms, 到 host 的距离)、不晚于 host；静止补样按上一帧滞后换到同一条时间轴；24 fps 片源能量不再一大一小 | 总是 |
 | 性能卫生 | `LumaDownscaler` / `MotionAnalyzer` | 裸指针读采样表、每帧临时数组复用、参考帧拷进已有存储；Instruments「Points of Interest」可看 `MotionDownscale` / `MotionAnalyze` | 总是 |

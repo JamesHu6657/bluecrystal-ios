@@ -765,7 +765,8 @@ final class VideoSyncPlayer: ObservableObject {
             lastActive = active
             // tick 走不开闸的发送路径，看门狗锁住的闸不会被自动帧打开
             ble.sendTick(levels: vals)
-            statusLine = String(format: "t=%.1fs 强度 %d", t, out.percent)
+            // 显示实际发出的值（画面→声音追赶期间是限速后的，不是 out.percent）
+            statusLine = String(format: "t=%.1fs 强度 %d", t, vals.max() ?? 0)
         }
     }
 

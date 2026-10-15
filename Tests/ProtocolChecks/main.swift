@@ -1171,13 +1171,14 @@ let continuousNow = SafetyClock.continuousSeconds()
 check(continuousNow.isFinite && continuousNow >= 0, "连续时钟有限且非负")
 check(SafetyClock.continuousSeconds() >= continuousNow, "连续时钟单调")
 #if canImport(Darwin)
-// 跨时钟比较只在同一计时源上做（CI 虚拟机上也稳）：先读 CLOCK_UPTIME_RAW（mach_absolute_time，睡眠停走），
-// 再读 CLOCK_MONOTONIC_RAW（mach_continuous_time，睡眠也走），后者恒 ≥ 前者。
-// 不再拿 systemUptime 比 CLOCK_MONOTONIC：Darwin 的 CLOCK_MONOTONIC 是 gettimeofday − kern.boottime，
-// 跟着墙钟调整走，runner 虚拟机上可能比 systemUptime 慢 0.5 秒以上（2026-10-16 起 main 也挂）
+// 系统时钟健全检查（只检查运行环境，不覆盖 SafetyClock 本身；SafetyClock 的行为由上面两条和下面的账本恢复检查覆盖）：
+// 同一计时源上先读 CLOCK_UPTIME_RAW（mach_absolute_time，睡眠停走），再读 CLOCK_MONOTONIC_RAW
+// （mach_continuous_time，睡眠也走），后者应 ≥ 前者。不拿 systemUptime 比 CLOCK_MONOTONIC：Darwin 的
+// CLOCK_MONOTONIC 是 gettimeofday − kern.boottime，跟着墙钟调整走，runner 虚拟机上可能比 systemUptime 慢 0.5 秒以上
 let uptimeRaw = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 let continuousRaw = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
-check(uptimeRaw > 0 && continuousRaw >= uptimeRaw, "睡眠也走的时钟不慢于睡眠停走的时钟（同一计时源）")
+check(uptimeRaw > 0 && continuousRaw >= uptimeRaw,
+      "系统时钟健全检查：CLOCK_MONOTONIC_RAW 不慢于 CLOCK_UPTIME_RAW（不覆盖 SafetyClock）")
 #endif
 fc.boot = "clock-a"
 fc.t = 500

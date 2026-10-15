@@ -178,6 +178,15 @@ struct MotionAnalyzer {
     /// 背景清晰度低于这个（本来就糊 / 纯色画面）不用「变糊」这一项
     static let minBackgroundSharpness: Double = 2
     static let nearFieldDeadzone: Double = 0.05
+    /// 切镜 / 闪变之后（第二轮审查 M1）：手一下盖住镜头也会触发切镜判定，所以切镜不立刻把新画面当背景，
+    /// 而是保留切镜前的背景继续比（最长 nearFreezeLimit）。新画面「安静」（近场 ≤ 0.5 或覆盖率 < 0.35）
+    /// 连续这么久才采用为背景；超过 nearFreezeLimit 无条件采用
+    static let cutAdoptSeconds: TimeInterval = 0.5
+    static let cutCalmCoverage: Double = 0.35
+    /// 切镜待定期间直方图项要「同时变糊」才算数：真实切到清晰的新场景（颜色分布也变了）很快恢复，
+    /// 手 / 物体贴镜头（失焦）照样判为近场。width 0.07、center 0.15 的变糊门
+    static let cutBlurCenter: Double = 0.15
+    static let cutBlurWidth: Double = 0.07
     /// 帧差中位数用的直方图：差值 -255...255
     static let diffBins = 511
 
@@ -199,6 +208,10 @@ struct MotionAnalyzer {
     private var backgroundSharpness: Double = 0
     private var backgroundValid = false
     private var backgroundFrozen: TimeInterval = 0
+    /// 切镜之后背景待定：仍用切镜前的背景；elapsed 从第一次切镜起算，calm 是新画面连续安静的时长
+    private var cutPending = false
+    private var cutPendingElapsed: TimeInterval = 0
+    private var cutPendingCalm: TimeInterval = 0
     private var shiftRate: Double = 0
     private var residualRatio: Double = 0
     // 每帧复用的临时数组（algo-opt-1 性能卫生：稳态不再每帧分配）
@@ -208,6 +221,8 @@ struct MotionAnalyzer {
     private var medianScratch: [Double] = []
 
     var hasReference: Bool { previousTime != nil }
+    /// 切镜后还在用切镜前的背景（新画面还没被采用为背景）
+    var isBackgroundPending: Bool { cutPending }
 
     init() {
         historyTimes.reserveCapacity(Self.historyCapacity + 1)
@@ -223,6 +238,7 @@ struct MotionAnalyzer {
         historyEnergies.removeAll(keepingCapacity: true)
         backgroundValid = false
         backgroundFrozen = 0
+        cutPending = false
         shiftRate = 0
         residualRatio = 0
     }
@@ -250,6 +266,25 @@ struct MotionAnalyzer {
         backgroundSharpness = g
         backgroundValid = true
         backgroundFrozen = 0
+        cutPending = false
+        cutPendingElapsed = 0
+        cutPendingCalm = 0
+    }
+
+    /// 切镜 / 切镜后的保持帧：背景不换成新画面，进入（或继续）待定。没有有效背景时才直接用新画面
+    private mutating func noteCutForBackground(sharpness g: Double, gap: Double) {
+        guard backgroundValid else {
+            resetBackground(sharpness: g)
+            return
+        }
+        if cutPending {
+            cutPendingElapsed += gap
+        } else {
+            cutPending = true
+            cutPendingElapsed = 0
+        }
+        cutPendingCalm = 0
+        if cutPendingElapsed >= Self.nearFreezeLimit { resetBackground(sharpness: g) }
     }
 
     mutating func analyze(_ frame: LumaFrame, time: Double) -> MotionSample? {
@@ -362,12 +397,12 @@ struct MotionAnalyzer {
             // 不出尖峰，也不突然掉到 0
             out = median(within: Self.substituteWindow, now: time)
             holdRemaining = Self.holdSamples
-            resetBackground(sharpness: sharp)
+            noteCutForBackground(sharpness: sharp, gap: gap)
         } else if holdRemaining > 0 {
             out = median(within: Self.substituteWindow, now: time)
             holdRemaining -= 1
             held = true
-            resetBackground(sharpness: sharp)
+            noteCutForBackground(sharpness: sharp, gap: gap)
         } else {
             record(energy, at: time)
             near = updateNearField(coverage: coverage, sharpness: sharp, shift: shift, gap: gap)
@@ -388,7 +423,14 @@ struct MotionAnalyzer {
         let blurTerm = backgroundSharpness >= Self.minBackgroundSharpness
             ? Self.sigmoid(1 - g / backgroundSharpness, 0.35, 0.1) : 0
         let wide = Self.sigmoid(c, 0.5, 0.1)
-        let occlusion = wide * max(Self.sigmoid(hDist, 0.35, 0.07), blurTerm)
+        var histTerm = Self.sigmoid(hDist, 0.35, 0.07)
+        if cutPending {
+            // 切镜待定：颜色分布变了还要同时变糊才算遮挡（清晰的新场景不算）
+            let blurGate = backgroundSharpness >= Self.minBackgroundSharpness
+                ? Self.sigmoid(1 - g / backgroundSharpness, Self.cutBlurCenter, Self.cutBlurWidth) : 0
+            histTerm *= blurGate
+        }
+        let occlusion = wide * max(histTerm, blurTerm)
 
         let camA = 1 - exp(-gap / Self.cameraSeconds)
         shiftRate += ((shift.accepted ? 1 : 0) - shiftRate) * camA
@@ -399,8 +441,16 @@ struct MotionAnalyzer {
         if !near.isFinite || near < Self.nearFieldDeadzone { near = 0 }
         near = min(1, near)
 
-        // 背景：判为近场时先冻结（最多 6 秒），否则按 4 秒跟上
-        if near > 0.5 && backgroundFrozen < Self.nearFreezeLimit {
+        if cutPending {
+            // 切镜待定：背景不动；新画面连续安静 0.5 秒（真实切镜、手停住）或待定满 nearFreezeLimit 才采用
+            cutPendingElapsed += gap
+            let calm = near <= 0.5 || c < Self.cutCalmCoverage
+            cutPendingCalm = calm ? cutPendingCalm + gap : 0
+            if cutPendingCalm >= Self.cutAdoptSeconds || cutPendingElapsed >= Self.nearFreezeLimit {
+                resetBackground(sharpness: g)
+            }
+        } else if near > 0.5 && backgroundFrozen < Self.nearFreezeLimit {
+            // 背景：判为近场时先冻结（最多 6 秒），否则按 4 秒跟上
             backgroundFrozen += gap
         } else {
             if near <= 0.5 { backgroundFrozen = 0 }
