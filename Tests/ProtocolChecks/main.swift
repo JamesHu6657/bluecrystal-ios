@@ -924,14 +924,6 @@ for _ in 0..<300 {
 }
 check(fuzzOK, "随机 300 段程序：每次升高 ≤20、两次升高至少隔 1 秒、强度 ≤70（M2）")
 
-// H2：保持最后强度时，120 秒没有新的用户消息就停止
-check(!AISafety.holdIdleExpired(now: 5000, holdStartedAt: nil, lastUserMessageAt: 0), "没在保持时不计时")
-check(!AISafety.holdIdleExpired(now: 1119, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 119 秒未超时")
-check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 120 秒没有新消息就停止")
-check(!AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: 1050), "保持期间的新消息重新计时")
-check(AISafety.holdIdleExpired(now: 1170, holdStartedAt: 1000, lastUserMessageAt: 1050), "新消息之后 120 秒仍没有回应就停止")
-check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: nil), "没有用户消息记录时从保持开始算")
-
 // Brain 审查 H1：在场超时覆盖整个运行（执行程序期间也算），单条程序总时长 ≤120 秒
 // 2026-10-15 用户要求关闭在场超时和程序时长上限：默认关闭
 check(!AISafety.presenceTimeoutEnabled, "在场超时默认关闭")
@@ -943,6 +935,14 @@ do {
 }
 // 以下原有测试：打开开关验证原逻辑
 AISafety.presenceTimeoutEnabled = true
+// H2：保持最后强度时，120 秒没有新的用户消息就停止
+check(!AISafety.holdIdleExpired(now: 5000, holdStartedAt: nil, lastUserMessageAt: 0), "没在保持时不计时")
+check(!AISafety.holdIdleExpired(now: 1119, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 119 秒未超时")
+check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: 990), "保持 120 秒没有新消息就停止")
+check(!AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: 1050), "保持期间的新消息重新计时")
+check(AISafety.holdIdleExpired(now: 1170, holdStartedAt: 1000, lastUserMessageAt: 1050), "新消息之后 120 秒仍没有回应就停止")
+check(AISafety.holdIdleExpired(now: 1120, holdStartedAt: 1000, lastUserMessageAt: nil), "没有用户消息记录时从保持开始算")
+
 check(!AISafety.presenceExpired(now: 1119, lastUserMessageAt: 1000, runStartedAt: 1010), "最近一条消息后 119 秒：继续")
 check(AISafety.presenceExpired(now: 1120, lastUserMessageAt: 1000, runStartedAt: 1010),
       "程序还在执行，离最近一条消息 120 秒也停止")
