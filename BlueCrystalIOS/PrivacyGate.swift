@@ -4,15 +4,17 @@ import Combine
 import LocalAuthentication
 
 // MARK: - 18+ 入口、面容 ID 解锁、后台隐私遮罩
-// 只是外观和隐私包装：不改 BLEManager 的任何状态，唯一发出去的是解锁页上的停止
+// 只是外观和隐私包装：不改 BLEManager 的任何状态，唯一发出去的是解锁页 / 入口页上的停止
 // （和各页停止键同一个 sendStop，并通知各页 VM 走自己的 stopAll）。
 // 退后台的停止仍由 BlueCrystalIOSApp 的 scenePhase 处理。
-// 设备可能仍在输出 / 停止未确认 / 连接或断开进行中 / 正在运行时，入口页、解锁页和系统验证框一律不出现，
-// 停止和警告永远直接可达。隐私模糊是例外：退到后台时一律出现；只是暂时不活跃（控制中心等）时，
+// 设备可能仍在输出 / 停止未确认 / 连接或断开进行中 / 正在运行时，入口页和系统验证框一律不出现，
+// 停止和警告永远直接可达。第四轮 M3：这时已锁定的 App 仍然盖住内容——解锁页换成"先处理设备"的样子
+// （设备卡片 + 停止键，没有解锁按钮、不弹验证框），之前是整个遮挡撤掉，不用验证就能看到、操作所有页面。
+// 隐私模糊是例外：退到后台时一律出现；只是暂时不活跃（控制中心等）时，
 // 设备可能在输出就不出现。不拦点击，回到前台立刻消失。
 
 extension BLEManager {
-    /// 这时绝不盖入口页 / 解锁页、不弹系统验证框（已弹出的会被取消）。
+    /// 这时绝不盖入口页、不弹系统验证框（已弹出的会被取消），解锁页上也不给解锁按钮（第四轮 M3：解锁页本身照样盖着）。
     /// 只看设备真的可能在输出的情况：
     /// - 正在运行、停止重试中、需要确认物理关机（含"设备可能仍在输出"）、提供强制断开；
     /// - 连接中、发现服务中、断开中：这时安全状态可能还没刷新；
@@ -45,7 +47,7 @@ final class PrivacyLock: ObservableObject {
     /// 本机可用的生物识别（名称和图标）；没有时为 nil。回到前台时重查（用户可能刚在系统设置里录入或删掉）
     @Published private(set) var biometry: Biometry? = PrivacyLock.currentBiometry()
 
-    /// 解锁页上的停止：除了 sendStop，各页 VM 收到后走自己的 stopAll（停 AI 计时和授权、停视频播放）
+    /// 解锁页 / 入口页上的停止：除了 sendStop，各页 VM 收到后走自己的 stopAll（停 AI 计时和授权、停视频播放）
     let stopAllRequested = PassthroughSubject<Void, Never>()
 
     struct Biometry: Equatable {
@@ -91,12 +93,14 @@ final class PrivacyLock: ObservableObject {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
-    /// 现在是否盖着入口页或解锁页（设备可能在输出时永远不盖）
+    /// 现在是否盖着入口页或解锁页。
+    /// 入口页：设备可能在输出时不盖。解锁页：锁着就一直盖着（第四轮 M3），设备需要处理时只是不给解锁、
+    /// 改为显示设备卡片和停止键——之前这时不盖，不用验证就能看到并操作整个 App
     func isCovering(_ ble: BLEManager) -> Bool {
-        !ble.privacyCoverBlocked && (!consented || locked)
+        (consented && locked) || (!consented && !ble.privacyCoverBlocked)
     }
 
-    /// 解锁页上的停止
+    /// 解锁页 / 入口页上的停止
     func requestStopAll() {
         stopAllRequested.send()
     }
@@ -209,7 +213,8 @@ struct PrivacyCover: ViewModifier {
     @Environment(\.scenePhase) private var scenePhase
 
     private var showGate: Bool { !ble.privacyCoverBlocked && !lock.consented }
-    private var showLock: Bool { !ble.privacyCoverBlocked && lock.consented && lock.locked }
+    /// 第四轮 M3：锁着就盖。设备需要处理时 LockScreenView 自己换成设备卡片 + 停止键、不给解锁
+    private var showLock: Bool { lock.consented && lock.locked }
     private var covered: Bool { lock.isCovering(ble) }
 
     /// 隐私模糊：退到后台（多任务截图）一律盖上；只是暂时不活跃（控制中心、系统弹框、下拉通知）时，
@@ -228,13 +233,17 @@ struct PrivacyCover: ViewModifier {
                 .accessibilityHidden(covered)
 
             if showGate {
-                AgeGateView(lock: lock)
-                    .accessibilityElement(children: .contain)
-                    .accessibilityAddTraits(.isModal)
-                    .transition(.opacity)
-                    .zIndex(2)
+                // 入口页底部也常驻停止键（第四轮）：它盖住了各页的停止键，状态万一没刷新也能一下停
+                AgeGateView(lock: lock, onStop: {
+                    ble.sendStop()
+                    lock.requestStopAll()
+                })
+                .accessibilityElement(children: .contain)
+                .accessibilityAddTraits(.isModal)
+                .transition(.opacity)
+                .zIndex(2)
             } else if showLock {
-                // 解锁页只在设备不需要处理时出现；万一状态还没刷新，底部也有停止键
+                // 底部常驻停止键；设备需要处理时只显示设备卡片和停止键，不给解锁
                 LockScreenView(lock: lock, onStop: {
                     ble.sendStop()
                     lock.requestStopAll()
@@ -286,9 +295,11 @@ struct PrivacyVeil: View {
     }
 }
 
-/// 18+ 确认（只出现一次）
+/// 18+ 确认（只出现一次）。第四轮：底部常驻停止键，设备需要处理时顶上带紧凑设备卡片（同解锁页）
 struct AgeGateView: View {
+    @EnvironmentObject var ble: BLEManager
     @ObservedObject var lock: PrivacyLock
+    let onStop: () -> Void
     @State private var useBiometric = false
     @State private var glow = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -298,6 +309,10 @@ struct AgeGateView: View {
             VelvetBackground(glow: 0.35).ignoresSafeArea()
             ScrollView {
                 VStack(spacing: 26) {
+                    if ble.needsAttentionCard {
+                        DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
+                            .padding(.top, 8)
+                    }
                     Spacer(minLength: 40)
                     ZStack {
                         Circle()
@@ -371,6 +386,9 @@ struct AgeGateView: View {
                 .padding(.horizontal, 24)
             }
         }
+        .safeAreaInset(edge: .bottom) {
+            StopDockBar(action: onStop)
+        }
         .onAppear { startGlow() }
         // 中途打开减弱动态效果：正在循环的光晕立刻停下；关掉时再亮起来
         .onChange(of: reduceMotion) { rm in
@@ -391,17 +409,20 @@ struct AgeGateView: View {
 }
 
 /// 面容 ID 解锁页：不自动弹验证，点「解锁」才弹；底部常驻停止键。
-/// 设备需要处理时（同 needsAttentionCard），上面钉一张紧凑设备卡片（没有连接键：连接中会撤掉解锁页）
+/// 设备需要处理时（同 needsAttentionCard），上面钉一张紧凑设备卡片（没有连接键）。
+/// 第四轮 M3：设备可能在输出 / 连接或断开进行中（privacyCoverBlocked）时解锁页照样盖着内容，
+/// 只是一直显示设备卡片、写明原因，不给解锁（系统验证框会盖住停止键）；设备处理好了解锁键自己回来
 struct LockScreenView: View {
     @EnvironmentObject var ble: BLEManager
     @ObservedObject var lock: PrivacyLock
     let onStop: () -> Void
 
     var body: some View {
+        let blocked: Bool = ble.privacyCoverBlocked
         ZStack {
             VelvetBackground(glow: 0.2).ignoresSafeArea()
             VStack(spacing: 22) {
-                if ble.needsAttentionCard {
+                if blocked || ble.needsAttentionCard {
                     DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
                         .padding(.top, 8)
                 }
@@ -416,24 +437,34 @@ struct LockScreenView: View {
                     .font(Velvet.display(.title))
                     .foregroundColor(Velvet.text)
                     .accessibilityAddTraits(.isHeader)
-                // 不写"今晚"：白天打开也说得通
-                Text("验证一下，再回到你的私密时光")
-                    .font(.subheadline)
-                    .foregroundColor(Velvet.textSecondary)
-                    // 大字号时会折行：折行后也居中，不整段压扁
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let m = lock.message {
-                    Text(m).font(.caption).foregroundColor(Velvet.warning).multilineTextAlignment(.center)
+                if blocked {
+                    Text("设备这边还需要处理（可能仍在输出、停止未确认，或正在连接 / 断开）。下面的停止随时可以点；处理好之后才能解锁")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.warning)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    // 不写"今晚"：白天打开也说得通
+                    Text("验证一下，再回到你的私密时光")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.textSecondary)
+                        // 大字号时会折行：折行后也居中，不整段压扁
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let m = lock.message {
+                        Text(m).font(.caption).foregroundColor(Velvet.warning).multilineTextAlignment(.center)
+                    }
+                    Button {
+                        // 点下去的一瞬间设备刚好变成需要处理：不弹验证框
+                        guard !ble.privacyCoverBlocked else { return }
+                        lock.unlock()
+                    } label: {
+                        Label("解锁", systemImage: lock.biometry?.icon ?? "lock.open.fill")
+                            .frame(minWidth: 160, minHeight: 46)
+                    }
+                    .buttonStyle(PillButtonStyle(kind: .primary))
+                    .disabled(lock.authenticating)
                 }
-                Button {
-                    lock.unlock()
-                } label: {
-                    Label("解锁", systemImage: lock.biometry?.icon ?? "lock.open.fill")
-                        .frame(minWidth: 160, minHeight: 46)
-                }
-                .buttonStyle(PillButtonStyle(kind: .primary))
-                .disabled(lock.authenticating)
                 Spacer()
             }
             .padding(.horizontal, 32)
