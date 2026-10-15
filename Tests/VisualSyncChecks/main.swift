@@ -115,6 +115,24 @@ vcheck(vsDownscale(flatSource, width: 1280, height: 720, bytesPerRow: 100) == ni
 
 // MARK: - 帧差
 
+// 镜头平移 / 手持晃动：整幅有纹理的画面平移 2 像素 → 补偿后几乎没有能量；不补偿（小物体）照旧
+func vsTexture(_ x: Int, _ y: Int) -> UInt8 {
+    let h = (x &* 73_856_093) ^ (y &* 19_349_663)
+    return UInt8(40 + (h & 0x7fff_ffff) % 160)
+}
+
+do {
+    var an = MotionAnalyzer()
+    _ = an.analyze(vsFrame { x, y in vsTexture(x, y) }, time: 0)
+    let panned = an.analyze(vsFrame { x, y in vsTexture(x - 2, y + 1) }, time: vsDt)
+    let e = panned?.energy ?? 99
+    vcheck(e < 0.5, "平移补偿：整幅画面平移 (2, −1) 像素 → 能量 < 0.5（得到 \(e)）")
+    var raw = MotionAnalyzer()
+    _ = raw.analyze(vsFrame { x, y in vsTexture(x, y) }, time: 0)
+    let changed = raw.analyze(vsFrame { x, y in vsTexture(x + 37, y + 11) }, time: vsDt)
+    vcheck((changed?.energy ?? 0) > 10, "平移补偿：画面整个换掉（对不齐）→ 能量照样大（\(changed?.energy ?? 0)）")
+}
+
 // VFR 静止段：没有新帧但播放头在走 → 零能量样本，参考帧保住
 do {
     var an = MotionAnalyzer()
@@ -273,8 +291,8 @@ do {
         a = autoChain.step(vsWindow(2.25))
         f = fixedChain.step(vsWindow(2.25), auto: false)
     }
-    vcheck(a >= 70, "归一化：小动作视频（e ≈ 2.25）40 秒后动作段 ≥ 70%（得到 \(Int(a))）")
-    vcheck(f < a - 30, "归一化：关掉自动适应时小动作视频明显更低（\(Int(f)) vs \(Int(a))）")
+    vcheck(a >= 35 && a <= 60, "归一化：小动作视频（e ≈ 2.25）适度放大到中档 35~60%（得到 \(Int(a))）")
+    vcheck(f < a - 15, "归一化：关掉自动适应时小动作视频更低（\(Int(f)) vs \(Int(a))）")
 }
 
 do {
@@ -300,7 +318,16 @@ do {
         t = talk.step(vsWindow(0.8))
         w = walk.step(vsWindow(3.5))
     }
-    vcheck(t < 30 && w >= 80, "归一化：讲话量级（e ≈ 0.8）远低于走动量级（e ≈ 3.5）（\(Int(t)) vs \(Int(w))）")
+    vcheck(t < 15 && w >= 45, "归一化：讲话量级（e ≈ 0.8）远低于走动量级（e ≈ 3.5）（\(Int(t)) vs \(Int(w))）")
+}
+
+// 安静的片子里突然一个大动作（手贴镜头比耶）：不再顶到最强
+do {
+    var c = VSChain()
+    for _ in 0..<100 { _ = c.step(vsWindow(0.8)) }
+    var peak = 0.0
+    for _ in 0..<5 { peak = max(peak, c.step(vsWindow(8))) }
+    vcheck(peak >= 40 && peak <= 80, "归一化：安静片子里 1.5 秒的大动作落在 40~80%，不顶满（得到 \(Int(peak))）")
 }
 
 do {

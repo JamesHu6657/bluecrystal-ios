@@ -119,7 +119,8 @@ struct MotionSample: Equatable {
     var isHeld: Bool
 }
 
-/// 帧差 → 运动能量（§4.3），直方图 + 均值突变判镜头切换 / 闪白（§4.5）。P1 不做平移补偿。
+/// 帧差 → 运动能量（§4.3），直方图 + 均值突变判镜头切换 / 闪白（§4.5）。
+/// 镜头平移 / 手持晃动补偿（§4.4 简化版）：大半画面都在变时，试 ±3 像素整体位移，能明显对齐就按对齐后的帧差算
 /// 第一帧、reset 之后、尺寸变了、相邻样本 Δt 不在 [0.03, 0.5] 秒（倒退 / 跳跃 / 长时间没帧）都只当参考帧，不出样本
 struct MotionAnalyzer {
     /// 每像素噪声门（0~255 亮度级；4×4 平均后压缩噪声约 ±2~3）
@@ -144,6 +145,12 @@ struct MotionAnalyzer {
     static let substituteWindow: Double = 1
     static let baselineWindow: Double = 2
     static let historyCapacity = 64
+    /// 整体位移搜索范围（分析帧像素，64×36 上 ±3 ≈ 原画面 ±5%）
+    static let maxShift = 3
+    /// 有变化的格子超过这个比例才试补偿（小物体移动不碰）
+    static let shiftChangedCells: Double = 0.5
+    /// 对齐后的差异要低于不对齐的这个比例才采用
+    static let shiftAcceptRatio: Double = 0.75
 
     private var previous: [UInt8] = []
     private var previousWidth = 0
@@ -204,14 +211,25 @@ struct MotionAnalyzer {
         let cells = cellOf
         let prevMean = previousMean
         let gate = Self.noiseGate
+        let (dx, dy) = Self.globalShift(pixels, mean: mean, previous: prev, previousMean: prevMean,
+                                        width: w, height: h, cells: cells)
         var cellSums = [Double](repeating: 0, count: Self.gridColumns * Self.gridRows)
         var total = 0.0
-        for i in 0..<n {
-            let d = (Double(pixels[i]) - mean) - (Double(prev[i]) - prevMean)
-            let e = abs(d) - gate
-            if e > 0 {
-                total += e
-                cellSums[cells[i]] += e
+        var valid = 0
+        for y in 0..<h {
+            let py = y - dy
+            guard py >= 0, py < h else { continue }
+            for x in 0..<w {
+                let px = x - dx
+                guard px >= 0, px < w else { continue }
+                let i = y * w + x
+                valid += 1
+                let d = (Double(pixels[i]) - mean) - (Double(prev[py * w + px]) - prevMean)
+                let e = abs(d) - gate
+                if e > 0 {
+                    total += e
+                    cellSums[cells[i]] += e
+                }
             }
         }
         var active = 0
@@ -226,7 +244,7 @@ struct MotionAnalyzer {
 
         let correction = min(Self.rateCorrection.upperBound,
                              max(Self.rateCorrection.lowerBound, Self.nominalInterval / gap))
-        let energy = total * inv * correction
+        let energy = valid > 0 ? total / Double(valid) * correction : 0
         let baseline = median(within: Self.baselineWindow, now: time)
         let jump = abs(mean - prevMean)
         let hardCut = distance > Self.cutDistanceAlways
@@ -263,6 +281,66 @@ struct MotionAnalyzer {
         }
         let out = held ? median(within: Self.substituteWindow, now: time) : 0
         return MotionSample(time: time, energy: out, coverage: 0, isCut: false, isHeld: held)
+    }
+
+    /// 整体位移（内容从上一帧移动了 (dx, dy)：cur[x, y] ≈ prev[x − dx, y − dy]）。
+    /// 只在大半格子有变化时才搜；对齐后差异要明显更小才采用，否则 (0, 0)（和不补偿逐位相同）
+    static func globalShift(_ cur: [UInt8], mean: Double, previous prev: [UInt8], previousMean: Double,
+                            width w: Int, height h: Int, cells: [Int]) -> (Int, Int) {
+        let r = maxShift
+        guard w > 2 * r + 4, h > 2 * r + 4, cur.count == w * h, prev.count == w * h, cells.count == w * h else {
+            return (0, 0)
+        }
+        let cellCount = gridColumns * gridRows
+        var cellDiff = [Double](repeating: 0, count: cellCount)
+        var cellN = [Double](repeating: 0, count: cellCount)
+        var zero = 0.0
+        var samples = 0
+        var y = r
+        while y < h - r {
+            var x = r
+            while x < w - r {
+                let i = y * w + x
+                let d = abs((Double(cur[i]) - mean) - (Double(prev[i]) - previousMean))
+                zero += d
+                cellDiff[cells[i]] += d
+                cellN[cells[i]] += 1
+                samples += 1
+                x += 2
+            }
+            y += 2
+        }
+        guard samples > 0, zero / Double(samples) > noiseGate else { return (0, 0) }
+        var changed = 0
+        var counted = 0
+        for c in 0..<cellCount where cellN[c] > 0 {
+            counted += 1
+            if cellDiff[c] / cellN[c] > noiseGate { changed += 1 }
+        }
+        guard counted > 0, Double(changed) / Double(counted) > shiftChangedCells else { return (0, 0) }
+        var best = zero
+        var bestShift = (0, 0)
+        for sy in -r...r {
+            for sx in -r...r where sx != 0 || sy != 0 {
+                var sad = 0.0
+                var yy = r
+                while yy < h - r && sad < best {
+                    var xx = r
+                    let row = yy * w
+                    let prow = (yy - sy) * w
+                    while xx < w - r {
+                        sad += abs((Double(cur[row + xx]) - mean) - (Double(prev[prow + xx - sx]) - previousMean))
+                        xx += 2
+                    }
+                    yy += 2
+                }
+                if sad < best {
+                    best = sad
+                    bestShift = (sx, sy)
+                }
+            }
+        }
+        return best < zero * shiftAcceptRatio ? bestShift : (0, 0)
     }
 
     private mutating func remember(_ pixels: [UInt8], width: Int, height: Int, mean: Double,
@@ -360,8 +438,8 @@ struct MotionWindowAccumulator {
     }
 }
 
-/// 画面能量 → 0~100（§4.8）：对数压缩 + 快升慢降的参考值跟踪这个视频自己的运动范围，「动得多」映射到 85%
-/// （同 AudioReactiveShaper.autoTargetPercent）。
+/// 画面能量 → 0~100（§4.8）：对数压缩 + 快升慢降的参考值跟踪这个视频自己的运动范围，「动得多」映射到 75%，
+/// 自动适应和固定尺度各占一半（同声音侧只补一半差距）。
 /// 实施时按测试调整（文档允许调常量）：
 /// - 下参考取 min(refLow, refHigh − 最小跨度)：一直在动的视频 refLow 会追上 refHigh，按原式会把动作段压到很低；
 /// - refHigh 不低于 ln(1 + 2.5)：讲话、轻微晃动的画面（e ≲ 1）不会被当成「动得多」放大；
@@ -370,7 +448,10 @@ struct MotionNormalizer {
     /// e_win 低于这个当静止：输出 0，也不学习
     static let absoluteGate: Double = 0.5
     static let minSpan: Double = 0.8
-    static let targetPercent: Double = 85
+    /// 「动得多」映射到 75%（原 85%）
+    static let targetPercent: Double = 75
+    /// 自动适应只占一半，另一半按固定尺度：安静的片子保持偏轻，一个手势不会被当成最激烈（真机反馈 2026-10-16）
+    static let adaptiveWeight: Double = 0.5
     static let warmUpSeconds: TimeInterval = 3
     static let initialHigh: Double = log(4.0)
     static let initialLow: Double = log(1.8)
@@ -416,14 +497,21 @@ struct MotionNormalizer {
             refLow += (l - refLow) * (1 - exp(-step / lowTau))
             if !refHigh.isFinite || !refLow.isFinite { resetAdaptation() }
         }
-        let hi = auto ? refHigh : Self.fixedHigh
-        let lo = auto ? min(refLow, hi - Self.minSpan) : Self.fixedLow
-        let span = max(Self.minSpan, hi - lo)
+        let fixedRatio = (l - Self.fixedLow) / (Self.fixedHigh - Self.fixedLow)
+        var ratio = fixedRatio
+        if auto {
+            let hi = refHigh
+            let lo = min(refLow, hi - Self.minSpan)
+            let span = max(Self.minSpan, hi - lo)
+            // 自动部分最多到满刻度：超出这个视频平时范围的瞬间（手贴镜头）只能靠固定尺度往上走
+            let adaptive = min(1, (l - lo) / span)
+            ratio = Self.adaptiveWeight * adaptive + (1 - Self.adaptiveWeight) * fixedRatio
+        }
         let clampedGain = gainDb.isFinite
             ? min(VisualSyncSettings.motionGainRange.upperBound, max(VisualSyncSettings.motionGainRange.lowerBound, gainDb))
             : 0
         let g = pow(10, clampedGain / 20)
-        let out = (l - lo) / span * g * Self.targetPercent
+        let out = ratio * g * Self.targetPercent
         return out.isFinite ? min(100, max(0, out)) : 0
     }
 }
