@@ -94,6 +94,10 @@ final class BLEManager: NSObject, ObservableObject {
 
         /// 设备区块里的一行说明
         var summary: String {
+            if !SafetyLimits.timeLimitsEnabled {
+                if let reason = blockReason { return reason }
+                return runRemaining != nil ? "正在输出（无时间上限，随时可按停止）" : "无时间上限"
+            }
             if let r = runRemaining { return "本次输出剩余 \(r) 秒（本次上限 \(runAllowed) 秒）" }
             if let reason = blockReason { return reason }
             let maxRun = min(Int(SafetyLimits.maxRunSeconds), budgetRemaining)

@@ -328,6 +328,22 @@ func makeLedger() -> DutyCycleLedger {
     DutyCycleLedger(clock: { fc.t }, wallClock: { fc.wall }, bootIdentity: { fc.boot })
 }
 
+// 2026-10-15 用户要求关闭时间上限：默认关闭时额度永远满、单次不会到点、遗留运行也不封锁
+check(!SafetyLimits.timeLimitsEnabled, "时间上限默认关闭")
+do {
+    let free = makeLedger()
+    check(free.checkAdmissible() == nil, "关闭上限：可以开始")
+    let allowed = free.begin() ?? 0
+    check(allowed >= SafetyLimits.unlimitedSeconds - 1, "关闭上限：本次上限为无限大")
+    fc.advance(3 * 3600)
+    check((free.runRemaining() ?? 0) > 0, "关闭上限：连续 3 小时也不到点")
+    free.end()
+    check(free.checkAdmissible() == nil && free.secondsUntilBudget() == 0, "关闭上限：停下立刻能再开始，不用等额度")
+    check(near(free.remainingBudget(), SafetyLimits.unlimitedSeconds), "关闭上限：额度不减少")
+    check(Int(SafetyLimits.maxRunSeconds) > 0 && Int(SafetyLimits.dutyBudgetSeconds) > 0, "无限值可以安全转 Int")
+}
+// 以下保留原有账本测试：打开时间上限后验证原逻辑没被改坏
+SafetyLimits.timeLimitsEnabled = true
 check(SafetyLimits.maxRunSeconds == 1200, "单次上限 20 分钟")
 check(SafetyLimits.dutyWindowSeconds == 1800 && SafetyLimits.dutyBudgetSeconds == 1200, "30 分钟 1200 秒")
 check(SafetyLimits.checkpointIntervalSeconds == 5, "每 5 秒保存时长下界")

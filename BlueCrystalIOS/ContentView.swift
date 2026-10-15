@@ -190,7 +190,7 @@ struct DeviceStatusCard: View {
 
     /// 正在输出时：本次还剩多少的细条（纯展示；文字说明在 safetySummary 里，旁白读那一行）
     @ViewBuilder private var runMeter: some View {
-        if let remaining = ble.safety.runRemaining, ble.safety.runAllowed > 0 {
+        if SafetyLimits.timeLimitsEnabled, let remaining = ble.safety.runRemaining, ble.safety.runAllowed > 0 {
             let total: Double = Double(ble.safety.runAllowed)
             let left: Double = Double(max(0, remaining))
             let frac: CGFloat = CGFloat(min(1.0, left / total))

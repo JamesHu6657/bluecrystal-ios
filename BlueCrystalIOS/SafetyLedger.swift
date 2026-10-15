@@ -43,14 +43,21 @@ enum SafetyClock {
 }
 
 /// 安全上限（结构沿用 legacy src/safety/limits.py；1.7.4 起按用户要求把单次上限调到 20 分钟，不可在 App 内配置）
+/// 2026-10-15 用户明确要求关闭时间上限（单次 20 分钟 + 30 分钟额度）：timeLimitsEnabled = false。
+/// 关闭后单次上限 / 额度都等于 unlimitedSeconds（实际不会到点），其余安全逻辑（STOP、停止确认、锁存、
+/// 心跳看门狗、断链 / 后台停机）不变。账本逻辑保留，测试把开关打开后照旧验证原有行为。
 enum SafetyLimits {
-    /// 单次连续输出上限：20 分钟（legacy 原值 300 秒）
-    static let maxRunSeconds: TimeInterval = 20 * 60
+    /// 时间上限开关（var 只为测试能打开它；App 内不可配置）
+    static var timeLimitsEnabled = false
+    /// "无上限"用的大有限值（一年）：转 Int / 做加减不会溢出
+    static let unlimitedSeconds: TimeInterval = 365 * 24 * 3600
+    /// 单次连续输出上限：20 分钟（legacy 原值 300 秒）；关闭时间上限时为 unlimitedSeconds
+    static var maxRunSeconds: TimeInterval { timeLimitsEnabled ? 20 * 60 : unlimitedSeconds }
     /// 一次运行至少要能跑 1 秒才允许开始（validate_duration 下限 1）
     static let minRunSeconds: TimeInterval = 1
     /// 滚动 30 分钟内最多输出 1200 秒（与单次上限相同，保证能跑满一次 20 分钟；legacy 原值 600 秒）
     static let dutyWindowSeconds: TimeInterval = 30 * 60
-    static let dutyBudgetSeconds: TimeInterval = 20 * 60
+    static var dutyBudgetSeconds: TimeInterval { timeLimitsEnabled ? 20 * 60 : unlimitedSeconds }
     static let checkpointIntervalSeconds: TimeInterval = 5
 }
 
@@ -124,6 +131,8 @@ final class DutyCycleLedger {
     /// 剩余额度，含进行中运行的整段预留（legacy remaining_budget_seconds）
     func remainingBudget() -> TimeInterval {
         prune()
+        // 时间上限关闭：额度永远是满的（也不受遗留运行的整窗记账影响）
+        guard SafetyLimits.timeLimitsEnabled else { return SafetyLimits.unlimitedSeconds }
         return max(0, SafetyLimits.dutyBudgetSeconds - usedSeconds())
     }
 
@@ -184,6 +193,7 @@ final class DutyCycleLedger {
 
     /// 额度不够时，还要等多久才有至少 minRunSeconds 的额度
     func secondsUntilBudget() -> TimeInterval {
+        guard SafetyLimits.timeLimitsEnabled else { return 0 }
         let now = clock()
         var used = usedSeconds()
         for e in completed.sorted(by: { $0.end < $1.end }) {
