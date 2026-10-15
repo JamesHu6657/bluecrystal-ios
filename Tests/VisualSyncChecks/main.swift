@@ -753,6 +753,29 @@ do {
 }
 
 do {
+    // 帧 → 静止补样 → 帧：补样和真实帧同一条显示时刻时间轴（host − 上一帧滞后）。
+    // 以前补样用 host，补样后第一帧被压到 lastOut + 31 ms，按间隔归一时能量 ×2
+    var ref = MotionAnalyzer()
+    _ = ref.analyze(vsBlock(20), time: 0)
+    let eRef = ref.analyze(vsBlock(24), time: vsDt)?.energy ?? -1
+    func hostAt(_ k: Int) -> Double { 10 + Double(k) / 15 }
+    func itemAt(_ k: Int) -> Double { 1 + Double(k) / 15 }
+    var an = MotionAnalyzer()
+    var clock = MotionDisplayClock()
+    let t0 = clock.time(host: hostAt(0), item: itemAt(0), shown: itemAt(0) - 0.05)
+    _ = an.analyze(vsBlock(20), time: t0)
+    let st = clock.stillTime(host: hostAt(4))
+    let still = an.still(at: st)
+    if still != nil { clock.noteStill(at: st) }
+    let t5 = clock.time(host: hostAt(5), item: itemAt(5), shown: itemAt(5) - 0.05)
+    let e5 = an.analyze(vsBlock(24), time: t5)?.energy ?? -1
+    vcheck(still != nil && st < hostAt(4) && t5 > st && t5 <= hostAt(5),
+           "内容时间戳：静止补样换到显示时刻时间轴，之后的帧仍晚于它（\(st) → \(t5)）")
+    vcheck(eRef > 0 && abs(e5 / eRef - 1) < 0.01,
+           "内容时间戳：帧 → 静止补样 → 帧，补样后第一帧能量不被间隔归一放大（\(e5) vs \(eRef)）")
+}
+
+do {
     // 来源交接
     var none = SourceHandover()
     var same = true
@@ -801,6 +824,17 @@ do {
     vcheck(r1 == [30, 30, 0, 0] && r2 == [50, 50, 0, 0] && r3 == [60, 60, 0, 0], "来源交接：画面→声音追赶时每拍 +20、到上限为止")
 }
 
+do {
+    // 同一个视频第二次切到画面：归一化早已热身（confidence = 1），新装的分析器还没出样本 → 仍用声音补
+    var h = SourceHandover()
+    h.begin(.motion)
+    let waiting = h.blend(motion: 0, confidence: 1, motionSignal: false, audio: 70, audioSignal: true, dt: 0.3)
+    vcheck(waiting.value == 70 && waiting.hasSignal,
+           "来源交接：再次切到画面、画面还没有新鲜样本时接着用声音（\(waiting.value)）")
+    let flowing = h.blend(motion: 40, confidence: 1, motionSignal: true, audio: 70, audioSignal: true, dt: 0.3)
+    vcheck(flowing.value == 40, "来源交接：画面有新鲜样本且已热身 → 只用画面（\(flowing.value)）")
+}
+
 // 轻柔声音：每段 4800 点 × 3（0.3 秒）的均匀噪声，振幅可按样本序号变
 func vsNoiseWindow(_ amp: (Int) -> Double) -> AudioWindow {
     var acc = AudioWindowAccumulator()
@@ -826,6 +860,48 @@ do {
     for _ in 0..<2_048 { silent.add(0) }
     silent.finish()
     vcheck(silent.blocks.count == 0, "块电平：静音块不进统计")
+}
+
+do {
+    // 跨 tap 回调接着分块（AudioLevelMeter 每个声道存一份 AudioBlockCarry）：1024 / 333 点的小段和一整段结果相同；
+    // 不延续（每段单独收尾，以前的做法）时回调边界上的起音漏掉、尾巴成了短块
+    func sample(_ i: Int) -> Double {
+        let amp = (i / 1_536) % 2 == 0 ? 0.02 : 0.3
+        return i % 2 == 0 ? amp : -amp
+    }
+    let total = 12_288
+    var whole = AudioChannelStats()
+    for i in 0..<total { whole.add(sample(i)) }
+    whole.finish()
+    var carry = AudioBlockCarry()
+    var carried = AudioBlockStats()
+    var fresh = AudioBlockStats()
+    var start = 0
+    var k = 0
+    while start < total {
+        let n = min(total - start, k % 2 == 0 ? 1_024 : 333)
+        var s = AudioChannelStats(carry: carry)
+        var f = AudioChannelStats()
+        for i in start..<(start + n) {
+            s.add(sample(i))
+            f.add(sample(i))
+        }
+        carry = s.carry
+        f.finish()
+        carried.merge(s.blocks)
+        fresh.merge(f.blocks)
+        start += n
+        k += 1
+    }
+    var tail = AudioChannelStats(carry: carry)
+    tail.finish()
+    carried.merge(tail.blocks)
+    let same = carried.count == whole.blocks.count && carried.onsets == whole.blocks.onsets
+        && abs(carried.dbSum - whole.blocks.dbSum) < 1e-9 && abs(carried.dbSumSquares - whole.blocks.dbSumSquares) < 1e-6
+    vcheck(same && whole.blocks.count == 24 && whole.blocks.onsets == 4,
+           "块电平：1024 / 333 点小段跨回调接着分块，和一整段结果相同（\(carried.count) / \(carried.onsets)）")
+    vcheck(fresh != whole.blocks,
+           "块电平：不延续时（每段单独收尾）结果不同（\(fresh.count) / \(fresh.onsets) vs \(whole.blocks.count) / \(whole.blocks.onsets)）")
 }
 
 do {

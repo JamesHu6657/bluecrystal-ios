@@ -1167,13 +1167,18 @@ check(!BackgroundResume.shouldRequestStop(wasBackground: true, linkWritable: fal
 
 // MARK: - 第二轮审查 M3：安全计时用睡眠期间也走的时钟；换时钟的旧快照保守恢复
 
-let uptimeNow = ProcessInfo.processInfo.systemUptime
 let continuousNow = SafetyClock.continuousSeconds()
-// CI 的 macOS 虚拟机上 systemUptime 与 CLOCK_MONOTONIC 起点可能不同（2026-10-16 runner 起 main 也挂），不再跨时钟比较；
-// 真机上 CLOCK_MONOTONIC 含睡眠时间，这里只钉住有限、非负和单调
-_ = uptimeNow
 check(continuousNow.isFinite && continuousNow >= 0, "连续时钟有限且非负")
 check(SafetyClock.continuousSeconds() >= continuousNow, "连续时钟单调")
+#if canImport(Darwin)
+// 跨时钟比较只在同一计时源上做（CI 虚拟机上也稳）：先读 CLOCK_UPTIME_RAW（mach_absolute_time，睡眠停走），
+// 再读 CLOCK_MONOTONIC_RAW（mach_continuous_time，睡眠也走），后者恒 ≥ 前者。
+// 不再拿 systemUptime 比 CLOCK_MONOTONIC：Darwin 的 CLOCK_MONOTONIC 是 gettimeofday − kern.boottime，
+// 跟着墙钟调整走，runner 虚拟机上可能比 systemUptime 慢 0.5 秒以上（2026-10-16 起 main 也挂）
+let uptimeRaw = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+let continuousRaw = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+check(uptimeRaw > 0 && continuousRaw >= uptimeRaw, "睡眠也走的时钟不慢于睡眠停走的时钟（同一计时源）")
+#endif
 fc.boot = "clock-a"
 fc.t = 500
 let clockRun = makeLedger()

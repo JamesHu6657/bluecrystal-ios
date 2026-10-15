@@ -683,6 +683,15 @@ struct AudioBlockStats: Equatable {
     }
 }
 
+/// 一个声道跨 tap 回调延续的分块状态：没满的块、上一块电平（起音要和上一块比）。
+/// 纯值、不分配内存：AudioLevelMeter 在实时线程上每个声道存一份，回调之间接着分块，
+/// 回调边界上的起音不再漏、回调尾巴也不再被当成单独的短块
+struct AudioBlockCarry: Equatable {
+    var sumSquares: Double = 0
+    var fill = 0
+    var lastDb: Double?
+}
+
 /// 一个声道一段样本的峰峰值和均方（非有限值跳过），顺带按 512 点分块记块电平（AudioBlockStats）
 struct AudioChannelStats {
     private(set) var minimum = Double.infinity
@@ -693,6 +702,20 @@ struct AudioChannelStats {
     private var blockSumSquares: Double = 0
     private var blockFill = 0
     private var lastBlockDb: Double?
+
+    init() {}
+
+    /// 接着上一段的分块状态往下分（峰峰值 / 均方只算这一段）
+    init(carry: AudioBlockCarry) {
+        blockSumSquares = carry.sumSquares.isFinite ? max(0, carry.sumSquares) : 0
+        blockFill = min(AudioBlockStats.blockSize - 1, max(0, carry.fill))
+        lastBlockDb = carry.lastDb
+    }
+
+    /// 这一段结束时没满的块和上一块电平：交给下一段的 init(carry:)（不要再调 finish）
+    var carry: AudioBlockCarry {
+        AudioBlockCarry(sumSquares: blockSumSquares, fill: blockFill, lastDb: lastBlockDb)
+    }
 
     @inline(__always)
     mutating func add(_ v: Double) {

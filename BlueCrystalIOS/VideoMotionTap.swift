@@ -277,11 +277,13 @@ final class VideoMotionTap {
         lastItemSeconds = itemSeconds
         guard output.hasNewPixelBuffer(forItemTime: itemTime) else {
             // 录屏 / 幻灯片这类 VFR 片源静止时没有新帧：播放头在走、超过 0.25 s 没出样本，就补一个零能量样本，
-            // 保住参考帧和「安静时不归零」。暂停时播放头不走，不会误补
+            // 保住参考帧和「安静时不归零」。暂停时播放头不走，不会误补。
+            // 补样时间和真实帧同一条显示时刻时间轴（host − 上一帧滞后），之后第一帧的间隔不会被压短
+            let stillTime = displayClock.stillTime(host: hostTime)
             if advancing, hostTime - lastSampleHost >= Self.stillFillInterval,
                hostTime - lastRealFrameHost <= Self.stillFillLimit,
-               let still = analyzer.still(at: hostTime) {
-                displayClock.noteStill(at: hostTime)
+               let still = analyzer.still(at: stillTime) {
+                displayClock.noteStill(at: stillTime)
                 lastSampleHost = hostTime
                 meter.add(still, generation: generation)
             }

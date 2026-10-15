@@ -121,7 +121,8 @@ struct MotionSample: Equatable {
     /// 切换之后的保持期（新镜头前两帧编码质量差，能量也用中位数）
     var isHeld: Bool
     /// 近场 / 遮挡分数 0~1（algo-opt-1）：手 / 物体贴近镜头、大面积遮挡、贴脸晃动的镜头。
-    /// 只用来让 MotionNormalizer 少放大、少学习（安全方向），不会让输出变大
+    /// 只用来让 MotionNormalizer 少放大、少学习：同一拍里只降不升；不学参考值会让之后的正常画面比不跳过时略高，
+    /// 但仍在 上限 / 升幅限速 / 夹紧 之内
     var nearField: Double = 0
 }
 
@@ -647,7 +648,7 @@ struct MotionNormalizer {
     static let highFallSeconds: TimeInterval = 25
     static let lowRiseSeconds: TimeInterval = 20
     static let lowFallSeconds: TimeInterval = 1.5
-    /// 近场 / 遮挡（algo-opt-1）：ratio 向「固定尺度的 60%」收拢 N 倍（只降不升）；N ≥ 0.5 的窗口不学参考值
+    /// 近场 / 遮挡（algo-opt-1）：ratio 向「固定尺度的 60%」收拢 N 倍（同一拍只降不升）；N ≥ 0.5 的窗口不学参考值
     static let nearFieldFixedShare: Double = 0.6
     static let nearFieldLearnLimit: Double = 0.5
 
@@ -722,15 +723,25 @@ struct MotionDisplayClock {
     static let minGap: Double = 0.031
 
     private(set) var rate: Double = 1
+    /// 上一个真实帧实际用的滞后（host − 输出时间，0~maxLag）：静止补样按它换到同一条时间轴
+    private(set) var lastLag: Double = 0
     private var lastHost: Double?
     private var lastItem: Double?
     private var lastOut: Double?
 
     mutating func reset() {
         rate = 1
+        lastLag = 0
         lastHost = nil
         lastItem = nil
         lastOut = nil
+    }
+
+    /// 静止补样的时间：和真实帧同一条「显示时刻」时间轴（host − 上一帧的滞后）。
+    /// 补样用 host、真实帧用显示时刻会让补样之后第一帧的间隔被压到 minGap，能量按间隔归一时最多 ×2
+    func stillTime(host: Double) -> Double {
+        guard host.isFinite else { return host }
+        return host - lastLag
     }
 
     /// host：拉帧时刻；item：这个时刻的播放头；shown：拿到的帧的显示时间（itemTimeForDisplay）
@@ -756,13 +767,15 @@ struct MotionDisplayClock {
         }
         if let last = lastOut { t = max(t, min(host, last + Self.minGap)) }
         lastOut = max(lastOut ?? t, t)
+        let used = host - t
+        lastLag = used.isFinite ? min(Self.maxLag, max(0, used)) : 0
         return t
     }
 
-    /// 没有新帧（still）的时刻：之后的帧时间要晚于它
-    mutating func noteStill(at host: Double) {
-        guard host.isFinite else { return }
-        lastOut = max(lastOut ?? host, host)
+    /// 发出了静止补样：time 用 stillTime(host:) 的值（同一条时间轴）。之后的帧时间要晚于它
+    mutating func noteStill(at time: Double) {
+        guard time.isFinite else { return }
+        lastOut = max(lastOut ?? time, time)
     }
 }
 
@@ -913,7 +926,7 @@ struct VisualSyncSettings: Equatable {
 }
 
 /// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
-/// - 声音 → 画面：画面归一化还在热身（confidence < 1）的那部分用声音的平滑值补上，并在 4 秒内线性淡出。
+/// - 声音 → 画面：画面归一化还在热身（confidence < 1）或画面还没有新鲜样本的那部分用声音的平滑值补上，并在 4 秒内线性淡出。
 ///   value = c·M + (1 − c)·淡出·A ≤ max(M, A)，不会比任一来源单独更强；之后和原来逐位相同；
 /// - 画面 → 声音：声音直出先经 SyncOutputStage（升幅 ≤ +20 / 拍、归零保持）从设备现在的输出追上，
 ///   追上或满 10 拍后回到原来的直出路径
@@ -952,7 +965,9 @@ struct SourceHandover {
         let next = e + step
         fadeElapsed = next >= Self.fadeSeconds ? nil : next
         let fade = max(0, 1 - e / Self.fadeSeconds)
-        let conf = c.isFinite ? min(1, max(0, c)) : 0
+        // 画面还没有新鲜样本（刚装上取帧 / 发热暂停）就当置信度 0、全用声音补：
+        // 同一个视频第二次切到画面时归一化早已热身完（confidence = 1），但新装的分析器还没出样本
+        let conf = motionSignal && c.isFinite ? min(1, max(0, c)) : 0
         let motionPart = motionSignal && m.isFinite ? conf * min(100, max(0, m)) : 0
         let audioPart = audioSignal && a.isFinite ? min(100, max(0, a)) : 0
         let v = motionPart + (1 - conf) * fade * audioPart
