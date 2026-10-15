@@ -171,6 +171,8 @@ struct FavoritesSection: View {
     private var undoSeconds: Double {
         UIAccessibility.isVoiceOverRunning ? 15 : 6
     }
+    /// 提示（footnote 那行字）显示的时长；提示会顶掉撤销条，跟着提示重计的撤销窗口要把这段时间让出去
+    private static let noticeSeconds: Double = 2.5
 
     private var listAnimation: Animation? {
         reduceMotion ? nil : .spring(response: 0.35, dampingFraction: 0.85)
@@ -443,12 +445,13 @@ struct FavoritesSection: View {
     }
 
     /// 撤销条整组收起的计时：删除和撤销各重新计一次，
-    /// 撤销一条后剩下的条目还有完整的可撤销时间（提示的显示不清空撤销栈）
-    private func armUndoDismissal() {
+    /// 撤销一条后剩下的条目还有完整的可撤销时间（提示的显示不清空撤销栈）。
+    /// delay：跟着提示重新计的窗口把提示顶掉撤销条的那几秒让出去——提示还盖着"撤销"键时窗口不该走
+    private func armUndoDismissal(after delay: Double = 0) {
         undoGen += 1
         let gen = undoGen
         let settle: Animation? = settleAnimation()
-        DispatchQueue.main.asyncAfter(deadline: .now() + undoSeconds) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay + undoSeconds) {
             guard gen == undoGen else { return }
             withAnimation(settle) { undoStack = [] }
         }
@@ -457,19 +460,20 @@ struct FavoritesSection: View {
     private func undoDelete(_ r: FavoriteStore.Removed) {
         let ok = store.restore(r)
         if ok {
-            // 放回成功才消费这条撤销；还有别的可撤销的：窗口重新计
+            // 放回成功才消费这条撤销；还有别的可撤销的：窗口重新计（提示会顶掉撤销条几秒，从提示收走后再算）
             undoStack.removeAll { $0 == r }
-            if !undoStack.isEmpty { armUndoDismissal() }
+            if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
             Haptics.select()
             flash("已放回「\(r.item.name)」")
         } else if store.isFull {
-            // 满了放不回去：撤销条留着（先整理出一格，再点撤销还能放回），窗口重新计
-            armUndoDismissal()
+            // 满了放不回去：撤销条留着（先整理出一格，再点撤销还能放回）。
+            // "整理出一格再点撤销"是个多步动作：提示这几秒盖着"撤销"键，窗口从提示收走后才开始，才走得完
+            armUndoDismissal(after: Self.noticeSeconds)
             flash("收藏已满 \(FavoriteSetting.maxCount) 组，先整理出一格，再点撤销")
         } else {
             // 同样的手感已经在收藏里：这条撤销没有意义了，别让用户再点进同一个失败
             undoStack.removeAll { $0 == r }
-            if !undoStack.isEmpty { armUndoDismissal() }
+            if !undoStack.isEmpty { armUndoDismissal(after: Self.noticeSeconds) }
             flash("同样的手感已经在收藏里了")
         }
     }
@@ -496,7 +500,7 @@ struct FavoritesSection: View {
             notice = text
         }
         UIAccessibility.post(notification: .announcement, argument: text)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.noticeSeconds) {
             guard gen == noticeGen else { return }
             withAnimation(settle) { notice = nil }
         }

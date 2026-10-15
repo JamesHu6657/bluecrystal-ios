@@ -477,12 +477,20 @@ struct VideoSyncView: View {
         ble.state == .disconnecting || ble.forceDisconnectOffered
     }
 
-    /// 选择器弹出前先停（选择器会盖住页面底部的停止键；选择器里另有一个停止键）
-    private func openPicker(_ kind: PickerKind) {
+    /// 选择器被拦下时的那句话：先处理什么、再选什么，一个出处
+    /// （旁白播的、钉在停止键上显示的、幕布上写的都是同一句）
+    private func pickerBlockedMessage(_ kind: PickerKind) -> String {
+        let what: String = kind == .video ? "视频" : "脚本"
+        return "先处理上方设备卡片的提示，再选\(what)"
+    }
+
+    /// 选择器弹出前先停（选择器会盖住页面底部的停止键；选择器里另有一个停止键）。
+    /// blockedReasonShown：这个入口自己把被拦的原因写在旁边了（幕布），不再往停止键上钉第二份
+    private func openPicker(_ kind: PickerKind, blockedReasonShown: Bool = false) {
         guard !pickerBlocked else {
             Haptics.warning()
-            UIAccessibility.post(notification: .announcement, argument: "先处理设备卡片上的提示，再选文件")
-            flashPickerNotice()
+            UIAccessibility.post(notification: .announcement, argument: pickerBlockedMessage(kind))
+            if !blockedReasonShown { flashPickerNotice(kind) }
             return
         }
         vm.stopBeforePicker()
@@ -490,12 +498,12 @@ struct VideoSyncView: View {
     }
 
     /// 被拦下的说明只显示一小会儿（3 秒）；减弱动态效果时只淡入淡出
-    private func flashPickerNotice() {
+    private func flashPickerNotice(_ kind: PickerKind) {
         pickerNoticeGen += 1
         let gen = pickerNoticeGen
         let settle: Animation? = reduceMotion ? nil : .easeInOut(duration: 0.2)
         withAnimation(settle) {
-            pickerNotice = "先处理上方设备卡片的提示，再选文件"
+            pickerNotice = pickerBlockedMessage(kind)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             guard gen == pickerNoticeGen else { return }
@@ -645,7 +653,8 @@ struct VideoSyncView: View {
             .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Velvet.stroke, lineWidth: 1))
             .shadow(color: Velvet.rose.opacity(vm.isPlaying ? 0.35 : 0.1), radius: 24)
         } else {
-            Button { openPicker(.video) } label: {
+            // 幕布自己把被拦的原因写在上面（blockedReasonShown）：点它被拦下时不再往停止键上钉同一句
+            Button { openPicker(.video, blockedReasonShown: true) } label: {
                 VStack(spacing: 10) {
                     Image(systemName: "play.circle")
                         .font(.system(size: 44, weight: .thin))
@@ -654,8 +663,8 @@ struct VideoSyncView: View {
                         .font(Velvet.display(.title3, .medium))
                         .foregroundColor(Velvet.text)
                     if pickerBlocked {
-                        // 设备需要先处理时选择器不弹：写明原因，不只是震一下
-                        Label("先处理上方设备卡片的提示，再选视频", systemImage: "exclamationmark.triangle.fill")
+                        // 设备需要先处理时选择器不弹：写明原因，不只是震一下（和钉在停止键上的那句同一出处）
+                        Label(pickerBlockedMessage(.video), systemImage: "exclamationmark.triangle.fill")
                             .font(.caption)
                             .foregroundColor(Velvet.warning)
                     } else {
@@ -707,6 +716,8 @@ struct VideoSyncView: View {
                         Text("\(formatTime(vm.currentSeconds)) / \(formatTime(vm.durationSeconds))")
                             .font(.caption.monospacedDigit())
                             .foregroundColor(Velvet.textSecondary)
+                            // 下面滑杆的旁白值读的就是这两个时间，这行字不再让旁白单独停一次
+                            .accessibilityHidden(true)
                     }
                 }
                 Spacer()
@@ -1284,6 +1295,8 @@ struct FullScreenVideoView: View {
                 .accessibilityLabel(vm.isPlaying ? "暂停" : "播放")
                 Text("\(Self.formatTime(vm.currentSeconds)) / \(Self.formatTime(vm.durationSeconds))")
                     .font(.caption.monospacedDigit())
+                    // 上面滑杆的旁白值读的就是这两个时间，这行字不再让旁白单独停一次
+                    .accessibilityHidden(true)
                 Spacer()
             }
             Text(vm.statusLine)
