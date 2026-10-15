@@ -645,6 +645,9 @@ struct SystemPlayerView: UIViewControllerRepresentable {
     var isCovered: () -> Bool = { false }
     /// 设备需要用户处理：在系统全屏里就退出来，让设备卡片露出来
     var attentionNeeded = false
+    /// 全屏盖着时 SwiftUI 不一定再调 updateUIViewController：协调器直接订阅设备状态变化，现查是否需要处理
+    var attentionChanged: AnyPublisher<Void, Never> = Empty().eraseToAnyPublisher()
+    var attentionCheck: () -> Bool = { false }
     /// 系统全屏进出（全屏弹出时 SwiftUI 页面可能收到 onDisappear，不能因此停机）
     var onFullScreenChange: (Bool) -> Void = { _ in }
 
@@ -663,6 +666,8 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         context.coordinator.player = player
         context.coordinator.hidesVideo = hidesVideo
         context.coordinator.isCovered = isCovered
+        context.coordinator.attentionCheck = attentionCheck
+        context.coordinator.watchAttention(attentionChanged)
         context.coordinator.applyPlayer()
         return vc
     }
@@ -674,6 +679,7 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         context.coordinator.player = player
         context.coordinator.hidesVideo = hidesVideo
         context.coordinator.isCovered = isCovered
+        context.coordinator.attentionCheck = attentionCheck
         context.coordinator.applyPlayer()
         context.coordinator.exitFullScreenIfNeeded(attentionNeeded)
     }
@@ -691,6 +697,20 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         weak var fullScreenVC: UIViewController?
         /// 页面最近一次给的「设备需要处理」
         var attentionNeeded = false
+        var attentionCheck: () -> Bool = { false }
+        private var attentionSub: AnyCancellable?
+
+        /// 设备状态一变就现查（下一轮主队列，等 @Published 的新值落地）：在全屏里需要处理就退出
+        func watchAttention(_ changed: AnyPublisher<Void, Never>) {
+            attentionSub = changed
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    DispatchQueue.main.async {
+                        guard let self = self, self.fullScreenVC != nil else { return }
+                        self.exitFullScreenIfNeeded(self.attentionCheck())
+                    }
+                }
+        }
 
         init(onFullScreenChange: @escaping (Bool) -> Void) {
             self.onFullScreenChange = onFullScreenChange
@@ -742,7 +762,7 @@ struct SystemPlayerView: UIViewControllerRepresentable {
         func retryExitSoon() {
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                self.exitFullScreenIfNeeded(self.attentionNeeded)
+                self.exitFullScreenIfNeeded(self.attentionNeeded || self.attentionCheck())
             }
         }
 
@@ -1004,7 +1024,12 @@ struct VideoSyncView: View {
             let manager: BLEManager = ble
             SystemPlayerView(player: p, hidesVideo: hidesVideo,
                              isCovered: { lock.isCovering(manager) },
-                             attentionNeeded: ble.needsAttentionCard || pickerBlocked) { systemFullScreen = $0 }
+                             attentionNeeded: ble.needsAttentionCard || pickerBlocked,
+                             attentionChanged: manager.objectWillChange.map { _ in () }.eraseToAnyPublisher(),
+                             attentionCheck: {
+                                 manager.needsAttentionCard || manager.safety.needsPhysicalAck ||
+                                 manager.safety.stopRetrying || manager.forceDisconnectOffered
+                             }) { systemFullScreen = $0 }
                 .frame(height: 240)
                 .frame(maxWidth: .infinity)
                 .background(Color.black)

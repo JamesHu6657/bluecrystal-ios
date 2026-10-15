@@ -355,7 +355,7 @@ do {
     var manual = AudioReactiveShaper()
     var m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3)
     for _ in 0..<120 { m = manual.step(sineWindow(-35), settings: AudioSyncSettings(maxPercent: 100), dt: 0.3) }
-    r4check(q.percent >= 70 && q.percent > m.percent, "自动灵敏度：小声视频的响段也能到 70% 以上（手动只有 \(m.percent)）")
+    r4check(q.percent > m.percent && q.percent <= 60, "自动灵敏度：小声视频会被适度放大但不顶到很强（自动 \(q.percent)，手动 \(m.percent)）")
     var loudVideo = AudioReactiveShaper()
     var l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3)
     for _ in 0..<60 { l = loudVideo.step(sineWindow(-1), settings: auto, dt: 0.3) }
