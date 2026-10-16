@@ -22,6 +22,8 @@ final class VideoSyncPlayer: ObservableObject {
     @Published private(set) var level: Double = 0
     /// 画面条：归一化之后、噪声门之前的运动量（0~100），纯展示
     @Published private(set) var motionLevel: Double = 0
+    /// 画面条下的提示：姿态辅助在起作用（algo-opt-3，姿态融合权重 ≥ 0.2），纯展示
+    @Published private(set) var motionPoseAssist = false
     /// 实际输出的强度（0 ~ 强度上限）
     @Published private(set) var intensity: Int = 0
     @Published private(set) var audioStatus: AudioLevelTap.Status = .none
@@ -479,6 +481,8 @@ final class VideoSyncPlayer: ObservableObject {
         motionMeter = nil
         motionStatus = .none
         motionLevel = 0
+        motionPoseAssist = false
+        motionNormalizer.reset()
         motionShaper.reset()
         motionFlow.reset()
     }
@@ -487,6 +491,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// 平滑 / 升幅基准从 0 起，旧样本不算新鲜
     private func resetMotionSide() {
         motionMeter?.reset()
+        // 姿态融合从头确认（seek / 跳转后可能已经不是同一个人）；运动范围和热身保留
+        motionNormalizer.reset()
         motionShaper.reset()
         motionFlow.reset()
         outputStage.reset()
@@ -639,6 +645,7 @@ final class VideoSyncPlayer: ObservableObject {
         lastActive = .zero
         level = 0
         motionLevel = 0
+        motionPoseAssist = false
         intensity = 0
         shaper.reset()
         motionShaper.reset()
@@ -779,6 +786,8 @@ final class VideoSyncPlayer: ObservableObject {
                                            auto: visualSettings.autoMotion, dt: dt)
         let shaped = motionShaper.step(target: target, dt: dt)
         motionLevel = shaped.level
+        let poseAssist = motionNormalizer.poseWeight >= 0.2
+        if poseAssist != motionPoseAssist { motionPoseAssist = poseAssist }
         let motionSignal = motionFlow.allowsFloor(analyzerRunning: motionStatus.isAnalyzing,
                                                   playerPlaying: p.timeControlStatus == .playing, now: now)
         // 没有交接时就是 hasSignal ? confidence × smoothed : 0（和以前逐位相同）；
@@ -1367,6 +1376,11 @@ struct VideoSyncView: View {
             if followsMotion {
                 MeterBar(title: "画面", fraction: vm.motionLevel / 100, color: Velvet.gold,
                          valueText: "\(Int(vm.motionLevel.rounded()))")
+                if vm.motionPoseAssist {
+                    Text("已识别人体姿态，按动作幅度和节奏跟随")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
             } else {
                 MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
                          valueText: "\(Int(vm.level.rounded()))")

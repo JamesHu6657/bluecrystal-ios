@@ -2,6 +2,8 @@ import Foundation
 import AVFoundation
 import CoreVideo
 import QuartzCore
+import ImageIO
+import Vision
 import os
 
 /// 一个视频的画面运动计：motion 队列上的分析结果写进来，主线程每 0.3 秒取走一次（照 AudioLevelMeter）。
@@ -48,11 +50,162 @@ final class VideoMotionMeter {
         if g == generation { accumulator.add(sample) }
         os_unfair_lock_unlock(lock)
     }
+
+    /// 姿态队列上的一次姿态读数（algo-opt-3）。跨 reset 的照样作废
+    fileprivate func addPose(_ reading: PoseReading, generation g: Int) {
+        os_unfair_lock_lock(lock)
+        if g == generation { accumulator.addPose(reading) }
+        os_unfair_lock_unlock(lock)
+    }
+}
+
+/// 视频轨方向 → Vision 的图像方向（algo-opt-3）
+private extension PoseOrientation {
+    var imageOrientation: CGImagePropertyOrientation {
+        switch self {
+        case .up: return .up
+        case .down: return .down
+        case .left: return .left
+        case .right: return .right
+        }
+    }
+}
+
+/// 姿态辅助（algo-opt-3）：独立 .utility 串行队列上约 9 Hz 跑 Vision 人体姿态（VNDetectHumanBodyPoseRequest，
+/// 缩放由 Vision 自己做），关键点换回分析帧像素坐标，扣掉相机运动后算速度 / 节奏，写进电平计。
+/// 上一次还没跑完就跳过这一拍（不排队、不阻塞画面分析）；发热 .serious 起不提交；Vision 连续出错 3 次就停用。
+/// 只读像素缓冲，不碰 BLE、不判断该不该输出
+private final class PoseWorker {
+    /// 提交间隔：15 Hz 拉帧时大约每 5 帧提交 3 帧
+    static let interval: Double = 1.0 / 9
+    static let maxFailures = 3
+    /// 慢设备节流（复审 L2）：一次 Vision 跑完后至少空闲「这次耗时 × 0.5」再提交下一次（最多空 1 秒），
+    /// 单次超过 1/9 秒时姿态队列最多约 2/3 的时间在跑，不会一直满负荷。
+    /// 不取 × 1：单次 0.2 秒时间隔就到 0.4 秒以上，超过 PoseMotionTracker.maxGap，姿态就一直连不上
+    static let idleShare: Double = 0.5
+    static let maxIdle: Double = 1
+
+    private let queue = DispatchQueue(label: "com.bluecrystal.motion.pose", qos: .utility)
+    /// inFlight / thermalOK / orientation / failures / idleUntil 跨队列读写，锁保护
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var inFlight = false
+    /// host 时间（CACurrentMediaTime）：上一次跑完 + 空闲时间，之前不提交
+    private var idleUntil: CFTimeInterval = 0
+    private var thermalOK = true
+    private var failures = 0
+    private var orientation = PoseOrientation.up
+    // 下面只在 queue 上用
+    private let request = VNDetectHumanBodyPoseRequest()
+    private var tracker = PoseMotionTracker()
+    private var trackedGeneration = -1
+    private var candidates: [PoseCandidate] = []
+
+    private static let joints: [(PoseJoint, VNHumanBodyPoseObservation.JointName)] = [
+        (.nose, .nose), (.neck, .neck), (.leftShoulder, .leftShoulder), (.rightShoulder, .rightShoulder),
+        (.root, .root), (.leftHip, .leftHip), (.rightHip, .rightHip), (.leftKnee, .leftKnee),
+        (.rightKnee, .rightKnee), (.leftWrist, .leftWrist), (.rightWrist, .rightWrist)]
+
+    init() {
+        lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lock.initialize(to: os_unfair_lock())
+        candidates.reserveCapacity(4)
+    }
+
+    deinit {
+        lock.deinitialize(count: 1)
+        lock.deallocate()
+    }
+
+    /// 任意线程：视频轨的 preferredTransform 读到以后（竖拍视频的缓冲是横的，要摆正了 Vision 才认得出人）
+    func setOrientation(_ o: PoseOrientation) {
+        os_unfair_lock_lock(lock)
+        orientation = o
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 主线程：只在 .nominal / .fair 跑姿态（画面分析本身在 .serious 降频、.critical 暂停）
+    func setThermalOK(_ ok: Bool) {
+        os_unfair_lock_lock(lock)
+        thermalOK = ok
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// workQueue：能提交就提交（返回 true），上一次还在跑 / 还在空闲期 / 发热 / 已停用就返回 false。
+    /// camera：上一次提交的那帧到这一帧的相机运动（分析帧像素）；continuous == false：中间断过
+    func submit(_ buffer: CVPixelBuffer, time: Double, camera: CameraTransform, continuous: Bool,
+                frameWidth: Int, frameHeight: Int, generation: Int, meter: VideoMotionMeter) -> Bool {
+        guard frameWidth > 0, frameHeight > 0, time.isFinite else { return false }
+        let now = CACurrentMediaTime()
+        os_unfair_lock_lock(lock)
+        let go = !inFlight && now >= idleUntil && thermalOK && failures < Self.maxFailures
+        if go { inFlight = true }
+        let o = orientation
+        os_unfair_lock_unlock(lock)
+        guard go else { return false }
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let start = CACurrentMediaTime()
+            self.run(buffer, time: time, camera: camera, continuous: continuous, orientation: o,
+                     frameWidth: frameWidth, frameHeight: frameHeight, generation: generation, meter: meter)
+            let end = CACurrentMediaTime()
+            let took = end - start
+            let idle = took.isFinite ? min(Self.maxIdle, max(0, took * Self.idleShare)) : 0
+            os_unfair_lock_lock(self.lock)
+            self.inFlight = false
+            self.idleUntil = end + idle
+            os_unfair_lock_unlock(self.lock)
+        }
+        return true
+    }
+
+    /// queue：Vision → 分析帧像素坐标的候选人 → PoseMotionTracker → 电平计
+    private func run(_ buffer: CVPixelBuffer, time: Double, camera: CameraTransform, continuous: Bool,
+                     orientation o: PoseOrientation, frameWidth: Int, frameHeight: Int, generation: Int,
+                     meter: VideoMotionMeter) {
+        if generation != trackedGeneration {
+            tracker.reset()
+            trackedGeneration = generation
+        }
+        let w = Double(frameWidth)
+        let h = Double(frameHeight)
+        let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: o.imageOrientation, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            os_unfair_lock_lock(lock)
+            failures += 1
+            os_unfair_lock_unlock(lock)
+            // 这一帧当作没人：下一次不和更早的帧算速度
+            let reading = tracker.update(time: time, candidates: [], camera: .identity, continuous: false,
+                                         frameHeight: h)
+            meter.addPose(reading, generation: generation)
+            return
+        }
+        os_unfair_lock_lock(lock)
+        failures = 0
+        os_unfair_lock_unlock(lock)
+        candidates.removeAll(keepingCapacity: true)
+        for observation in request.results ?? [] {
+            guard let points = try? observation.recognizedPoints(.all) else { continue }
+            var person = PoseCandidate()
+            person.confidence = Double(observation.confidence)
+            for (joint, name) in Self.joints {
+                guard let p = points[name], p.confidence > 0 else { continue }
+                let b = o.bufferPoint(visionX: Double(p.location.x), visionY: Double(p.location.y))
+                person.set(joint, x: b.x * w, y: b.y * h, confidence: Double(p.confidence))
+            }
+            candidates.append(person)
+        }
+        let reading = tracker.update(time: time, candidates: candidates, camera: camera, continuous: continuous,
+                                     frameHeight: h)
+        meter.addPose(reading, generation: generation)
+    }
 }
 
 /// 给 AVPlayerItem 挂一个 AVPlayerItemVideoOutput（420f，只读 Y 平面），独立串行队列上 15 Hz 拉帧分析。
 /// 只在跟随画面时安装（声音模式零开销）。上一帧还没算完就丢掉这一拍，永远不阻塞主线程；
-/// 发热 .serious 降到 8 Hz，.critical 暂停分析。这里不碰 BLE、不判断该不该输出：那全由 VideoSyncPlayer 决定
+/// 发热 .serious 降到 8 Hz，.critical 暂停分析。这里不碰 BLE、不判断该不该输出：那全由 VideoSyncPlayer 决定。
+/// algo-opt-3：另有姿态辅助（PoseWorker），把拉到的帧约 9 Hz 交给 Vision 认人体关键点，块运动给的相机运动一并带过去
 final class VideoMotionTap {
     enum Status: Equatable {
         case none
@@ -116,6 +269,12 @@ final class VideoMotionTap {
     private var lastItemSeconds: Double = .nan
     private var lastSampleHost: CFTimeInterval = 0
     private var lastRealFrameHost: CFTimeInterval = 0
+    /// 姿态辅助（algo-opt-3）。poseCamera / poseContinuous / poseNext 只在 workQueue 上用：
+    /// 上一次提交姿态的那帧到现在的相机运动（逐帧合成），中间断过（参考帧 / 切镜 / reset）就记为不连续
+    private let pose = PoseWorker()
+    private var poseCamera = CameraTransform.identity
+    private var poseContinuous = false
+    private var poseNext: Double = -.infinity
 
     private init(item: AVPlayerItem, meter: VideoMotionMeter, completion: @escaping (Status) -> Void) {
         self.item = item
@@ -189,6 +348,14 @@ final class VideoMotionTap {
         asset.loadTracks(withMediaType: .video) { [weak self] tracks, error in
             let hasTrack = !(tracks ?? []).isEmpty
             let reason = error?.localizedDescription
+            // 姿态辅助要知道视频轨方向（竖拍视频的缓冲是横的）；读不到就按 .up
+            if let track = tracks?.first {
+                Task { [weak self] in
+                    guard let t = try? await track.load(.preferredTransform) else { return }
+                    self?.pose.setOrientation(PoseOrientation.from(a: Double(t.a), b: Double(t.b),
+                                                                   c: Double(t.c), d: Double(t.d)))
+                }
+            }
             DispatchQueue.main.async { [weak self] in
                 self?.attach(hasTrack: hasTrack, error: reason)
             }
@@ -235,6 +402,7 @@ final class VideoMotionTap {
         os_unfair_lock_lock(flagLock)
         paused = rate <= 0
         os_unfair_lock_unlock(flagLock)
+        pose.setThermalOK(state == .nominal || state == .fair)
         let tickRate = rate > 0 ? rate : 1
         if tickRate != timerRate {
             timerRate = tickRate
@@ -269,6 +437,9 @@ final class VideoMotionTap {
             analyzer.reset()
             displayClock.reset()
             analyzedGeneration = generation
+            poseCamera = .identity
+            poseContinuous = false
+            poseNext = -.infinity
         }
         let itemTime = output.itemTime(forHostTime: hostTime)
         guard itemTime.isValid else { return }
@@ -315,8 +486,28 @@ final class VideoMotionTap {
         os_signpost(.begin, log: Self.signpostLog, name: "MotionAnalyze")
         let analyzed = analyzer.analyze(frame, time: frameTime)
         os_signpost(.end, log: Self.signpostLog, name: "MotionAnalyze")
+        notePose(buffer, time: frameTime, generation: generation)
         guard let sample = analyzed else { return }
         lastSampleHost = hostTime
         meter.add(sample, generation: generation)
+    }
+
+    /// workQueue：把这一帧的相机运动合进「上次提交姿态以来」那一段，到点就把这一帧交给姿态辅助（algo-opt-3）
+    private func notePose(_ buffer: CVPixelBuffer, time: Double, generation: Int) {
+        if analyzer.cameraContinuous {
+            poseCamera = poseCamera.then(analyzer.lastCamera)
+        } else {
+            poseCamera = .identity
+            poseContinuous = false
+        }
+        if time < poseNext - 1 { poseNext = -.infinity }
+        guard time.isFinite, time >= poseNext - 0.005 else { return }
+        guard pose.submit(buffer, time: time, camera: poseCamera, continuous: poseContinuous,
+                          frameWidth: frame.width, frameHeight: frame.height, generation: generation,
+                          meter: meter) else { return }
+        poseCamera = .identity
+        poseContinuous = true
+        poseNext = poseNext.isFinite ? max(poseNext + PoseWorker.interval, time + PoseWorker.interval * 0.5)
+                                     : time + PoseWorker.interval
     }
 }
