@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import CoreMedia
 import MediaToolbox
 import os
 
@@ -19,11 +20,29 @@ final class AudioLevelMeter {
     private let carries: UnsafeMutablePointer<AudioBlockCarry>
     private var carryResetPending = false
 
+    /// rhythm-context P3（撞击声相位校正，默认关）：三频带 10 毫秒能量块。关着时实时线程一个样本都不多看。
+    /// bands 环形缓冲（锁里读写）由实时线程写、主线程 drainBands 取走；splitter / pendingBands 只在实时线程上用，
+    /// 别的线程要清它们只在锁里置 splitterResetPending。全部 init 时一次分配好，回调里不分配
+    static let bandCapacity = 1024
+    static let pendingCapacity = 128
+    private let bands: UnsafeMutablePointer<AudioBandFrame>
+    private var bandHead = 0
+    private var bandCount = 0
+    private var bandsEnabled = false
+    private var bandSampleRate: Double = 0
+    private var splitterResetPending = true
+    private var splitter = AudioBandSplitter()
+    private let pendingBands: UnsafeMutablePointer<AudioBandFrame>
+
     init() {
         lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
         lock.initialize(to: os_unfair_lock())
         carries = UnsafeMutablePointer<AudioBlockCarry>.allocate(capacity: Self.maxCarryChannels)
         carries.initialize(repeating: AudioBlockCarry(), count: Self.maxCarryChannels)
+        bands = UnsafeMutablePointer<AudioBandFrame>.allocate(capacity: Self.bandCapacity)
+        bands.initialize(repeating: AudioBandFrame(), count: Self.bandCapacity)
+        pendingBands = UnsafeMutablePointer<AudioBandFrame>.allocate(capacity: Self.pendingCapacity)
+        pendingBands.initialize(repeating: AudioBandFrame(), count: Self.pendingCapacity)
     }
 
     deinit {
@@ -31,6 +50,35 @@ final class AudioLevelMeter {
         lock.deallocate()
         carries.deinitialize(count: Self.maxCarryChannels)
         carries.deallocate()
+        bands.deinitialize(count: Self.bandCapacity)
+        bands.deallocate()
+        pendingBands.deinitialize(count: Self.pendingCapacity)
+        pendingBands.deallocate()
+    }
+
+    /// 主线程（rhythm-context P3）：「撞击声相位校正」开着时才分频带。关掉时丢掉没取走的块
+    func setBandsEnabled(_ on: Bool) {
+        os_unfair_lock_lock(lock)
+        if bandsEnabled != on {
+            bandsEnabled = on
+            bandHead = 0
+            bandCount = 0
+            splitterResetPending = true
+        }
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 主线程：取走上次以来的频带能量块（时间 = 视频时间，秒），按时间先后
+    func drainBands() -> [AudioBandFrame] {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        guard bandCount > 0 else { return [] }
+        var out: [AudioBandFrame] = []
+        out.reserveCapacity(bandCount)
+        let start = (bandHead + Self.bandCapacity - bandCount) % Self.bandCapacity
+        for k in 0..<bandCount { out.append(bands[(start + k) % Self.bandCapacity]) }
+        bandCount = 0
+        return out
     }
 
     /// 取走上次以来的窗口并清零（主线程）
@@ -46,6 +94,9 @@ final class AudioLevelMeter {
         accumulator = AudioWindowAccumulator()
         // 跳转前没满的块 / 上一块电平不带到新位置
         carryResetPending = true
+        bandHead = 0
+        bandCount = 0
+        splitterResetPending = true
         os_unfair_lock_unlock(lock)
     }
 
@@ -56,6 +107,10 @@ final class AudioLevelMeter {
         format = f
         accumulator = AudioWindowAccumulator()
         carryResetPending = true
+        bandSampleRate = Double(asbd.mSampleRate)
+        bandHead = 0
+        bandCount = 0
+        splitterResetPending = true
         os_unfair_lock_unlock(lock)
     }
 
@@ -66,16 +121,23 @@ final class AudioLevelMeter {
     }
 
     /// 实时线程：交错 / 非交错都按每个 AudioBuffer 自己的声道数走；多声道取最响的那个
-    fileprivate func process(_ list: UnsafeMutablePointer<AudioBufferList>, frames: Int) {
+    /// start：这段第一个样本的视频时间（秒；拿不到是 NaN，此时不出频带块）
+    fileprivate func process(_ list: UnsafeMutablePointer<AudioBufferList>, frames: Int, start: Double = .nan) {
         os_unfair_lock_lock(lock)
         let current = format
         let resetCarries = carryResetPending
         carryResetPending = false
+        let bandsOn = bandsEnabled
+        let resetSplitter = splitterResetPending
+        splitterResetPending = false
+        let rate = bandSampleRate
         os_unfair_lock_unlock(lock)
         if resetCarries {
             for i in 0..<Self.maxCarryChannels { carries[i] = AudioBlockCarry() }
         }
+        if resetSplitter { splitter.configure(sampleRate: rate) }
         guard let f = current, frames > 0 else { return }
+        if bandsOn { splitBands(list, frames: frames, format: f, start: start) }
         var chunkPeakToPeak = 0.0
         var chunkMeanSquare = 0.0
         var chunkFrames = 0
@@ -104,6 +166,56 @@ final class AudioLevelMeter {
         guard chunkFrames > 0 else { return }
         os_unfair_lock_lock(lock)
         accumulator.add(peakToPeak: chunkPeakToPeak, meanSquare: chunkMeanSquare, frames: chunkFrames, blocks: chunkBlocks)
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 实时线程（rhythm-context P3）：第一个 AudioBuffer 的第 0 声道 → 三频带 10 毫秒块 → 环形缓冲
+    private func splitBands(_ list: UnsafeMutablePointer<AudioBufferList>, frames: Int, format f: AudioSampleFormat,
+                            start: Double) {
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+        guard buffers.count > 0 else { return }
+        let buffer = buffers[0]
+        let channels = max(1, Int(buffer.mNumberChannels))
+        guard let data = buffer.mData else { return }
+        let n = min(frames, Int(buffer.mDataByteSize) / (f.bytesPerSample * channels))
+        guard n > 0 else { return }
+        var local = splitter
+        let sr = local.sampleRate
+        guard sr > 0 else { return }
+        local.begin(start: start, frames: n)
+        let scale = f.scale
+        var pending = 0
+        for i in 0..<n {
+            let x: Double
+            switch f {
+            case .float32: x = Double(data.assumingMemoryBound(to: Float32.self)[i * channels])
+            case .float64: x = data.assumingMemoryBound(to: Float64.self)[i * channels]
+            case .int16: x = Double(data.assumingMemoryBound(to: Int16.self)[i * channels]) * scale
+            case .int32: x = Double(data.assumingMemoryBound(to: Int32.self)[i * channels]) * scale
+            }
+            if let block = local.add(x, at: start + Double(i) / sr) {
+                pendingBands[pending] = block
+                pending += 1
+                if pending == Self.pendingCapacity {
+                    pushBands(pending)
+                    pending = 0
+                }
+            }
+        }
+        splitter = local
+        if pending > 0 { pushBands(pending) }
+    }
+
+    /// 实时线程：pendingBands 前 count 个写进环形缓冲（满了丢最旧的）
+    private func pushBands(_ count: Int) {
+        os_unfair_lock_lock(lock)
+        if bandsEnabled {
+            for k in 0..<count {
+                bands[bandHead] = pendingBands[k]
+                bandHead = (bandHead + 1) % Self.bandCapacity
+                bandCount = min(Self.bandCapacity, bandCount + 1)
+            }
+        }
         os_unfair_lock_unlock(lock)
     }
 
@@ -194,14 +306,17 @@ enum AudioLevelTap {
                     .takeUnretainedValue().unprepare()
             },
             process: { tap, numberFrames, _, bufferListInOut, numberFramesOut, flagsOut in
+                // rhythm-context P3：顺便要这段声音的视频时间范围（撞击声对时间用；拿不到就是 NaN，不出频带块）
+                var range = CMTimeRange.invalid
                 let status = MTAudioProcessingTapGetSourceAudio(tap, numberFrames, bufferListInOut,
-                                                                flagsOut, nil, numberFramesOut)
+                                                                flagsOut, &range, numberFramesOut)
                 guard status == noErr else {
                     numberFramesOut.pointee = 0
                     return
                 }
+                let start = range.start.isValid && range.start.isNumeric ? CMTimeGetSeconds(range.start) : Double.nan
                 Unmanaged<AudioLevelMeter>.fromOpaque(MTAudioProcessingTapGetStorage(tap))
-                    .takeUnretainedValue().process(bufferListInOut, frames: Int(numberFramesOut.pointee))
+                    .takeUnretainedValue().process(bufferListInOut, frames: Int(numberFramesOut.pointee), start: start)
             })
         // Xcode 16 SDK 里输出参数是 Unmanaged（+1 引用）：成功后 takeRetainedValue 交给 ARC
         var tap: Unmanaged<MTAudioProcessingTap>?

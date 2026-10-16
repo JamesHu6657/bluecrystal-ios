@@ -32,6 +32,9 @@ final class VideoSyncPlayer: ObservableObject {
     @Published private(set) var rhythmStatus: String?
     /// rhythm-phase P2：相位脉动的状态（没打开时 nil）
     @Published private(set) var pulseStatus: String?
+    /// rhythm-context P3：动作识别 / 撞击声相位校正的状态行（开着时才有）
+    @Published private(set) var contextStatus: String?
+    @Published private(set) var anchorStatus: String?
     @Published private var scrubber = PlaybackScrubber()
 
     var displaySeconds: Double { scrubber.position ?? currentSeconds }
@@ -93,6 +96,11 @@ final class VideoSyncPlayer: ObservableObject {
     /// 子拍只在 tick() 里、只经 outputStage（上限 / 升幅按时间折算 ≤ +20 / 0.3 秒 / 归零保持）→ sendTick，不新增发送路径
     private var phaseLock = RhythmPhaseLock()
     private var pulse = RhythmPulseDriver()
+    /// rhythm-context P3（默认关）：动作识别只改交给频率跟随器 / 相位锁的那份窗口副本（强度那条路不看）；
+    /// 撞击声相位校正只给脉动的相位加一个有界偏移（RhythmPulseDriver.phaseOffset）。都不新增发送路径
+    private var actionContext = ActionContext()
+    private var onsetDetector = AudioOnsetDetector()
+    private var audioAnchor = AudioPhaseAnchor()
     /// Timer 间隔：平时 0.3 秒（和以前逐位相同）；相位脉动打开时 0.1 秒，每 3 次里 1 次走完整拍
     private var tickInterval: TimeInterval = AudioReactiveShaper.interval
     /// 播放中切换来源的交接（algo-opt-1）：声音→画面 4 秒内用声音补画面热身的空档（只淡出），
@@ -146,7 +154,13 @@ final class VideoSyncPlayer: ObservableObject {
         let previous = visualSettings.source
         let previousRhythm = visualSettings.rhythmFollow
         let previousPulse = visualSettings.rhythmPulse
+        let previousContext = visualSettings.usesRhythmContext
+        let previousAnchor = visualSettings.usesAudioAnchor
         visualSettings = v
+        // P3：动作识别 / 撞击声校正开关一变就从头确认（关掉 = 回到 P2 行为）
+        if v.usesRhythmContext != previousContext { resetContext() }
+        if v.usesAudioAnchor != previousAnchor { resetAnchor() }
+        applyRhythmFlags()
         // 打开 / 关掉频率跟随：从头确认节奏（打开后 weight 1 秒内交接，关掉时伸缩回到按动作强度，降不限速）
         if v.rhythmFollow != previousRhythm { resetRhythm() }
         // P2：打开 / 关掉相位脉动从头锁相位；Timer 间隔跟着换（只重建 Timer，不动其余状态）
@@ -404,6 +418,7 @@ final class VideoSyncPlayer: ObservableObject {
         let gen = meterGen
         let m = AudioLevelMeter()
         meter = m
+        m.setBandsEnabled(visualSettings.usesAudioAnchor)
         AudioLevelTap.install(on: item, asset: asset, meter: m) { [weak self, weak item] status in
             guard let self = self, let item = item,
                   item === self.player?.currentItem, gen == self.meterGen else { return }
@@ -491,7 +506,15 @@ final class VideoSyncPlayer: ObservableObject {
             }
         }
         // 正在联动时切到画面：立刻开始拉帧
+        applyRhythmFlags()
         motionTap?.setActive(timer != nil)
+    }
+
+    /// rhythm-context P3：分析那边的两个开关（相位拟合只在相位脉动用得上时算；动作识别开着才跑手 / 脸 / 周期区域），
+    /// 撞击声频带只在校正开着时分
+    private func applyRhythmFlags() {
+        motionTap?.setRhythmFlags(phaseFit: visualSettings.usesPulseTiming, context: visualSettings.usesRhythmContext)
+        meter?.setBandsEnabled(visualSettings.usesAudioAnchor)
     }
 
     /// 拆掉取帧（停定时器、item.remove(output)），智晚到的回调按代次作废
@@ -809,7 +832,8 @@ final class VideoSyncPlayer: ObservableObject {
         var vals = settings.channels.levels(percent: out.percent)
         if handover.isCatchingUp {
             // 画面→声音：先按出口的升幅限速 / 归零保持从设备现在的输出追上声音直出，追上（或 10 拍）后回到原路径
-            let limited = outputStage.step(shaper.smoothed, settings: settings, hasSignal: floorAllowed)
+            let limited = outputStage.step(shaper.smoothed, settings: settings, hasSignal: floorAllowed,
+                                           now: CACurrentMediaTime())
             handover.noteCatchUp(limited: limited, direct: vals)
             vals = limited
             intensity = vals.max() ?? 0
@@ -829,7 +853,23 @@ final class VideoSyncPlayer: ObservableObject {
     private func resetRhythm() {
         rhythm.reset()
         if rhythmStatus != nil { rhythmStatus = nil }
+        resetContext()
         resetPulse()
+    }
+
+    /// rhythm-context P3：动作识别从头判断（未知 = P2 行为）
+    private func resetContext() {
+        actionContext.reset()
+        if contextStatus != nil { contextStatus = nil }
+    }
+
+    /// rhythm-context P3：撞击声校正从头来，偏移立刻回 0（= P2 相位）
+    private func resetAnchor() {
+        audioAnchor.reset()
+        onsetDetector.reset()
+        pulse.phaseOffset = 0
+        _ = meter?.drainBands()
+        if anchorStatus != nil { anchorStatus = nil }
     }
 
     /// rhythm-phase P2：相位从头锁、脉动停掉（下一个完整拍按 P1 出口规则继续）
@@ -837,6 +877,34 @@ final class VideoSyncPlayer: ObservableObject {
         phaseLock.reset()
         pulse.reset()
         if pulseStatus != nil { pulseStatus = nil }
+        resetAnchor()
+    }
+
+    /// rhythm-context P3：每个完整拍取走撞击声频带 → 撞击时刻（视频时间 → host 时间）→ 和相位锁比 → 脉动相位偏移。
+    /// 没开 / 没锁 / 声音节奏和画面对不上 / 倍速读不出 → 偏移回 0（= P2）
+    private func updateAudioAnchor(_ p: AVPlayer, dt: TimeInterval) {
+        guard visualSettings.usesAudioAnchor, let m = meter else {
+            if pulse.phaseOffset != 0 || anchorStatus != nil { resetAnchor() }
+            return
+        }
+        for band in m.drainBands() { onsetDetector.add(band) }
+        let now = CACurrentMediaTime()
+        let rate = Double(p.rate)
+        let itemNow = p.currentTime().seconds
+        guard rate.isFinite, rate > 0.01, itemNow.isFinite else {
+            audioAnchor.reset()
+            pulse.phaseOffset = 0
+            return
+        }
+        let since = itemNow - (AudioPhaseAnchor.windowSeconds + 0.5) * rate
+        let onsets = onsetDetector.onsets(since: since).map { now + ($0 - itemNow) / rate }
+        // 声音节奏按视频时间算，画面频率是 host 时间上看到的快慢：乘倍速再比
+        let r = onsetDetector.rhythm()
+        let known = visualSettings.usesRhythmContext && actionContext.directionKnown
+        pulse.phaseOffset = audioAnchor.step(onsets: onsets, audioHz: r.hz * rate, audioConfidence: r.confidence,
+                                             lock: phaseLock, directionKnown: known, now: now, dt: dt)
+        let text = audioAnchor.statusText(lockHz: phaseLock.hz)
+        if text != anchorStatus { anchorStatus = text }
     }
 
     /// rhythm-phase P2 子拍：播放器确实在播、联动开着、跟随画面 + 频率跟随 + 相位脉动都开着，且上一个完整拍在脉动，
@@ -867,11 +935,20 @@ final class VideoSyncPlayer: ObservableObject {
             if rhythmStatus != nil { resetRhythm() }
             return nil
         }
-        if motionSignal { rhythm.step(window, dt: dt, active: activity > 0) } else { rhythm.reset() }
+        // P3：动作识别开着时，跟随器 / 相位锁吃按动作改写过的窗口副本（未知 = 原窗口）；关着时就是原窗口（= P2）
+        var input = window
+        if visualSettings.usesRhythmContext, motionSignal {
+            input = actionContext.refine(window, now: CACurrentMediaTime())
+            let text = actionContext.statusText()
+            if text != contextStatus { contextStatus = text }
+        } else if contextStatus != nil {
+            resetContext()
+        }
+        if motionSignal { rhythm.step(input, dt: dt, active: activity > 0) } else { rhythm.reset() }
         if visualSettings.rhythmPulse {
             // P2：相位锁跟在频率跟随器后面（跟随器没锁 / 镜头切换 / 不动 2 拍 → 相位锁立刻放开）
             if motionSignal {
-                phaseLock.step(window, followerHz: rhythm.hz, followerLocked: rhythm.locked,
+                phaseLock.step(input, followerHz: rhythm.hz, followerLocked: rhythm.locked,
                                followerSource: rhythm.source, now: CACurrentMediaTime(), dt: dt, active: activity > 0)
             } else {
                 phaseLock.reset()
@@ -938,6 +1015,8 @@ final class VideoSyncPlayer: ObservableObject {
             let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
                                              rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
             if visualSettings.rhythmPulse {
+                // P3：撞击声校正（开着才有）只调脉动相位，有界、对不上就回 0
+                updateAudioAnchor(p, dt: dt)
                 // P2：锁上相位才在 P1 档位上叠加脉动（往里时加强）；没锁 / 没标定 / 太快 / 太弱 = P1 原样
                 vals = pulse.beat(levels: levels, lock: phaseLock, visual: visualSettings, settings: settings,
                                   hasSignal: hasSignal, value: value, activity: motionActivity,
@@ -945,12 +1024,12 @@ final class VideoSyncPlayer: ObservableObject {
                 let text = pulse.statusText(lock: phaseLock, visual: visualSettings)
                 if text != pulseStatus { pulseStatus = text }
             } else {
-                vals = outputStage.step(levels: levels, settings: settings)
+                vals = outputStage.step(levels: levels, settings: settings, now: CACurrentMediaTime(), timed: false)
             }
             updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: vals[0],
                                value: value, hasSignal: hasSignal)
         } else {
-            vals = outputStage.step(value, settings: settings, hasSignal: hasSignal)
+            vals = outputStage.step(value, settings: settings, hasSignal: hasSignal, now: CACurrentMediaTime())
         }
         let shown = vals.max() ?? 0
         intensity = shown
@@ -1203,6 +1282,9 @@ struct VideoSyncView: View {
     @AppStorage(VisualSyncSettings.Keys.pulseDepth) private var pulseDepth = VisualSyncSettings.defaultPulseDepth
     @AppStorage(VisualSyncSettings.Keys.pulseLatencyMs) private var pulseLatencyMs = VisualSyncSettings.defaultPulseLatencyMs
     @AppStorage(VisualSyncSettings.Keys.pulseInvert) private var pulseInvert = VisualSyncSettings.defaultPulseInvert
+    // rhythm-context P3：动作识别（手 / 头 / 髋 + 周期区域）/ 撞击声相位校正（实验，默认都关）
+    @AppStorage(VisualSyncSettings.Keys.rhythmContext) private var rhythmContext = VisualSyncSettings.defaultRhythmContext
+    @AppStorage(VisualSyncSettings.Keys.rhythmAudioAnchor) private var rhythmAudioAnchor = VisualSyncSettings.defaultRhythmAudioAnchor
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -1222,7 +1304,8 @@ struct VideoSyncView: View {
     private var visualSettings: VisualSyncSettings {
         VisualSyncSettings(source: visualSource, motionGainDb: motionGainDb, autoMotion: autoMotion,
                            rhythmFollow: rhythmFollow, rateTable: rateTable, rhythmPulse: rhythmPulse,
-                           pulseDepth: pulseDepth, pulseLatencyMs: pulseLatencyMs, pulseInvert: pulseInvert)
+                           pulseDepth: pulseDepth, pulseLatencyMs: pulseLatencyMs, pulseInvert: pulseInvert,
+                           rhythmContext: rhythmContext, rhythmAudioAnchor: rhythmAudioAnchor)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -1552,6 +1635,18 @@ struct VideoSyncView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if rhythmFollow, rhythmContext, let context = vm.contextStatus {
+                    Text(context)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if rhythmFollow, rhythmPulse, rhythmAudioAnchor, let anchor = vm.anchorStatus {
+                    Text(anchor)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
                          valueText: "\(Int(vm.level.rounded()))")
@@ -1695,8 +1790,26 @@ struct VideoSyncView: View {
                     .foregroundColor(rateTableIsBad ? Velvet.warning : Velvet.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            contextControls
             pulseControls
         }
+    }
+
+    /// rhythm-context P3：动作识别（实验，默认关；只在频率跟随打开时显示）
+    @ViewBuilder private var contextControls: some View {
+        Toggle(isOn: $rhythmContext) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("动作识别（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("另外认手、脸、髋部和画面里一直在往复的那块区域，判断是插入 / 口 / 手的动作，只按真正在做的那个部位跟频率和相位。"
+                     + "认不出时和不开一样；更耗电，手机发热时自动不认姿态")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
     }
 
     private var pulseDepthText: String { "\(Int(pulseDepth.rounded())) 档" }
@@ -1757,6 +1870,19 @@ struct VideoSyncView: View {
                         Text("画面往里时设备反而在减弱就打开")
                             .font(.caption2)
                             .foregroundColor(Velvet.textMuted)
+                    }
+                }
+                .tint(Velvet.gold)
+                Toggle(isOn: $rhythmAudioAnchor) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("撞击声相位校正（实验）")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Text("视频里有和画面同节奏的拍打 / 撞击声时，用声音的时刻微调脉动时机（认出动作方向时最多 ±60°）。"
+                             + "声音节奏和画面对不上（背景音乐、说话）就不用")
+                            .font(.caption2)
+                            .foregroundColor(Velvet.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 .tint(Velvet.gold)

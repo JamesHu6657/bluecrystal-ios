@@ -924,6 +924,110 @@ VideoMotionTap ─ MotionAnalyzer → SubjectFlowTracker：followEstimate 有频
 - 航位推算：如果 STOP 后设备总停在同一个位置、且档位 → 频率的标定足够稳定，可以从开始输出那一刻按标定频率积分出设备相位，再用档位微调去追画面相位（真机确认前不做）。
 - P4 提前读视频：画面分析提前跑几百毫秒，可以替代一部分延迟补偿的外推。
 
+### rhythm-context P3：动作识别（手 / 头 / 髋 + 周期区域 ROI + 撞击声相位校正，默认关）+ P2 评审 L1–L3 修复
+
+**目标**：P1 / P2 一直按「整幅画面的主体」或「姿态挑出的那组关节」跟频率和相位，真实视频里常常跟错部位（两个人一起动、手在画面边上、镜头晃）。
+P3 多一层**上下文**：认出现在是哪种动作（插入 / 口 / 手），只按真正在做的那个部位跟频率和相位；在画面里一直往复的那块区域（周期区域）里
+再做一次高分辨率块运动；视频里有和画面同节奏的撞击声时，用声音的时刻微调脉动的指令相位。
+**边界**：仍是开环（设备没有位置反馈）；P3 只改「交给 RhythmFollower / RhythmPhaseLock 的那份窗口副本」和「脉动指令相位偏移」，
+不改强度那条路（MotionNormalizer / SyncBlender）、不改档位规则、不改出口。认不出 / 不可信时一律退回 P2（逐位相同）。
+
+#### 两个开关（都默认关）
+
+| 开关 | 存储键 | 显示条件 | 真正生效 | 关着时 |
+| --- | --- | --- | --- | --- |
+| 动作识别（实验） | `bcVisualSyncRhythmContext` | 「伸缩跟随动作频率」打开时 | `usesRhythmContext` = 跟随画面 + 频率跟随 + 动作识别 | VideoMotionTap 不跑手 / 脸检测、不攒每块运动、不算周期区域 / 区域内运动；主线程不建 ActionContext；窗口不改 |
+| 撞击声相位校正（实验） | `bcVisualSyncRhythmAudioAnchor` | 「相位脉动（实验）」打开时（方向反转下面） | `usesAudioAnchor` = `usesPulseTiming` + 撞击声 | 音频实时线程不分频带、不出块；主线程不做撞击检测；`phaseOffset` 恒 0 |
+
+#### 数据流
+
+```
+VideoMotionTap（分析队列）
+  MotionAnalyzer → BlockMotionEstimator：每块扣掉相机后的位移 residuals
+    └ 动作识别开着：PeriodicityMap.add(residuals) → 每 0.3 秒按跟随频率找周期区域 PeriodicityROI
+                    RoiFlowTracker：按区域裁原图（LumaCropDownscaler，放大 1.5~4 倍）→ BlockMotionEstimator（不拟合相机，整块扣整幅相机平移）
+                    → SubjectFlowTracker → RoiReading（频率跟随 + 相位拟合，速度换回分析帧像素）；切镜 / 保持期样本不带
+  PoseWorker（姿态队列）：身体（原有）+ 动作识别开着时手（VNDetectHumanHandPoseRequest，≤ 4 只）/ 脸（VNDetectFaceRectanglesRequest），
+    各自 try? perform，出错不影响身体；PartMotionTracker（手 / 脸）、PoseMotionTracker.bodyContext（髋 / 头 / 腕三组 + 另一个人的髋 / 头）
+    → PoseContext（切镜前那些帧算出来的不认）
+  → MotionWindowAccumulator.drain() → MotionWindow（+ roi / roiSamples / context）
+AudioLevelTap（音频实时线程，撞击声开着）：AudioBandSplitter → 10 ms 一块三频带能量（低 < 200 Hz / 中 / 高 > 2 kHz，时间 = 块中点的视频时间）
+  → 无锁环形缓冲（1024 块）；主线程 drainBands
+VideoSyncPlayer（主线程，完整拍）
+  ActionContext.step(window, followerHz…) → 改写窗口副本（选部位的频率 / 相位、区域内运动代替整幅）+ 往里方向
+  RhythmFollower.step / RhythmPhaseLock.step（吃改写后的副本）               # P1 / P2 不变
+  AudioOnsetDetector.add(bands) → onsets / rhythm()；AudioPhaseAnchor.step(onsets, audioHz, lock, directionKnown) → offset
+  RhythmPulseDriver.phaseOffset = offset → beat / subBeat                      # 只挪指令相位
+  → 同一个 outputStage（上限 / 升幅按时间 ≤ +20 / 0.3 秒 / 归零保持 0.85 秒 / 通道 3、4 恒 0）→ 变化才 ble.sendTick
+```
+
+#### 类型（`VisualSync.swift`「rhythm-context P3」）
+
+| 类型 | 作用 | 关键参数 |
+| --- | --- | --- |
+| `PeriodicityMap` | 每块扣掉相机后的速度最近约 4 秒的环形缓冲（64 帧，稳态不分配）；在跟随频率上对每块做 DFT，功率最大且周期性够的块为种子，向 8 邻域扩展 | ≥ 12 个样本；窗口 2 个周期（夹在 1.5~4 秒）；幅度 ≥ 4 px/s；种子周期性 ≥ 0.4、成员 ≥ 0.3、功率 ≥ 种子 25%、同向或反向（\|Re 相关\| ≥ 0.5）；区域 ≤ 60% 的块；0.3 秒更新一次；帧间隔 > 0.5 秒重攒 |
+| `LumaCropDownscaler` / `CropRect` | Y 平面里一个裁剪框 → 小图（同 LumaDownscaler 的 4×4 平均，采样表按框缓存） | 框夹在画面内 |
+| `RoiFlowTracker` / `RoiReading` | 周期区域内的高分辨率块运动 | 放大 1.5~4 倍、外扩 1.3 倍；框 1 秒最多挪一次（IoU < 0.5 才挪，< 0.2 时节奏重攒）；区域 1 秒没更新就不用；帧间隔 0.03~0.5 秒 |
+| `PartCandidate` / `PartReading` / `PartMotionTracker` | 手 / 脸检测和运动跟踪（同 PoseMotionTracker：1.5 尺度连续性换目标、指数平滑 + 死区、扣相机、按尺度归一 → StrokeRhythm） | 置信度 ≥ 0.3；手的尺度 = 3 × 腕到中指根、脸 = 2.5 × 脸框高；速度 ≤ 8 尺度/秒；读数不旧于 0.5 秒；没开相位脉动时不算相位 |
+| `PoseBodyContext` / `PartRhythm` / `PoseContext` | 跟踪的那个人的髋 / 头 / 腕位置和三组节奏，另一个人的髋 / 头 | 另一个人：上一帧那个人附近 1.5 个身体尺度内优先 |
+| `ActionContext` | 每个完整拍判断动作：手在区域旁且频率一致 → 撸动（看手 / 手腕）；头 / 脸在区域旁 → 口交；髋往复为主 → 插入；据此改写窗口副本；按「朝另一个人的髋」判断往里方向 | 证据 ≥ 0.3 且领先 ≥ 0.1 才换、滞回 0.9 秒；1.5 秒没依据回「未知」；切镜立刻「未知」；频率一致 ≤ 15%；方向点积 ≥ 0.34、保持 1 秒；「未知」时只用区域内运动（区域可信时），部位 / 方向都不改 |
+| `AudioBandSplitter` / `AudioBandFrame` | 实时线程上两个一阶低通分三段，10 ms 一块 | 只有几个数的状态，不分配、不加锁；采样率不对不出块；回调之间时间对不上 > 50 ms（seek / 丢样本）丢掉没满的块 |
+| `AudioOnsetDetector` | 三频带对数能量正向增量（加权 1 / 1 / 0.5）= 撞击强度；高于最近 1 秒均值 + 1.5σ 且 ≥ 1.5、局部峰、间隔 ≥ 0.12 秒、不静音 → 撞击；`rhythm()`：最近 4 秒的撞击时刻做成脉冲串（σ = 15 ms 的高斯）求归一化自相关，0.4~4 Hz 里取最短的、不低于最高峰 85% 的局部峰（倍周期的相关一样高，避免认成 1/2、1/3 频率） | 时间倒退 / 块间隔 > 0.1 秒重来；稳定的噪声 / 哼声没有撞击，也就没有节奏 |
+| `AudioPhaseAnchor` | 声音节奏和画面频率差 ≤ 15%、置信度 ≥ 0.3、最近 4 秒 ≥ 4 次撞击、撞击时刻的画面相位集中（R ≥ 0.6）→ offset 每拍向 −(平均撞击相位) 收 30%，把撞击对到「最深点」（相位 0） | 方向已判断时只做 ±60° 细调，判断不了时可以整个翻过来；条件不满足：保持 2 秒后按 2 秒时间常数回 0；相位锁放开 / 切镜 / seek 立刻 0 |
+| `RhythmPulseDriver.phaseOffset` | 加到指令相位上（弧度），只挪时机 | 默认 0 = P2 逐位相同 |
+| `VisualSyncSettings` | `rhythmContext` / `rhythmAudioAnchor`（默认 false）、`usesRhythmContext` / `usesAudioAnchor` | 不影响 `tickInterval` |
+
+#### P2 评审问题的修复（不带开关，但关着 P2 时和 main 逐位相同）
+
+- **L1 相位拟合只在需要时算**：`SubjectFlowTracker` / `MotionAnalyzer` / `PoseMotionTracker` / `PartMotionTracker` / `RoiFlowTracker` 的 `phaseFitEnabled`（默认 false），
+  VideoMotionTap 按「相位脉动」每帧设。P2 里 `phaseFit` 一直在算（只写新字段），现在关着时不算，省 CPU。
+- **L2 统一的按时间限速账本**：`SyncOutputStage.step(_:settings:hasSignal:now:)` / `step(levels:settings:now:timed:)`，VideoSyncPlayer 所有出口（值路径、档位路径、交接追赶）
+  都带主机时钟 `now`。上一次是按时间限速的（`pendingTimed`），这一次不管走哪条路径都按实际间隔给预算；满 0.3 秒交回按拍。
+  P2 时子拍后 0.1 秒的按拍出口还会按「一拍」给 +20，现在只给 ≈ +7。从没按时间限速过时和 P1 出口逐位相同（随机序列比对）。
+- **L3 完整拍按 0.3 秒网格调度**：`takesFullBeat`：到「上一个完整拍该在的时刻 + 0.3 − 0.05 秒」且离上一个实际完整拍 ≥ 0.2 秒就算，算完网格往前推 0.3 秒
+  （晚 > 0.1 秒才以现在为新起点）。原来按「距上一个实际完整拍 ≥ 0.265 秒」，Timer 晚一点就会拖到 ≈ 0.4 秒一拍并一直错开。
+
+#### 界面
+
+- 「伸缩跟随动作频率」打开后，「相位脉动（实验）」上面多一个开关「动作识别（实验）」；仪表区多一行 `contextStatus`：
+  「动作识别：插入（看髋）/ 口交（看脸 / 头）/ 撸动（看手 / 手腕）/ 还没认出动作（按整幅画面跟）」+「用周期区域内的运动」+「往里方向已判断 / 判断不了」。
+- 「相位脉动（实验）」打开后，「方向反转」下面多一个开关「撞击声相位校正（实验）」；仪表区多一行 `anchorStatus`（已对齐 / 偏移角度 / 没听到和画面同节奏的撞击声）。
+
+#### 安全不变
+
+- 不改 BLEManager / SafetyLedger / Protocol / AIProgram / Models / 工程文件（没有新文件，新类型都在 `VisualSync.swift`）；**不新增发送路径**：仍只在 `tick()` 里经 `SyncOutputStage` → `sendTick`。
+  STOP / 看门狗 / 断连 / 暂停 / 缓冲 / seek / 关联动的处理不变。
+- 出口规则不变：≤ 上限、单步升 ≤ 20、任意两刻之间升幅 ≤ 20 × 间隔 / 0.3 + 1、归零后 ≥ 0.85 秒才再升、通道 3 / 4 恒 0（P3 测试里子拍 / 完整拍 / 交接追赶随机混走仍守住）。
+- 动作识别只改「跟哪个部位的频率 / 相位」，强度那条路不看这份副本；撞击声只改指令相位，不改档位、不改深度。
+- **两个开关关着时和 P2 逐位相同**；P2 的开关也关着时和 main 逐位相同（测试钉住）。手 / 脸 Vision 请求只在动作识别开着时跑，出错只丢这一次上下文。
+
+#### 测试（`Tests/VisualSyncChecks/main.swift`「rhythm-context P3」）
+
+- L1：相位拟合默认关，关着时块运动 / 姿态都不算相位；L2：带 now 的出口在没按时间限速过时和 P1 出口逐位相同（12000 步随机）、子拍 / 完整拍 / 交接追赶随机混走时任意两刻升幅包络不破、
+  子拍后 0.1 秒的完整拍只给 +7、满 0.3 秒交回按拍；L3：Timer 每次 112 / 95 ms / 抖 ±30 ms 时完整拍平均间隔都是 0.300 秒。
+- 关着 = P2：分析器默认不算周期区域、开着时其余读数逐位相同；没有上下文的窗口动作识别不改。
+- 周期区域：往复块被框出、随机游走的干扰块不算；裁剪降采样（稳态不重新分配）；放大框（1.5~4 倍、贴边不出画面、区域太大不放大、小变化不挪）；
+  放大跟踪（裁剪小图里 1.5 Hz 往复读出 1.50 Hz、幅度换回分析帧）。
+- 手 / 脸跟踪（1.5 Hz、镜头平移时照样 1.5 Hz、旁边更大的手不抢、相位只在开关开着时算）；姿态上下文（髋 / 头 / 腕 + 另一个人，关着时是空的、姿态读数逐位相同）；
+  窗口（区域读数 / 上下文跟着样本走，切镜清掉、切镜前算出来的不认）。
+- 动作识别：手 / 髋 / 脸同频往复分别认成撸动 / 插入 / 口交并用那个部位的节奏；方向：主轴朝着髋 = 往里、背着髋相位翻 180°、垂直时判断不了。
+- 撞击声：频带（10 ms 一块、哼声进低频、白噪声进高频、采样率不对不出块、seek 丢半块）；撞击检测（1.6 Hz 撞击 13 / 13、误差 ≤ 20 ms、声音节奏 1.60 Hz、稳定噪声没有撞击、时间倒退重来）；
+  相位校正（收敛到 −μ、方向已判断时限 ±60°、频率对不上 / 撞击散乱不校正、声音没了 2 秒后慢慢回 0、没锁立刻 0）；脉动相位偏移（偏移 Δ 和相位锁本身提前 Δ 逐位相同，默认 0 = P2）。
+- 设置：默认 / 键名 / 读回 / `usesRhythmContext` / `usesAudioAnchor`。
+
+`VideoMotionTap.swift` / `AudioLevelTap.swift` / `VideoSyncView.swift` 的接线（Vision 手 / 脸请求、区域裁剪、音频 tap 时间、界面）Linux 编不了，靠 PR Checks（Xcode 16.4）编译确认，再上真机。
+
+#### 真机验证清单
+
+1. 两个开关都关：和 P2 完全一样（状态行没有新行）；P2 也关：和 main 一样。
+2. 打开「动作识别」：手机发热 / 耗电和不开比有没有明显变化（多了手 / 脸 Vision 请求和区域块运动）；Xcode Instruments 看姿态队列每帧耗时。
+3. 区域对不对：找一段固定机位的真实视频，状态行出现「用周期区域内的运动」时，频率跟随是否更稳；镜头推拉 / 摇时区域会不会乱跳。
+4. 动作分类：插入 / 口 / 手各找 2~3 段，看状态行认得对不对、切换要多久（应 ≤ 2 秒）；两个人都在动时是否跟对了主动的那个。
+5. 往里方向：「往里方向已判断」时设备强弱是否和画面对上；判断错了用「方向反转」能不能救回来（反馈回来以便改规则）。
+6. 撞击声：有拍打声的视频（不放背景音乐）上「撞击声相位校正」状态行能否在 4~6 秒内「已对齐」；配乐 / 说话的视频应保持「没听到」、偏移 0。
+   `AudioLevelTap` 的 tap 时间（`MTAudioProcessingTapGetSourceAudio` 的 timeRange）在真机上是否有效、和画面时间差多少（看对齐后的偏移是否稳定）。
+7. P2 的标定表 / 延迟补偿 / FFA2 观察照 `docs/rhythm-calibration.md` 第 8 节；P3 的验证见第 9 节。
+
 ## 11. 风险与待定
 
 1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。rhythm-follow P1 也按速度档设计，P0 标定（`docs/rhythm-calibration.md` 第 1 步）先确认。
