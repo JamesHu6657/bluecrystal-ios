@@ -439,7 +439,7 @@ struct MotionAnalyzer {
                                        x0: x0, x1: x1, y0: y0, y1: y1, valid: valid)
             if alt < Self.contrastAcceptRatio * total {
                 total = alt
-                swap(&cellSums, &cellSumsAlt)
+                for c in 0..<cellSums.count { cellSums[c] = cellSumsAlt[c] }
             }
         }
         var active = 0
