@@ -3869,7 +3869,8 @@ do {
         let fresh = VisualSyncSettings.load(from: d)
         d.set("yes", forKey: VisualSyncSettings.Keys.rhythmPulse)
         d.set("deep", forKey: VisualSyncSettings.Keys.pulseDepth)
-        d.set(true, forKey: VisualSyncSettings.Keys.pulseLatencyMs)
+        // 注意 Darwin 上存的 Bool 会被 `as? Double` 桥接成 1.0，坏值只用字符串
+        d.set("slow", forKey: VisualSyncSettings.Keys.pulseLatencyMs)
         let bad = VisualSyncSettings.load(from: d)
         d.set(true, forKey: VisualSyncSettings.Keys.rhythmPulse)
         d.set(35.0, forKey: VisualSyncSettings.Keys.pulseDepth)
