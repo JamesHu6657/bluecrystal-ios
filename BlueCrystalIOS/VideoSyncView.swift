@@ -81,6 +81,9 @@ final class VideoSyncPlayer: ObservableObject {
     /// 画面模式的出口：上限 / 最低强度（与声音侧逐位一致）+ 升幅限速 + 归零保持
     private var outputStage = SyncOutputStage()
     private var visualSettings = VisualSyncSettings()
+    /// 播放中切换来源的交接（algo-opt-1）：声音→画面 4 秒内用声音补画面热身的空档（只淡出），
+    /// 画面→声音先走出口限速追上声音直出（最多 10 拍）。不新增发送路径，仍只在 tick 里 sendTick
+    private var handover = SourceHandover()
     /// 系统控件开播：只认"暂停 → 播放"的边沿；停止后锁存一次
     private var externalPlay = ExternalPlayGate()
     /// App 自己 seek 引起的 timeJumped 回声
@@ -112,6 +115,7 @@ final class VideoSyncPlayer: ObservableObject {
             shaper.reset()
             motionShaper.reset()
             outputStage.reset()
+            handover.cancel()
             intensity = 0
             // 全零帧在运行中会换成完整停止帧对、运行继续（OutputGate），设备没在输出时不发
             ble?.sendTick(levels: ActiveChannels.zero.values)
@@ -136,6 +140,8 @@ final class VideoSyncPlayer: ObservableObject {
             outputStage.seed(lastActive.values)
             motionShaper.reset()
             motionFlow.reset()
+            // 正在输出时才交接；没在播 / 联动关着时下一次开播本来就从 0 起
+            if isPlaying, settings.enabled { handover.begin(v.source) } else { handover.cancel() }
         }
         needsResync = true
     }
@@ -336,6 +342,7 @@ final class VideoSyncPlayer: ObservableObject {
         uninstallMotion()
         motionNormalizer.resetAdaptation()
         outputStage.reset()
+        handover.cancel()
         // 新播放器从暂停开始；旧视频的停止锁存和 seek 回声不带过来
         externalPlay = ExternalPlayGate()
         ownSeekEcho.clear()
@@ -483,6 +490,7 @@ final class VideoSyncPlayer: ObservableObject {
         motionShaper.reset()
         motionFlow.reset()
         outputStage.reset()
+        handover.cancel()
     }
 
     /// 当前视频在 App 目录里的副本（换视频时删旧的，避免占空间）
@@ -635,6 +643,7 @@ final class VideoSyncPlayer: ObservableObject {
         shaper.reset()
         motionShaper.reset()
         outputStage.reset()
+        handover.cancel()
     }
 
     var canPlay: Bool {
@@ -711,6 +720,7 @@ final class VideoSyncPlayer: ObservableObject {
             _ = motionMeter?.drain()
             motionShaper.reset()
             outputStage.reset()
+            handover.cancel()
             level = 0
             motionLevel = 0
             intensity = 0
@@ -741,14 +751,22 @@ final class VideoSyncPlayer: ObservableObject {
         }
         intensity = out.percent
         guard settings.enabled else { return }
-        let vals = settings.channels.levels(percent: out.percent)
+        var vals = settings.channels.levels(percent: out.percent)
+        if handover.isCatchingUp {
+            // 画面→声音：先按出口的升幅限速 / 归零保持从设备现在的输出追上声音直出，追上（或 10 拍）后回到原路径
+            let limited = outputStage.step(shaper.smoothed, settings: settings, hasSignal: floorAllowed)
+            handover.noteCatchUp(limited: limited, direct: vals)
+            vals = limited
+            intensity = vals.max() ?? 0
+        }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
             needsResync = false
             lastActive = active
             // tick 走不开闸的发送路径，看门狗锁住的闸不会被自动帧打开
             ble.sendTick(levels: vals)
-            statusLine = String(format: "t=%.1fs 强度 %d", t, out.percent)
+            // 显示实际发出的值（画面→声音追赶期间是限速后的，不是 out.percent）
+            statusLine = String(format: "t=%.1fs 强度 %d", t, vals.max() ?? 0)
         }
     }
 
@@ -761,12 +779,20 @@ final class VideoSyncPlayer: ObservableObject {
                                            auto: visualSettings.autoMotion, dt: dt)
         let shaped = motionShaper.step(target: target, dt: dt)
         motionLevel = shaped.level
-        let hasSignal = motionFlow.allowsFloor(analyzerRunning: motionStatus.isAnalyzing,
-                                               playerPlaying: p.timeControlStatus == .playing, now: now)
-        let value = hasSignal ? motionNormalizer.confidence * shaped.smoothed : 0
+        let motionSignal = motionFlow.allowsFloor(analyzerRunning: motionStatus.isAnalyzing,
+                                                  playerPlaying: p.timeControlStatus == .playing, now: now)
+        // 没有交接时就是 hasSignal ? confidence × smoothed : 0（和以前逐位相同）；
+        // 刚从声音切过来：画面还在热身的那部分用声音补上，4 秒内淡出，不会高于两者中较大的那个
+        let audioSignal = audioFlow.allowsFloor(tapReady: audioStatus == .ready,
+                                                playerPlaying: p.timeControlStatus == .playing, now: now)
+        let blended = handover.blend(motion: shaped.smoothed, confidence: motionNormalizer.confidence,
+                                     motionSignal: motionSignal, audio: shaper.smoothed, audioSignal: audioSignal, dt: dt)
+        let value = blended.value
+        let hasSignal = blended.hasSignal
         guard settings.enabled else {
             // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
             outputStage.reset()
+            handover.cancel()
             intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
             return
         }
@@ -1009,6 +1035,7 @@ struct VideoSyncView: View {
     @AppStorage(AudioSyncSettings.Keys.channels) private var channelsRaw = AudioSyncSettings.defaultChannels.rawValue
     @AppStorage(AudioSyncSettings.Keys.minPercent) private var minPercent = AudioSyncSettings.defaultMinPercent
     @AppStorage(AudioSyncSettings.Keys.autoGain) private var autoGain = AudioSyncSettings.defaultAutoGain
+    @AppStorage(AudioSyncSettings.Keys.softDuck) private var softDuck = AudioSyncSettings.defaultSoftDuck
     // 画面联动设置（同上；来源默认声音，老用户无感升级）
     @AppStorage(VisualSyncSettings.Keys.source) private var visualSourceRaw = VisualSyncSettings.defaultSource.rawValue
     @AppStorage(VisualSyncSettings.Keys.motionGainDb) private var motionGainDb = VisualSyncSettings.defaultMotionGainDb
@@ -1018,7 +1045,7 @@ struct VideoSyncView: View {
         AudioSyncSettings(enabled: syncEnabled, sensitivityDb: sensitivityDb,
                           maxPercent: maxPercent,
                           channels: AudioSyncChannels(rawValue: channelsRaw) ?? .both,
-                          minPercent: minPercent, autoGain: autoGain)
+                          minPercent: minPercent, autoGain: autoGain, softDuck: softDuck)
     }
 
     /// 存储里认不出的来源（含 P2 才有的「声音+画面」）按声音
@@ -1164,6 +1191,7 @@ struct VideoSyncView: View {
         .onChange(of: channelsRaw) { _ in vm.applySettings(audioSettings) }
         .onChange(of: minPercent) { _ in vm.applySettings(audioSettings) }
         .onChange(of: autoGain) { _ in vm.applySettings(audioSettings) }
+        .onChange(of: softDuck) { _ in vm.applySettings(audioSettings) }
         // 跟随来源 / 画面灵敏度 / 自动适应画面：播放中即时生效，不停播
         .onChange(of: visualSettings) { v in vm.applyVisualSettings(v) }
         // 弹出层盖在根视图的入口页 / 解锁页 / 隐私模糊之上，各自也挂一份
@@ -1418,6 +1446,17 @@ struct VideoSyncView: View {
                             .font(.subheadline)
                             .foregroundColor(Velvet.text)
                         Text("按这个视频自己的音量自动调整，灵敏度滑块变成微调")
+                            .font(.caption2)
+                            .foregroundColor(Velvet.textMuted)
+                    }
+                }
+                .tint(Velvet.gold)
+                Toggle(isOn: $softDuck) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("轻柔声音降权")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Text("持续平稳的小声音（底噪、环境声、轻音乐）输出更轻，只会变轻不会变强")
                             .font(.caption2)
                             .foregroundColor(Velvet.textMuted)
                     }

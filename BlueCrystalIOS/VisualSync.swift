@@ -85,19 +85,22 @@ struct LumaDownscaler {
         let ow = size.width
         let oh = size.height
         let area = k * k
-        let cols = columnTaps
-        let rows = rowOffsets
-        frame.pixels.withUnsafeMutableBufferPointer { out in
-            for oy in 0..<oh {
-                for ox in 0..<ow {
-                    var sum = 0
-                    for j in 0..<k {
-                        let row = rows[oy * k + j]
-                        for i in 0..<k {
-                            sum += Int(src[row + cols[ox * k + i]])
+        // 采样表用裸指针读（algo-opt-1 性能卫生：省掉数组下标的边界检查 / 引用计数，结果逐位不变）
+        columnTaps.withUnsafeBufferPointer { cols in
+            rowOffsets.withUnsafeBufferPointer { rows in
+                frame.pixels.withUnsafeMutableBufferPointer { out in
+                    for oy in 0..<oh {
+                        for ox in 0..<ow {
+                            var sum = 0
+                            for j in 0..<k {
+                                let row = rows[oy * k + j]
+                                for i in 0..<k {
+                                    sum += Int(src[row + cols[ox * k + i]])
+                                }
+                            }
+                            out[oy * ow + ox] = UInt8((sum + area / 2) / area)
                         }
                     }
-                    out[oy * ow + ox] = UInt8((sum + area / 2) / area)
                 }
             }
         }
@@ -117,6 +120,22 @@ struct MotionSample: Equatable {
     var isCut: Bool
     /// 切换之后的保持期（新镜头前两帧编码质量差，能量也用中位数）
     var isHeld: Bool
+    /// 近场 / 遮挡分数 0~1（algo-opt-1）：手 / 物体贴近镜头、大面积遮挡、贴脸晃动的镜头。
+    /// 只用来让 MotionNormalizer 少放大、少学习：同一拍里只降不升；不学参考值会让之后的正常画面比不跳过时略高，
+    /// 但仍在 上限 / 升幅限速 / 夹紧 之内
+    var nearField: Double = 0
+}
+
+/// 整体位移搜索的结果
+struct MotionShift: Equatable {
+    var dx = 0
+    var dy = 0
+    /// 这一帧满足条件、真的搜过
+    var searched = false
+    /// 最好的对齐后差异 / 不对齐差异（搜过才有意义；越小越像纯平移）
+    var ratio: Double = 1
+
+    var accepted: Bool { dx != 0 || dy != 0 }
 }
 
 /// 帧差 → 运动能量（§4.3），直方图 + 均值突变判镜头切换 / 闪白（§4.5）。
@@ -151,6 +170,25 @@ struct MotionAnalyzer {
     static let shiftChangedCells: Double = 0.5
     /// 对齐后的差异要低于不对齐的这个比例才采用
     static let shiftAcceptRatio: Double = 0.75
+    /// 近场 / 遮挡分数（algo-opt-1）：背景直方图 / 清晰度按 4 秒跟踪；判为近场时最多冻结 6 秒不学；
+    /// 平移采用率 / 对齐残差按 1 秒跟踪
+    static let backgroundSeconds: TimeInterval = 4
+    static let nearFreezeLimit: TimeInterval = 6
+    static let cameraSeconds: TimeInterval = 1
+    /// 背景清晰度低于这个（本来就糊 / 纯色画面）不用「变糊」这一项
+    static let minBackgroundSharpness: Double = 2
+    static let nearFieldDeadzone: Double = 0.05
+    /// 切镜 / 闪变之后（第二轮审查 M1）：手一下盖住镜头也会触发切镜判定，所以切镜不立刻把新画面当背景，
+    /// 而是保留切镜前的背景继续比（最长 nearFreezeLimit）。新画面「安静」（近场 ≤ 0.5 或覆盖率 < 0.35）
+    /// 连续这么久才采用为背景；超过 nearFreezeLimit 无条件采用
+    static let cutAdoptSeconds: TimeInterval = 0.5
+    static let cutCalmCoverage: Double = 0.35
+    /// 切镜待定期间直方图项要「同时变糊」才算数：真实切到清晰的新场景（颜色分布也变了）很快恢复，
+    /// 手 / 物体贴镜头（失焦）照样判为近场。width 0.07、center 0.15 的变糊门
+    static let cutBlurCenter: Double = 0.15
+    static let cutBlurWidth: Double = 0.07
+    /// 帧差中位数用的直方图：差值 -255...255
+    static let diffBins = 511
 
     private var previous: [UInt8] = []
     private var previousWidth = 0
@@ -165,17 +203,88 @@ struct MotionAnalyzer {
     private var cellHeight = 0
     private var cellOf: [Int] = []
     private var cellPixels: [Double] = []
+    // 近场跟踪
+    private var backgroundHistogram = [Double](repeating: 0, count: MotionAnalyzer.histogramBins)
+    private var backgroundSharpness: Double = 0
+    private var backgroundValid = false
+    private var backgroundFrozen: TimeInterval = 0
+    /// 切镜之后背景待定：仍用切镜前的背景；elapsed 从第一次切镜起算，calm 是新画面连续安静的时长
+    private var cutPending = false
+    private var cutPendingElapsed: TimeInterval = 0
+    private var cutPendingCalm: TimeInterval = 0
+    private var shiftRate: Double = 0
+    private var residualRatio: Double = 0
+    // 每帧复用的临时数组（algo-opt-1 性能卫生：稳态不再每帧分配）
+    private var histogram = [Double](repeating: 0, count: MotionAnalyzer.histogramBins)
+    private var cellSums = [Double](repeating: 0, count: MotionAnalyzer.gridColumns * MotionAnalyzer.gridRows)
+    private var diffHistogram = [Int](repeating: 0, count: MotionAnalyzer.diffBins)
+    private var medianScratch: [Double] = []
 
     var hasReference: Bool { previousTime != nil }
+    /// 切镜后还在用切镜前的背景（新画面还没被采用为背景）
+    var isBackgroundPending: Bool { cutPending }
 
-    /// 丢掉参考帧和历史（seek / 开播 / 不连续）：下一帧只当参考帧
+    init() {
+        historyTimes.reserveCapacity(Self.historyCapacity + 1)
+        historyEnergies.reserveCapacity(Self.historyCapacity + 1)
+        medianScratch.reserveCapacity(Self.historyCapacity + 1)
+    }
+
+    /// 丢掉参考帧和历史（seek / 开播 / 不连续）：下一帧只当参考帧。参考帧的存储留着复用（previousTime == nil 就不会被读）
     mutating func reset() {
         previousTime = nil
-        previous = []
-        previousHistogram = []
         holdRemaining = 0
         historyTimes.removeAll(keepingCapacity: true)
         historyEnergies.removeAll(keepingCapacity: true)
+        backgroundValid = false
+        backgroundFrozen = 0
+        cutPending = false
+        shiftRate = 0
+        residualRatio = 0
+    }
+
+    private static func sigmoid(_ x: Double, _ center: Double, _ width: Double) -> Double {
+        1 / (1 + exp(-(x - center) / width))
+    }
+
+    /// 清晰度：相邻像素横向 + 纵向亮度差的平均（手贴镜头 / 失焦遮挡时明显下降）
+    static func sharpness(_ p: UnsafeBufferPointer<UInt8>, width w: Int, height h: Int) -> Double {
+        guard w > 1, h > 1 else { return 0 }
+        var total = 0
+        for y in 0..<(h - 1) {
+            let row = y * w
+            for x in 0..<(w - 1) {
+                let v = Int(p[row + x])
+                total += abs(Int(p[row + x + 1]) - v) + abs(Int(p[row + w + x]) - v)
+            }
+        }
+        return Double(total) / Double((w - 1) * (h - 1))
+    }
+
+    private mutating func resetBackground(sharpness g: Double) {
+        for b in 0..<Self.histogramBins { backgroundHistogram[b] = histogram[b] }
+        backgroundSharpness = g
+        backgroundValid = true
+        backgroundFrozen = 0
+        cutPending = false
+        cutPendingElapsed = 0
+        cutPendingCalm = 0
+    }
+
+    /// 切镜 / 切镜后的保持帧：背景不换成新画面，进入（或继续）待定。没有有效背景时才直接用新画面
+    private mutating func noteCutForBackground(sharpness g: Double, gap: Double) {
+        guard backgroundValid else {
+            resetBackground(sharpness: g)
+            return
+        }
+        if cutPending {
+            cutPendingElapsed += gap
+        } else {
+            cutPending = true
+            cutPendingElapsed = 0
+        }
+        cutPendingCalm = 0
+        if cutPendingElapsed >= Self.nearFreezeLimit { resetBackground(sharpness: g) }
     }
 
     mutating func analyze(_ frame: LumaFrame, time: Double) -> MotionSample? {
@@ -187,11 +296,17 @@ struct MotionAnalyzer {
             return nil
         }
         let pixels = frame.pixels
-        var histogram = [Double](repeating: 0, count: Self.histogramBins)
+        for b in 0..<Self.histogramBins { histogram[b] = 0 }
         var sum = 0
-        for p in pixels {
-            sum += Int(p)
-            histogram[Int(p) >> 4] += 1
+        var sharp = 0.0
+        pixels.withUnsafeBufferPointer { p in
+            histogram.withUnsafeMutableBufferPointer { hist in
+                for v in p {
+                    sum += Int(v)
+                    hist[Int(v) >> 4] += 1
+                }
+            }
+            sharp = Self.sharpness(p, width: w, height: h)
         }
         let inv = 1 / Double(n)
         for b in 0..<Self.histogramBins { histogram[b] *= inv }
@@ -200,35 +315,58 @@ struct MotionAnalyzer {
         guard let lastTime = previousTime, previousWidth == w, previousHeight == h, previous.count == n,
               previousHistogram.count == Self.histogramBins, Self.gapRange.contains(time - lastTime) else {
             reset()
-            remember(pixels, width: w, height: h, mean: mean, histogram: histogram, time: time)
+            resetBackground(sharpness: sharp)
+            remember(pixels, width: w, height: h, mean: mean, time: time)
             return nil
         }
         let gap = time - lastTime
         if cellWidth != w || cellHeight != h { buildCells(width: w, height: h) }
 
-        // 去均值帧差 + 噪声门：整体变亮变暗（闪光、渐变、自动曝光）几乎没有贡献
-        let prev = previous
-        let cells = cellOf
+        // 帧差 + 噪声门。整体位移的选择仍按去均值（保持原来的平移判定）；
+        // 能量 / 覆盖率改减「对齐后帧差的中位数」（algo-opt-1）：整体变亮变暗照样几乎没有贡献，
+        // 但局部变暗（窗帘、阴影、半边画面变化）不会再把另一半没动的画面也算成在动
         let prevMean = previousMean
         let gate = Self.noiseGate
-        let (dx, dy) = Self.globalShift(pixels, mean: mean, previous: prev, previousMean: prevMean,
-                                        width: w, height: h, cells: cells)
-        var cellSums = [Double](repeating: 0, count: Self.gridColumns * Self.gridRows)
+        let shift = Self.globalShift(pixels, mean: mean, previous: previous, previousMean: prevMean,
+                                     width: w, height: h, cells: cellOf)
+        let dx = shift.dx
+        let dy = shift.dy
+        let x0 = max(0, dx)
+        let x1 = min(w, w + dx)
+        let y0 = max(0, dy)
+        let y1 = min(h, h + dy)
+        for b in 0..<Self.diffBins { diffHistogram[b] = 0 }
+        for c in 0..<cellSums.count { cellSums[c] = 0 }
         var total = 0.0
         var valid = 0
-        for y in 0..<h {
-            let py = y - dy
-            guard py >= 0, py < h else { continue }
-            for x in 0..<w {
-                let px = x - dx
-                guard px >= 0, px < w else { continue }
-                let i = y * w + x
-                valid += 1
-                let d = (Double(pixels[i]) - mean) - (Double(prev[py * w + px]) - prevMean)
-                let e = abs(d) - gate
-                if e > 0 {
-                    total += e
-                    cellSums[cells[i]] += e
+        previous.withUnsafeBufferPointer { prev in
+            pixels.withUnsafeBufferPointer { cur in
+                diffHistogram.withUnsafeMutableBufferPointer { dh in
+                    for y in y0..<max(y0, y1) {
+                        let row = y * w
+                        let prow = (y - dy) * w - dx
+                        for x in x0..<max(x0, x1) {
+                            dh[Int(cur[row + x]) - Int(prev[prow + x]) + 255] += 1
+                        }
+                    }
+                }
+                valid = max(0, x1 - x0) * max(0, y1 - y0)
+                let offset = Self.histogramMedian(diffHistogram, count: valid) - 255
+                cellOf.withUnsafeBufferPointer { cells in
+                    cellSums.withUnsafeMutableBufferPointer { cs in
+                        for y in y0..<max(y0, y1) {
+                            let row = y * w
+                            let prow = (y - dy) * w - dx
+                            for x in x0..<max(x0, x1) {
+                                let d = Double(Int(cur[row + x]) - Int(prev[prow + x])) - offset
+                                let e = abs(d) - gate
+                                if e > 0 {
+                                    total += e
+                                    cs[cells[row + x]] += e
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -254,19 +392,93 @@ struct MotionAnalyzer {
 
         var out = energy
         var held = false
+        var near = 0.0
         if isCut {
             // 不出尖峰，也不突然掉到 0
             out = median(within: Self.substituteWindow, now: time)
             holdRemaining = Self.holdSamples
+            noteCutForBackground(sharpness: sharp, gap: gap)
         } else if holdRemaining > 0 {
             out = median(within: Self.substituteWindow, now: time)
             holdRemaining -= 1
             held = true
+            noteCutForBackground(sharpness: sharp, gap: gap)
         } else {
             record(energy, at: time)
+            near = updateNearField(coverage: coverage, sharpness: sharp, shift: shift, gap: gap)
         }
-        remember(pixels, width: w, height: h, mean: mean, histogram: histogram, time: time)
-        return MotionSample(time: time, energy: out, coverage: coverage, isCut: isCut, isHeld: held)
+        remember(pixels, width: w, height: h, mean: mean, time: time)
+        return MotionSample(time: time, energy: out, coverage: coverage, isCut: isCut, isHeld: held, nearField: near)
+    }
+
+    /// 近场 / 遮挡分数（algo-opt-1）：
+    /// 遮挡 = 大面积在动 × (画面颜色分布和最近背景差很多 或 明显变糊)；
+    /// 贴脸晃动 = 大面积在动 × 经常需要平移补偿 × 补偿后仍对不齐（视差大）。两者取大，< 0.05 当 0
+    private mutating func updateNearField(coverage c: Double, sharpness g: Double, shift: MotionShift,
+                                          gap: Double) -> Double {
+        if !backgroundValid { resetBackground(sharpness: g) }
+        var hDist = 0.0
+        for b in 0..<Self.histogramBins { hDist += abs(histogram[b] - backgroundHistogram[b]) }
+        hDist *= 0.5
+        let blurTerm = backgroundSharpness >= Self.minBackgroundSharpness
+            ? Self.sigmoid(1 - g / backgroundSharpness, 0.35, 0.1) : 0
+        let wide = Self.sigmoid(c, 0.5, 0.1)
+        var histTerm = Self.sigmoid(hDist, 0.35, 0.07)
+        if cutPending {
+            // 切镜待定：颜色分布变了还要同时变糊才算遮挡（清晰的新场景不算）
+            let blurGate = backgroundSharpness >= Self.minBackgroundSharpness
+                ? Self.sigmoid(1 - g / backgroundSharpness, Self.cutBlurCenter, Self.cutBlurWidth) : 0
+            histTerm *= blurGate
+        }
+        let occlusion = wide * max(histTerm, blurTerm)
+
+        let camA = 1 - exp(-gap / Self.cameraSeconds)
+        shiftRate += ((shift.accepted ? 1 : 0) - shiftRate) * camA
+        if shift.searched, shift.ratio.isFinite { residualRatio += (min(1, max(0, shift.ratio)) - residualRatio) * camA }
+        let camera = wide * Self.sigmoid(shiftRate, 0.5, 0.15) * Self.sigmoid(residualRatio, 0.45, 0.08)
+
+        var near = max(occlusion, camera)
+        if !near.isFinite || near < Self.nearFieldDeadzone { near = 0 }
+        near = min(1, near)
+
+        if cutPending {
+            // 切镜待定：背景不动；新画面连续安静 0.5 秒（真实切镜、手停住）或待定满 nearFreezeLimit 才采用
+            cutPendingElapsed += gap
+            let calm = near <= 0.5 || c < Self.cutCalmCoverage
+            cutPendingCalm = calm ? cutPendingCalm + gap : 0
+            if cutPendingCalm >= Self.cutAdoptSeconds || cutPendingElapsed >= Self.nearFreezeLimit {
+                resetBackground(sharpness: g)
+            }
+        } else if near > 0.5 && backgroundFrozen < Self.nearFreezeLimit {
+            // 背景：判为近场时先冻结（最多 6 秒），否则按 4 秒跟上
+            backgroundFrozen += gap
+        } else {
+            if near <= 0.5 { backgroundFrozen = 0 }
+            let a = 1 - exp(-gap / Self.backgroundSeconds)
+            for b in 0..<Self.histogramBins { backgroundHistogram[b] += (histogram[b] - backgroundHistogram[b]) * a }
+            backgroundSharpness += (g - backgroundSharpness) * a
+        }
+        if !shiftRate.isFinite || !residualRatio.isFinite || !backgroundSharpness.isFinite {
+            shiftRate = 0
+            residualRatio = 0
+            backgroundValid = false
+        }
+        return near
+    }
+
+    /// 直方图中位数（偶数个取中间两个的平均）；count == 0 时返回 255（差值 0）
+    static func histogramMedian(_ hist: [Int], count: Int) -> Double {
+        guard count > 0 else { return 255 }
+        let lowRank = (count - 1) / 2
+        let highRank = count / 2
+        var seen = 0
+        var low = -1
+        for b in 0..<hist.count {
+            seen += hist[b]
+            if low < 0 && seen > lowRank { low = b }
+            if seen > highRank { return Double(low + b) / 2 }
+        }
+        return low >= 0 ? Double(low) : 255
     }
 
     /// 没有新帧但播放头在走（VFR 静止段）：当作一帧完全没动的画面，刷新参考时间，记零能量
@@ -286,10 +498,10 @@ struct MotionAnalyzer {
     /// 整体位移（内容从上一帧移动了 (dx, dy)：cur[x, y] ≈ prev[x − dx, y − dy]）。
     /// 只在大半格子有变化时才搜；对齐后差异要明显更小才采用，否则 (0, 0)（和不补偿逐位相同）
     static func globalShift(_ cur: [UInt8], mean: Double, previous prev: [UInt8], previousMean: Double,
-                            width w: Int, height h: Int, cells: [Int]) -> (Int, Int) {
+                            width w: Int, height h: Int, cells: [Int]) -> MotionShift {
         let r = maxShift
         guard w > 2 * r + 4, h > 2 * r + 4, cur.count == w * h, prev.count == w * h, cells.count == w * h else {
-            return (0, 0)
+            return MotionShift()
         }
         let cellCount = gridColumns * gridRows
         var cellDiff = [Double](repeating: 0, count: cellCount)
@@ -310,14 +522,14 @@ struct MotionAnalyzer {
             }
             y += 2
         }
-        guard samples > 0, zero / Double(samples) > noiseGate else { return (0, 0) }
+        guard samples > 0, zero / Double(samples) > noiseGate else { return MotionShift() }
         var changed = 0
         var counted = 0
         for c in 0..<cellCount where cellN[c] > 0 {
             counted += 1
             if cellDiff[c] / cellN[c] > noiseGate { changed += 1 }
         }
-        guard counted > 0, Double(changed) / Double(counted) > shiftChangedCells else { return (0, 0) }
+        guard counted > 0, Double(changed) / Double(counted) > shiftChangedCells else { return MotionShift() }
         var best = zero
         var bestShift = (0, 0)
         for sy in -r...r {
@@ -340,16 +552,30 @@ struct MotionAnalyzer {
                 }
             }
         }
-        return best < zero * shiftAcceptRatio ? bestShift : (0, 0)
+        let ratio = zero > 0 ? best / zero : 1
+        guard best < zero * shiftAcceptRatio else { return MotionShift(searched: true, ratio: ratio) }
+        return MotionShift(dx: bestShift.0, dy: bestShift.1, searched: true, ratio: ratio)
     }
 
-    private mutating func remember(_ pixels: [UInt8], width: Int, height: Int, mean: Double,
-                                   histogram: [Double], time: Double) {
-        previous = pixels
+    /// 记下参考帧：尺寸没变就拷进已有存储（不和调用方的帧缓冲共享、不每帧分配）
+    private mutating func remember(_ pixels: [UInt8], width: Int, height: Int, mean: Double, time: Double) {
+        if previous.count == pixels.count {
+            previous.withUnsafeMutableBufferPointer { dst in
+                pixels.withUnsafeBufferPointer { src in
+                    if let d = dst.baseAddress, let s = src.baseAddress { d.update(from: s, count: src.count) }
+                }
+            }
+        } else {
+            previous = pixels
+            previous.reserveCapacity(pixels.count)
+        }
         previousWidth = width
         previousHeight = height
         previousMean = mean
-        previousHistogram = histogram
+        if previousHistogram.count != Self.histogramBins {
+            previousHistogram = [Double](repeating: 0, count: Self.histogramBins)
+        }
+        for b in 0..<Self.histogramBins { previousHistogram[b] = histogram[b] }
         previousTime = time
     }
 
@@ -364,15 +590,15 @@ struct MotionAnalyzer {
     }
 
     /// 最近 window 秒内正常样本（不含切换 / 保持期）的能量中位数；没有样本时为 0
-    private func median(within window: Double, now: Double) -> Double {
-        var values: [Double] = []
+    private mutating func median(within window: Double, now: Double) -> Double {
+        medianScratch.removeAll(keepingCapacity: true)
         for i in 0..<historyTimes.count where now - historyTimes[i] <= window {
-            values.append(historyEnergies[i])
+            medianScratch.append(historyEnergies[i])
         }
-        guard !values.isEmpty else { return 0 }
-        values.sort()
-        let m = values.count / 2
-        return values.count % 2 == 1 ? values[m] : (values[m - 1] + values[m]) / 2
+        guard !medianScratch.isEmpty else { return 0 }
+        medianScratch.sort()
+        let m = medianScratch.count / 2
+        return medianScratch.count % 2 == 1 ? medianScratch[m] : (medianScratch[m - 1] + medianScratch[m]) / 2
     }
 
     private mutating func buildCells(width w: Int, height h: Int) {
@@ -402,6 +628,9 @@ struct MotionWindow: Equatable {
     var frames: Int = 0
     var cutCount: Int = 0
     var heldCount: Int = 0
+    /// 窗口内样本的平均覆盖率 / 平均近场分数（algo-opt-1；老调用方不填 = 0，行为不变）
+    var coverage: Double = 0
+    var nearField: Double = 0
 
     static let empty = MotionWindow()
 
@@ -418,10 +647,14 @@ struct MotionWindowAccumulator {
     private(set) var frames = 0
     private(set) var cutCount = 0
     private(set) var heldCount = 0
+    private var coverageSum: Double = 0
+    private var nearSum: Double = 0
 
     mutating func add(_ s: MotionSample) {
         guard s.energy.isFinite, s.energy >= 0 else { return }
         sum += s.energy
+        if s.coverage.isFinite { coverageSum += min(1, max(0, s.coverage)) }
+        if s.nearField.isFinite { nearSum += min(1, max(0, s.nearField)) }
         peak = max(peak, s.energy)
         frames += 1
         if s.isCut { cutCount += 1 }
@@ -431,7 +664,8 @@ struct MotionWindowAccumulator {
     mutating func drain() -> MotionWindow {
         let window = frames > 0
             ? MotionWindow(meanEnergy: sum / Double(frames), peakEnergy: peak, frames: frames,
-                           cutCount: cutCount, heldCount: heldCount)
+                           cutCount: cutCount, heldCount: heldCount,
+                           coverage: coverageSum / Double(frames), nearField: nearSum / Double(frames))
             : .empty
         self = MotionWindowAccumulator()
         return window
@@ -464,6 +698,9 @@ struct MotionNormalizer {
     static let highFallSeconds: TimeInterval = 25
     static let lowRiseSeconds: TimeInterval = 20
     static let lowFallSeconds: TimeInterval = 1.5
+    /// 近场 / 遮挡（algo-opt-1）：ratio 向「固定尺度的 60%」收拢 N 倍（同一拍只降不升）；N ≥ 0.5 的窗口不学参考值
+    static let nearFieldFixedShare: Double = 0.6
+    static let nearFieldLearnLimit: Double = 0.5
 
     private(set) var refHigh: Double = MotionNormalizer.initialHigh
     private(set) var refLow: Double = MotionNormalizer.initialLow
@@ -490,7 +727,9 @@ struct MotionNormalizer {
         guard e.isFinite, e >= Self.absoluteGate else { return 0 }
         let l = log(1 + e)
         // 开关关着也一直学：中途打开自动适应时参考值已经是这个视频的（同声音侧）
-        if w.settled, l.isFinite {
+        let near = w.nearField.isFinite ? min(1, max(0, w.nearField)) : 0
+        // 手贴镜头 / 大面积遮挡不训练「这个视频平时动多大」，否则之后真正的动作会被压低
+        if w.settled, near < Self.nearFieldLearnLimit, l.isFinite {
             let highTau = l > refHigh ? Self.highRiseSeconds : Self.highFallSeconds
             refHigh += (l - refHigh) * (1 - exp(-step / highTau))
             refHigh = max(Self.minHigh, refHigh)
@@ -509,12 +748,84 @@ struct MotionNormalizer {
             let adaptive = min(1, (l - lo) / span)
             ratio = Self.adaptiveWeight * adaptive + (1 - Self.adaptiveWeight) * fixedRatio
         }
+        if near > 0 {
+            // 近场画面变化很大但不是「内容在动」：往固定尺度的 60% 收，最多收到那里，不会比原来高
+            let floorRatio = Self.nearFieldFixedShare * max(0, fixedRatio)
+            ratio -= near * max(0, ratio - floorRatio)
+        }
         let clampedGain = gainDb.isFinite
             ? min(VisualSyncSettings.motionGainRange.upperBound, max(VisualSyncSettings.motionGainRange.lowerBound, gainDb))
             : 0
         let g = pow(10, clampedGain / 20)
         let out = ratio * g * Self.targetPercent
         return out.isFinite ? min(100, max(0, out)) : 0
+    }
+}
+
+/// 内容时间戳（algo-opt-1）：VideoMotionTap 15 Hz 拉帧，但 24 / 25 / 30 fps 的片子两次拉到的帧之间隔的内容时间
+/// 一会儿 1 帧一会儿 2 帧，按拉帧时刻算间隔能量会一大一小地抖。改用「这一帧真正该显示的时刻」：
+/// t = host − (播放头时间 − 这帧的显示时间) / 播放速率（滞后在 0~0.5 秒内才用，否则退回 host）。
+/// 输出单调递增、相邻至少 minGap（不会让 MotionAnalyzer 因间隔太短而重置），且不晚于 host
+struct MotionDisplayClock {
+    static let rateRange: ClosedRange<Double> = 0.1...8
+    static let rateSmoothing: Double = 0.3
+    static let maxLag: Double = 0.5
+    static let minGap: Double = 0.031
+
+    private(set) var rate: Double = 1
+    /// 上一个真实帧实际用的滞后（host − 输出时间，0~maxLag）：静止补样按它换到同一条时间轴
+    private(set) var lastLag: Double = 0
+    private var lastHost: Double?
+    private var lastItem: Double?
+    private var lastOut: Double?
+
+    mutating func reset() {
+        rate = 1
+        lastLag = 0
+        lastHost = nil
+        lastItem = nil
+        lastOut = nil
+    }
+
+    /// 静止补样的时间：和真实帧同一条「显示时刻」时间轴（host − 上一帧的滞后）。
+    /// 补样用 host、真实帧用显示时刻会让补样之后第一帧的间隔被压到 minGap，能量按间隔归一时最多 ×2
+    func stillTime(host: Double) -> Double {
+        guard host.isFinite else { return host }
+        return host - lastLag
+    }
+
+    /// host：拉帧时刻；item：这个时刻的播放头；shown：拿到的帧的显示时间（itemTimeForDisplay）
+    mutating func time(host: Double, item: Double, shown: Double) -> Double {
+        guard host.isFinite else { return host }
+        defer {
+            lastHost = host
+            if item.isFinite { lastItem = item }
+        }
+        if let h0 = lastHost, let i0 = lastItem, item.isFinite {
+            let dh = host - h0
+            let di = item - i0
+            if dh > 0.001, di > 0 {
+                let r = min(Self.rateRange.upperBound, max(Self.rateRange.lowerBound, di / dh))
+                rate += (r - rate) * Self.rateSmoothing
+                if !rate.isFinite { rate = 1 }
+            }
+        }
+        var t = host
+        if item.isFinite, shown.isFinite {
+            let lag = (item - shown) / rate
+            if lag >= 0, lag <= Self.maxLag { t = host - lag }
+        }
+        if let last = lastOut { t = max(t, min(host, last + Self.minGap)) }
+        lastOut = max(lastOut ?? t, t)
+        let used = host - t
+        lastLag = used.isFinite ? min(Self.maxLag, max(0, used)) : 0
+        return t
+    }
+
+    /// 发出了静止补样：time 用 stillTime(host:) 的值（同一条时间轴）。之后的帧时间要晚于它
+    mutating func noteStill(at time: Double) {
+        guard time.isFinite else { return }
+        lastOut = max(lastOut ?? time, time)
     }
 }
 
@@ -662,6 +973,63 @@ struct VisualSyncSettings: Equatable {
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
+}
+
+/// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
+/// - 声音 → 画面：画面归一化还在热身（confidence < 1）或画面还没有新鲜样本的那部分用声音的平滑值补上，并在 4 秒内线性淡出。
+///   value = c·M + (1 − c)·淡出·A ≤ max(M, A)，不会比任一来源单独更强；之后和原来逐位相同；
+/// - 画面 → 声音：声音直出先经 SyncOutputStage（升幅 ≤ +20 / 拍、归零保持）从设备现在的输出追上，
+///   追上或满 10 拍后回到原来的直出路径
+struct SourceHandover {
+    static let fadeSeconds: TimeInterval = 4
+    static let maxCatchUpTicks = 10
+
+    private(set) var fadeElapsed: TimeInterval?
+    private(set) var catchUpTicks: Int?
+
+    var isFading: Bool { fadeElapsed != nil }
+    var isCatchingUp: Bool { catchUpTicks != nil }
+
+    mutating func begin(_ to: VisualSyncSource) {
+        switch to {
+        case .motion:
+            fadeElapsed = 0
+            catchUpTicks = nil
+        case .audio:
+            fadeElapsed = nil
+            catchUpTicks = 0
+        }
+    }
+
+    mutating func cancel() {
+        fadeElapsed = nil
+        catchUpTicks = nil
+    }
+
+    /// 画面一拍的输入值。没有交接时 = motionSignal ? confidence × motion : 0
+    mutating func blend(motion m: Double, confidence c: Double, motionSignal: Bool, audio a: Double,
+                        audioSignal: Bool, dt: TimeInterval) -> (value: Double, hasSignal: Bool) {
+        let mv = motionSignal ? c * m : 0
+        guard let e = fadeElapsed else { return (mv, motionSignal) }
+        let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
+        let next = e + step
+        fadeElapsed = next >= Self.fadeSeconds ? nil : next
+        let fade = max(0, 1 - e / Self.fadeSeconds)
+        // 画面还没有新鲜样本（刚装上取帧 / 发热暂停）就当置信度 0、全用声音补：
+        // 同一个视频第二次切到画面时归一化早已热身完（confidence = 1），但新装的分析器还没出样本
+        let conf = motionSignal && c.isFinite ? min(1, max(0, c)) : 0
+        let motionPart = motionSignal && m.isFinite ? conf * min(100, max(0, m)) : 0
+        let audioPart = audioSignal && a.isFinite ? min(100, max(0, a)) : 0
+        let v = motionPart + (1 - conf) * fade * audioPart
+        return (v.isFinite ? min(100, max(0, v)) : 0, motionSignal || (audioSignal && fade > 0))
+    }
+
+    /// 画面 → 声音的一拍：限速结果追上直出，或满 maxCatchUpTicks 拍，交接结束
+    mutating func noteCatchUp(limited: [Int], direct: [Int]) {
+        guard let t = catchUpTicks else { return }
+        let next = t + 1
+        catchUpTicks = (limited == direct || next >= Self.maxCatchUpTicks) ? nil : next
+    }
 }
 
 /// 画面模式的出口（§4.12）：最低强度 / 上限映射（与 AudioReactiveShaper.step 尾部逐位一致）

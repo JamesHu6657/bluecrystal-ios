@@ -644,12 +644,78 @@ enum AudioSampleFormat: Equatable {
     }
 }
 
-/// 一个声道一段样本的峰峰值和均方（非有限值跳过）
+/// 一段样本里按 512 点分块的块电平统计（algo-opt-1）：块 dB 的均值 / 方差和「起音」次数（块电平比上一块跳高 ≥ 6 dB）。
+/// 只用来判断声音是「持续平稳」还是「有起伏」（AudioReactiveShaper 的轻柔声音降权），不改峰峰值 / RMS 的算法。
+/// 纯值类型、不分配内存：可以在实时音频线程上用
+struct AudioBlockStats: Equatable {
+    static let blockSize = 512
+    /// 末尾不足一块但够这么多点的也算一块
+    static let minPartialBlock = 128
+    /// 低于这个电平的块（静音 / 数字零）不进统计
+    static let silentBlockDb: Double = -70
+    static let onsetJumpDb: Double = 6
+
+    var count = 0
+    var dbSum: Double = 0
+    var dbSumSquares: Double = 0
+    var onsets = 0
+
+    var mean: Double { count > 0 ? dbSum / Double(count) : 0 }
+    var std: Double {
+        guard count > 1 else { return 0 }
+        let m = mean
+        let v = dbSumSquares / Double(count) - m * m
+        return v > 0 && v.isFinite ? v.squareRoot() : 0
+    }
+
+    /// 一块的均方 → dB（与 loudnessDb 的 RMS 部分同刻度：满幅正弦 ≈ 0 dB）
+    static func blockDb(meanSquare: Double) -> Double {
+        guard meanSquare > 0, meanSquare.isFinite else { return -.infinity }
+        return 10 * log10(meanSquare * 2)
+    }
+
+    mutating func merge(_ o: AudioBlockStats) {
+        guard o.count > 0, o.dbSum.isFinite, o.dbSumSquares.isFinite else { return }
+        count += o.count
+        dbSum += o.dbSum
+        dbSumSquares += o.dbSumSquares
+        onsets += max(0, o.onsets)
+    }
+}
+
+/// 一个声道跨 tap 回调延续的分块状态：没满的块、上一块电平（起音要和上一块比）。
+/// 纯值、不分配内存：AudioLevelMeter 在实时线程上每个声道存一份，回调之间接着分块，
+/// 回调边界上的起音不再漏、回调尾巴也不再被当成单独的短块
+struct AudioBlockCarry: Equatable {
+    var sumSquares: Double = 0
+    var fill = 0
+    var lastDb: Double?
+}
+
+/// 一个声道一段样本的峰峰值和均方（非有限值跳过），顺带按 512 点分块记块电平（AudioBlockStats）
 struct AudioChannelStats {
     private(set) var minimum = Double.infinity
     private(set) var maximum = -Double.infinity
     private(set) var sumSquares: Double = 0
     private(set) var count = 0
+    private(set) var blocks = AudioBlockStats()
+    private var blockSumSquares: Double = 0
+    private var blockFill = 0
+    private var lastBlockDb: Double?
+
+    init() {}
+
+    /// 接着上一段的分块状态往下分（峰峰值 / 均方只算这一段）
+    init(carry: AudioBlockCarry) {
+        blockSumSquares = carry.sumSquares.isFinite ? max(0, carry.sumSquares) : 0
+        blockFill = min(AudioBlockStats.blockSize - 1, max(0, carry.fill))
+        lastBlockDb = carry.lastDb
+    }
+
+    /// 这一段结束时没满的块和上一块电平：交给下一段的 init(carry:)（不要再调 finish）
+    var carry: AudioBlockCarry {
+        AudioBlockCarry(sumSquares: blockSumSquares, fill: blockFill, lastDb: lastBlockDb)
+    }
 
     @inline(__always)
     mutating func add(_ v: Double) {
@@ -658,6 +724,31 @@ struct AudioChannelStats {
         if v > maximum { maximum = v }
         sumSquares += v * v
         count += 1
+        blockSumSquares += v * v
+        blockFill += 1
+        if blockFill >= AudioBlockStats.blockSize { closeBlock() }
+    }
+
+    /// 段末：不足一块但够 minPartialBlock 点的也记一块（调用方在一段样本加完后调用）
+    mutating func finish() {
+        if blockFill >= AudioBlockStats.minPartialBlock { closeBlock() }
+        blockSumSquares = 0
+        blockFill = 0
+    }
+
+    private mutating func closeBlock() {
+        let db = AudioBlockStats.blockDb(meanSquare: blockSumSquares / Double(max(1, blockFill)))
+        blockSumSquares = 0
+        blockFill = 0
+        guard db.isFinite, db > AudioBlockStats.silentBlockDb else {
+            lastBlockDb = nil
+            return
+        }
+        blocks.count += 1
+        blocks.dbSum += db
+        blocks.dbSumSquares += db * db
+        if let last = lastBlockDb, db - last >= AudioBlockStats.onsetJumpDb { blocks.onsets += 1 }
+        lastBlockDb = db
     }
 
     var peakToPeak: Double { count > 0 ? maximum - minimum : 0 }
@@ -669,6 +760,11 @@ struct AudioWindow: Equatable {
     var peakToPeak: Double = 0
     var rms: Double = 0
     var frames: Int = 0
+    /// 块电平统计（algo-opt-1）：没有块数据（老调用方 / 测试）时 blockCount == 0，降权逻辑只看窗口间起伏
+    var blockCount: Int = 0
+    var blockDbMean: Double = 0
+    var blockDbStd: Double = 0
+    var onsets: Int = 0
 
     static let silent = AudioWindow()
 }
@@ -678,18 +774,23 @@ struct AudioWindowAccumulator {
     private(set) var peakToPeak: Double = 0
     private var weightedMeanSquare: Double = 0
     private(set) var frames = 0
+    private(set) var blocks = AudioBlockStats()
 
-    mutating func add(peakToPeak p2p: Double, meanSquare: Double, frames n: Int) {
+    mutating func add(peakToPeak p2p: Double, meanSquare: Double, frames n: Int,
+                      blocks b: AudioBlockStats = AudioBlockStats()) {
         guard n > 0, p2p.isFinite, meanSquare.isFinite, p2p >= 0, meanSquare >= 0 else { return }
         peakToPeak = max(peakToPeak, p2p)
         weightedMeanSquare += meanSquare * Double(n)
         frames += n
+        blocks.merge(b)
     }
 
     /// 取走本窗口的结果并清零
     mutating func drain() -> AudioWindow {
         let window = frames > 0
-            ? AudioWindow(peakToPeak: peakToPeak, rms: (weightedMeanSquare / Double(frames)).squareRoot(), frames: frames)
+            ? AudioWindow(peakToPeak: peakToPeak, rms: (weightedMeanSquare / Double(frames)).squareRoot(), frames: frames,
+                          blockCount: blocks.count, blockDbMean: blocks.mean, blockDbStd: blocks.std,
+                          onsets: blocks.onsets)
             : .silent
         self = AudioWindowAccumulator()
         return window
@@ -733,6 +834,7 @@ struct AudioSyncSettings: Equatable {
         static let channels = "bcAudioSyncChannels"
         static let minPercent = "bcAudioSyncMinPercent"
         static let autoGain = "bcAudioSyncAutoGain"
+        static let softDuck = "bcAudioSyncSoftDuck"
     }
 
     static let defaultEnabled = true
@@ -749,6 +851,9 @@ struct AudioSyncSettings: Equatable {
     static let defaultMinPercent: Double = 10
     /// 自动灵敏度：跟踪当前视频最近的响度，自动把它的响段映射到接近上限，安静的视频和响的视频都用满范围
     static let defaultAutoGain = true
+    /// 轻柔声音降权（algo-opt-1）：持续、平稳、偏小的声音（底噪、环境声、轻音乐）输出更轻，自动增益也少放大它们。
+    /// App 里默认开；init 参数默认关，纯逻辑测试和老调用方行为逐位不变
+    static let defaultSoftDuck = true
 
     var enabled: Bool
     var sensitivityDb: Double
@@ -756,10 +861,11 @@ struct AudioSyncSettings: Equatable {
     var channels: AudioSyncChannels
     var minPercent: Double
     var autoGain: Bool
+    var softDuck: Bool
 
     init(enabled: Bool = defaultEnabled, sensitivityDb: Double = defaultSensitivityDb,
          maxPercent: Double = defaultMaxPercent, channels: AudioSyncChannels = defaultChannels,
-         minPercent: Double = 0, autoGain: Bool = false) {
+         minPercent: Double = 0, autoGain: Bool = false, softDuck: Bool = false) {
         self.enabled = enabled
         self.sensitivityDb = Self.clamp(sensitivityDb, to: Self.sensitivityRange, fallback: Self.defaultSensitivityDb)
         self.maxPercent = Self.clamp(maxPercent, to: Self.maxPercentRange, fallback: Self.defaultMaxPercent)
@@ -767,6 +873,7 @@ struct AudioSyncSettings: Equatable {
         // 最低强度不超过上限
         self.minPercent = min(self.maxPercent, Self.clamp(minPercent, to: Self.minPercentRange, fallback: 0))
         self.autoGain = autoGain
+        self.softDuck = softDuck
     }
 
     static func load(from defaults: UserDefaults) -> AudioSyncSettings {
@@ -777,7 +884,8 @@ struct AudioSyncSettings: Equatable {
             maxPercent: defaults.object(forKey: Keys.maxPercent) as? Double ?? defaultMaxPercent,
             channels: channels ?? defaultChannels,
             minPercent: defaults.object(forKey: Keys.minPercent) as? Double ?? defaultMinPercent,
-            autoGain: defaults.object(forKey: Keys.autoGain) as? Bool ?? defaultAutoGain)
+            autoGain: defaults.object(forKey: Keys.autoGain) as? Bool ?? defaultAutoGain,
+            softDuck: defaults.object(forKey: Keys.softDuck) as? Bool ?? defaultSoftDuck)
     }
 
     /// 灵敏度的倍数写法（界面显示）
@@ -824,6 +932,14 @@ struct AudioReactiveShaper {
     static let autoRelativeGateDb: Double = 24
     /// 低于相对噪声门的样本学习得很慢（下降时间常数）
     static let autoBelowGateFallSeconds: TimeInterval = 180
+    /// 轻柔声音降权（algo-opt-1，settings.softDuck 开时生效）：
+    /// 起伏度 Dyn（块电平方差 / 窗口间起伏 / 起音率 / 峰均比取最大，0~1）→ 轻柔度 S = (1 − Dyn) × 「绝对偏小或比这个视频响段低很多」，
+    /// 平滑后电平 × (1 − 0.4·S̄)，自动增益的「放大」部分 × (0.3 + 0.7·Dyn̄)。只会让输出变小，不会变大
+    static let softHistoryCount = 7
+    static let softSmoothingSeconds: TimeInterval = 0.6
+    static let dynamicsSmoothingSeconds: TimeInterval = 10
+    static let softDuckDepth: Double = 0.4
+    static let softAutoGainKeep: Double = 0.3
 
     struct Output: Equatable {
         /// 灵敏度之后、噪声门之前的电平（0~100），界面电平条用
@@ -839,10 +955,16 @@ struct AudioReactiveShaper {
     /// 这个视频是否已经出现过高于相对噪声门的声音；换视频时清掉
     private(set) var heardAboveGate = false
     private(set) var aboveGateSeconds: TimeInterval = 0
+    /// 轻柔度 S̄（0~1，τ 0.6 s）和长期起伏度 Dyn̄（0~1，τ 10 s，换视频回 1 = 先当有起伏、不降自动增益）
+    private(set) var softness: Double = 0
+    private(set) var dynamics: Double = 1
+    private var levelHistory: [Double] = []
 
     mutating func reset() {
         smoothed = 0
         gateOpen = false
+        softness = 0
+        levelHistory.removeAll(keepingCapacity: true)
     }
 
     /// 换视频：重新学习响度
@@ -851,6 +973,62 @@ struct AudioReactiveShaper {
         refDb = Self.autoInitialRefDb
         heardAboveGate = false
         aboveGateSeconds = 0
+        dynamics = 1
+    }
+
+    private static func clip01(_ v: Double) -> Double { v.isFinite ? min(1, max(0, v)) : 0 }
+
+    /// 逻辑斯蒂：x 远大于 center 时 → 1
+    static func sigmoid(_ x: Double, center: Double, width: Double) -> Double {
+        guard x.isFinite, width > 0 else { return x == .infinity ? 1 : 0 }
+        return 1 / (1 + exp(-(x - center) / width))
+    }
+
+    /// 起伏度 0~1：任何一项明显就算「有起伏」（音乐节拍、讲话、动作音效），全都平稳才算持续声音
+    static func dynamicsScore(_ w: AudioWindow, levelStd: Double, dt: TimeInterval) -> Double {
+        let blockVar = w.blockCount >= 2 ? clip01((w.blockDbStd - 2.5) / 4) : 0
+        let windowVar = clip01((levelStd - 1.5) / 4.5)
+        let onsetRate = dt > 0 ? clip01(Double(max(0, w.onsets)) / dt / 2) : 0
+        var crest = 0.0
+        if w.rms > 0, w.peakToPeak > 0, w.rms.isFinite, w.peakToPeak.isFinite {
+            crest = clip01((20 * log10(w.peakToPeak / 2 / w.rms) - 14) / 6)
+        }
+        return max(blockVar, windowVar, onsetRate, crest)
+    }
+
+    /// 轻柔度 0~1：平稳（1 − Dyn）且（绝对电平低于约 −20 dB，或比参考响度低 8 dB 以上）
+    static func softScore(loudnessDb db: Double, refDb: Double, dynamics: Double) -> Double {
+        guard db.isFinite, refDb.isFinite else { return 0 }
+        let quiet = max(sigmoid(-db, center: 20, width: 3), sigmoid(refDb - db, center: 8, width: 2))
+        return clip01((1 - clip01(dynamics)) * quiet)
+    }
+
+    /// 开关关着也一直跟踪（中途打开时已经是这个视频的状态）；输出只在 softDuck 时用
+    private mutating func trackSoftness(_ w: AudioWindow, loudnessDb db: Double, dt: TimeInterval) {
+        let a = 1 - exp(-dt / Self.softSmoothingSeconds)
+        guard db.isFinite, db > Self.absoluteGateDb else {
+            softness += (0 - softness) * a
+            if !softness.isFinite { softness = 0 }
+            return
+        }
+        levelHistory.append(db)
+        if levelHistory.count > Self.softHistoryCount { levelHistory.removeFirst(levelHistory.count - Self.softHistoryCount) }
+        var levelStd = 0.0
+        if levelHistory.count >= 3 {
+            let m = levelHistory.reduce(0, +) / Double(levelHistory.count)
+            let v = levelHistory.reduce(0) { $0 + ($1 - m) * ($1 - m) } / Double(levelHistory.count)
+            levelStd = v > 0 ? v.squareRoot() : 0
+        } else {
+            // 刚开始 / 刚 seek：历史不够，先当有起伏（不降权）
+            levelStd = 6
+        }
+        let dyn = Self.dynamicsScore(w, levelStd: levelStd, dt: dt)
+        dynamics += (dyn - dynamics) * (1 - exp(-dt / Self.dynamicsSmoothingSeconds))
+        softness += (Self.softScore(loudnessDb: db, refDb: refDb, dynamics: dyn) - softness) * a
+        if !dynamics.isFinite { dynamics = 1 }
+        if !softness.isFinite { softness = 0 }
+        dynamics = Self.clip01(dynamics)
+        softness = Self.clip01(softness)
     }
 
     /// 当前自动增益（dB）：把参考响度放到 autoTargetPercent
@@ -909,12 +1087,17 @@ struct AudioReactiveShaper {
         var gain = settings.sensitivityDb
         // 开关关着也一直学：中途打开自动灵敏度时参考响度已经是这个视频的
         adapt(loudnessDb: db, dt: step)
+        trackSoftness(w, loudnessDb: db, dt: step)
         if settings.autoGain {
             // 自动增益 + 手动灵敏度作微调
             let trim = min(Self.autoTrimRange.upperBound, max(Self.autoTrimRange.lowerBound, settings.sensitivityDb))
-            gain = min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, autoGainDb + trim))
+            var auto = autoGainDb
+            // 轻柔声音降权：持续平稳的视频少放大（只缩「放大」部分，压低的部分不动）
+            if settings.softDuck, auto > 0 { auto *= Self.softAutoGainKeep + (1 - Self.softAutoGainKeep) * dynamics }
+            gain = min(Self.autoGainRange.upperBound, max(Self.autoGainRange.lowerBound, auto + trim))
         }
         var level = Self.targetPercent(loudnessDb: db, sensitivityDb: gain)
+        if settings.softDuck { level *= 1 - Self.softDuckDepth * softness }
         // 自动模式：远低于这个视频响段的声音（安静段底噪）不输出，只剩最低强度
         if settings.autoGain, db.isFinite, db < refDb - Self.autoRelativeGateDb { level = 0 }
         if gateOpen {

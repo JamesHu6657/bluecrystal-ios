@@ -7,19 +7,30 @@ import os
 /// 实时线程上不分配内存、不调 Swift 运行时以外的阻塞接口；两边只在 os_unfair_lock 里交换几个数。
 /// 每个视频一个新的电平计：旧播放器的 tap 晚到的回调写不进新视频的窗口
 final class AudioLevelMeter {
+    /// 跨回调延续分块状态的声道数上限（超出的声道每次回调单独分块、段末收尾，和以前一样）
+    static let maxCarryChannels = 8
+
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private var accumulator = AudioWindowAccumulator()
     /// prepare 回调记下的处理格式；nil = 还没 prepare / 系统给的格式认不出（此时不分析、不输出）
     private var format: AudioSampleFormat?
+    /// 每个声道的分块延续状态。只在实时线程（process）上读写；init 时一次分配好，回调里不分配。
+    /// 别的线程要清它只在锁里置 carryResetPending，由下一次 process 自己清
+    private let carries: UnsafeMutablePointer<AudioBlockCarry>
+    private var carryResetPending = false
 
     init() {
         lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
         lock.initialize(to: os_unfair_lock())
+        carries = UnsafeMutablePointer<AudioBlockCarry>.allocate(capacity: Self.maxCarryChannels)
+        carries.initialize(repeating: AudioBlockCarry(), count: Self.maxCarryChannels)
     }
 
     deinit {
         lock.deinitialize(count: 1)
         lock.deallocate()
+        carries.deinitialize(count: Self.maxCarryChannels)
+        carries.deallocate()
     }
 
     /// 取走上次以来的窗口并清零（主线程）
@@ -33,6 +44,8 @@ final class AudioLevelMeter {
     func reset() {
         os_unfair_lock_lock(lock)
         accumulator = AudioWindowAccumulator()
+        // 跳转前没满的块 / 上一块电平不带到新位置
+        carryResetPending = true
         os_unfair_lock_unlock(lock)
     }
 
@@ -42,6 +55,7 @@ final class AudioLevelMeter {
         os_unfair_lock_lock(lock)
         format = f
         accumulator = AudioWindowAccumulator()
+        carryResetPending = true
         os_unfair_lock_unlock(lock)
     }
 
@@ -55,32 +69,55 @@ final class AudioLevelMeter {
     fileprivate func process(_ list: UnsafeMutablePointer<AudioBufferList>, frames: Int) {
         os_unfair_lock_lock(lock)
         let current = format
+        let resetCarries = carryResetPending
+        carryResetPending = false
         os_unfair_lock_unlock(lock)
+        if resetCarries {
+            for i in 0..<Self.maxCarryChannels { carries[i] = AudioBlockCarry() }
+        }
         guard let f = current, frames > 0 else { return }
         var chunkPeakToPeak = 0.0
         var chunkMeanSquare = 0.0
         var chunkFrames = 0
+        var chunkBlocks = AudioBlockStats()
+        // 声道序号跨 AudioBuffer 连续编号（非交错时一个 buffer 一个声道），用来找这个声道的分块延续状态
+        var channelBase = 0
         for buffer in UnsafeMutableAudioBufferListPointer(list) {
-            guard let data = buffer.mData else { continue }
             let channels = max(1, Int(buffer.mNumberChannels))
+            defer { channelBase += channels }
+            guard let data = buffer.mData else { continue }
             let n = min(frames, Int(buffer.mDataByteSize) / (f.bytesPerSample * channels))
             guard n > 0 else { continue }
             for ch in 0..<channels {
-                let stats = Self.channelStats(data, format: f, frames: n, channels: channels, channel: ch)
+                let slot = channelBase + ch
+                let carried = slot < Self.maxCarryChannels
+                let stats = Self.channelStats(data, format: f, frames: n, channels: channels, channel: ch,
+                                              carry: carried ? carries[slot] : nil)
+                if carried { carries[slot] = stats.carry }
                 chunkPeakToPeak = max(chunkPeakToPeak, stats.peakToPeak)
+                // 块电平取最响那个声道的（同 meanSquare 的选法）
+                if stats.meanSquare >= chunkMeanSquare { chunkBlocks = stats.blocks }
                 chunkMeanSquare = max(chunkMeanSquare, stats.meanSquare)
             }
             chunkFrames = max(chunkFrames, n)
         }
         guard chunkFrames > 0 else { return }
         os_unfair_lock_lock(lock)
-        accumulator.add(peakToPeak: chunkPeakToPeak, meanSquare: chunkMeanSquare, frames: chunkFrames)
+        accumulator.add(peakToPeak: chunkPeakToPeak, meanSquare: chunkMeanSquare, frames: chunkFrames, blocks: chunkBlocks)
         os_unfair_lock_unlock(lock)
     }
 
+    /// carry 不为 nil：接着这个声道上一次回调的分块往下分，没满的块留给下一次（不收尾）；
+    /// nil（声道太多）：这一段单独分块、段末收尾
     private static func channelStats(_ data: UnsafeMutableRawPointer, format f: AudioSampleFormat,
-                                     frames n: Int, channels: Int, channel ch: Int) -> AudioChannelStats {
-        var s = AudioChannelStats()
+                                     frames n: Int, channels: Int, channel ch: Int,
+                                     carry: AudioBlockCarry?) -> AudioChannelStats {
+        var s: AudioChannelStats
+        if let c = carry {
+            s = AudioChannelStats(carry: c)
+        } else {
+            s = AudioChannelStats()
+        }
         let scale = f.scale
         switch f {
         case .float32:
@@ -96,6 +133,7 @@ final class AudioLevelMeter {
             let p = data.assumingMemoryBound(to: Int32.self)
             for i in 0..<n { s.add(Double(p[i * channels + ch]) * scale) }
         }
+        if carry == nil { s.finish() }
         return s
     }
 }

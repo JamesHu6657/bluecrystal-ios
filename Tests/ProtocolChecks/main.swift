@@ -1167,10 +1167,26 @@ check(!BackgroundResume.shouldRequestStop(wasBackground: true, linkWritable: fal
 
 // MARK: - 第二轮审查 M3：安全计时用睡眠期间也走的时钟；换时钟的旧快照保守恢复
 
-let uptimeNow = ProcessInfo.processInfo.systemUptime
 let continuousNow = SafetyClock.continuousSeconds()
-check(continuousNow.isFinite && continuousNow + 0.5 >= uptimeNow, "连续时钟不慢于 systemUptime（睡眠时继续走）")
+check(continuousNow.isFinite && continuousNow >= 0, "连续时钟有限且非负")
 check(SafetyClock.continuousSeconds() >= continuousNow, "连续时钟单调")
+#if canImport(Darwin)
+// 系统时钟健全检查（只检查运行环境，不覆盖 SafetyClock 本身；SafetyClock 的行为由上面两条和下面的账本恢复检查覆盖）：
+// 同一计时源上先读 CLOCK_UPTIME_RAW（mach_absolute_time，睡眠停走），再读 CLOCK_MONOTONIC_RAW
+// （mach_continuous_time，睡眠也走），后者应 ≥ 前者。不拿 systemUptime 比 CLOCK_MONOTONIC：两者在 runner 虚拟机上
+// 时间基准不同（实测可差 0.5 秒以上），跨时钟比较会误报
+let uptimeRaw = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+let continuousRaw = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+check(uptimeRaw > 0 && continuousRaw >= uptimeRaw,
+      "系统时钟健全检查：CLOCK_MONOTONIC_RAW 不慢于 CLOCK_UPTIME_RAW（不覆盖 SafetyClock）")
+// M3 回归保护：SafetyClock 必须读 CLOCK_MONOTONIC（与 SafetyLedger 同一换算），前后各读一次把它夹住；
+// 退回 systemUptime（时间轴不同）就会失败
+let monoBefore = TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000_000
+let safetyNow = SafetyClock.continuousSeconds()
+let monoAfter = TimeInterval(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1_000_000_000
+check(monoBefore <= safetyNow && safetyNow <= monoAfter,
+      "SafetyClock 读的是 CLOCK_MONOTONIC（夹在前后两次读数之间）")
+#endif
 fc.boot = "clock-a"
 fc.t = 500
 let clockRun = makeLedger()
