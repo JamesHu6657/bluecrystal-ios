@@ -797,7 +797,7 @@ final class VideoSyncPlayer: ObservableObject {
     }
 
     /// rhythm-follow P1：这一拍的节奏档位（没打开 / 没锁定 / 没有新鲜画面时 nil = 伸缩照旧按动作强度）。
-    /// activity：画面自己的强度能让节奏用几成（RhythmOutput.activity）；0 = 画面没在动，跟随器马上解锁、不保持。
+    /// activity：画面自己的强度能让节奏用几成（RhythmOutput.motionActivity）；0 = 画面没在动，跟随器马上解锁、不保持。
     /// 频率按画面帧的显示时刻（host 时间轴）算，倍速播放时已经是实际看到的快慢，不再乘倍速
     private func rhythmLevel(_ window: MotionWindow, motionSignal: Bool, activity: Double, dt: TimeInterval) -> Int? {
         guard visualSettings.rhythmFollow else {
@@ -838,8 +838,11 @@ final class VideoSyncPlayer: ObservableObject {
                                      motionSignal: motionSignal, audio: shaper.smoothed, audioSignal: audioSignal, dt: dt)
         let value = blended.value
         let hasSignal = blended.hasSignal
-        // 节奏只认画面自己的新鲜样本和画面自己的强度（交接期间声音补的那部分没有频率，也不算「在动」）
-        let motionActivity = RhythmOutput.activity(motionSignal ? motionNormalizer.confidence * shaped.smoothed : 0)
+        // 节奏只认画面自己的新鲜样本和画面自己的强度（交接期间声音补的那部分没有频率，也不算「在动」）；
+        // 下降跟门前的即时强度走（r2 复审 M1）：动作一停节奏马上不加伸缩，不等 0.7 秒释放平滑
+        let motionActivity = RhythmOutput.motionActivity(level: shaped.level, smoothed: shaped.smoothed,
+                                                         confidence: motionNormalizer.confidence,
+                                                         motionSignal: motionSignal)
         let rateLevel = rhythmLevel(window, motionSignal: motionSignal, activity: motionActivity, dt: dt)
         guard settings.enabled else {
             // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
