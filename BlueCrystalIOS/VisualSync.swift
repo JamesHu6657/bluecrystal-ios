@@ -1560,6 +1560,13 @@ struct StrokeRhythm {
         estimate = compute(now: t)
     }
 
+    /// 到 now 还算数的估计：最近 maxAge 秒没有新样本（这组关节被挡住 / 出画）就当没有节奏，旧估计不再加成
+    func freshEstimate(at now: Double, maxAge: Double) -> Estimate {
+        guard count > 0, now.isFinite else { return Estimate() }
+        let last = times[(head + Self.capacity - 1) % Self.capacity]
+        return now - last <= maxAge ? estimate : Estimate()
+    }
+
     private mutating func compute(now: Double) -> Estimate {
         let cap = Self.capacity
         let start = (head + cap - count) % cap
@@ -1678,9 +1685,10 @@ enum StrokeScore {
     static let flowSpeedHigh: Double = 4.5
     static let flowAmplitudeLow: Double = 1
     static let flowAmplitudeHigh: Double = 6
-    /// 人体姿态：躯干长度 / 秒；幅度：躯干长度
-    static let poseSpeedLow: Double = 0.12
-    static let poseSpeedHigh: Double = 2.2
+    /// 人体姿态：躯干长度 / 秒（关节位置先按 PoseMotionTracker.jitterSeconds 平滑、位移再减掉 jitterDeadZone 死区，
+    /// 静止的人 1.5~2% 躯干的检测抖动 → 0；平滑让快动作的速度读数变小，上限相应从 2.2 降到 1.8）；幅度：躯干长度
+    static let poseSpeedLow: Double = 0.14
+    static let poseSpeedHigh: Double = 1.8
     static let poseAmplitudeLow: Double = 0.03
     static let poseAmplitudeHigh: Double = 0.25
     static let tempoLow: Double = 0.6
@@ -1886,6 +1894,14 @@ struct PoseMotionTracker {
     /// 换人判定：和上一帧（按相机运动预测）的中心距离超过 1.5 个身体尺度就按置信度 × 尺度重选
     static let continuityLimit: Double = 1.5
     static let rhythmGapLimit: Double = 1
+    /// 髋 / 头这组关节超过 0.5 秒没有新样本（被挡住 / 出画）：它的旧节奏估计不再加成
+    static let rhythmMaxAge: Double = 0.5
+    /// 检测抖动（algo-opt-3 复审 M1）：Vision 每帧独立检测、不做平滑，静止的人关键点也会抖 1~2% 躯干。
+    /// 每个关节先做时间常数 0.08 秒的指数平滑（按帧间隔算系数，平滑状态随相机运动一起搬），
+    /// 再从平滑后的位移里减掉 0.015 躯干的死区；关节置信度低于 0.6 时死区按 0.6 / 置信度放大（0.3 → 2 倍）
+    static let jitterSeconds: Double = 0.08
+    static let jitterDeadZone: Double = 0.015
+    static let jitterConfidenceRef: Double = 0.6
     static let capacity = 24
     static let groups: [[PoseJoint]] = [[.nose, .neck], [.leftShoulder, .rightShoulder], [.root, .leftHip, .rightHip],
                                         [.leftKnee, .rightKnee], [.leftWrist, .rightWrist]]
@@ -1900,6 +1916,9 @@ struct PoseMotionTracker {
     private var ux = [Double](repeating: 0, count: PoseJoint.count)
     private var uy = [Double](repeating: 0, count: PoseJoint.count)
     private var usable = [Bool](repeating: false, count: PoseJoint.count)
+    /// 平滑后的关节位置（上一次 update 那帧的坐标；下一次先按相机运动搬过来）
+    private var smoothX = [Double](repeating: 0, count: PoseJoint.count)
+    private var smoothY = [Double](repeating: 0, count: PoseJoint.count)
     private var sortX = [Double](repeating: 0, count: PoseJoint.count)
     private var sortY = [Double](repeating: 0, count: PoseJoint.count)
     private var speedTimes = [Double](repeating: 0, count: PoseMotionTracker.capacity)
@@ -2034,14 +2053,39 @@ struct PoseMotionTracker {
         let linked = !pick.switched && hasPrevious && continuous && dt > Self.minGap && dt <= Self.maxGap && scale > 0
         if linked {
             scale += (size - scale) * (1 - exp(-dt / Self.scaleSeconds))
+            let alpha = 1 - exp(-dt / Self.jitterSeconds)
             var n = 0
             for j in 0..<PoseJoint.count {
                 usable[j] = false
-                guard person.c[j] >= Self.minJointConfidence, previous.c[j] >= Self.minJointConfidence else { continue }
+                guard person.c[j] >= Self.minJointConfidence, previous.c[j] >= Self.minJointConfidence else {
+                    smoothX[j] = person.x[j]
+                    smoothY[j] = person.y[j]
+                    continue
+                }
+                // 跳变判定照旧按原始检测位置（误检的关节不进平滑）
                 let p = cam.apply(x: previous.x[j], y: previous.y[j])
-                let vx = (person.x[j] - p.x) / scale / dt
-                let vy = (person.y[j] - p.y) / scale / dt
-                guard vx.isFinite, vy.isFinite, (vx * vx + vy * vy).squareRoot() <= Self.maxJointSpeed else { continue }
+                let rx = (person.x[j] - p.x) / scale / dt
+                let ry = (person.y[j] - p.y) / scale / dt
+                guard rx.isFinite, ry.isFinite, (rx * rx + ry * ry).squareRoot() <= Self.maxJointSpeed else {
+                    smoothX[j] = person.x[j]
+                    smoothY[j] = person.y[j]
+                    continue
+                }
+                let s = cam.apply(x: smoothX[j], y: smoothY[j])
+                let mx = alpha * (person.x[j] - s.x)
+                let my = alpha * (person.y[j] - s.y)
+                smoothX[j] = s.x + mx
+                smoothY[j] = s.y + my
+                // 平滑后的位移（躯干长度）减掉死区
+                let dx = mx / scale
+                let dy = my / scale
+                let conf = min(person.c[j], previous.c[j])
+                let zone = Self.jitterDeadZone * max(1, Self.jitterConfidenceRef / max(conf, Self.minJointConfidence))
+                let m = (dx * dx + dy * dy).squareRoot()
+                let keep = m > zone ? (m - zone) / m : 0
+                let vx = dx * keep / dt
+                let vy = dy * keep / dt
+                guard vx.isFinite, vy.isFinite else { continue }
                 ux[j] = vx
                 uy[j] = vy
                 usable[j] = true
@@ -2073,10 +2117,19 @@ struct PoseMotionTracker {
             }
         } else {
             scale = size
+            for j in 0..<PoseJoint.count {
+                smoothX[j] = person.x[j]
+                smoothY[j] = person.y[j]
+            }
             // 断过（seek / 切镜）、换了人或者人丢了超过 1 秒：节奏重新攒；短暂丢失（检测一闪）不清
             if !continuous || pick.switched || !(time - previousTime <= Self.rhythmGapLimit) {
                 hips.reset()
                 head.reset()
+            }
+            // 断过 / 换了人：上一个人的速度历史也不算（新的人重新攒够样本才有读数）
+            if !continuous || pick.switched {
+                speedCount = 0
+                speedHead = 0
             }
         }
         previous = person
@@ -2094,12 +2147,15 @@ struct PoseMotionTracker {
         }
         guard n >= Self.minSpeedSamples else { return absent(time) }
         let p80 = MotionStats.quantile(&scratch, n, 0.8)
-        let byHips = StrokeScore.pose(speed: p80, rhythm: hips.estimate)
-        let byHead = StrokeScore.pose(speed: p80, rhythm: head.estimate)
+        // 这组关节最近 0.5 秒没有新样本（被挡住 / 出画）：旧节奏不再加成
+        let hipsRhythm = hips.freshEstimate(at: time, maxAge: Self.rhythmMaxAge)
+        let headRhythm = head.freshEstimate(at: time, maxAge: Self.rhythmMaxAge)
+        let byHips = StrokeScore.pose(speed: p80, rhythm: hipsRhythm)
+        let byHead = StrokeScore.pose(speed: p80, rhythm: headRhythm)
         let score = max(byHips, byHead)
         reading = PoseReading(time: time, present: true, score: MotionStats.clamp01(score),
                               confidence: MotionStats.clamp01(person.confidence),
-                              hz: byHips >= byHead ? hips.estimate.hz : head.estimate.hz)
+                              hz: byHips >= byHead ? hipsRhythm.hz : headRhythm.hz)
         return reading
     }
 
@@ -2139,6 +2195,8 @@ struct PoseBlend {
             heldScore = MotionStats.clamp01(w.poseScore)
             heldConfidence = MotionStats.clamp01(w.poseConfidence)
         } else {
+            // 切了镜头、新画面里没人：不保持切镜前的姿态分数，直接开始降权重
+            if w.cutCount > 0 { absentRun = max(absentRun, Self.holdSeconds) }
             absentRun += dt
             if absentRun > Self.holdSeconds { presentRun = 0 }
         }
@@ -2293,6 +2351,8 @@ struct MotionNormalizer {
     private(set) var scoreHigh: Double = MotionNormalizer.subjectInitialHigh
     private(set) var scoreLow: Double = MotionNormalizer.subjectInitialLow
     private(set) var pose = PoseBlend()
+    /// 连续没有画面样本的时长（发热暂停 / 缓冲）：超过姿态保持时间，恢复后姿态融合从头确认
+    private var idleRun: TimeInterval = 0
 
     /// 热身置信度：换视频后 3 秒内从 0 线性升到 1（只会让输出偏低，安全方向）
     var confidence: Double { min(1, max(0, warmElapsed / Self.warmUpSeconds)) }
@@ -2303,6 +2363,7 @@ struct MotionNormalizer {
     /// 姿态融合从头确认（algo-opt-3：seek 后可能已经不是同一个人）
     mutating func reset() {
         pose.reset()
+        idleRun = 0
     }
 
     /// 换视频：重新学习运动范围、重新热身
@@ -2313,11 +2374,18 @@ struct MotionNormalizer {
         scoreHigh = Self.subjectInitialHigh
         scoreLow = Self.subjectInitialLow
         pose.reset()
+        idleRun = 0
     }
 
     mutating func step(_ w: MotionWindow, gainDb: Double, auto: Bool, dt: TimeInterval) -> Double {
         let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
-        guard w.frames > 0 else { return 0 }
+        guard w.frames > 0 else {
+            // 分析停着（.critical 发热暂停 / 缓冲）时 PoseBlend 不走：停够保持时间就清掉，恢复后不沿用暂停前的姿态分数
+            idleRun += step
+            if idleRun > PoseBlend.holdSeconds { pose.reset() }
+            return 0
+        }
+        idleRun = 0
         warmElapsed = min(Self.warmUpSeconds, warmElapsed + step)
         let e = w.representative
         // 开关关着也一直学：中途打开自动适应时参考值已经是这个视频的（同声音侧）

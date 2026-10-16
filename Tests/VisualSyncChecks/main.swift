@@ -1652,6 +1652,120 @@ do {
            "稳态不分配：块运动 / 主体跟踪的 \(extra) 个缓冲在抖动 + 往复画面里地址不变")
 }
 
+/// 确定性的近似高斯噪声（Box–Muller，用 vs3Hash）：均值 0、标准差 1
+func vs3Gauss(_ i: Int, _ j: Int, _ salt: Int) -> Double {
+    let u1 = 1 - 0.999 * vs3Hash(i, j, salt)
+    let u2 = vs3Hash(i, j, salt + 1)
+    return (-2 * log(u1)).squareRoot() * cos(2 * Double.pi * u2)
+}
+
+/// 每个关键点 x / y 各加 sigma 像素的检测抖动（第 i 次估计、互相独立）
+func vs3Jittered(_ base: PoseCandidate, i: Int, sigma: Double, salt: Int = 11) -> PoseCandidate {
+    var p = base
+    for j in 0..<PoseJoint.count {
+        p.x[j] += sigma * vs3Gauss(i, 2 * j, salt)
+        p.y[j] += sigma * vs3Gauss(i, 2 * j + 1, salt)
+    }
+    return p
+}
+
+do {
+    // 复审 M1：静止的人 + Vision 关键点抖动（σ = 1.5% 躯干 = 0.15 像素，每个点每次独立）→ 接近最低；
+    // 同样的抖动叠在髋部 2 Hz 大幅往复上照样是强
+    let still = vs3PoseRun(flow: 0) { i, _ in vs3Jittered(vs3Skeleton(), i: i, sigma: 0.15) }
+    let stillMax = still.outs.max() ?? 99
+    let stillScore = still.readings.map { $0.score }.max() ?? 99
+    let moving = vs3PoseRun(flow: 0.2) { i, t in vs3Jittered(vs3Skeleton(hipX: vs3HipWave(t)), i: i, sigma: 0.15) }
+    let movingLate = vs3Late(moving.outs)
+    vcheck(stillMax <= 10 && stillScore <= 0.1 && movingLate >= 65,
+           "姿态：静止的人 + 1.5% 躯干的检测抖动 → 接近最低（最高 \(Int(stillMax))，姿态分 \(String(format: "%.3f", stillScore))）；"
+           + "叠加同样抖动的 2 Hz 髋部往复仍强（\(Int(movingLate))）")
+}
+
+do {
+    // 复审 M2：髋 2 Hz 往复 6 秒后髋 / 膝被挡住（上半身还在、同一个人），0.5 秒后髋的旧节奏不再加成
+    var tracker = PoseMotionTracker()
+    var before = PoseReading()
+    var staleHz = 0.0
+    var after = 0
+    for i in 0..<80 {
+        let t = Double(i) * 0.11
+        var p = vs3Skeleton(hipX: vs3HipWave(t))
+        if t >= 6 {
+            for j in [PoseJoint.root, .leftHip, .rightHip, .leftKnee, .rightKnee] { p.c[j.rawValue] = 0 }
+        }
+        let r = tracker.update(time: t, candidates: [p], camera: .identity, continuous: true, frameHeight: 36)
+        if t < 6 { before = r }
+        if t >= 6.6, r.present {
+            staleHz = max(staleHz, r.hz)
+            after += 1
+        }
+    }
+    vcheck(before.present && abs(before.hz - 2) <= 0.2 && after > 0 && staleHz == 0,
+           "姿态：髋部被挡住超过 0.5 秒，旧的 2 Hz 节奏不再加成（挡住前 \(String(format: "%.2f", before.hz)) Hz，"
+           + "之后最高 \(String(format: "%.2f", staleHz)) Hz，读数 \(after) 次）")
+}
+
+do {
+    // 复审 L1：跟了 A（髋部往复）3 秒后换成远处静止的 B：B 不能沿用 A 的速度历史，重新攒够 3 个样本前没有读数
+    var tracker = PoseMotionTracker()
+    var afterSwitch: [PoseReading] = []
+    for i in 0..<40 {
+        let t = Double(i) * 0.11
+        let p = t < 3 ? vs3Skeleton(hipX: vs3HipWave(t)) : vs3Skeleton(shiftX: 30)
+        let r = tracker.update(time: t, candidates: [p], camera: .identity, continuous: true, frameHeight: 36)
+        if t >= 3 { afterSwitch.append(r) }
+    }
+    let early = afterSwitch.prefix(3)
+    let later = afterSwitch.dropFirst(3)
+    vcheck(early.count == 3 && early.allSatisfy { !$0.present } && later.allSatisfy { $0.present && $0.score <= 1e-9 },
+           "姿态：换人后不沿用上一个人的速度历史（换人后前 3 次 \(early.map { $0.present })）")
+}
+
+do {
+    // 复审 L2：切镜头到没人的画面不保持切镜前的姿态分数；分析停够保持时间（发热暂停）后恢复，姿态融合从头确认
+    var on = MotionWindow()
+    on.frames = 5
+    on.subjectFrames = 5
+    on.poseFrames = 3
+    on.posePresentFrames = 3
+    on.poseScore = 1
+    on.poseConfidence = 0.9
+    var off = on
+    off.poseFrames = 3
+    off.posePresentFrames = 0
+    var cut = off
+    cut.cutCount = 1
+    var held = PoseBlend()
+    var cutBlend = PoseBlend()
+    for _ in 0..<10 {
+        _ = held.step(on, flow: 0, dt: 0.3)
+        _ = cutBlend.step(on, flow: 0, dt: 0.3)
+    }
+    let peak = held.step(on, flow: 0, dt: 0.3)
+    _ = cutBlend.step(on, flow: 0, dt: 0.3)
+    let heldOut = held.step(off, flow: 0, dt: 0.3)
+    let cutOut = cutBlend.step(cut, flow: 0, dt: 0.3)
+    let cutNext = cutBlend.step(off, flow: 0, dt: 0.3)
+    vcheck(peak >= 0.75 && heldOut >= peak - 1e-9 && cutOut <= peak - 0.1 && cutNext < cutOut,
+           "姿态：切镜到没人的画面直接降权重（不切 \(String(format: "%.2f", heldOut))，切镜 \(String(format: "%.2f", cutOut)) → \(String(format: "%.2f", cutNext))）")
+
+    var paused = MotionNormalizer()
+    var blip = MotionNormalizer()
+    for _ in 0..<12 {
+        _ = paused.step(on, gainDb: 0, auto: true, dt: 0.3)
+        _ = blip.step(on, gainDb: 0, auto: true, dt: 0.3)
+    }
+    let before = paused.poseWeight
+    for _ in 0..<5 { _ = paused.step(.empty, gainDb: 0, auto: true, dt: 0.3) }
+    _ = blip.step(.empty, gainDb: 0, auto: true, dt: 0.3)
+    _ = paused.step(off, gainDb: 0, auto: true, dt: 0.3)
+    _ = blip.step(off, gainDb: 0, auto: true, dt: 0.3)
+    vcheck(before >= 0.7 && paused.poseWeight == 0 && blip.poseWeight >= 0.7,
+           "姿态：分析停 1.5 秒（发热暂停）后恢复不沿用暂停前的姿态（\(String(format: "%.2f", before)) → "
+           + "\(String(format: "%.2f", paused.poseWeight))；只空 1 拍保持 \(String(format: "%.2f", blip.poseWeight))）")
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)
