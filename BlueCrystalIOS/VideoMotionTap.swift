@@ -240,7 +240,13 @@ private final class PoseWorker {
                                      frameHeight: h)
         meter.addPose(reading, generation: generation)
         guard context else { return }
-        runContext(handler, time: time, camera: camera, continuous: continuous, orientation: o, width: w, height: h)
+        // 自审 L3：手 / 脸检测让每帧姿态开销约翻倍，只在 .nominal 跑；.fair 起只留人体姿态（手 / 脸当没检测到）
+        if ProcessInfo.processInfo.thermalState == .nominal {
+            runContext(handler, time: time, camera: camera, continuous: continuous, orientation: o, width: w, height: h)
+        } else {
+            handTracker.reset()
+            faceTracker.reset()
+        }
         let c = PoseContext(valid: true, time: time, frameWidth: w, frameHeight: h, body: tracker.bodyContext,
                             hand: handTracker.reading, face: faceTracker.reading)
         meter.addContext(c, generation: generation)

@@ -4582,8 +4582,10 @@ struct RhythmPulseDriver {
         let cap = SyncOutputStage.hardCap(s)
         capped = engaged && Double(levels[0]) + depth / 2 > Double(cap)
         // rhythm-context P3（L2）：按不按时间由出口自己记（上一次按时间的，这一次也按实际间隔，不管中间经过哪条路径）
+        // 自审 L1：完整拍网格允许两拍最近 0.2 秒；离上一次出口不满一个名义拍时也按时间折算（不按拍给满 +20）
+        let short = lastOutputAt.map { now.isFinite && now - $0 < SyncOutputStage.nominalTick - SyncOutputStage.timedReleaseSlack } ?? false
         let out = stage.step(levels: modulated(levels, lock: lock, now: now, cap: cap), settings: s, now: now,
-                             timed: engaged)
+                             timed: engaged || short)
         timedLast = engaged || stage.pendingTimed
         lastOutputAt = now
         return out
@@ -5721,7 +5723,9 @@ struct ActionContext {
             }
             part = 1
         }
-        if let pr = chosen, ctxFresh, pr.follow.hz > 0 {
+        // 自审 M1：整幅画面 / 周期区域没有可信往复节奏（refHz == 0）时不改写、不抬高姿态节奏——
+        // 只有手 / 脸在动（点头、手势）不该把跟随器锁上、推高伸缩档位
+        if let pr = chosen, ctxFresh, pr.follow.hz > 0, refHz > 0 {
             r.poseRhythmHz = pr.follow.hz
             r.poseRhythmConfidence = MotionStats.clamp01(pr.follow.confidence)
             r.poseRhythmPart = part
@@ -6087,6 +6091,8 @@ struct AudioPhaseAnchor {
     static let minRhythmConfidence: Double = 0.3
     static let gain: Double = 0.3
     static let knownLimit: Double = Double.pi / 3
+    /// 自审 L2：方向没判断出来时也最多 ±90°（背景音乐碰巧同频时不会把脉动整个翻过来）
+    static let unknownLimit: Double = Double.pi / 2
     static let holdSeconds: Double = 2
     static let decaySeconds: Double = 2
     /// 撞击对应的画面相位（最深点）
@@ -6131,9 +6137,10 @@ struct AudioPhaseAnchor {
                 if concentration >= Self.minConcentration {
                     let mu = atan2(sy, sx)
                     var target = StrokeRhythm.wrapPhase(Self.impactPhase - mu)
-                    if directionKnown { target = min(Self.knownLimit, max(-Self.knownLimit, target)) }
+                    let limit = directionKnown ? Self.knownLimit : Self.unknownLimit
+                    target = min(limit, max(-limit, target))
                     offset = StrokeRhythm.wrapPhase(offset + Self.gain * StrokeRhythm.wrapPhase(target - offset))
-                    if directionKnown { offset = min(Self.knownLimit, max(-Self.knownLimit, offset)) }
+                    offset = min(limit, max(-limit, offset))
                     lastGood = now
                     good = true
                 }
