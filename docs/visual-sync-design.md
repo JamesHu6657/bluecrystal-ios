@@ -577,10 +577,24 @@ xcrun swiftc \
 | 内容时间戳 | `MotionDisplayClock` + `VideoMotionTap` | t = host − (播放头 − 帧显示时间)/速率（滞后 0~0.5 s 内），单调、间隔 ≥ min(31 ms, 到 host 的距离)、不晚于 host；静止补样按上一帧滞后换到同一条时间轴；24 fps 片源能量不再一大一小 | 总是 |
 | 性能卫生 | `LumaDownscaler` / `MotionAnalyzer` | 裸指针读采样表、每帧临时数组复用、参考帧拷进已有存储；Instruments「Points of Interest」可看 `MotionDownscale` / `MotionAnalyze` | 总是 |
 | 轻柔声音降权 | `AudioChannelStats`（512 点块电平，`AudioLevelMeter` 按声道跨 tap 回调接着分块）→ `AudioWindow.block*` → `AudioReactiveShaper` | 起伏度 Dyn、轻柔度 S；电平 ×(1 − 0.4·S̄)，自动增益的放大部分 ×(0.3 + 0.7·Dyn̄) | 视频页开关「轻柔声音降权」，App 默认开；`AudioSyncSettings.init` 默认关（逐位不变） |
-| 来源交接 | `SourceHandover` + `VideoSyncPlayer` | 声音→画面：4 s 内用声音补画面热身 / 还没有新鲜画面样本的空档并淡出（≤ max(两来源)）；画面→声音：先经 `SyncOutputStage` 限速追上直出（≤ 10 拍） | 播放中切换时 |
+| 来源交接 | `SourceHandover` + `VideoSyncPlayer` | 声音→画面：4 s 内用声音补画面热身 / 还没有新鲜画面样本的空档并淡出（≤ max(两来源)；algo-opt-2 起画面占比再按 1.5 s 爬坡）；画面→声音：先经 `SyncOutputStage` 限速追上直出（≤ 10 拍） | 播放中切换时 |
 
 没做（后续）：声音+画面可靠度混合（P2）、节奏 / 投影速度 + 自相关（P3）、亚像素 / 四象限相似变换平移、Vision（P4）。
 真机要验证：手贴镜头 / 遮挡片段的输出、24 / 25 fps 片源的平稳度、轻音乐 / 白噪声视频的力度、切换来源时的手感、Instruments 每帧耗时。
+
+### algo-opt-2：软切恢复 / 交接平滑 / 稳态零分配 / 对比度补偿（v1.8.0 之上）
+
+同样只改纯逻辑（`VisualSync.swift`）和测试；安全文件不动、无新发送路径、无新文件。上限 / 最低强度 / 升幅 ≤ +20 / 拍 / 夹紧 [0, min(上限, 99)] 不变。
+
+| 项 | 位置 | 做法 |
+|---|---|---|
+| 软切快速恢复 | `MotionAnalyzer.isSoftCut` / `updateNearField` | 切镜待定或近场冻结开始时记下「出事前」的上一帧和每格纹理。之后的帧同时满足：① 整幅都换了（出事前有纹理的格子原样留着的 ≤ 5%）② 帧间稳定（均值变化 ≤ 4、直方图距离 ≤ 0.12、清晰度变化 ≤ 20%）③ 动得不多（能量 ≤ 8）④ 不是又暗又平（均值 < 40 且清晰度 < 2），就算软切；连续 0.5 s 就采用为背景（含没被识别成切镜、走近场冻结的情况），约 0.6~0.75 s 恢复，原来最长 6 s。手盖住 75% 时右边背景还在（留着 ≥ 12%），照旧按遮挡；软切只会让背景更早采用，不会让近场分数变高 |
+| 交接平滑 | `SourceHandover.blend` | 画面占比 k = 爬坡 r × 置信度 c，r 从画面有新鲜样本起 1.5 s 由 0 到 1，每次 `begin` 清零：v = k·M + (1 − k)·淡出·A ≤ max(M, A)。以前同一视频第二次切到画面时 c = 1，画面一出样本就一拍掉到 M（刚 reset，≈ 0）；现在每拍最多降约 12。淡出满且 r 满（或画面没在流）才结束，结束那拍和原路径连续 |
+| 稳态零分配 | `MotionAnalyzer.globalShift(scratch:)` 等 | 原来每帧两次 `[Double]` 分配（cellDiff / cellN）改成复用 `shiftScratch`；新增缓冲（参考帧、每格纹理、补偿用每格能量）全部预分配，尺寸变了才重分配。`scratchAddresses` 供测试确认地址不变 |
+| 整体对比度补偿 | `MotionAnalyzer.contrastModel` / `contrastResidual` | 两帧亮度标准差之比 g 偏离 1 ≥ 8%（0.5~2，两帧标准差 ≥ 4）时，按 cur − g·prev − b 再算残差，不到原来一半才采用：渐黑 / 渐亮、自动曝光、按比例的闪光不再算成运动（渐黑 ×0.8 / 帧：约 4.5 → 0）。偏离 < 8% 时逐位不变；真实动作解释不掉，照旧 |
+
+没做：亚像素 / 抖动专门的防抖（只靠现有整像素平移补偿）；节奏、Vision 仍在后续。
+真机要验证：切到柔焦 / 暗场 / 特写镜头后 1 s 内是否恢复力度；手盖镜头仍明显降权；渐黑转场、开关灯时不再有假输出；连续两次切换来源时手感是否平滑。
 
 ## 11. 风险与待定
 

@@ -938,7 +938,73 @@ do {
     vcheck(waiting.value == 70 && waiting.hasSignal,
            "来源交接：再次切到画面、画面还没有新鲜样本时接着用声音（\(waiting.value)）")
     let flowing = h.blend(motion: 40, confidence: 1, motionSignal: true, audio: 70, audioSignal: true, dt: 0.3)
-    vcheck(flowing.value == 40, "来源交接：画面有新鲜样本且已热身 → 只用画面（\(flowing.value)）")
+    vcheck(flowing.value > 60 && flowing.value <= 70,
+           "来源交接：画面刚有新鲜样本时不立刻整段换成画面（algo-opt-2，\(flowing.value)）")
+}
+
+// algo-opt-2：同一个视频第二次（及以后每次）切到画面，声音补的那部分平滑交给画面，不再一拍掉光
+func vsSecondSwitch(_ h: inout SourceHandover) -> [Double] {
+    h.begin(.motion)
+    // 前 3 拍新装的分析器还没出样本；之后画面平滑值从 0 爬到 40（归一化早已热身，confidence = 1）
+    let motion: [Double] = [0, 0, 0, 0, 15, 30, 40]
+    var out: [Double] = []
+    for k in 0..<20 {
+        let flowing = k >= 3
+        let m = k < motion.count ? motion[k] : 40
+        out.append(h.blend(motion: m, confidence: 1, motionSignal: flowing, audio: 70, audioSignal: true, dt: 0.3).value)
+    }
+    return out
+}
+
+do {
+    var h = SourceHandover()
+    let first = vsSecondSwitch(&h)
+    var maxDrop = 0.0
+    for k in 1..<first.count { maxDrop = max(maxDrop, first[k - 1] - first[k]) }
+    // 以前：第 4 拍（画面一有样本）直接 = 画面 0，从约 60 一拍掉到 0
+    vcheck(first[3] > 50, "来源交接：再次切到画面，画面刚有样本那一拍仍接着声音（\(first[3])）")
+    vcheck(maxDrop <= 15, "来源交接：再次切到画面时每拍最多降 15（以前一拍降约 60；最大 \(maxDrop)）")
+    var bounded = true
+    for k in 0..<first.count {
+        let m = k < 7 ? [0.0, 0, 0, 0, 15, 30, 40][k] : 40
+        let cap = max(k >= 3 ? m : 0, 70)
+        if first[k] < 0 || first[k] > cap + 1e-9 { bounded = false }
+    }
+    vcheck(bounded, "来源交接：平滑交接中不高于 max(画面, 声音)")
+    vcheck(abs(first[9] - 40) < 1e-6 && !h.isFading && first.last == 40,
+           "来源交接：画面有样本 1.5 秒后完全交给画面，交接结束后和原路径相同（\(first[9])）")
+    let again = vsSecondSwitch(&h)
+    vcheck(again == first, "来源交接：每次切到画面都同样平滑（第三次和第二次逐拍相同）")
+}
+
+do {
+    // 随机交接：任意信号组合下都在 0 ~ max(有信号的画面, 有信号的声音) 之间，交接一定结束
+    // 自己的随机序列：不改变后面测试用的 vsRandom 序列
+    var seed: UInt64 = 0xBEEF
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    var h = SourceHandover()
+    var bounded = true
+    var ended = true
+    for round in 0..<200 {
+        h.begin(.motion)
+        var ticks = 0
+        while h.isFading && ticks < 60 {
+            let m = rnd() * 100
+            let a = rnd() * 100
+            let ms = rnd() < 0.7
+            let au = rnd() < 0.7
+            let r = h.blend(motion: m, confidence: rnd(), motionSignal: ms, audio: a, audioSignal: au,
+                            dt: round % 9 == 0 ? Double.nan : 0.1 + rnd() * 0.4)
+            if r.value < 0 || r.value > max(ms ? m : 0, au ? a : 0) + 1e-9 { bounded = false }
+            ticks += 1
+        }
+        if h.isFading { ended = false }
+    }
+    vcheck(bounded, "来源交接：随机信号下不高于 max(有信号的画面, 有信号的声音)、不低于 0")
+    vcheck(ended, "来源交接：随机信号下交接都会结束")
 }
 
 // 轻柔声音：每段 4800 点 × 3（0.3 秒）的均匀噪声，振幅可按样本序号变
@@ -1070,6 +1136,133 @@ do {
     vcheck(bounded, "轻柔声音：随机 / NaN / 无穷输入下输出在 0 ~ 上限、内部状态有限")
     vcheck(AudioSyncSettings().softDuck == false && AudioSyncSettings.defaultSoftDuck
            && !AudioSyncSettings.Keys.softDuck.contains("."), "轻柔声音：init 默认关（老调用方不变）、App 默认开、键名不带点")
+}
+
+// MARK: - algo-opt-2：软切 / 对比度补偿 / 稳态不分配
+
+/// 偏糊的新镜头：大块柔和明暗（相邻像素差约 7，切镜前的噪声纹理约 100），宽 width 的区域里左右两半在奇数帧
+/// 往相反方向挪 2 像素（不是整体平移，补偿不掉，覆盖率接近 1、能量约 4）；x ≥ width 是切镜前的噪声背景原样留着
+func vsSoftShot(_ x: Int, _ y: Int, _ i: Int, width: Int = 64) -> UInt8 {
+    guard x < width else { return vsNoise(x, y) }
+    let o = i % 2 == 0 ? 0.0 : (x < width / 2 ? 2.0 : -2.0)
+    return UInt8(max(0, min(255, 100 + 30 * sin((Double(x) + o) / 5) + 20 * cos(Double(y) / 4))))
+}
+
+do {
+    // 切到偏糊、整幅轻微在动的新镜头：以前覆盖率高 + 变糊 → 近场分数一直高，最长 6 秒才恢复
+    let soft = vsRunCut(90) { i in vsFrame { x, y in vsSoftShot(x, y, i) } }
+    let early = soft.samples[30..<45].compactMap { $0 }.map(\.nearField)
+    vcheck((early.max() ?? 0) > 0.5, "软切：刚切到偏糊、轻微在动的新镜头时近场分数高（前提，最大 \(early.max() ?? -1)）")
+    let late = soft.samples[45..<90].compactMap { $0 }.map(\.nearField)
+    vcheck(late.count >= 40 && (late.max() ?? 1) < 0.2,
+           "软切：1 秒内恢复，之后近场分数最大 \(late.max() ?? -1)（以前最长 6 秒）")
+    vcheck(!soft.pending[45], "软切：1 秒内已采用新背景")
+
+    // 同样偏糊、同样在动，但只盖住左边 75%，右边切镜前的背景原样留着：是遮挡，不当软切
+    let partial = vsRunCut(90) { i in vsFrame { x, y in vsSoftShot(x, y, i, width: 48) } }
+    let mid = partial.samples[45..<75].compactMap { $0 }.map(\.nearField)
+    let midMean = mid.reduce(0, +) / Double(max(1, mid.count))
+    vcheck(mid.count >= 25 && midMean > 0.5,
+           "软切：偏糊画面只盖住 75%、原来的背景还在 → 1~3 秒后仍按遮挡降权（\(midMean)）")
+}
+
+do {
+    // 整体按比例变暗（渐黑，每帧 ×0.8）：减中位数去不掉，以前每帧都像在动
+    let base = vsTexture(40, 200)
+    func faded(_ k: Int) -> LumaFrame {
+        var f = base
+        let s = pow(0.8, Double(k))
+        for i in 0..<f.pixels.count { f.pixels[i] = UInt8((Double(base.pixels[i]) * s).rounded()) }
+        return f
+    }
+    var on = MotionAnalyzer()
+    var off = MotionAnalyzer()
+    off.compensatesContrast = false
+    var maxOn = 0.0
+    var maxOff = 0.0
+    var anyCut = false
+    for k in 0...8 {
+        let t = Double(k) * vsDt
+        if let s = on.analyze(faded(k), time: t) {
+            maxOn = max(maxOn, s.energy)
+            if s.isCut { anyCut = true }
+        }
+        if let s = off.analyze(faded(k), time: t) { maxOff = max(maxOff, s.energy) }
+    }
+    vcheck(maxOff > 3, "对比度补偿：不补偿时渐黑像在动（前提，最大能量 \(maxOff)）")
+    vcheck(maxOn < 0.2 && !anyCut, "对比度补偿：渐黑（每帧 ×0.8）→ 能量 ≈ 0（最大 \(maxOn)）、不算切镜")
+
+    // 自动曝光 / 闪光式的对比度 +25%（围绕 120）
+    var stretched = base
+    for i in 0..<base.pixels.count {
+        stretched.pixels[i] = UInt8((120 + 1.25 * (Double(base.pixels[i]) - 120)).rounded())
+    }
+    var on2 = MotionAnalyzer()
+    var off2 = MotionAnalyzer()
+    off2.compensatesContrast = false
+    _ = on2.analyze(base, time: 0)
+    _ = off2.analyze(base, time: 0)
+    let sOn = on2.analyze(stretched, time: vsDt)
+    let sOff = off2.analyze(stretched, time: vsDt)
+    let eOn = sOn?.energy ?? 99
+    let eOff = sOff?.energy ?? 0
+    vcheck(eOff > 3 && eOn < 0.2 && sOn?.isCut == false && sOn?.coverage == 0,
+           "对比度补偿：整体对比度 +25% → 能量 \(eOn)（不补偿 \(eOff)）")
+
+    // 对比度变化的同时方块在动：动作照样算出来（补偿解释不掉真实动作）
+    func withBlock(_ f: LumaFrame, _ bx: Int) -> LumaFrame {
+        var g = f
+        for y in 14..<22 {
+            for x in bx..<(bx + 8) { g.pixels[y * 64 + x] = 250 }
+        }
+        return g
+    }
+    var mv = MotionAnalyzer()
+    _ = mv.analyze(withBlock(base, 20), time: 0)
+    let moved = mv.analyze(withBlock(stretched, 24), time: vsDt)
+    vcheck((moved?.energy ?? 0) > 1, "对比度补偿：对比度变化时方块移动照样有能量（\(moved?.energy ?? -1)）")
+
+    // 模型本身：偏离 < 8%、太平、没有像素都不补偿；σ 40 → 50 得到 g = 1.25
+    vcheck(MotionAnalyzer.contrastModel(sumCur: 0, sumPrev: 0, sumCurSq: 0, sumPrevSq: 0, count: 0) == nil
+           && MotionAnalyzer.contrastModel(sumCur: 10_000, sumPrev: 10_000, sumCurSq: 1_000_000, sumPrevSq: 1_000_000,
+                                           count: 100) == nil
+           && MotionAnalyzer.contrastModel(sumCur: 10_000, sumPrev: 10_000, sumCurSq: 1_160_000, sumPrevSq: 1_170_000,
+                                           count: 100) == nil,
+           "对比度补偿：没有像素 / 两帧都平 / 对比度几乎没变时不补偿")
+    let model = MotionAnalyzer.contrastModel(sumCur: 10_000, sumPrev: 10_000, sumCurSq: 1_250_000,
+                                             sumPrevSq: 1_160_000, count: 100)
+    vcheck(model != nil && abs((model?.gain ?? 0) - 1.25) < 1e-9 && abs((model?.bias ?? 0) + 25) < 1e-9,
+           "对比度补偿：σ 40 → 50 得到 g = 1.25、b = −25")
+}
+
+do {
+    // 稳态不分配：平移、切镜（记参考帧）、软切、渐黑（对比度补偿）各跑一轮之后，每帧复用的缓冲地址不再变
+    let tex = vsTexture(40, 200)
+    func cycleFrame(_ k: Int) -> LumaFrame {
+        let j = k % 60
+        switch j {
+        case 0..<15:
+            return vsBeforeCut(j)
+        case 15..<30:
+            return vsFrame { x, y in vsPanTex(x - 2 * j, y) }
+        case 30..<45:
+            return vsFrame { x, y in vsSoftShot(x, y, j) }
+        default:
+            var f = tex
+            let s = pow(0.85, Double(j - 45))
+            for i in 0..<f.pixels.count { f.pixels[i] = UInt8((Double(tex.pixels[i]) * s).rounded()) }
+            return f
+        }
+    }
+    var an = MotionAnalyzer()
+    for k in 0..<60 { _ = an.analyze(cycleFrame(k), time: Double(k) * vsDt) }
+    let warm = an.scratchAddresses.sorted()
+    var samples = 0
+    for k in 60..<240 {
+        if an.analyze(cycleFrame(k), time: Double(k) * vsDt) != nil { samples += 1 }
+    }
+    vcheck(samples > 150 && an.scratchAddresses.sorted() == warm,
+           "稳态不分配：热身一轮后再跑 180 帧，复用缓冲的存储地址都没变（\(samples) 个样本）")
 }
 
 if vsFailures > 0 {
