@@ -2581,9 +2581,105 @@ do {
     vcheck(p10.rhythm - p10.base <= 6 && p15.rhythm - p15.base <= 10 && p40.rhythm == rate && rate > 40,
            "节奏出档（r2 L4）：节奏 1.5 Hz（\(rate) 档）时强度 10 → \(p10.rhythm)（原 \(p10.base)）、15 → \(p15.rhythm)（原 \(p15.base)）；"
            + "强度 40 的真动作照样到节奏档位 \(p40.rhythm)")
-    vcheck(RhythmOutput.rhythmCeiling(mapped: 0) == 12 && RhythmOutput.rhythmCeiling(mapped: 10) == 22
-           && RhythmOutput.rhythmCeiling(mapped: 30) == 60,
-           "节奏出档（r2 L4）：节奏档位上界 = max(按强度档位 + 12, 按强度档位 × 2)")
+    // r3 复审 M1：上界按上限之前的强度算；≤ 20 时 max(+12, ×2)，20~30 线性放开，≥ 30 没有上界（99）
+    let ceilings = (0...100).map { RhythmOutput.rhythmCeiling(intensity: $0) }
+    vcheck(ceilings[0] == 12 && ceilings[10] == 22 && ceilings[15] == 30 && ceilings[20] == 40
+           && ceilings[30] == 99 && ceilings[100] == 99 && zip(ceilings, ceilings.dropFirst()).allSatisfy { $0 <= $1 },
+           "节奏出档（r2 L4 / r3 M1）：弱动作上界 0 → 12、10 → 22、15 → 30、20 → 40，单调，强度 ≥ 30 不设上界（\(ceilings[25])@25）")
+}
+
+do {
+    // r3 复审 M1：弱动作上界按上限之前的强度算，再和上限取小；上限 40 / 60 下真动作（强度 30 / 40）照样跟频率。
+    // 设备快一点的标定表（10:1.0, 30:2.0, 50:3.0），2 Hz → 30 档、3 Hz → 50 档，都在上限附近
+    let fast = DeviceRateMap(points: [DeviceRateMap.Point(level: 10, hz: 1.0), DeviceRateMap.Point(level: 30, hz: 2.0),
+                                      DeviceRateMap.Point(level: 50, hz: 3.0)])!
+    let u = DeviceRateMap.uncalibrated
+    func thrust(_ v: Double, cap: Double, _ map: DeviceRateMap, _ hz: Double) -> Int {
+        let st = AudioSyncSettings(maxPercent: cap, channels: .both)
+        return RhythmOutput.target(value: v, settings: st, hasSignal: true, rateLevel: map.level(forHz: hz), weight: 1)[0]
+    }
+    var rows: [String] = []
+    var differ = true
+    for cap in [40.0, 60.0] {
+        for v in [30.0, 40.0] {
+            let t2 = thrust(v, cap: cap, fast, 2)
+            let t3 = thrust(v, cap: cap, fast, 3)
+            // 到上限为止跟节奏档位：2 Hz 30 档；3 Hz min(上限, 50)
+            if t2 == t3 || t2 != 30 || t3 != min(Int(cap), 50) { differ = false }
+            rows.append("上限 \(Int(cap)) 强度 \(Int(v))：2 Hz \(t2) / 3 Hz \(t3)")
+        }
+    }
+    // 估计值表：上限 60 时 1.5 Hz（46 档）和 2 Hz（63 → 上限 60）也要分开；上限 99、强度 30 时 2 Hz 63 / 3 Hz 99（以前都是 60）
+    let u60a = thrust(40, cap: 60, u, 1.5)
+    let u60b = thrust(40, cap: 60, u, 2)
+    let u99a = thrust(30, cap: 99, u, 2)
+    let u99b = thrust(30, cap: 99, u, 3)
+    vcheck(differ && u60a == u.level(forHz: 1.5) && u60b == 60 && u99a == u.level(forHz: 2) && u99b == 99,
+           "节奏出档（r3 M1）：上限 40 / 60 下真动作的伸缩随频率变（\(rows.joined(separator: "；"))；"
+           + "估计值上限 60 强度 40：1.5 Hz \(u60a) / 2 Hz \(u60b)；上限 99 强度 30：2 Hz \(u99a) / 3 Hz \(u99b)）")
+    // 手势保护照旧（和上限无关）：强度 10 / 15 节奏最多到 22 / 30 档，上限 40 / 60 / 100 都一样
+    var guardOK = true
+    var guardRows: [String] = []
+    for cap in [40.0, 60.0, 100.0] {
+        let g10 = thrust(10, cap: cap, u, 2)
+        let g15 = thrust(15, cap: cap, u, 2)
+        if g10 > 22 || g15 > 30 { guardOK = false }
+        guardRows.append("上限 \(Int(cap))：\(g10) / \(g15)")
+    }
+    vcheck(guardOK, "节奏出档（r3 M1）：弱动作上界不随上限放大或缩小（2 Hz 时强度 10 / 15：\(guardRows.joined(separator: "，"))）")
+    // 状态行：上界压低了节奏档位时提示「动作偏弱」，真动作 / 到上限时不提示
+    let st60 = AudioSyncSettings(maxPercent: 60, channels: .both)
+    let weak = RhythmOutput.statusText(hz: 2, weight: 1, locked: true, rateLevel: u.level(forHz: 2), activity: 0.4,
+                                       thrust: thrust(10, cap: 60, u, 2), value: 10, hasSignal: true, map: u,
+                                       calibrated: true, settings: st60)
+    let strong = RhythmOutput.statusText(hz: 2, weight: 1, locked: true, rateLevel: u.level(forHz: 2), activity: 1,
+                                         thrust: 60, value: 40, hasSignal: true, map: u, calibrated: true, settings: st60)
+    vcheck(weak.contains("动作偏弱") && !weak.contains("已到上限") && !strong.contains("动作偏弱") && strong.contains("已到上限 60")
+           && RhythmOutput.ceilingLimits(value: 10, settings: st60, hasSignal: true, rateLevel: 63)
+           && !RhythmOutput.ceilingLimits(value: 10, settings: st60, hasSignal: true, rateLevel: 15)
+           && !RhythmOutput.ceilingLimits(value: 10, settings: AudioSyncSettings(maxPercent: 60, channels: .vibration),
+                                          hasSignal: true, rateLevel: 63),
+           "节奏状态（r3 M1）：弱动作上界压低时提示（\(weak)），真动作不提示（\(strong)）")
+}
+
+// r3 复审 L1：真实 MotionShaper 链路，锁定后置信度落到 0.35（在释放 0.30 和锁定 0.40 之间，靠滞回锁着），
+// 第 20 拍一帧都没分析到（窗口 frames = 0，MotionNormalizer 给 0）/ 或门一拍没开（有帧、强度 0）：都不能丢锁
+func rhythmBlipRun(target: Double, conf: Double, blank: Set<Int>, frameless: Bool) -> (thrust: [Int], locked: [Bool]) {
+    let u = DeviceRateMap.uncalibrated
+    let st = AudioSyncSettings(maxPercent: 99, channels: .both)
+    var sh = MotionShaper()
+    var rf = RhythmFollower()
+    var stage = SyncOutputStage()
+    var thrust: [Int] = []
+    var locked: [Bool] = []
+    for i in 0..<40 {
+        let b = blank.contains(i)
+        let o = sh.step(target: b ? 0 : target, dt: 0.3)
+        let a = RhythmOutput.motionActivity(level: o.level, smoothed: o.smoothed, confidence: 1, motionSignal: true)
+        let w = b && frameless ? MotionWindow.empty : rfWindow(flowHz: 2, flowConf: i < 10 ? 0.8 : conf)
+        rf.step(b && !frameless ? rfWindow() : w, dt: 0.3, active: a > 0)
+        let lv = rf.weight > 0 && rf.hz > 0 ? u.level(forHz: rf.hz) : nil
+        thrust.append(stage.step(levels: RhythmOutput.target(value: o.smoothed, settings: st, hasSignal: true,
+                                                             rateLevel: lv, weight: rf.weight, activity: a), settings: st)[0])
+        locked.append(rf.locked)
+    }
+    return (thrust, locked)
+}
+do {
+    let u = DeviceRateMap.uncalibrated
+    let rate = u.level(forHz: 2)
+    let empty = rhythmBlipRun(target: 35, conf: 0.35, blank: [20], frameless: true)
+    let gate = rhythmBlipRun(target: 35, conf: 0.35, blank: [20], frameless: false)
+    let gate2 = rhythmBlipRun(target: 35, conf: 0.35, blank: [20, 21], frameless: false)
+    let heldEmpty = empty.locked[10...].allSatisfy { $0 } && empty.thrust[23...].allSatisfy { $0 == rate }
+    let heldGate = gate.locked[10...].allSatisfy { $0 } && gate.thrust[23...].allSatisfy { $0 == rate }
+    vcheck(heldEmpty && heldGate,
+           "节奏跟随（r3 L1）：置信度 0.35 靠滞回锁着，一拍没帧 / 门一拍没开都不丢锁，伸缩回到节奏档位"
+           + "（没帧：\(empty.thrust[18...26].map { $0 })；门：\(gate.thrust[18...26].map { $0 })）")
+    // 有帧的「画面不动」连续 2 拍照样解锁（置信度 0.35 < 0.40，之后不再锁上）；那一拍伸缩照样当拍交回强度
+    vcheck(!gate2.locked[21] && !gate2.locked[39] && empty.thrust[20] < rate
+           && gate.thrust[20] < rate,
+           "节奏跟随（r3 L1）：连续 2 拍有帧不动才解锁（\(gate2.thrust[18...26].map { $0 })），闪断那拍伸缩当拍按强度（\(gate.thrust[20])）")
 }
 
 do {
@@ -2607,17 +2703,21 @@ do {
     }
     var stopTicks: Int?
     var stopLockedAgain = false
+    var stopUnlockedAt: Int?
     for k in 0..<10 {
         let value = 0.0
         stopF.step(rfWindow(flowHz: 2, flowConf: 0.7), dt: 0.3, active: RhythmOutput.activity(value) > 0)
-        if stopF.locked { stopLockedAgain = true }
+        // r3 复审 L1：锁定中要连续 2 拍不动才解锁（第 1 拍按保持），解锁后旧节奏还在窗口里也不能再锁上
+        if !stopF.locked, stopUnlockedAt == nil { stopUnlockedAt = k + 1 }
+        if stopF.locked, stopUnlockedAt != nil { stopLockedAgain = true }
         let lv = stopF.weight > 0 ? u.level(forHz: stopF.hz) : nil
         let thrust = stopStage.step(levels: RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: lv,
                                                                 weight: stopF.weight), settings: st)[0]
         if stopTicks == nil, thrust == 0 { stopTicks = k + 1 }
     }
     let stopRelease = Double(stopTicks ?? 99) * 0.3
-    vcheck(thrustBefore == u.level(forHz: 2) && stopRelease <= 0.5 && stopF.weight == 0 && !stopLockedAgain,
+    vcheck(thrustBefore == u.level(forHz: 2) && stopRelease <= 0.5 && stopF.weight == 0 && !stopLockedAgain
+           && stopUnlockedAt == RhythmFollower.inactiveUnlockTicks,
            "节奏出档（M2）：动作停了（强度 0）伸缩 \(String(format: "%.1f", stopRelease)) 秒内归零（之前 \(thrustBefore) 档），"
            + "旧节奏还在窗口里也不重新锁定")
 
@@ -2682,10 +2782,11 @@ do {
     let zero = RhythmOutput.target(value: 0, settings: s0, hasSignal: true, rateLevel: 55, weight: 1)
     let zeroFloor = RhythmOutput.target(value: 0, settings: s, hasSignal: true, rateLevel: 55, weight: 0.5)
     let plainZeroFloor = s.channels.levels(percent: SyncOutputStage.map(0, cap: 70, floor: 15))
-    // r2 复审 L4：activityFull 15 → 25，一半在 13.5；节奏档位不超过 max(按强度 + 12, 按强度 × 2)（13.5 → 9 档 → 上界 21）
+    // r2 复审 L4：activityFull 15 → 25，一半在 13.5；r3 复审 M1：弱动作上界按上限之前的强度（13.5 → 14 → 上界 28，
+    // 不再按上限 70 换算后的 9 档 → 21），9 档和 28 档之间插一半 → 19
     let halfActive = RhythmOutput.target(value: 13.5, settings: s0, hasSignal: true, rateLevel: 55, weight: 1)
     let idle = RhythmOutput.target(value: 50, settings: s, hasSignal: true, rateLevel: 90, weight: 1, activity: 0)
-    vcheck(zero == [0, 0, 0, 0] && zeroFloor == plainZeroFloor && halfActive[0] == 15
+    vcheck(zero == [0, 0, 0, 0] && zeroFloor == plainZeroFloor && halfActive[0] == 19
            && abs(RhythmOutput.activity(13.5) - 0.5) < 1e-12 && RhythmOutput.activity(.nan) == 0 && idle == plain,
            "节奏出档（M2）：画面强度 0 时伸缩 \(zero[0])（有最低强度 15 时 \(zeroFloor[0])），强度 13.5 时交接一半（\(halfActive[0])），"
            + "画面自己没在动（activity 0）时和原路径一样")
@@ -2747,15 +2848,15 @@ do {
     // 复审 L4：状态行显示实际发出的档位；「比设备最快」和「已到上限」各自提示；按 weight 判断节奏还在不在起作用
     let u = DeviceRateMap.uncalibrated
     let cap60 = AudioSyncSettings(maxPercent: 60, channels: .both)
-    let both = RhythmOutput.statusText(hz: 3.5, weight: 1, locked: true, rateLevel: 99, activity: 1, thrust: 60,
+    let both = RhythmOutput.statusText(hz: 3.5, weight: 1, locked: true, rateLevel: 99, activity: 1, thrust: 60, value: 60, hasSignal: true,
                                        map: u, calibrated: false, settings: cap60)
-    let fading = RhythmOutput.statusText(hz: 1, weight: 0.4, locked: false, rateLevel: 28, activity: 1, thrust: 24,
+    let fading = RhythmOutput.statusText(hz: 1, weight: 0.4, locked: false, rateLevel: 28, activity: 1, thrust: 24, value: 60, hasSignal: true,
                                          map: u, calibrated: true, settings: cap60)
-    let still = RhythmOutput.statusText(hz: 1, weight: 0.4, locked: false, rateLevel: 28, activity: 0, thrust: 0,
+    let still = RhythmOutput.statusText(hz: 1, weight: 0.4, locked: false, rateLevel: 28, activity: 0, thrust: 0, value: 60, hasSignal: true,
                                         map: u, calibrated: true, settings: cap60)
-    let noRhythm = RhythmOutput.statusText(hz: 1, weight: 0, locked: false, rateLevel: nil, activity: 1, thrust: 30,
+    let noRhythm = RhythmOutput.statusText(hz: 1, weight: 0, locked: false, rateLevel: nil, activity: 1, thrust: 30, value: 60, hasSignal: true,
                                            map: u, calibrated: true, settings: cap60)
-    let vibOnly = RhythmOutput.statusText(hz: 1, weight: 1, locked: true, rateLevel: 28, activity: 1, thrust: 0, map: u,
+    let vibOnly = RhythmOutput.statusText(hz: 1, weight: 1, locked: true, rateLevel: 28, activity: 1, thrust: 0, value: 60, hasSignal: true, map: u,
                                           calibrated: true, settings: AudioSyncSettings(maxPercent: 60, channels: .vibration))
     vcheck(both.contains("伸缩 60 档") && both.contains("比设备最快的 3.0 次/秒还快") && both.contains("已到上限 60")
            && both.contains("设备还没标定") && fading.contains("动作节奏 1.0 次/秒 → 伸缩 24 档")

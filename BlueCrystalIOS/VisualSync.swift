@@ -3217,6 +3217,9 @@ struct RhythmFollower {
     static let rampInSeconds: TimeInterval = 1.0
     static let rampOutSeconds: TimeInterval = 1.5
     static let fastReleaseSeconds: TimeInterval = 0.3
+    /// 锁定中「画面不动」要连续这么多拍（有分析过的帧）才解锁（r3 复审 L1：一拍闪断 / 门一拍没开不丢锁；
+    /// 输出那边 activity 照旧按即时强度，当拍就不加伸缩，所以动作停下的释放不变慢）
+    static let inactiveUnlockTicks = 2
 
     private(set) var hz: Double = 0
     private(set) var confidence: Double = 0
@@ -3233,6 +3236,8 @@ struct RhythmFollower {
     private var pendingRun: TimeInterval = 0
     /// 因画面不动 / 切镜解锁：weight 按 fastReleaseSeconds 归零
     private var fastRelease = false
+    /// 锁定中连续「画面不动」（有帧）的拍数
+    private var inactiveTicks = 0
 
     mutating func reset() {
         self = RhythmFollower()
@@ -3280,20 +3285,29 @@ struct RhythmFollower {
     }
 
     /// 每拍一次。没有画面信号时调用方应 reset（不保持）。
-    /// active：画面自己的强度确实在动（RhythmOutput.activity > 0）；false 时马上解锁、weight 快速归零
+    /// active：画面自己的强度确实在动（RhythmOutput.activity > 0）；false 时不锁定，锁定中连续 2 拍（有帧）false 才解锁、weight 快速归零；
+    /// frames == 0 的窗口不算 false（没有信息，按一拍没候选保持）
     @discardableResult
     mutating func step(_ w: MotionWindow, dt: TimeInterval, active: Bool = true) -> RhythmFollower {
         let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
         let gate = locked ? Self.releaseConfidence : Self.lockConfidence
-        if !active || w.cutCount > 0 {
-            // 画面不动 / 切镜：不保持旧节奏（新镜头重新确认），伸缩马上交回动作强度
-            locked = false
-            confidence = 0
-            source = .none
-            lostRun = 0
-            fastRelease = true
-            clearPending()
+        // r3 复审 L1：这一拍一帧都没分析到（上一帧还在算被丢、解码卡顿）= 没有信息，不当成「画面不动」，按一拍没候选保持
+        let frameless = w.frames <= 0
+        if w.cutCount > 0 {
+            // 切镜：不保持旧节奏（新镜头重新确认），伸缩马上交回动作强度
+            unlock()
+        } else if !active && !frameless {
+            // 画面不动：没锁定时不锁（也不保持交接）；锁定中要连续 inactiveUnlockTicks 拍才解锁，之前按一拍没候选保持
+            inactiveTicks += 1
+            if !locked || inactiveTicks >= Self.inactiveUnlockTicks {
+                unlock()
+            } else {
+                holdMissing(step)
+            }
+        } else if frameless {
+            if locked { holdMissing(step) } else { clearPending() }
         } else if let c = Self.candidate(w), c.confidence >= gate {
+            inactiveTicks = 0
             lostRun = 0
             confidence = c.confidence
             source = c.source
@@ -3306,17 +3320,10 @@ struct RhythmFollower {
                 track(c.hz, step: step)
             }
         } else if locked {
-            // r2 复审 L1：一拍没候选（置信度在 0.30 上下来回、主体分数一拍拍掉）不清待确认的跳变，只是这拍不算；
-            // 连续缺满 pendingGapSeconds 才清
-            lostRun += step
-            if lostRun > Self.pendingGapSeconds { clearPending() }
-            if lostRun > Self.holdSeconds {
-                locked = false
-                confidence = 0
-                source = .none
-                clearPending()
-            }
+            inactiveTicks = 0
+            holdMissing(step)
         } else {
+            inactiveTicks = 0
             clearPending()
         }
         if !hz.isFinite { reset() }
@@ -3372,6 +3379,31 @@ struct RhythmFollower {
         }
     }
 
+    /// 画面不动 / 切镜：马上解锁，weight 按 fastReleaseSeconds 归零
+    private mutating func unlock() {
+        locked = false
+        confidence = 0
+        source = .none
+        lostRun = 0
+        inactiveTicks = 0
+        fastRelease = true
+        clearPending()
+    }
+
+    /// 锁定中一拍没有可用候选（r2 复审 L1）：不清待确认的跳变，只是这拍不算；连续缺满 pendingGapSeconds 才清，
+    /// 满 holdSeconds 解锁（普通 1.5 秒降）
+    private mutating func holdMissing(_ step: TimeInterval) {
+        lostRun += step
+        if lostRun > Self.pendingGapSeconds { clearPending() }
+        if lostRun > Self.holdSeconds {
+            locked = false
+            confidence = 0
+            source = .none
+            inactiveTicks = 0
+            clearPending()
+        }
+    }
+
     private mutating func clearPending() {
         pendingDirection = 0
         pendingBeats = 0
@@ -3385,7 +3417,9 @@ struct RhythmFollower {
 /// 伸缩跟随频率时每通道的目标档位（rhythm-follow P1，r1 复审修正；纯函数，结果再经 SyncOutputStage.step(levels:)）：
 /// - 先按原来的规则（最低强度 / 上限映射、通道分配）把画面强度 value 换成档位；
 /// - 节奏只在画面确实在动时起作用：有效 weight = weight × activity（画面自己的强度 ≤ 2 → 0，≥ 25 → 1；
-///   播放器用 motionActivity，下降跟门前即时强度走，动作一停当拍就不加伸缩）；节奏档位不超过 max(按强度档位 + 12, 按强度档位 × 2)（r2 复审 M1 / L4）。
+///   播放器用 motionActivity，下降跟门前即时强度走，动作一停当拍就不加伸缩）；
+///   弱动作的节奏上界 rhythmCeiling 按「上限之前」的强度（value 按上限 100、不加最低强度换算的档位）算，再和上限取小
+///   （r3 复审 M1：以前按乘过上限的档位算，上限 40 / 60 时频率完全不起作用）；强度 ≥ 30 的真动作没有这个上界，任何上限下都跟频率。
 ///   画面强度为 0（门关了 / 不动了）时伸缩就是原来的档位，节奏不加任何伸缩；
 /// - 伸缩通道在用（「伸缩 + 震动」或「仅伸缩」）、有画面信号、有节奏档位时：
 ///   伸缩 = 按有效 weight 在「原来的档位」和「节奏档位」之间插值；节奏档位先抬到最低强度、再压到上限；
@@ -3395,10 +3429,13 @@ enum RhythmOutput {
     static let activityFloor: Double = 2
     /// 到这个按节奏档位全权（r2 复审 L4：15 → 25，点头 / 比划手势这类弱动作只交接一部分）
     static let activityFull: Double = 25
-    /// 节奏档位最多比按强度的伸缩档位高多少（r2 复审 L4）：≤ max(按强度档位 + rhythmHeadroomMin, 按强度档位 × rhythmHeadroomScale)。
-    /// 弱动作（强度 10 / 15）有节奏也只比原来高一点；强度 ≥ 30 左右的真动作不受影响
+    /// 弱动作的节奏上界（r2 复审 L4，r3 复审 M1 改成按上限之前的强度 m 算，和用户上限无关）：
+    /// m ≤ rhythmHeadroomKnee 时 ≤ max(m + rhythmHeadroomMin, m × rhythmHeadroomScale)（点头 / 手势：强度 10 → 22、15 → 30）；
+    /// m 在 knee ~ rhythmFreeIntensity 之间线性放开到 99；m ≥ rhythmFreeIntensity（30）的真动作没有上界，只受用户上限 / 设备上限
     static let rhythmHeadroomMin = 12
     static let rhythmHeadroomScale = 2
+    static let rhythmHeadroomKnee = 20
+    static let rhythmFreeIntensity = 30
 
     /// 画面自己的强度 → 节奏档位能用几成（0~1）
     static func activity(_ value: Double) -> Double {
@@ -3414,9 +3451,38 @@ enum RhythmOutput {
         return activity(MotionStats.clamp01(confidence) * min(level, smoothed))
     }
 
-    /// 节奏档位的上界（r2 复审 L4）：按强度的伸缩档位 mapped 往上最多给这么多
-    static func rhythmCeiling(mapped: Int) -> Int {
-        max(mapped + rhythmHeadroomMin, mapped * rhythmHeadroomScale)
+    /// 节奏档位的上界（r2 复审 L4 / r3 复审 M1）。intensity：上限之前的强度档位 0~100（intensityLevel(value)），不是乘过上限的档位
+    static func rhythmCeiling(intensity: Int) -> Int {
+        let m = max(0, min(100, intensity))
+        let full = BCProtocol.maxManualLevel
+        if m >= rhythmFreeIntensity { return full }
+        let weak = max(m + rhythmHeadroomMin, m * rhythmHeadroomScale)
+        guard m > rhythmHeadroomKnee else { return weak }
+        let kneeCeiling = max(rhythmHeadroomKnee + rhythmHeadroomMin, rhythmHeadroomKnee * rhythmHeadroomScale)
+        let f = Double(m - rhythmHeadroomKnee) / Double(rhythmFreeIntensity - rhythmHeadroomKnee)
+        return min(full, max(weak, Int((Double(kneeCeiling) + Double(full - kneeCeiling) * f).rounded())))
+    }
+
+    /// 上限之前的强度档位（按上限 100、不加最低强度换算 value；节奏上界只看动作本身有多强）
+    static func intensityLevel(_ value: Double) -> Int {
+        SyncOutputStage.map(value, cap: 100, floor: 0)
+    }
+
+    /// 节奏档位（抬到最低强度、压到上限）；ceiling：false = 不加弱动作上界（只给状态行比较用）
+    private static func rhythmTarget(value: Double, rateLevel r: Int, settings s: AudioSyncSettings, floor: Double,
+                                     ceiling: Bool) -> Int {
+        let cap = SyncOutputStage.hardCap(s)
+        let floorLevel = floor.isFinite ? max(0, Int(floor.rounded())) : 0
+        let lifted = ceiling ? min(r, Self.rhythmCeiling(intensity: Self.intensityLevel(value))) : r
+        return min(cap, max(floorLevel, lifted))
+    }
+
+    /// 弱动作上界这一拍有没有把节奏档位压低（状态行提示用；和 target 用同一套换算）
+    static func ceilingLimits(value: Double, settings s: AudioSyncSettings, hasSignal: Bool, rateLevel: Int?) -> Bool {
+        guard hasSignal, let r = rateLevel, s.channels != .vibration else { return false }
+        let floor = SyncOutputStage.floorPercent(settings: s, hasSignal: hasSignal)
+        return rhythmTarget(value: value, rateLevel: r, settings: s, floor: floor, ceiling: true)
+            < rhythmTarget(value: value, rateLevel: r, settings: s, floor: floor, ceiling: false)
     }
 
     /// activity：nil = 按 value 算（调用方在声音→画面交接期间传画面自己那部分的 activity）
@@ -3429,8 +3495,7 @@ enum RhythmOutput {
         let w = MotionStats.clamp01(weight) * a
         guard hasSignal, let r = rateLevel, w > 0, s.channels != .vibration else { return t }
         let cap = SyncOutputStage.hardCap(s)
-        let floorLevel = floor.isFinite ? max(0, Int(floor.rounded())) : 0
-        let rl = min(cap, max(floorLevel, min(r, Self.rhythmCeiling(mapped: t[0]))))
+        let rl = Self.rhythmTarget(value: value, rateLevel: r, settings: s, floor: floor, ceiling: true)
         let blended = (Double(t[0]) + (Double(rl) - Double(t[0])) * w).rounded()
         t[0] = blended.isFinite ? min(cap, max(0, Int(blended))) : 0
         return t
@@ -3438,8 +3503,10 @@ enum RhythmOutput {
 
     /// 界面上的一行节奏状态（纯展示，VideoSyncPlayer 每拍刷新）。thrust：这一拍伸缩实际发出的档位（联动关着时是预览值）；
     /// 节奏还在不在起作用看 weight > 0（不是 locked：解锁后的交接期里伸缩还有一部分按节奏）。
-    /// 「比设备最快 / 最慢」和「已到上限」各自独立提示
+    /// 「比设备最快 / 最慢」和「已到上限」各自独立提示。value / hasSignal：和 target 同一拍的输入，
+    /// 弱动作上界压低了节奏档位时提示「动作偏弱」（r3 复审 M1）
     static func statusText(hz: Double, weight: Double, locked: Bool, rateLevel: Int?, activity: Double, thrust: Int,
+                           value: Double, hasSignal: Bool,
                            map: DeviceRateMap, calibrated: Bool, settings s: AudioSyncSettings) -> String {
         let note = calibrated ? "" : "；设备还没标定，档位是估计值"
         guard weight > 0, hz.isFinite, hz > 0, let level = rateLevel else {
@@ -3454,6 +3521,9 @@ enum RhythmOutput {
         } else if !locked {
             text += "（节奏丢了，正在交回动作强度）"
         }
+        if activity > 0, ceilingLimits(value: value, settings: s, hasSignal: hasSignal, rateLevel: level) {
+            text += "（动作偏弱，伸缩只按节奏加快一点）"
+        }
         if hz > map.maxHz * 1.05 {
             text += String(format: "（比设备最快的 %.1f 次/秒还快）", map.maxHz)
         } else if hz < map.minHz * 0.95 {
@@ -3462,7 +3532,9 @@ enum RhythmOutput {
         let cap = SyncOutputStage.hardCap(s)
         let floorPercent = SyncOutputStage.floorPercent(settings: s, hasSignal: true)
         let floorLevel = floorPercent.isFinite ? max(0, Int(floorPercent.rounded())) : 0
-        if max(floorLevel, level) > cap {
+        // 弱动作上界已经压到上限以下时不算「到上限」（r3 复审 M1，提示的是「动作偏弱」）
+        let lifted = hasSignal && value.isFinite ? min(level, rhythmCeiling(intensity: intensityLevel(value))) : level
+        if max(floorLevel, lifted) > cap {
             text += "（已到上限 \(cap)）"
         }
         return text + note

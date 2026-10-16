@@ -797,7 +797,8 @@ final class VideoSyncPlayer: ObservableObject {
     }
 
     /// rhythm-follow P1：这一拍的节奏档位（没打开 / 没锁定 / 没有新鲜画面时 nil = 伸缩照旧按动作强度）。
-    /// activity：画面自己的强度能让节奏用几成（RhythmOutput.motionActivity）；0 = 画面没在动，跟随器马上解锁、不保持。
+    /// activity：画面自己的强度能让节奏用几成（RhythmOutput.motionActivity）；0 = 画面没在动，当拍不加伸缩，
+    /// 跟随器连续 2 拍（有帧）不动才解锁（这一拍一帧都没分析到不算，r3 复审 L1）。
     /// 频率按画面帧的显示时刻（host 时间轴）算，倍速播放时已经是实际看到的快慢，不再乘倍速
     private func rhythmLevel(_ window: MotionWindow, motionSignal: Bool, activity: Double, dt: TimeInterval) -> Int? {
         guard visualSettings.rhythmFollow else {
@@ -809,9 +810,10 @@ final class VideoSyncPlayer: ObservableObject {
     }
 
     /// 界面上的一行节奏状态（thrust：这一拍伸缩实际发出 / 预览的档位；变化才刷新）
-    private func updateRhythmStatus(rateLevel: Int?, activity: Double, thrust: Int) {
+    private func updateRhythmStatus(rateLevel: Int?, activity: Double, thrust: Int, value: Double, hasSignal: Bool) {
         let text = RhythmOutput.statusText(hz: rhythm.hz, weight: rhythm.weight, locked: rhythm.locked,
                                            rateLevel: rateLevel, activity: activity, thrust: thrust,
+                                           value: value, hasSignal: hasSignal,
                                            map: visualSettings.rateMap,
                                            calibrated: visualSettings.calibratedRateMap != nil, settings: settings)
         if text != rhythmStatus { rhythmStatus = text }
@@ -852,7 +854,8 @@ final class VideoSyncPlayer: ObservableObject {
                 let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
                                                  rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
                 intensity = min(SyncOutputStage.hardCap(settings), levels.max() ?? 0)
-                updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: levels[0])
+                updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: levels[0],
+                                   value: value, hasSignal: hasSignal)
             } else {
                 intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
             }
@@ -864,7 +867,8 @@ final class VideoSyncPlayer: ObservableObject {
             let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
                                              rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
             vals = outputStage.step(levels: levels, settings: settings)
-            updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: vals[0])
+            updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: vals[0],
+                               value: value, hasSignal: hasSignal)
         } else {
             vals = outputStage.step(value, settings: settings, hasSignal: hasSignal)
         }
