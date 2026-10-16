@@ -4589,11 +4589,11 @@ do {
     var unlocked = free.0
     let zero = unlocked.step(onsets: [], audioHz: 1, audioConfidence: 0.7, lock: RhythmPhaseLock(), directionKnown: false,
                              now: 30, dt: 0.3)
-    vcheck(abs(free.1 + 2.0) < 0.05 && free.0.active && abs(known.1 + Double.pi / 3) < 1e-3 && abs(small.1 - 0.4) < 0.05
+    vcheck(abs(free.1 + AudioPhaseAnchor.unknownLimit) < 1e-3 && free.0.active && abs(known.1 + Double.pi / 3) < 1e-3 && abs(small.1 - 0.4) < 0.05
            && wrongHz.1 == 0 && !wrongHz.0.active && scattered.1 == 0 && abs(held1.offset - free.1) < 1e-9
            && abs(held2.offset) < abs(free.1) * 0.35 && zero == 0 && unlocked.offset == 0
            && free.0.statusText(lockHz: 1).contains("已对齐") && wrongHz.0.statusText(lockHz: 1).contains("没听到"),
-           "P3 撞击声校正：偏移收敛到 \(String(format: "%.2f", free.1))（撞击在 2.0 rad）、方向已判断时限 ±60°（\(String(format: "%.2f", known.1))）；"
+           "P3 撞击声校正：偏移收敛到 \(String(format: "%.2f", free.1))（撞击在 2.0 rad，方向未判断时限 ±90°）、方向已判断时限 ±60°（\(String(format: "%.2f", known.1))）；"
            + "频率对不上 / 撞击散乱不校正；声音没了 2 秒后慢慢回 0（\(String(format: "%.2f", held2.offset))）、没锁立刻 0")
 }
 
