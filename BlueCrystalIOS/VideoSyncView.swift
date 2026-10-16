@@ -556,6 +556,9 @@ final class VideoSyncPlayer: ObservableObject {
         // 上次运行留下的视频副本清掉
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SyncVideos", isDirectory: true)
         try? FileManager.default.removeItem(at: dir)
+        // 同样清掉上次没导完的相册视频副本、导出过的调试表格
+        PhotoVideoPicker.purgeImports()
+        MotionDebugLog.purgeExports()
     }
 
     private static func importVideo(from url: URL) -> URL? {
@@ -678,6 +681,13 @@ final class VideoSyncPlayer: ObservableObject {
         guard isPlaying else { return }
         stopAll()
         statusLine = "打开文件前已停止"
+    }
+
+    /// 导出调试表格之前：分享面板同样会盖住底部停止键，正在联动就先停下
+    func stopBeforeExport() {
+        guard isPlaying else { return }
+        stopAll()
+        statusLine = "导出表格前已停止"
     }
 
     /// 被动停机（看门狗/退后台/单次上限/输出被拒）：只归零 UI，不补发停止帧
@@ -942,7 +952,9 @@ final class VideoSyncPlayer: ObservableObject {
         // P3：动作识别开着时，跟随器 / 相位锁吃按动作改写过的窗口副本（未知 = 原窗口）；关着时就是原窗口（= P2）
         var input = window
         if visualSettings.usesRhythmContext, motionSignal {
-            input = actionContext.refine(window, now: CACurrentMediaTime())
+            // rhythm-action tune：跟随器上一拍牢牢锁着的频率（轻抚判断：锁在别的往复上就不算轻抚）
+            let lockHz = ActionContext.lockedHz(locked: rhythm.locked, weight: rhythm.weight, hz: rhythm.hz)
+            input = actionContext.refine(window, now: CACurrentMediaTime(), followerHz: lockHz)
             let text = actionContext.statusText()
             if text != contextStatus { contextStatus = text }
         } else if contextStatus != nil {
@@ -982,6 +994,8 @@ final class VideoSyncPlayer: ObservableObject {
         // 姿态不能比画面本身的运动高太多；认出轻抚 / 摸自己时强度最多到 ActionContext.caressCeiling（上一拍的判断，只降不升）
         let tuned = visualSettings.usesRhythmContext
         motionNormalizer.actionTuned = tuned
+        // 慢 / 轻动作的压低只给轻抚 / 还没认出动作且没锁节奏的（上一拍的判断；关着时不看）
+        if tuned { motionNormalizer.gentleAllowed = actionContext.allowsGentle(followerLocked: rhythm.locked) }
         var target = motionNormalizer.step(window, gainDb: visualSettings.motionGainDb,
                                            auto: visualSettings.autoMotion, dt: dt)
         if tuned, let ceiling = actionContext.intensityCeiling { target = min(target, ceiling) }
@@ -1277,8 +1291,12 @@ struct VideoSyncView: View {
     @State private var showPhotoPicker = false
     /// 选来源：相册 / 文件
     @State private var showSourceChoice = false
-    /// 相册视频正在拷出来（iCloud 视频可能要下载一会儿）
+    /// 相册视频正在拷出来（iCloud 视频可能要下载一会儿）：期间选视频的入口都不可用，素材卡片上显示进度和取消
     @State private var photoImporting = false
+    /// 正在拷的那次的进度（取消 = 换视频 / 离开页面 / 点取消）
+    @State private var photoProgress: Progress?
+    /// 相册导入的代数：每次开始 / 取消 +1，回调带着发起时的代数，不一样就不认（拷出来的文件删掉）
+    @State private var photoImportGen = 0
     /// 调试记录（默认关，只记数字）
     @AppStorage("bcMotionDebugLog") private var debugLogOn = false
     @State private var debugExportURL: URL?
@@ -1370,6 +1388,8 @@ struct VideoSyncView: View {
     /// 选择器弹出前先停（选择器会盖住页面底部的停止键；选择器里另有一个停止键）。
     /// blockedReasonShown：这个入口自己把被拦的原因写在旁边了（幕布），不再往停止键上钉第二份
     private func openPicker(blockedReasonShown: Bool = false) {
+        // 相册视频还在导入：先取消导入（素材卡片上的取消键）才能再选
+        guard !photoImporting else { return }
         guard !pickerBlocked else {
             Haptics.warning()
             UIAccessibility.post(notification: .announcement, argument: pickerBlockedMessage)
@@ -1380,9 +1400,47 @@ struct VideoSyncView: View {
         showSourceChoice = true
     }
 
+    /// 相册里选中了一个（主线程）：开始拷贝，记下进度和代数
+    private func startPhotoImport(_ provider: NSItemProvider) {
+        cancelPhotoImport()
+        let gen = photoImportGen
+        let progress = PhotoVideoPicker.copyVideo(from: provider) { url in
+            finishPhotoImport(url, gen: gen)
+        }
+        guard let progress else {
+            loadPhotoVideo(nil)
+            return
+        }
+        photoProgress = progress
+        photoImporting = true
+        vm.statusLine = "正在从相册导入视频…"
+    }
+
+    /// 拷贝回调（主线程）：过期的（取消过 / 又开始了新的）不认，拷出来的文件删掉
+    private func finishPhotoImport(_ url: URL?, gen: Int) {
+        guard gen == photoImportGen else {
+            if let url { try? FileManager.default.removeItem(at: url) }
+            return
+        }
+        photoImportGen += 1
+        photoProgress = nil
+        photoImporting = false
+        loadPhotoVideo(url)
+    }
+
+    /// 取消正在进行的相册导入（换视频 / 离开页面 / 点取消；没在导入时只让代数 +1）
+    private func cancelPhotoImport() {
+        photoImportGen += 1
+        photoProgress?.cancel()
+        photoProgress = nil
+        if photoImporting {
+            photoImporting = false
+            vm.statusLine = "已取消相册导入"
+        }
+    }
+
     /// 相册视频拷出来之后（主线程）：和文件选择器同一条 loadVideo
     private func loadPhotoVideo(_ url: URL?) {
-        photoImporting = false
         guard let url else {
             vm.videoName = "导入失败：相册视频"
             vm.statusLine = "相册视频无法读取（iCloud 视频请先在相册里下载），请重新选择"
@@ -1474,8 +1532,15 @@ struct VideoSyncView: View {
             vm.debugRecording = on
             if !on { vm.debugLog.clear(); debugRows = 0 }
         }
+        // 分享面板同其它弹出层：先停（导出键里），底部带停止条，挂隐私遮挡
         .sheet(isPresented: Binding(get: { debugExportURL != nil }, set: { if !$0 { debugExportURL = nil } })) {
-            if let url = debugExportURL { ActivityShareSheet(items: [url]) }
+            VStack(spacing: 0) {
+                if let url = debugExportURL { ActivityShareSheet(items: [url]) }
+                pickerStopBar
+            }
+            .privacyCover()
+            .environmentObject(privacy)
+            .environmentObject(ble)
         }
         // 设备那边处理好了：钉着的"先处理设备卡片"立刻收掉
         .onChange(of: pickerBlocked) { blocked in
@@ -1501,6 +1566,8 @@ struct VideoSyncView: View {
                 DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
                                onCancel: { showPicker = false }) { url in
                     showPicker = false
+                    // 换成文件里的视频：还在拷的相册视频作废
+                    cancelPhotoImport()
                     vm.loadVideo(url: url)
                 }
                 pickerStopBar
@@ -1517,13 +1584,9 @@ struct VideoSyncView: View {
         }
         .sheet(isPresented: $showPhotoPicker) {
             VStack(spacing: 0) {
-                PhotoVideoPicker(onCancel: { showPhotoPicker = false }) { url in
+                PhotoVideoPicker(onCancel: { showPhotoPicker = false }) { provider in
                     showPhotoPicker = false
-                    loadPhotoVideo(url)
-                } onStart: {
-                    showPhotoPicker = false
-                    photoImporting = true
-                    vm.statusLine = "正在从相册导入视频…"
+                    startPhotoImport(provider)
                 }
                 pickerStopBar
             }
@@ -1532,7 +1595,12 @@ struct VideoSyncView: View {
             .environmentObject(ble)
         }
         // 系统全屏弹出时部分系统版本也会触发 onDisappear：全屏中不停机
-        .onDisappear { if !systemFullScreen { vm.stopAll() } }
+        .onDisappear {
+            if !systemFullScreen {
+                vm.stopAll()
+                cancelPhotoImport()
+            }
+        }
         // 解锁页上的停止：和本页停止键同一个 stopAll
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
@@ -1592,7 +1660,9 @@ struct VideoSyncView: View {
                 )
             }
             .buttonStyle(PressableStyle())
-            // 不用 disabled：变灰会把原因那行字一起压暗。点了由 openPicker 拦下（震动 + 旁白说明）
+            // 不用 disabled：变灰会把原因那行字一起压暗。点了由 openPicker 拦下（震动 + 旁白说明）。
+            // 相册视频导入中才禁用（进度在素材卡片上）
+            .disabled(photoImporting)
             .accessibilityHint(pickerBlocked ? "先处理设备卡片上的提示" : "选择视频")
         }
     }
@@ -1826,7 +1896,7 @@ struct VideoSyncView: View {
                 Text("调试记录")
                     .font(.subheadline)
                     .foregroundColor(Velvet.text)
-                Text("播放时把每一拍的运动量、识别结果和输出强度记成表格（只有数字，没有画面），最多约 10 分钟")
+                Text("播放时把每一拍的运动量、识别结果和输出强度记成表格（只有数字，没有画面），最多约 30 分钟")
                     .font(.caption2)
                     .foregroundColor(Velvet.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1836,6 +1906,7 @@ struct VideoSyncView: View {
         if debugLogOn {
             HStack {
                 Button("导出表格") {
+                    vm.stopBeforeExport()
                     debugRows = vm.debugLog.count
                     debugExportURL = vm.debugLog.writeCSV()
                 }
@@ -2146,7 +2217,7 @@ struct VideoSyncView: View {
             }
             // 设备需要处理时不灰掉视频准备项：点了由 openPicker 拦下并说明，和选视频幕布一致
             ReadinessChip(title: "视频", done: hasVideo, icon: "film",
-                          hint: "选择视频") { openPicker() }
+                          hint: "选择视频", enabled: !photoImporting) { openPicker() }
         }
     }
 
@@ -2155,8 +2226,26 @@ struct VideoSyncView: View {
         VStack(alignment: .leading, spacing: 12) {
             SectionLabel(title: "素材", systemImage: "film.stack")
             // 被拦下的原因常驻写在本卡片底部（blockedReasonShown）：点这一行时不再往停止键上钉第二份
-            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") {
+            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择",
+                        enabled: !photoImporting) {
                 openPicker(blockedReasonShown: vm.player != nil)
+            }
+            if photoImporting {
+                // 相册视频导入中（iCloud 视频可能要先下载）：进度 + 取消
+                HStack(spacing: 10) {
+                    if let progress = photoProgress {
+                        ProgressView(progress)
+                            .tint(Velvet.gold)
+                    } else {
+                        ProgressView()
+                    }
+                    Button("取消导入", role: .cancel) { cancelPhotoImport() }
+                        .buttonStyle(.borderless)
+                        .font(.subheadline)
+                }
+                .frame(minHeight: 44)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("正在从相册导入视频")
             }
             if pickerBlocked && vm.player != nil {
                 // 已选过视频后幕布不在了，素材行是唯一入口：被拦的原因常驻写在这里
@@ -2169,7 +2258,7 @@ struct VideoSyncView: View {
         .velvetCard()
     }
 
-    private func materialRow(icon: String, title: String, value: String, action: String,
+    private func materialRow(icon: String, title: String, value: String, action: String, enabled: Bool = true,
                              perform: @escaping () -> Void) -> some View {
         HStack(spacing: 10) {
             Image(systemName: icon)
@@ -2185,6 +2274,7 @@ struct VideoSyncView: View {
             // 同上：设备需要处理时不用 disabled（灰了不知道为什么），点一下由 openPicker 拦下并说明
             Button(action, action: perform)
                 .buttonStyle(PillButtonStyle(kind: .secondary))
+                .disabled(!enabled)
         }
     }
 
@@ -2269,15 +2359,47 @@ private struct ReadinessChip: View {
     }
 }
 
-/// 系统相册选择器（PHPicker：只列视频、不需要相册权限）。
-/// loadFileRepresentation 给的临时文件在回调返回后就删，所以在回调里同步拷到自己的临时目录，
-/// 再回主线程交给 loadVideo（它会再移进 SyncVideos 目录）。
+/// 系统相册选择器（PHPicker：只列视频、不需要相册权限）。选中后只把 NSItemProvider 交出去（主线程），
+/// 拷贝由页面用 copyVideo 发起：页面持有 Progress（换视频 / 离开页面时取消）和代数（过期的回调不认）。
 struct PhotoVideoPicker: UIViewControllerRepresentable {
     var onCancel: () -> Void = {}
-    /// 拷好后（主线程）；nil = 读不出来
-    let onPick: (URL?) -> Void
-    /// 选中后、开始拷贝前（主线程）
-    var onStart: () -> Void = {}
+    /// 选中了一个（主线程）
+    let onPick: (NSItemProvider) -> Void
+
+    /// 相册视频拷出来的临时目录（loadVideo 再移进 SyncVideos；启动时清掉上次留下的）
+    static var importDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("PhotoImports", isDirectory: true)
+    }
+
+    static func purgeImports() {
+        try? FileManager.default.removeItem(at: importDirectory)
+    }
+
+    /// loadFileRepresentation 给的临时文件在回调返回后就删，所以在回调里（后台）同步拷到 importDirectory；
+    /// 拷失败删掉半截文件。completion 回主线程，nil = 读不出来 / 被取消。没有视频类型时返回 nil、不回调
+    static func copyVideo(from provider: NSItemProvider, completion: @escaping (URL?) -> Void) -> Progress? {
+        let types = [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie]
+        guard let type = types.first(where: { provider.hasItemConformingToTypeIdentifier($0.identifier) }) else {
+            return nil
+        }
+        let dir = importDirectory
+        return provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, _ in
+            var copied: URL?
+            if let url {
+                let fm = FileManager.default
+                try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+                let dest = dir.appendingPathComponent("相册视频-" + String(UUID().uuidString.prefix(8)) + "." + ext)
+                do {
+                    try fm.copyItem(at: url, to: dest)
+                    copied = dest
+                } catch {
+                    try? fm.removeItem(at: dest)
+                }
+            }
+            DispatchQueue.main.async { completion(copied) }
+        }
+    }
 
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var config = PHPickerConfiguration()
@@ -2291,16 +2413,14 @@ struct PhotoVideoPicker: UIViewControllerRepresentable {
 
     func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
 
-    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel, onStart: onStart) }
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
 
     final class Coordinator: NSObject, PHPickerViewControllerDelegate {
-        let onPick: (URL?) -> Void
+        let onPick: (NSItemProvider) -> Void
         let onCancel: () -> Void
-        let onStart: () -> Void
-        init(onPick: @escaping (URL?) -> Void, onCancel: @escaping () -> Void, onStart: @escaping () -> Void) {
+        init(onPick: @escaping (NSItemProvider) -> Void, onCancel: @escaping () -> Void) {
             self.onPick = onPick
             self.onCancel = onCancel
-            self.onStart = onStart
         }
 
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
@@ -2308,25 +2428,7 @@ struct PhotoVideoPicker: UIViewControllerRepresentable {
                 onCancel()
                 return
             }
-            let types = [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie]
-            guard let type = types.first(where: { provider.hasItemConformingToTypeIdentifier($0.identifier) }) else {
-                onPick(nil)
-                return
-            }
-            onStart()
-            let done = onPick
-            provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, _ in
-                var copied: URL?
-                if let url {
-                    let fm = FileManager.default
-                    let dir = fm.temporaryDirectory.appendingPathComponent("PhotoImports", isDirectory: true)
-                    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-                    let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
-                    let dest = dir.appendingPathComponent("相册视频-" + String(UUID().uuidString.prefix(8)) + "." + ext)
-                    if (try? fm.copyItem(at: url, to: dest)) != nil { copied = dest }
-                }
-                DispatchQueue.main.async { done(copied) }
-            }
+            onPick(provider)
         }
     }
 }
@@ -2413,12 +2515,24 @@ final class MotionDebugLog {
         }
     }
 
-    /// 写到临时目录，返回文件地址（失败 nil）
+    /// 导出的表格放这里（每次导出前清掉上一份；启动时也清）
+    static var exportDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("MotionDebug", isDirectory: true)
+    }
+
+    static func purgeExports() {
+        try? FileManager.default.removeItem(at: exportDirectory)
+    }
+
+    /// 写到临时目录（先删掉以前导出的），返回文件地址（失败 nil）
     func writeCSV() -> URL? {
         var text = Self.header + "\n"
         for i in 0..<rows.count { text += rows[(start + i) % rows.count] + "\n" }
         let stamp = Int(Date().timeIntervalSince1970)
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("bluecrystal-motion-\(stamp).csv")
+        let fm = FileManager.default
+        Self.purgeExports()
+        try? fm.createDirectory(at: Self.exportDirectory, withIntermediateDirectories: true)
+        let url = Self.exportDirectory.appendingPathComponent("bluecrystal-motion-\(stamp).csv")
         do {
             try text.write(to: url, atomically: true, encoding: .utf8)
             return url
