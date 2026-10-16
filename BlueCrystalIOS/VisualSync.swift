@@ -1087,6 +1087,10 @@ struct BlockMotionEstimator {
     var noiseGuard = false
     static let guardMinTexture: Double = 4
     static let guardMaskDistinct: Double = 0.5
+    /// 没纹理的块的法向流先记在 weakFlow；旁边（8 邻域）有一块有纹理、确实在动的块时才采用（真的一大片皮肤在动，
+    /// 边上总有对得上的块；画面到处一样的闪烁 / 噪声，邻块也全是没纹理的）
+    private var weak = [Bool](repeating: false, count: BlockMotionEstimator.blockCount)
+    private var weakFlow = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
 
     /// rhythm-context P3：上一次 estimate 每块扣掉相机后的位移（像素 / 帧间隔）。只有可靠块 / 混合块有向量，其它块 (0, 0)
     func blockResidual(_ b: Int) -> (x: Double, y: Double) {
@@ -1128,6 +1132,7 @@ struct BlockMotionEstimator {
                         window: Window(x0: x0, x1: x1, y0: y0, y1: y1, minCount: (full + 1) / 2))
             }
         }
+        if noiseGuard { coherentWeakFlow() }
 
         // 相机：中位数平移 → 内点 → 相似变换 → 再取内点重拟合
         let cx0 = Double(w) / 2
@@ -1250,6 +1255,36 @@ struct BlockMotionEstimator {
         return out
     }
 
+    /// rhythm-action tune（noiseGuard）：没纹理的块，8 邻域里有一块有纹理、在动的块（可靠 / 混合块位移或法向流 > movingThreshold）
+    /// 才采用它自己的法向流。只看有纹理的邻块，和块的顺序无关
+    private mutating func coherentWeakFlow() {
+        let cols = Self.columns
+        let rows = Self.rows
+        for b in 0..<Self.blockCount where weak[b] && weakFlow[b] > 0 {
+            let r = b / cols
+            let c = b % cols
+            var coherent = false
+            for dr in -1...1 {
+                for dc in -1...1 where (dr != 0 || dc != 0) && !coherent {
+                    let rr = r + dr
+                    let cc = c + dc
+                    guard rr >= 0, rr < rows, cc >= 0, cc < cols else { continue }
+                    let nb = rr * cols + cc
+                    guard !weak[nb] else { continue }
+                    switch kind[nb] {
+                    case 1, 4:
+                        coherent = (vx[nb] * vx[nb] + vy[nb] * vy[nb]).squareRoot() > Self.movingThreshold
+                    case 2:
+                        coherent = normalFlow[nb] > Self.movingThreshold
+                    default:
+                        break
+                    }
+                }
+            }
+            if coherent { normalFlow[b] = weakFlow[b] }
+        }
+    }
+
     private static func displacement(_ m: (tx: Double, ty: Double, a: Double, b: Double),
                                       x: Double, y: Double) -> (x: Double, y: Double) {
         (m.tx + m.a * x - m.b * y, m.ty + m.b * x + m.a * y)
@@ -1325,6 +1360,8 @@ struct BlockMotionEstimator {
         normalFlow[b] = 0
         kind[b] = 0
         unexplained[b] = false
+        weak[b] = false
+        weakFlow[b] = 0
         guard win.x1 > win.x0 + 1, win.y1 > win.y0 + 1 else { return }
         // 纹理：窗口内相邻像素差的均方（每个轴）
         var grad = 0
@@ -1421,11 +1458,14 @@ struct BlockMotionEstimator {
         } else {
             // 法向流：|I_t| ≈ |∇I · d| → |d| ≈ rms(I_t) / rms(∇I)（扣掉噪声，纹理太弱时按 2 算，最多 6）
             kind[b] = 2
+            let nf = max(0, s0 - gate).squareRoot() / max(gradRms, 2)
             if noiseGuard && gradRms < Self.guardMinTexture {
-                // rhythm-action tune：没纹理的块（大片皮肤 / 暗场）里的帧差几乎全是噪声，除以很小的梯度会变成假运动
+                // rhythm-action tune：没纹理的块（大片皮肤 / 暗场）里的帧差多半是噪声：先不给，
+                // estimate 里旁边有有纹理且在动的块时再采用（coherentWeakFlow）
                 normalFlow[b] = 0
+                weak[b] = true
+                weakFlow[b] = nf.isFinite ? min(Self.maxNormalFlow, nf) : 0
             } else {
-                let nf = max(0, s0 - gate).squareRoot() / max(gradRms, 2)
                 normalFlow[b] = nf.isFinite ? min(Self.maxNormalFlow, nf) : 0
             }
         }
@@ -3213,8 +3253,17 @@ struct MotionNormalizer {
     /// rhythm-action tune：见 gentleLow（默认关）
     var actionTuned = false
     /// rhythm-action tune：这一拍能不能用 gentle / 放大门槛（VideoSyncPlayer 每拍按上一拍的动作识别设：
-    /// 轻抚，或还没认出动作且跟随器没锁 = true；认出了往复动作 / 节奏锁着 = false，慢的真动作不压）。只在 actionTuned 时看
+    /// 轻抚 / 节奏只来自摸着自己的手 = true；其余 false）。画面完全没有节奏时（unrhythmic）不看这个也压。只在 actionTuned 时看
     var gentleAllowed = true
+
+    /// rhythm-action tune：画面里没有任何节奏（块运动 / 姿态的跟随置信度都 < quietRhythm）= 静止画面的噪声 / 近景抖动的正面依据，
+    /// 不管动作识别怎么判都可以 gentle；有一点节奏（慢的、不规则的真往复）不算
+    static let quietRhythm: Double = 0.25
+    static func unrhythmic(_ w: MotionWindow) -> Bool {
+        let flow = w.subjectFollowRhythm.isFinite ? w.subjectFollowRhythm : 0
+        let pose = w.posePresentFrames > 0 && w.poseRhythmConfidence.isFinite ? w.poseRhythmConfidence : 0
+        return flow < quietRhythm && pose < quietRhythm
+    }
 
     /// rhythm-action tune：慢 / 轻动作的绝对压低（纯函数，0~1 → 0~1，单调、不升）
     static func gentle(_ s: Double) -> Double {
@@ -3320,7 +3369,7 @@ struct MotionNormalizer {
         // rhythm-action tune：慢 / 轻的动作先按绝对刻度压低（关着时 shaped = s，逐位不变）。
         // 只在轻抚 / 还没认出动作且没锁节奏时（gentleAllowed）；按近场收拢之前的分数压、再照样收拢，
         // 不和近场收拢叠加（结果仍 ≤ s：gentle 不升、收拢单调）
-        let gentleOn = actionTuned && gentleAllowed
+        let gentleOn = actionTuned && (gentleAllowed || Self.unrhythmic(w))
         var shaped = s
         if gentleOn {
             var g = Self.gentle(unpulled)
@@ -5823,7 +5872,8 @@ struct ActionContext {
     /// 没检测到身体时：整幅主体分数 ≥ 0.2（画面确实在动）才让手 / 脸的节奏能被跟随器采用
     static let liftSubjectScore: Double = 0.2
     /// rhythm-action tune：自己的手腕在自己的躯干上（胸口锚点往髋的方向 −0.15 ~ 0.7 段、离中线 ≤ 0.6 个身体尺度）、
-    /// 髋没在和画面同频地大幅往复、主要的周期区域就在这只手旁（或者没有区域）→ 轻抚（依据 0.6）
+    /// 髋没在和画面同频地大幅往复、主要的周期区域就在这只手旁（要有新鲜的区域）、这只手的动作小 / 不规则（quietTouch）
+    /// → 轻抚（依据最多 0.6）。没有区域时只算 selfPaced（软压低 + 不跟节奏，不封顶）
     static let caressEvidence: Double = 0.6
     static let torsoAbove: Double = 0.15
     static let torsoBelow: Double = 0.7
@@ -5847,6 +5897,12 @@ struct ActionContext {
     static let caressMaxSubject: Double = 0.55
     /// 跟随器锁着、锁的权重 ≥ 这个时，频率和摸着身体的那只手对不上就不算轻抚（锁的是别的往复）
     static let caressLockWeight: Double = 0.5
+    /// 「锁在别的频率上」的一致范围放宽到 ±35%（两个估计各自有误差，±15% 太严，会把真轻抚判成锁在别处）
+    static let lockAgreeRatio: Double = 0.35
+    /// 摸着自己的那只手：节奏置信度 ≥ 0.5 且单程幅度 ≥ 0.12 躯干（规则、幅度大）= 往复，不是轻抚；
+    /// 和区域 / 整幅的参考频率一致时它算撸动等的依据（不从对手依据里扣掉）
+    static let caressMaxConfidence: Double = 0.5
+    static let caressMaxAmplitude: Double = 0.12
 
     /// rhythm-action tune：摸着自己躯干的那只手腕（位置 + 它自己的节奏），另一只手腕（有的话）
     struct SelfTouch: Equatable {
@@ -5895,16 +5951,40 @@ struct ActionContext {
     /// 方向已判断（给撞击声校正：已知时只做 ±60° 的细调）
     var directionKnown: Bool { inwardKnown && (flowDirection != 0 || poseDirection != 0) }
 
-    /// rhythm-action tune：轻抚时节奏不起作用（VideoSyncPlayer 把这一拍当成「画面不在往复」）
-    var suppressesRhythm: Bool { kind == .caress }
+    /// rhythm-action tune：节奏只来自摸着自己的、动作小 / 不规则的那只手（没有区域、算不上轻抚时）
+    private(set) var quietSelf = false
+
+    /// rhythm-action tune：轻抚，或还没认出动作且节奏只来自摸着自己的安静的手时节奏不起作用
+    /// （VideoSyncPlayer 把这一拍当成「画面不在往复」）
+    var suppressesRhythm: Bool { kind == .caress || (kind == .unknown && quietSelf) }
 
     /// rhythm-action tune：这一拍画面强度（上限之前的 0~100）最多多少；nil = 不限
     var intensityCeiling: Double? { kind == .caress ? Self.caressCeiling : nil }
 
-    /// rhythm-action tune：MotionNormalizer.gentleAllowed——轻抚，或还没认出动作且频率跟随器没锁时才压慢 / 轻动作
-    /// （锁着的节奏就是摸着自己的那只手自己的慢节奏、没有往复的对手时也算没锁：见 selfPaced）
+    /// rhythm-action tune：MotionNormalizer.gentleAllowed——只有正面依据才压慢 / 轻动作：轻抚，或还没认出动作且
+    /// 节奏只来自摸着自己的那只手（selfPaced）。只是「没认出 / 没锁」不算（慢的、不规则的真往复不压）；
+    /// 画面完全没节奏时 MotionNormalizer.unrhythmic 自己会压。followerLocked 不再参与（保留参数给调用方）
     func allowsGentle(followerLocked: Bool) -> Bool {
-        kind == .caress || (kind == .unknown && (!followerLocked || selfPaced))
+        kind == .caress || (kind == .unknown && selfPaced)
+    }
+
+    /// rhythm-action tune：摸着自己的手动作小 / 不规则（才可能是轻抚）
+    static func quietTouch(_ r: PartRhythm) -> Bool {
+        let f = r.follow
+        let conf = f.confidence.isFinite ? f.confidence : 0
+        let amp = f.amplitude.isFinite ? f.amplitude : 0
+        return conf < caressMaxConfidence || amp < caressMaxAmplitude
+    }
+
+    /// rhythm-action tune：摸着自己的手规则、大幅地往复，且和参考频率一致（有的话）：是往复动作（撸动 / 乳交 / 骑乘时的手）
+    static func reciprocatingTouch(_ r: PartRhythm, refHz: Double) -> Bool {
+        let f = r.follow
+        guard !quietTouch(r), f.hz.isFinite, RhythmFollower.hzRange.contains(f.hz) else { return false }
+        return refHz > 0 ? agrees(f.hz, refHz) : true
+    }
+
+    private static func agreesLoosely(_ a: Double, _ b: Double) -> Bool {
+        a > 0 && b > 0 && a.isFinite && b.isFinite && abs(log(a / b)) <= log(1 + lockAgreeRatio)
     }
 
     /// rhythm-action tune：传给 refine 的 followerHz（锁定且权重够才算牢牢锁着；否则 0）
@@ -6037,6 +6117,7 @@ struct ActionContext {
         usesRoi = false
         usesOtherHips = false
         selfPaced = false
+        quietSelf = false
         guard now.isFinite else { return w }
         if w.cutCount > 0 {
             // 切镜：立刻回「未知」，新镜头重新判断
@@ -6072,8 +6153,12 @@ struct ActionContext {
         let body = context.body
         let hand = context.hand
         let face = context.face
-        // rhythm-action tune：自己的手在自己躯干上（姿态没给胸口 / 各自的手腕时 nil）
-        let selfTouch: SelfTouch? = ctxFresh ? Self.selfTouch(body) : nil
+        // rhythm-action tune：自己的手在自己躯干上（姿态没给胸口 / 各自的手腕时 nil）。
+        // 那只手规则、大幅地和参考频率同步往复（手在胸口 / 肚子前撸、乳交、骑乘时手放胸口）：不当成摸自己，
+        // 它照常算撸动等的依据，也不算轻抚（reciprocatingSelf）
+        let touched: SelfTouch? = ctxFresh ? Self.selfTouch(body) : nil
+        let reciprocatingSelf = touched.map { Self.reciprocatingTouch($0.rhythm, refHz: refHz) } ?? false
+        let selfTouch: SelfTouch? = reciprocatingSelf ? nil : touched
         // 撸动看的手腕：平时是两腕的平均；一只手摸着自己时只看另一只（它可能在撸动）
         var wristPart = body.wrists
         var wristX = body.wristX
@@ -6158,9 +6243,13 @@ struct ActionContext {
             // 主要的周期区域就在这只手旁（要有新鲜的区域，且离这只手比离任何髋都近）。
             // 有往复的对手（撸动 / 口交 / 插入依据 ≥ minEvidence、髋在往复）、整幅画面在大幅动、
             // 或者跟随器牢牢锁在别的频率上时不算（而且已经是轻抚的立刻放开，见下面）
+            // 轻抚的放开条件（L2：不管现在还有没有手摸着自己都算）
+            let hipsActive = Self.reciprocating(body.hips.follow, refHz: refHz)
+                || (body.hasOtherHip && Self.reciprocating(body.otherHips.follow, refHz: refHz))
+            let competitor = max(ev.stroke, ev.oral, ev.insertion)
+            let strong = w.subjectFrames > 0 && w.subjectScore.isFinite && w.subjectScore >= Self.caressMaxSubject
+            caressBlocked = hipsActive || competitor >= Self.minEvidence || strong || reciprocatingSelf
             if let st = selfTouch {
-                let hipsActive = Self.reciprocating(body.hips.follow, refHz: refHz)
-                    || (body.hasOtherHip && Self.reciprocating(body.otherHips.follow, refHz: refHz))
                 var own = Self.slowSupport(st.rhythm, x: st.x, y: st.y, size: 0.5 * body.scale, refHz: refHz,
                                            region: region, frameWidth: fw, frameHeight: fh)
                 var ownHz = st.rhythm.follow.hz
@@ -6182,17 +6271,20 @@ struct ActionContext {
                     if body.hasOtherHip { hipD = min(hipD, Self.distance(body.otherHipX, body.otherHipY, cx, cy)) }
                     regionOK = Self.distance(st.x, st.y, cx, cy) < hipD
                 }
-                let competitor = max(ev.stroke, ev.oral, ev.insertion)
-                let strong = w.subjectFrames > 0 && w.subjectScore.isFinite && w.subjectScore >= Self.caressMaxSubject
-                let lockedElsewhere = followerHz > 0 && followerHz.isFinite && !Self.agrees(ownHz, followerHz)
-                caressBlocked = hipsActive || competitor >= Self.minEvidence || strong || lockedElsewhere
-                if !caressBlocked && regionOK { ev.caress = min(Self.caressEvidence, own) }
+                let lockedElsewhere = followerHz > 0 && followerHz.isFinite && !Self.agreesLoosely(ownHz, followerHz)
+                caressBlocked = caressBlocked || lockedElsewhere
+                // 硬上限 + 不跟节奏只给动作小 / 不规则的手（规则大幅的往复不封顶，最多 selfPaced 的软压低）
+                let quiet = Self.quietTouch(st.rhythm)
+                if !caressBlocked && regionOK && quiet { ev.caress = min(Self.caressEvidence, own) }
                 selfPaced = !caressBlocked && own >= Self.minEvidence
+                quietSelf = selfPaced && quiet
             }
         }
         evidence = ev
         // 已经是轻抚、但出现了往复的对手：立刻放开（强度上限 / 不跟节奏马上撤掉），对手照常确认
-        if kind == .caress, caressBlocked {
+        // （姿态上下文过期时也看整幅画面是不是在大幅动）
+        let strongNow = w.subjectFrames > 0 && w.subjectScore.isFinite && w.subjectScore >= Self.caressMaxSubject
+        if kind == .caress, caressBlocked || strongNow {
             kind = .unknown
             pendingKind = nil
         }
@@ -6290,8 +6382,8 @@ struct ActionContext {
             // 否则会按手 / 脸的位置去翻原来那份（可能是髋的）姿态相位
             if refHz <= 0 { moving = nil }
         }
-        if kind == .caress {
-            // rhythm-action tune：轻抚不是往复动作，频率跟随 / 相位锁这一拍都没有候选
+        if suppressesRhythm {
+            // rhythm-action tune：轻抚 / 只有摸着自己的安静的手（quietSelf）不是往复动作，频率跟随 / 相位锁这一拍都没有候选
             // （VideoSyncPlayer 还按 suppressesRhythm 把这一拍当成「画面不在往复」，伸缩当拍不跟节奏）
             r.subjectFollowHz = 0
             r.subjectFollowRhythm = 0

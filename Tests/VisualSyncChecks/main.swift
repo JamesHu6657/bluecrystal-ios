@@ -5037,7 +5037,7 @@ do {
 
 /// 一拍的窗口：主体在 1.2 Hz 往复（块运动 0.45、姿态 0.4、腕的节奏 1.2 Hz）；上下文里一只手在胸口（32, 12）。
 /// chest = true：姿态给了胸口锚点和右手腕（调优后的 PoseMotionTracker 才给）；false：92681ea 的上下文（没有这几项）
-func atChestWindow(time: Double, chest: Bool, region: Bool = false) -> MotionWindow {
+func atChestWindow(time: Double, chest: Bool, region: Bool = false, amplitude: Double = 0.08) -> MotionWindow {
     var w = MotionWindow(meanEnergy: 2, peakEnergy: 3, frames: 5, cutCount: 0, heldCount: 0)
     w.subjectFrames = 5
     w.subjectScore = 0.45
@@ -5059,7 +5059,8 @@ func atChestWindow(time: Double, chest: Bool, region: Bool = false) -> MotionWin
     c.frameWidth = 64
     c.frameHeight = 36
     var rh = PartRhythm()
-    rh.follow = StrokeRhythm.FollowEstimate(hz: 1.2, confidence: 0.8, amplitude: 0.15, sampleRate: 9)
+    // 轻抚：手小幅地摸（默认 0.08 躯干）；amplitude ≥ 0.12 的同一个窗口就是在胸口前规则地撸（H1 反例）
+    rh.follow = StrokeRhythm.FollowEstimate(hz: 1.2, confidence: 0.8, amplitude: amplitude, sampleRate: 9)
     c.hand = PartReading(present: true, time: c.time, x: 32, y: 12, size: 6, confidence: 0.8, rhythm: rh)
     c.body.present = true
     c.body.time = c.time
@@ -5454,8 +5455,14 @@ do {
     let newNoRegion = atRun(tuned: true, context: true) { atChestWindow(time: $0, chest: true, region: false) }
     let oldMean = vs3Late(oldNoRegion.values)
     let newMean = vs3Late(newNoRegion.values)
-    vcheck(newMean <= oldMean - 3,
-           "动作调优：没区域时摸胸口也按轻动作压低（92681ea \(Int(oldMean)) → \(Int(newMean))）")
+    // M1：伸缩通道（out[0]）也不能被手的 1.2 Hz 节奏推上去：selfPaced 时跟随器不锁、伸缩跟强度走
+    let oldNRThrust = Double(oldNoRegion.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    let newNRThrust = Double(newNoRegion.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    let newNRPeak = newNoRegion.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 99
+    vcheck(newMean <= oldMean - 3 && newNRThrust <= oldNRThrust - 5 && newNoRegion.locked.suffix(10).allSatisfy { !$0 }
+           && Double(newNRPeak) <= newMean + 3,
+           "动作调优：没区域时摸胸口也按轻动作压低（92681ea \(Int(oldMean)) → \(Int(newMean))），伸缩不跟手的节奏"
+           + "（\(Int(oldNRThrust)) → \(Int(newNRThrust))，最高 \(newNRPeak)）")
 }
 
 /// 慢的真插入：髋 0.8 Hz 往复（置信度 0.8、幅度 0.15 躯干），主体分数 0.32（0.8 Hz、1.5 像素 / 帧、4 像素幅度的实际分数）
@@ -5566,6 +5573,122 @@ do {
     let oldLate = vs3Late(oldOuts)
     vcheck(newMax <= 3 && oldLate >= 10,
            "动作调优（真机 b）：臀部特写不动 + 残余块运动噪声 0.12~0.2 + 关键点抖动：输出 92681ea \(Int(oldLate)) → 调优最高 \(String(format: "%.1f", newMax))")
+}
+
+// MARK: - rhythm-action tune 复审 2：在胸口前的真往复不封顶、gentle 要正面依据、没纹理的真运动、轻抚的放开
+
+/// H1 反例：同一个胸口窗口，但那只手规则、大幅（0.2 躯干）地 1.2 Hz 往复
+/// kind：handjob = 一只手在胸口前撸（POV，被撸的人不在画面里）；titjob = 两只手都在胸口；cowgirl = 一只手放胸口、髋出画
+func atReciprocationWindow(time: Double, kind: String, chest: Bool) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: chest, region: true, amplitude: 0.2)
+    if kind == "titjob", chest {
+        w.context.body.hasLeftWrist = true
+        w.context.body.leftWristX = 29
+        w.context.body.leftWristY = 13
+        w.context.body.leftWristRhythm = w.context.body.rightWristRhythm
+    }
+    if kind == "cowgirl" {
+        w.context.body.hasHip = false
+        w.context.body.hips = PartRhythm()
+    }
+    return w
+}
+
+do {
+    var ok = true
+    var notes: [String] = []
+    for kind in ["handjob", "titjob", "cowgirl"] {
+        let old = atRun(tuned: false, context: true) { atReciprocationWindow(time: $0, kind: kind, chest: false) }
+        let new = atRun(tuned: true, context: true) { atReciprocationWindow(time: $0, kind: kind, chest: true) }
+        let oldMean = vs3Late(old.values)
+        let newMean = vs3Late(new.values)
+        let newPeak = new.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 0
+        let ac = atSettle { atReciprocationWindow(time: $0, kind: kind, chest: true) }
+        let fine = !new.kinds.contains(.caress) && ac.intensityCeiling == nil && !ac.suppressesRhythm
+            && newMean >= 0.9 * oldMean && newPeak > 20 && new.locked.last == true
+        ok = ok && fine
+        notes.append("\(kind): \(ac.kind) \(Int(oldMean))→\(Int(newMean)) 峰 \(newPeak) 锁 \(new.locked.last ?? false)")
+    }
+    vcheck(ok, "动作调优（H1）：胸口前规则大幅的真往复（POV 撸动 / 乳交 / 骑乘手放胸口、髋出画）不认轻抚、不封顶 20、照常跟节奏（\(notes)）")
+}
+
+do {
+    // M2：没认到身体的特写里慢的、不规则的真插入（0.6 Hz、跟随置信度 0.35 < 锁定门 0.4，跟随器锁不上）≈ 92681ea
+    func slow(_ t: Double) -> MotionWindow {
+        var w = MotionWindow(meanEnergy: 2, peakEnergy: 3, frames: 5, cutCount: 0, heldCount: 0)
+        w.subjectFrames = 5
+        w.subjectScore = 0.32
+        w.subjectHz = 0.6
+        w.subjectFollowHz = 0.6
+        w.subjectFollowRhythm = 0.35
+        w.subjectFollowAmplitude = 2
+        return w
+    }
+    let old = atRun(tuned: false, context: true, window: slow)
+    let new = atRun(tuned: true, context: true, window: slow)
+    // 画面完全没节奏（静止特写的残余噪声 0.2）：照样压到几乎 0
+    let still = atRun(tuned: true, context: true) { t in
+        var w = slow(t)
+        w.subjectScore = 0.2
+        w.subjectFollowRhythm = 0
+        w.subjectFollowHz = 0
+        return w
+    }
+    let oldMean = vs3Late(old.values)
+    let newMean = vs3Late(new.values)
+    let stillMax = still.values.max() ?? 99
+    vcheck(newMean >= 0.95 * oldMean && oldMean >= 20 && stillMax <= 3 && !(new.locked.last ?? true),
+           "动作调优（M2）：没骨架的慢速不规则真插入不被 gentle 压（92681ea \(Int(oldMean)) / 调优 \(Int(newMean))）；"
+           + "完全没节奏的静止画面照样压（最高 \(String(format: "%.1f", stillMax))）")
+}
+
+do {
+    // M3：边缘清楚、里面很平滑的一块皮肤（圆盘，中间圆顶的明暗梯度 < 4）每帧往右移 2.5 像素：
+    // 噪声防护开着时里面的平滑块靠旁边在动的边缘块采用法向流，和关着时差不多；到处闪烁的平面照样 0
+    func disk(_ cx: Double) -> [UInt8] {
+        var f = [UInt8](repeating: 60, count: 64 * 36)
+        let r0 = 14.0
+        for y in 0..<36 {
+            for x in 0..<64 {
+                let dx = Double(x) - cx
+                let dy = Double(y) - 18
+                let r2 = dx * dx + dy * dy
+                if r2 < r0 * r0 { f[y * 64 + x] = UInt8(120 + 20 * (1 - r2 / (r0 * r0))) }
+            }
+        }
+        return f
+    }
+    let prev = disk(28)
+    let cur = disk(30.5)
+    func run(_ guardOn: Bool) -> BlockMotionResult {
+        var e = BlockMotionEstimator()
+        e.noiseGuard = guardOn
+        return cur.withUnsafeBufferPointer { c in
+            prev.withUnsafeBufferPointer { p in e.estimate(cur: c, prev: p, width: 64, height: 36, gap: vsDt) }
+        }
+    }
+    let off = run(false)
+    let on = run(true)
+    vcheck(on.movingBlocks >= off.movingBlocks - 1 && on.speed >= 0.8 * off.speed && on.movingBlocks >= 3,
+           "动作调优（M3）：平滑皮肤真的在动时噪声防护不丢运动（关 \(off.movingBlocks) 块 \(String(format: "%.2f", off.speed)) / "
+           + "开 \(on.movingBlocks) 块 \(String(format: "%.2f", on.speed))）")
+}
+
+do {
+    // L2：轻抚中手离开胸口、画面开始大幅动（主体 0.8）/ 髋开始往复：这一拍就放开轻抚
+    for variant in ["strong", "hips"] {
+        var ac = atSettle { atChestWindow(time: $0, chest: true, region: true) }
+        let was = ac.kind == .caress
+        var w = atChestWindow(time: 13, chest: false, region: true)
+        if variant == "strong" {
+            w.subjectScore = 0.8
+        } else {
+            w.context.body.hips.follow = StrokeRhythm.FollowEstimate(hz: 1.2, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
+        }
+        _ = ac.refine(w, now: 13)
+        vcheck(was && ac.kind != .caress && ac.intensityCeiling == nil && !ac.suppressesRhythm,
+               "动作调优（L2）：轻抚中手离开胸口且\(variant == "strong" ? "画面大幅动" : "髋开始往复")：当拍放开（\(ac.kind)）")
+    }
 }
 
 if vsFailures > 0 {
