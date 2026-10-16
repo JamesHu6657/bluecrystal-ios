@@ -236,11 +236,23 @@ final class NotifyProbeMonitor: ObservableObject {
     @Published private(set) var summary = "FFA2 观察：还没有收到通知"
     private var probe = NotifyPeriodProbe()
     private var lastRefresh: TimeInterval = -.infinity
+    /// 设备详情展开、这一行在屏幕上时才做周期分析（正弦拟合较重，收起 / 切到视频页时只记录、不在主线程上算）
+    private var visible = false
 
     func note(_ hex: String) {
         let now = ProcessInfo.processInfo.systemUptime
         probe.add(time: now, hex: hex)
-        guard now - lastRefresh >= 1 else { return }
+        refresh(now: now, force: false)
+    }
+
+    /// 这一行出现 / 消失（onAppear / onDisappear）；出现时立刻按已记录的 20 秒算一次
+    func setVisible(_ v: Bool) {
+        visible = v
+        if v { refresh(now: ProcessInfo.processInfo.systemUptime, force: true) }
+    }
+
+    private func refresh(now: TimeInterval, force: Bool) {
+        guard visible, force || now - lastRefresh >= 1 else { return }
         lastRefresh = now
         let text = NotifyPeriodProbe.summary(probe.report(now: now))
         if text != summary { summary = text }
@@ -558,6 +570,8 @@ struct ManualControlView: View {
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundColor(Velvet.textMuted)
                 .fixedSize(horizontal: false, vertical: true)
+                .onAppear { notifyProbe.setVisible(true) }
+                .onDisappear { notifyProbe.setVisible(false) }
             Text(modeProtocolNote)
                 .font(.caption2).foregroundColor(Velvet.textMuted)
             Text("旋转通道官方 mizzzee 配置未使用，已隐藏（恒发 0）")
