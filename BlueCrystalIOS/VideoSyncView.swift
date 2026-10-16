@@ -944,12 +944,14 @@ final class VideoSyncPlayer: ObservableObject {
         } else if contextStatus != nil {
             resetContext()
         }
-        if motionSignal { rhythm.step(input, dt: dt, active: activity > 0) } else { rhythm.reset() }
+        // rhythm-action tune：认出轻抚 / 摸自己时当成「画面不在往复」（跟随器 / 相位锁不锁、已锁的按不动放开）
+        let moving = activity > 0 && !(visualSettings.usesRhythmContext && actionContext.suppressesRhythm)
+        if motionSignal { rhythm.step(input, dt: dt, active: moving) } else { rhythm.reset() }
         if visualSettings.rhythmPulse {
             // P2：相位锁跟在频率跟随器后面（跟随器没锁 / 镜头切换 / 不动 2 拍 → 相位锁立刻放开）
             if motionSignal {
                 phaseLock.step(input, followerHz: rhythm.hz, followerLocked: rhythm.locked,
-                               followerSource: rhythm.source, now: CACurrentMediaTime(), dt: dt, active: activity > 0)
+                               followerSource: rhythm.source, now: CACurrentMediaTime(), dt: dt, active: moving)
             } else {
                 phaseLock.reset()
             }
@@ -972,8 +974,13 @@ final class VideoSyncPlayer: ObservableObject {
     private func motionTick(_ p: AVPlayer, ble: BLEManager, t: Double, now: TimeInterval, dt: TimeInterval) {
         let window = motionMeter?.drain() ?? .empty
         motionFlow.note(window, now: now)
-        let target = motionNormalizer.step(window, gainDb: visualSettings.motionGainDb,
+        // rhythm-action tune（动作识别开着才生效；关着时这几行和以前逐位相同）：慢 / 轻动作按绝对刻度压低、
+        // 姿态不能比画面本身的运动高太多；认出轻抚 / 摸自己时强度最多到 ActionContext.caressCeiling（上一拍的判断，只降不升）
+        let tuned = visualSettings.usesRhythmContext
+        motionNormalizer.actionTuned = tuned
+        var target = motionNormalizer.step(window, gainDb: visualSettings.motionGainDb,
                                            auto: visualSettings.autoMotion, dt: dt)
+        if tuned, let ceiling = actionContext.intensityCeiling { target = min(target, ceiling) }
         let shaped = motionShaper.step(target: target, dt: dt)
         motionLevel = shaped.level
         let poseAssist = motionNormalizer.poseWeight >= 0.2
@@ -994,15 +1001,17 @@ final class VideoSyncPlayer: ObservableObject {
                                                          confidence: motionNormalizer.confidence,
                                                          motionSignal: motionSignal)
         let rateLevel = rhythmLevel(window, motionSignal: motionSignal, activity: motionActivity, dt: dt)
+        // rhythm-action tune：认出轻抚时这一拍伸缩不跟节奏（activity 当 0；关着时就是 motionActivity）
+        let rhythmActivity = tuned && actionContext.suppressesRhythm ? 0 : motionActivity
         guard settings.enabled else {
             // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
             outputStage.reset()
             handover.cancel()
             if visualSettings.rhythmFollow {
                 let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
-                                                 rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
+                                                 rateLevel: rateLevel, weight: rhythm.weight, activity: rhythmActivity)
                 intensity = min(SyncOutputStage.hardCap(settings), levels.max() ?? 0)
-                updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: levels[0],
+                updateRhythmStatus(rateLevel: rateLevel, activity: rhythmActivity, thrust: levels[0],
                                    value: value, hasSignal: hasSignal)
             } else {
                 intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
@@ -1013,20 +1022,20 @@ final class VideoSyncPlayer: ObservableObject {
         if visualSettings.rhythmFollow {
             // 伸缩按动作频率（weight × 画面强度交接），震动照旧；同一个出口：上限 / 升幅 ≤ +20 / 归零保持
             let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
-                                             rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
+                                             rateLevel: rateLevel, weight: rhythm.weight, activity: rhythmActivity)
             if visualSettings.rhythmPulse {
                 // P3：撞击声校正（开着才有）只调脉动相位，有界、对不上就回 0
                 updateAudioAnchor(p, dt: dt)
                 // P2：锁上相位才在 P1 档位上叠加脉动（往里时加强）；没锁 / 没标定 / 太快 / 太弱 = P1 原样
                 vals = pulse.beat(levels: levels, lock: phaseLock, visual: visualSettings, settings: settings,
-                                  hasSignal: hasSignal, value: value, activity: motionActivity,
+                                  hasSignal: hasSignal, value: value, activity: rhythmActivity,
                                   followerWeight: rhythm.weight, now: CACurrentMediaTime(), stage: &outputStage)
                 let text = pulse.statusText(lock: phaseLock, visual: visualSettings)
                 if text != pulseStatus { pulseStatus = text }
             } else {
                 vals = outputStage.step(levels: levels, settings: settings, now: CACurrentMediaTime(), timed: false)
             }
-            updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: vals[0],
+            updateRhythmStatus(rateLevel: rateLevel, activity: rhythmActivity, thrust: vals[0],
                                value: value, hasSignal: hasSignal)
         } else {
             vals = outputStage.step(value, settings: settings, hasSignal: hasSignal, now: CACurrentMediaTime())
