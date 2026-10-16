@@ -1829,6 +1829,368 @@ do {
            + "\(postWindow.posePresentFrames) 次照常算）")
 }
 
+// MARK: - rhythm-follow P1：设备档位↔频率标定表 / 节奏跟随 / 伸缩按频率出档位
+
+do {
+    let m = DeviceRateMap.parse("20:0.6, 40:1.1, 60:1.7, 99:2.8")
+    vcheck(m?.points.count == 4 && m?.minLevel == 20 && m?.maxLevel == 99 && m?.minHz == 0.6 && m?.maxHz == 2.8,
+           "标定表：标准格式解析")
+    let wide = DeviceRateMap.parse("99：2.8；20：0.6，60：1.7\n40: 1.1 ")
+    vcheck(wide == m, "标定表：全角冒号 / 逗号 / 分号 / 换行、乱序都认，按档位排序")
+    vcheck(m.flatMap { DeviceRateMap.parse($0.text) } == m, "标定表：text 能原样解析回来（\(m?.text ?? "nil")）")
+    let bad = ["", "  ", "abc", "20:0.6", "20:0.6, 40:0.5", "20:0.6, 20:0.8", "0:0.5, 50:1", "20:0.6, 100:3",
+               "20:0.05, 40:1", "20:0.6, 40:9", "20:nan, 40:1", "20:0.6, 40", "20:0.6:1, 40:1", "20:0.6, x:1",
+               (1...13).map { "\($0 * 7):\(Double($0) * 0.5)" }.joined(separator: ","),
+               "20:0.6, 99:2.8" + String(repeating: " ", count: VisualSyncSettings.maxRateTableLength)]
+    let accepted = bad.filter { DeviceRateMap.parse($0) != nil }
+    vcheck(accepted.isEmpty, "标定表：空 / 格式错 / 不单调 / 越界 / 超 12 点 / 超长都按没标定（误收：\(accepted)）")
+    vcheck(DeviceRateMap.parse((1...12).map { "\($0 * 8):\(Double($0) * 0.5)" }.joined(separator: ",")) != nil,
+           "标定表：12 点能收")
+    if let m {
+        var mono = true
+        var prev = 0
+        var hz = 0.1
+        while hz <= 5 {
+            let l = m.level(forHz: hz)
+            if l < prev || l < 20 || l > 99 { mono = false }
+            prev = l
+            hz += 0.01
+        }
+        vcheck(mono && m.level(forHz: 0.2) == 20 && m.level(forHz: 4) == 99 && m.level(forHz: .nan) == 20
+               && m.level(forHz: 1.1) == 40 && m.level(forHz: 1.4) == 50,
+               "标定表：频率 → 档位单调、夹到表的两端、中间线性插值（1.4 Hz → \(m.level(forHz: 1.4))）")
+        var inverse = true
+        for l in 20...99 {
+            guard let h = m.hz(forLevel: l), abs(m.level(forHz: h) - l) <= 1 else { inverse = false; continue }
+        }
+        vcheck(inverse && m.hz(forLevel: 19) == nil && m.hz(forLevel: 99) == 2.8,
+               "标定表：档位 → 频率和反查一致（±1 档），低于最低档 nil")
+    }
+    let u = DeviceRateMap.uncalibrated
+    vcheck(u.minLevel == 10 && u.maxLevel == 99 && u.level(forHz: 1) == 28 && u.level(forHz: 2) == 63,
+           "标定表：没标定时的保守猜测 10 档 0.5 Hz ~ 99 档 3 Hz（1 Hz → \(u.level(forHz: 1))，2 Hz → \(u.level(forHz: 2))）")
+}
+
+do {
+    // 真实视频 2 Hz（15 fps 上 7.5 格一个周期）+ 1 Hz 的身体晃动、速度量化成整数像素：以前自相关 15 格 = 1.0、7/8 格偏低 → 报 1 Hz
+    let mixed = vs3Rhythm(seconds: 10) { t in
+        ((5 * cos(2 * Double.pi * 2 * t) + 1.5 * cos(2 * Double.pi * t)).rounded(), 0)
+    }
+    // 真的 1 Hz、推拉不对称（30% / 60% 二次谐波）：一半滞后上是负相关，不能减半成 2 Hz
+    let pushPull = [0.3, 0.6].map { h in
+        vs3Rhythm(seconds: 10) { t in (cos(2 * Double.pi * t) + h * cos(4 * Double.pi * t + 0.5), 0) }
+    }
+    let late = mixed.suffix(90)
+    vcheck(late.allSatisfy { abs($0.hz - 2) <= 0.1 && $0.confidence >= 0.4 }
+           && pushPull.allSatisfy { $0.suffix(90).allSatisfy { abs($0.hz - 1) <= 0.05 } },
+           "节奏：半整数周期的 2 Hz 不被当成 1 Hz（\(String(format: "%.2f", late.last?.hz ?? 0)) Hz），推拉不对称的 1 Hz 不减半")
+}
+
+func rfWindow(flowHz: Double = 0, flowConf: Double = 0, amp: Double = 3,
+              poseHz: Double = 0, poseConf: Double = 0) -> MotionWindow {
+    var w = MotionWindow()
+    w.frames = 5
+    if flowHz > 0 {
+        w.subjectFrames = 5
+        w.subjectScore = 0.5
+        w.subjectHz = flowHz
+        w.subjectRhythm = flowConf
+        w.subjectAmplitude = amp
+    }
+    if poseHz > 0 {
+        w.poseFrames = 3
+        w.posePresentFrames = 3
+        w.poseRhythmHz = poseHz
+        w.poseRhythmConfidence = poseConf
+    }
+    return w
+}
+
+do {
+    let both = RhythmFollower.candidate(rfWindow(flowHz: 1.5, flowConf: 0.6, poseHz: 1.6, poseConf: 0.5))
+    vcheck(both?.source == .both && (both?.hz ?? 0) > 1.5 && (both?.hz ?? 9) < 1.6
+           && abs((both?.confidence ?? 0) - 0.7) < 1e-9,
+           "节奏候选：块运动和姿态频率一致（差 ≤ 15%）时加权合并、置信度 +0.1")
+    let near = RhythmFollower.candidate(rfWindow(flowHz: 1.0, flowConf: 0.6, poseHz: 2.0, poseConf: 0.58))
+    let far = RhythmFollower.candidate(rfWindow(flowHz: 1.0, flowConf: 0.7, poseHz: 2.0, poseConf: 0.6))
+    vcheck(near?.source == .pose && near?.hz == 2 && far?.source == .flow && far?.hz == 1,
+           "节奏候选：两路不一致时取置信度高的（姿态略优先）")
+    let tiny = RhythmFollower.candidate(rfWindow(flowHz: 1.5, flowConf: 0.9, amp: 0.5))
+    var camOnly = rfWindow(flowHz: 1.5, flowConf: 0.9)
+    camOnly.subjectScore = 0.01
+    let fast = RhythmFollower.candidate(rfWindow(flowHz: 5, flowConf: 0.9))
+    let slow = RhythmFollower.candidate(rfWindow(poseHz: 0.3, poseConf: 0.9))
+    var nanW = rfWindow(flowHz: 1.5, flowConf: 0.9, poseHz: 1.5, poseConf: 0.9)
+    nanW.subjectHz = .nan
+    nanW.poseRhythmConfidence = .infinity
+    vcheck(tiny == nil && camOnly.subjectFrames > 0 && RhythmFollower.candidate(camOnly) == nil && fast == nil && slow == nil && RhythmFollower.candidate(nanW) == nil
+           && RhythmFollower.candidate(.empty) == nil,
+           "节奏候选：主体分数几乎为 0（只有相机在动）、幅度不到 1 像素、频率不在 0.4~4 Hz、NaN / 无穷都不算")
+}
+
+do {
+    var f = RhythmFollower()
+    var weights: [Double] = []
+    for _ in 0..<12 { weights.append(f.step(rfWindow(flowHz: 1.5, flowConf: 0.7), dt: 0.3).weight) }
+    vcheck(f.locked && abs(f.hz - 1.5) < 1e-9 && f.source == .flow && weights[3] == 1 && weights[0] <= 0.3 + 1e-9,
+           "节奏跟随：稳定 1.5 Hz 第一拍就锁定，weight 约 1 秒升满（\(weights.prefix(4).map { String(format: "%.2f", $0) })）")
+
+    var j = RhythmFollower()
+    var seed: UInt64 = 12345
+    var inMax = 0.0
+    var outMax = 0.0
+    var lastIn = 1.5
+    var lastOut = 0.0
+    for k in 0..<60 {
+        seed = seed &* 6364136223846793005 &+ 1442695040888963407
+        let r = Double(seed >> 33) / Double(1 << 31) * 2 - 1
+        let h = 1.5 * (1 + 0.1 * r)
+        j.step(rfWindow(flowHz: h, flowConf: 0.6), dt: 0.3)
+        if k >= 20 {
+            inMax = max(inMax, abs(h - lastIn))
+            outMax = max(outMax, abs(j.hz - lastOut))
+        }
+        lastIn = h
+        lastOut = j.hz
+    }
+    vcheck(abs(j.hz - 1.5) <= 0.075 && outMax <= 0.4 * inMax,
+           "节奏跟随：±10% 抖动被平滑（输出 \(String(format: "%.2f", j.hz)) Hz，拍间变化 \(String(format: "%.3f", outMax)) vs 输入 \(String(format: "%.3f", inMax))）")
+
+    var s = RhythmFollower()
+    for _ in 0..<20 { s.step(rfWindow(flowHz: 1, flowConf: 0.7), dt: 0.3) }
+    var reached: Double?
+    var firstAfter = 0.0
+    for k in 0..<20 {
+        s.step(rfWindow(flowHz: 2, flowConf: 0.7), dt: 0.3)
+        if k == 0 { firstAfter = s.hz }
+        if reached == nil, abs(s.hz - 2) <= 0.2 { reached = Double(k + 1) * 0.3 }
+    }
+    vcheck(abs(firstAfter - 1) < 1e-9 && (reached ?? 99) <= 3 && (reached ?? 0) >= 0.6 - 1e-9,
+           "节奏跟随：1 → 2 Hz 阶跃先确认 0.6 秒再跟，≤ 3 秒到位（\(reached.map { String(format: "%.1f 秒", $0) } ?? "没到")）")
+
+    var o = RhythmFollower()
+    var worst = 0.0
+    for k in 0..<30 {
+        let h = k == 15 ? 3.0 : 1.5
+        o.step(rfWindow(flowHz: h, flowConf: 0.7), dt: 0.3)
+        worst = max(worst, abs(o.hz - 1.5))
+    }
+    var o2 = RhythmFollower()
+    for k in 0..<30 { o2.step(rfWindow(flowHz: k == 15 || k == 17 ? 3.0 : 1.5, flowConf: 0.7), dt: 0.3); worst = max(worst, abs(o2.hz - 1.5)) }
+    vcheck(worst < 1e-9, "节奏跟随：单拍 / 隔拍的倍频误检不跟")
+
+    var g = RhythmFollower()
+    for _ in 0..<20 { g.step(rfWindow(flowHz: 1.5, flowConf: 0.7), dt: 0.3) }
+    g.step(rfWindow(flowHz: 1.8, flowConf: 0.7), dt: 0.3)
+    let one = g.hz
+    for _ in 0..<19 { g.step(rfWindow(flowHz: 1.8, flowConf: 0.7), dt: 0.3) }
+    vcheck(one > 1.5 && one < 1.6 && abs(g.hz - 1.8) <= 0.05,
+           "节奏跟随：20% 以内的变化平滑跟上（1 拍后 \(String(format: "%.2f", one))，6 秒后 \(String(format: "%.2f", g.hz))）")
+
+    var h = RhythmFollower()
+    for _ in 0..<20 { h.step(rfWindow(flowHz: 1.5, flowConf: 0.35), dt: 0.3) }
+    let neverLocked = !h.locked && h.weight == 0 && h.hz == 0
+    for _ in 0..<5 { h.step(rfWindow(flowHz: 1.5, flowConf: 0.7), dt: 0.3) }
+    for _ in 0..<10 { h.step(rfWindow(flowHz: 1.6, flowConf: 0.33), dt: 0.3) }
+    let stillLocked = h.locked && h.weight == 1 && h.hz > 1.5
+    var drops: [Double] = []
+    var lockedAt4 = false
+    var hzAt4 = 0.0
+    var prevW = h.weight
+    var unlockedBy = -1
+    for k in 0..<14 {
+        h.step(rfWindow(flowHz: 1.5, flowConf: 0.2), dt: 0.3)
+        drops.append(prevW - h.weight)
+        prevW = h.weight
+        if k == 3 { lockedAt4 = h.locked; hzAt4 = h.hz }
+        if unlockedBy < 0, !h.locked { unlockedBy = k + 1 }
+    }
+    vcheck(neverLocked && stillLocked, "节奏跟随：置信度 0.35 不锁定；锁定后 0.33 不丢（回差 0.40 / 0.30）")
+    vcheck(lockedAt4 && hzAt4 > 1.5 && unlockedBy == 6 && drops.allSatisfy { $0 <= 0.2 + 1e-9 }
+           && h.weight == 0 && h.hz == 0 && !h.locked,
+           "节奏跟随：丢了保持 1.5 秒再解锁（第 \(unlockedBy) 拍），weight 1.5 秒降到 0 后频率清零")
+
+    var r = RhythmFollower()
+    for _ in 0..<5 { r.step(rfWindow(flowHz: 1.5, flowConf: 0.7), dt: .nan) }
+    r.step(rfWindow(flowHz: 1.5, flowConf: 0.7), dt: -1)
+    let finite = r.hz.isFinite && r.weight.isFinite && r.locked
+    r.reset()
+    vcheck(finite && !r.locked && r.hz == 0 && r.weight == 0 && r.source == .none,
+           "节奏跟随：dt 是 NaN / 负数不出错；reset 回初始")
+}
+
+do {
+    let s = AudioSyncSettings(maxPercent: 70, channels: .both, minPercent: 15)
+    let base = RhythmOutput.target(value: 50, settings: s, hasSignal: true, rateLevel: nil, weight: 1)
+    let plain = s.channels.levels(percent: SyncOutputStage.map(50, cap: 70, floor: 15))
+    let full = RhythmOutput.target(value: 50, settings: s, hasSignal: true, rateLevel: 90, weight: 1)
+    let low = RhythmOutput.target(value: 50, settings: s, hasSignal: true, rateLevel: 5, weight: 1)
+    let half = RhythmOutput.target(value: 0, settings: s, hasSignal: true, rateLevel: 55, weight: 0.5)
+    let noSig = RhythmOutput.target(value: 0, settings: s, hasSignal: false, rateLevel: 55, weight: 1)
+    let vibSettings = AudioSyncSettings(maxPercent: 70, channels: .vibration)
+    let vib = RhythmOutput.target(value: 50, settings: vibSettings, hasSignal: true, rateLevel: 60, weight: 1)
+    vcheck(base == plain && full[0] == 70 && full[1] == plain[1] && low[0] == 15 && half[0] == 35 && noSig[0] == 0
+           && vib == RhythmOutput.target(value: 50, settings: vibSettings, hasSignal: true, rateLevel: nil, weight: 1),
+           "节奏出档：伸缩 = 节奏档位（抬到最低强度、压到上限、按 weight 交接），震动照旧；没信号 / 仅震动不起作用（\(full) \(low) \(half)）")
+
+    var seed: UInt64 = 987654321
+    func rnd() -> Double {
+        seed = seed &* 6364136223846793005 &+ 1442695040888963407
+        return Double(seed >> 33) / Double(1 << 31)
+    }
+    var stage = SyncOutputStage()
+    var a = SyncOutputStage()
+    var b = SyncOutputStage()
+    var prev = [0, 0, 0, 0]
+    var zeroRun = [SyncOutputStage.zeroHoldTicks, SyncOutputStage.zeroHoldTicks]
+    var ok = true
+    var same = true
+    var bad = ""
+    let channels = AudioSyncChannels.allCases
+    for i in 0..<3000 {
+        if i % 200 == 0 { stage.reset(); a.reset(); b.reset(); prev = [0, 0, 0, 0]
+            zeroRun = [SyncOutputStage.zeroHoldTicks, SyncOutputStage.zeroHoldTicks] }
+        let st = AudioSyncSettings(maxPercent: 5 + rnd() * 100, channels: channels[Int(rnd() * 3) % 3],
+                                   minPercent: rnd() * 60)
+        let value = rnd() < 0.05 ? Double.nan : rnd() * 120 - 10
+        let sig = rnd() < 0.85
+        let rate: Int? = rnd() < 0.2 ? nil : Int(rnd() * 130) - 10
+        let w = rnd() * 2 - 0.5
+        let out = stage.step(levels: RhythmOutput.target(value: value, settings: st, hasSignal: sig, rateLevel: rate,
+                                                         weight: w), settings: st)
+        let cap = SyncOutputStage.hardCap(st)
+        if out.count != 4 || out[2] != 0 || out[3] != 0 { ok = false; bad = "通道 \(out)" }
+        for ch in 0..<2 {
+            if out[ch] < 0 || out[ch] > cap { ok = false; bad = "上限 \(out) cap \(cap)" }
+            if out[ch] - prev[ch] > SyncOutputStage.maxRisePerTick { ok = false; bad = "升幅 \(prev) → \(out)" }
+            if out[ch] > 0, prev[ch] == 0, zeroRun[ch] < SyncOutputStage.zeroHoldTicks { ok = false; bad = "归零保持" }
+            zeroRun[ch] = out[ch] == 0 ? zeroRun[ch] + 1 : 0
+        }
+        prev = out
+        let ta = RhythmOutput.target(value: value, settings: st, hasSignal: sig, rateLevel: nil, weight: w)
+        if a.step(levels: ta, settings: st) != b.step(value, settings: st, hasSignal: sig) { same = false }
+    }
+    vcheck(ok, "节奏出档：3000 组随机输入经 step(levels:) 后 ≤ 上限、单拍升幅 ≤ 20、归零保持 2 拍、只用两个通道 \(bad)")
+    vcheck(same, "节奏出档：没有节奏档位时和原来的 step(value) 逐位一致")
+}
+
+func rfFollow(_ windows: [MotionWindow], dt: Double = 5.0 / 15) -> (f: RhythmFollower, lockedTicks: Int) {
+    var f = RhythmFollower()
+    var n = 0
+    for w in windows {
+        f.step(w, dt: dt)
+        if f.locked { n += 1 }
+    }
+    return (f, n)
+}
+
+let rf1Hz = vs3Analyze(VS3Scene(rect: vs3Mid, hz: 1, peak: 4))
+do {
+    let one = rfFollow(rf1Hz.windows)
+    let two = rfFollow(vs3Strong20.windows)
+    let u = DeviceRateMap.uncalibrated
+    vcheck(one.f.locked && two.f.locked && abs(one.f.hz - 1) <= 0.1 && abs(two.f.hz - 2) <= 0.2
+           && u.level(forHz: two.f.hz) > u.level(forHz: one.f.hz) + 20,
+           "节奏端到端：合成画面 1 Hz / 2 Hz 往复锁定到 \(String(format: "%.2f", one.f.hz)) / \(String(format: "%.2f", two.f.hz)) Hz，"
+           + "档位 \(u.level(forHz: one.f.hz)) / \(u.level(forHz: two.f.hz))")
+    let still = rfFollow(vs3Static.windows)
+    let shake = rfFollow(vs3Shake.windows)
+    vcheck(still.lockedTicks == 0 && shake.lockedTicks == 0,
+           "节奏端到端：静止画面不锁定、只有手持抖动不锁定（\(still.lockedTicks) / \(shake.lockedTicks) 拍）")
+    let shakeStrong = rfFollow(vs3ShakeStrong.windows)
+    vcheck(shakeStrong.f.locked && abs(shakeStrong.f.hz - 2) <= 0.25,
+           "节奏端到端：手持抖动 + 主体 2 Hz 往复照样锁到主体频率（\(String(format: "%.2f", shakeStrong.f.hz)) Hz）")
+
+    func run(_ windows: [MotionWindow]) -> (late: Double, rise: Int) {
+        var chain = VSChain()
+        var stage = SyncOutputStage()
+        var f = RhythmFollower()
+        let st = AudioSyncSettings(maxPercent: 100, channels: .both)
+        var outs: [Int] = []
+        for w in windows {
+            let v = chain.step(w)
+            f.step(w, dt: 5.0 / 15)
+            let rate = f.weight > 0 ? u.level(forHz: f.hz) : nil
+            outs.append(stage.step(levels: RhythmOutput.target(value: v, settings: st, hasSignal: true,
+                                                               rateLevel: rate, weight: f.weight), settings: st)[0])
+        }
+        var rise = 0
+        for i in 1..<max(1, outs.count) { rise = max(rise, outs[i] - outs[i - 1]) }
+        let tail = outs.suffix(outs.count / 3)
+        return (tail.isEmpty ? 0 : Double(tail.reduce(0, +)) / Double(tail.count), rise)
+    }
+    let r1 = run(rf1Hz.windows)
+    let r2 = run(vs3Strong20.windows)
+    vcheck(abs(r1.late - Double(u.level(forHz: 1))) <= 4 && abs(r2.late - Double(u.level(forHz: 2))) <= 6
+           && r1.rise <= 20 && r2.rise <= 20,
+           "节奏端到端：伸缩档位稳定在频率对应档（1 Hz \(Int(r1.late))、2 Hz \(Int(r2.late))），升幅 ≤ 20")
+}
+
+do {
+    // 腕 1.5 Hz 上下撸动（约 0.3 躯干），髋 / 头不动：节奏取腕
+    var tracker = PoseMotionTracker()
+    var acc = MotionWindowAccumulator()
+    var follower = RhythmFollower()
+    var last = PoseReading()
+    var lastWindow = MotionWindow()
+    for k in 0..<(14 * 15) {
+        let t = Double(k) * vsDt
+        acc.add(MotionSample(time: t, energy: 1, coverage: 0.2, isCut: false, isHeld: false,
+                             subject: SubjectReading(valid: true, score: 0.2)))
+        if k % 5 == 0 || k % 5 == 2 || k % 5 == 4 {
+            var p = vs3Skeleton()
+            let dy = 3 * sin(2 * Double.pi * 1.5 * t)
+            p.set(.leftWrist, x: 26, y: 18 + dy, confidence: 0.9)
+            p.set(.rightWrist, x: 38, y: 18 + dy, confidence: 0.9)
+            last = tracker.update(time: t, candidates: [p], camera: .identity, continuous: true, frameHeight: 36)
+            acc.addPose(last)
+        }
+        if k % 5 == 4 {
+            lastWindow = acc.drain()
+            follower.step(lastWindow, dt: 5.0 / 15)
+        }
+    }
+    vcheck(last.rhythmPart == 3 && abs(last.rhythmHz - 1.5) <= 0.15 && last.rhythmConfidence >= 0.4,
+           "节奏姿态：只有手腕在往复时取腕（第 \(last.rhythmPart) 组 \(String(format: "%.2f", last.rhythmHz)) Hz）")
+    vcheck(abs(lastWindow.poseRhythmHz - 1.5) <= 0.15 && follower.locked && follower.source == .pose
+           && abs(follower.hz - 1.5) <= 0.15,
+           "节奏姿态：窗口带出姿态节奏，跟随器按姿态锁定到 \(String(format: "%.2f", follower.hz)) Hz")
+    let hip = vs3PoseHips.readings.last ?? PoseReading()
+    let none = vs3PoseNone.readings.last ?? PoseReading()
+    vcheck(hip.rhythmPart == 1 && abs(hip.rhythmHz - 2) <= 0.2 && none.rhythmPart == 0 && none.rhythmHz == 0,
+           "节奏姿态：髋 2 Hz 往复取髋（\(String(format: "%.2f", hip.rhythmHz)) Hz），没人时没有节奏")
+}
+
+do {
+    vcheck(!VisualSyncSettings.Keys.rhythmFollow.contains(".") && !VisualSyncSettings.Keys.rateTable.contains("."),
+           "节奏设置：@AppStorage 键名不带点")
+    let long = String(repeating: "1", count: VisualSyncSettings.maxRateTableLength + 1)
+    vcheck(VisualSyncSettings(rateTable: long).rateTable == "" && VisualSyncSettings().rateMap == .uncalibrated
+           && VisualSyncSettings().calibratedRateMap == nil
+           && VisualSyncSettings(rateTable: "20:0.6, 99:2.8").calibratedRateMap?.maxHz == 2.8
+           && VisualSyncSettings(rateTable: "20:0.6, 10:2.8").rateMap == .uncalibrated,
+           "节奏设置：超长表回默认，填错按没标定")
+    let suite = "bc.visualsync.rhythm.checks"
+    if let d = UserDefaults(suiteName: suite) {
+        d.removePersistentDomain(forName: suite)
+        let def = VisualSyncSettings.load(from: d)
+        vcheck(!def.rhythmFollow && def.rateTable == "", "节奏设置：默认关、没标定（老用户行为不变）")
+        d.set("yes", forKey: VisualSyncSettings.Keys.rhythmFollow)
+        d.set(42, forKey: VisualSyncSettings.Keys.rateTable)
+        let bad = VisualSyncSettings.load(from: d)
+        d.set(long, forKey: VisualSyncSettings.Keys.rateTable)
+        let tooLong = VisualSyncSettings.load(from: d)
+        d.set(true, forKey: VisualSyncSettings.Keys.rhythmFollow)
+        d.set("20:0.6, 60:1.8, 99:2.8", forKey: VisualSyncSettings.Keys.rateTable)
+        let stored = VisualSyncSettings.load(from: d)
+        vcheck(!bad.rhythmFollow && bad.rateTable == "" && tooLong.rateTable == "" && stored.rhythmFollow
+               && stored.calibratedRateMap?.points.count == 3, "节奏设置：坏值回默认、读回存的值")
+        d.removePersistentDomain(forName: suite)
+    } else {
+        vcheck(false, "节奏设置：创建测试用 UserDefaults")
+    }
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)

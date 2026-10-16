@@ -714,9 +714,79 @@ VideoMotionTap（workQueue，15 Hz）── 64×36 亮度帧 ──▶ MotionAna
 9. Instruments：`MotionAnalyze` 每帧耗时（目标 < 2 ms）；姿态队列不影响 15 Hz 拉帧；主线程无卡顿。
 10. 安全回归：STOP、看门狗、断连、上限 / 最低强度、关联动立刻归零，与 v1.8.0 一致。
 
+### rhythm-follow P0 / P1：伸缩跟随动作频率（只跟快慢，不对相位）
+
+**目标**：画面里动作每秒往复几次，设备伸缩也尽量每秒往复几次。0x08 帧只能发档位（Protocol.swift 不改，视频路径尾字节固定 0），
+没有位置 / 相位可发，所以 P1 只做频率；「往里对往里」的相位对齐不在范围内（见研究报告 P2）。默认关，老用户无感。
+
+**P0（真机标定，需要用户做）**：`docs/rhythm-calibration.md`——先确认伸缩是速度档还是幅度档，再量 10~99 档的往复次数、响应时间、STOP 位置，
+结果填进 App 的「设备标定表」。`Tools/make-rhythm-test-videos.sh` 生成已知频率的测试视频（0.5 / 1 / 2 / 3 Hz 常频、1→2 Hz 阶跃、0.5→3 Hz 扫频，最右端有咔哒声）。
+
+#### 数据流
+
+```
+VideoMotionTap ─ MotionAnalyzer（块运动主体：subjectHz / 自相关 subjectRhythm / 单程幅度 subjectAmplitude）
+               └ PoseMotionTracker（髋 / 头 / 腕三组 StrokeRhythm → rhythmPick → rhythmHz / rhythmConfidence / rhythmPart）
+        → MotionWindowAccumulator.drain() → MotionWindow（新增 4 个字段，最后一个有效值）
+        → VideoSyncPlayer.motionTick：
+             RhythmFollower.step(window, dt)            # 合成「现在的动作频率」+ weight
+             DeviceRateMap.level(forHz:)                # 频率 → 伸缩档位（标定表 / 估计值）
+             RhythmOutput.target(value, …, rateLevel, weight)   # 伸缩按频率、震动照旧按强度
+             SyncOutputStage.step(levels:)              # 同一套：上限 / 升幅 ≤ +20 / 拍 / 归零保持
+        → ble.sendTick（仍只在 tick 里，变化才发）
+```
+
+#### 类型（`VisualSync.swift` 末尾「rhythm-follow P1」）
+
+| 类型 | 作用 | 关键参数 |
+| --- | --- | --- |
+| `DeviceRateMap` | 档位 ↔ 次/秒的单调分段线性表；`parse` 认「档位:次数」，全角符号 / 换行也认 | 2~12 点，档位 1~99、0.1~8 Hz，严格递增；`uncalibrated` = 10:0.5, 99:3.0 |
+| `RhythmCandidate` | 一拍的频率候选（flow / pose / both） | — |
+| `RhythmFollower` | 候选 → 锁定 / 平滑 / 跳变确认 / 丢失保持 → `hz`、`weight` | 0.4~4 Hz；块运动要主体分数 ≥ 0.05、幅度 ≥ 1 px；两路差 ≤ 15% 合并（置信度 +0.1），否则取高的（姿态 +0.05）；锁定 0.40 / 释放 0.30；log 域平滑 τ 1.5 s；跳变 > 30% 连续 0.6 s 才接受；丢失保持 1.5 s；weight 1 s 升 / 1.5 s 降 |
+| `RhythmOutput.target` | 原来的映射 + 通道分配，伸缩通道按 weight 插值到 `min(上限, max(最低强度, 节奏档位))` | 「仅震动」、没信号、没节奏档位时与原路径逐位相同 |
+| `SyncOutputStage.step(levels:)` | 和 `step(value)` 共用 `limit`（上限、升幅、归零保持） | 不变 |
+| `VisualSyncSettings` | `rhythmFollow`（`bcVisualSyncRhythmFollow`，默认 false）、`rateTable`（`bcVisualSyncRateTable`，默认 ""，≤ 400 字） | `rateMap` 填错 / 没填 → 估计值 |
+
+姿态侧新增腕组（`wristGroup`，只给节奏、不进 score），`PoseReading.rhythmPart`：0 无 / 1 髋 / 2 头 / 3 腕。
+
+**`StrokeRhythm` 修正（影响 algo-opt-3 的 subjectHz）**：真实视频的 2 Hz 在 15 fps 上是 7.5 格一个周期，块匹配速度有量化、
+相邻两下形状不同，自相关 7/8 格只有 ~0.67、15 / 30 格 1.0，原来 85% 的规则会报 1 Hz（用生成的 2 Hz 视频和 1→2 Hz 阶跃复现）。
+现在选中周期后再看「正好一半处」（插值后 ±0.75 格）有没有 ≥ 最高峰 55% 的峰，有就减半（可连续）。
+推拉不对称的真 1 Hz 在半周期上是负相关，不受影响（有测试钉住）。
+
+#### 界面（`VideoSyncView.swift`）
+
+- 「画面」灵敏度区：开关「伸缩跟随动作频率」；打开后显示「设备标定表」输入框 + 提示（已标定范围 / 没标定 / 格式不对）。
+- 仪表区：`rhythmStatus` 一行，例如「动作节奏 1.8 次/秒 → 伸缩 46 档」「（比设备最快的 2.8 次/秒还快）」「（已到上限 60）」「；设备还没标定，档位是估计值」。
+- 所有 `motionShaper.reset()` 处同时 `resetRhythm()`（seek、缓冲、切来源、关联动、新视频、拆取帧）；开关切换时也从头确认。
+- 频率按画面帧的显示时刻（host 时间轴）算，倍速播放时已是实际看到的快慢，不再乘倍速。
+
+#### 安全不变
+
+不改 BLEManager / SafetyLedger / Protocol / AIProgram / 工程文件；只换伸缩的**目标档位**，出口照旧上限夹紧、升幅 ≤ +20 / 0.3 s、归零保持 2 拍、STOP / 看门狗 / 关联动归零不变；仍只在 `tick()` 里 `sendTick`。
+
+#### 测试（`Tests/VisualSyncChecks/main.swift`「rhythm-follow P1」，本地 Linux 235 项全部 PASS）
+
+标定表解析 / 校验 / 插值单调 / 反查；候选合并与冲突、相机抖动 / 小幅度 / 越界 / NaN 不算；跟随器稳态、±10% 抖动、1→2 Hz 阶跃 0.6 s 确认后到位、
+单拍倍频误检不跟、回差、丢失保持 1.5 s、weight 斜率、NaN dt；3000 组随机输入经 `step(levels:)` 后 ≤ 上限、升幅 ≤ 20、归零保持、只用两个通道；
+没有节奏档位时与 `step(value)` 逐位一致；合成画面 1 / 2 Hz 端到端锁定并给出不同档位、静止 / 纯抖动不锁定、抖动 + 主体照样锁定；
+腕 1.5 Hz → 取腕、髋 2 Hz → 取髋；半整数周期 2 Hz 不当 1 Hz；设置默认值 / 坏值 / 超长 / 键名。
+另外用 `make-rhythm-test-videos.sh` 生成的 6 个视频缩到 64×36、15 fps 离线跑：常频 0.5 / 1 / 2 / 3 Hz 均锁到 ±1%，阶跃 4 s 内跟上，扫频跟上（滞后 1~3 s，有一次短暂跳到 1/3 频率）。
+`VideoSyncView.swift` 的 SwiftUI 部分 Linux 编不了，需要 Xcode 编译确认。
+
+#### 真机验证清单
+
+1. P0 标定做完、表填进 App，输入框下面显示「已标定：…」。
+2. 测试视频 const-1hz / 2hz：状态行 3~6 s 内显示 ≈ 1.0 / 2.0 次/秒，设备实际往复次数与视频接近（±15%）。
+3. step-1to2hz：20 s 后 2~4 s 内设备明显变快；中途不来回跳。
+4. 真实视频：快慢变化能跟上；人离开 / 切镜后 1.5 s 内状态回到「还没找到稳定的动作节奏」，伸缩平滑回到按强度。
+5. 上限 60 / 最低强度 20：伸缩档位不超过 60、不低于 20；「仅震动」时不跟频率。
+6. 关掉开关：行为与 algo-opt-3 完全一样。
+7. 安全回归：STOP、看门狗、断连、关联动立刻归零。
+
 ## 11. 风险与待定
 
-1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。
+1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。rhythm-follow P1 也按速度档设计，P0 标定（`docs/rhythm-calibration.md` 第 1 步）先确认。
 2. **帧差 ≠ 语义**：雨、烟、水面、粒子特效、快速闪烁的灯光会被当成「运动」；P2 的平移补偿和覆盖率可以缓解，彻底解决要 P4 或更多语义特征，本设计不承诺。
 3. **暗场景对比度低**：同样的动作能量偏低，自适应归一化会部分补回；必要时 P2 可加「按亮度标准差归一」（std 下限 8）。
 4. **HDR 片源转换成本**：需实测，超预算时对 HDR 降到 8 Hz。
