@@ -1210,20 +1210,28 @@ struct VisualSyncSettings: Equatable {
 
 /// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
 /// - 声音 → 画面：画面归一化还在热身（confidence < 1）或画面还没有新鲜样本的那部分用声音的平滑值补上，并在 4 秒内线性淡出。
-///   value = c·M + (1 − c)·淡出·A ≤ max(M, A)，不会比任一来源单独更强；之后和原来逐位相同；
+///   画面占比 k = 爬坡 r × 置信度 c，r 从画面有新鲜样本起 1.5 秒内由 0 升到 1（algo-opt-2）：
+///   value = k·M + (1 − k)·淡出·A ≤ max(M, A)，不会比任一来源单独更强。同一个视频第二次切到画面时 c 早已是 1，
+///   以前画面一有样本就整段换成 M（刚 reset 的平滑值，接近 0）→ 声音补的那部分一拍掉光；现在每次都按 r 平滑交接。
+///   淡出结束且 r 满（或画面没在流）才结束交接，之后和原来逐位相同；
 /// - 画面 → 声音：声音直出先经 SyncOutputStage（升幅 ≤ +20 / 拍、归零保持）从设备现在的输出追上，
 ///   追上或满 10 拍后回到原来的直出路径
 struct SourceHandover {
     static let fadeSeconds: TimeInterval = 4
     static let maxCatchUpTicks = 10
+    /// 画面有新鲜样本之后，画面占比从 0 爬满的时间
+    static let motionRampSeconds: TimeInterval = 1.5
 
     private(set) var fadeElapsed: TimeInterval?
     private(set) var catchUpTicks: Int?
+    /// 这次交接里画面有新鲜样本的累计时长（每次 begin 清零）
+    private(set) var motionElapsed: TimeInterval = 0
 
     var isFading: Bool { fadeElapsed != nil }
     var isCatchingUp: Bool { catchUpTicks != nil }
 
     mutating func begin(_ to: VisualSyncSource) {
+        motionElapsed = 0
         switch to {
         case .motion:
             fadeElapsed = 0
@@ -1237,6 +1245,7 @@ struct SourceHandover {
     mutating func cancel() {
         fadeElapsed = nil
         catchUpTicks = nil
+        motionElapsed = 0
     }
 
     /// 画面一拍的输入值。没有交接时 = motionSignal ? confidence × motion : 0
@@ -1245,15 +1254,19 @@ struct SourceHandover {
         let mv = motionSignal ? c * m : 0
         guard let e = fadeElapsed else { return (mv, motionSignal) }
         let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
-        let next = e + step
-        fadeElapsed = next >= Self.fadeSeconds ? nil : next
         let fade = max(0, 1 - e / Self.fadeSeconds)
-        // 画面还没有新鲜样本（刚装上取帧 / 发热暂停）就当置信度 0、全用声音补：
-        // 同一个视频第二次切到画面时归一化早已热身完（confidence = 1），但新装的分析器还没出样本
+        // 画面还没有新鲜样本（刚装上取帧 / 发热暂停）就当占比 0、全用声音补；有了样本也从 0 起爬
+        let ramp = min(1, max(0, motionElapsed / Self.motionRampSeconds))
+        if motionSignal { motionElapsed += step }
         let conf = motionSignal && c.isFinite ? min(1, max(0, c)) : 0
-        let motionPart = motionSignal && m.isFinite ? conf * min(100, max(0, m)) : 0
+        let weight = ramp * conf
+        let motionPart = motionSignal && m.isFinite ? min(100, max(0, m)) : 0
         let audioPart = audioSignal && a.isFinite ? min(100, max(0, a)) : 0
-        let v = motionPart + (1 - conf) * fade * audioPart
+        let v = weight * motionPart + (1 - weight) * fade * audioPart
+        let next = e + step
+        let rampDone = motionElapsed >= Self.motionRampSeconds
+        // 淡出满了还要等爬坡满（画面没在流时这一项本来就是 0，直接结束）：结束那一拍和原路径连续
+        fadeElapsed = next >= Self.fadeSeconds && (rampDone || !motionSignal) ? nil : min(next, Self.fadeSeconds)
         return (v.isFinite ? min(100, max(0, v)) : 0, motionSignal || (audioSignal && fade > 0))
     }
 

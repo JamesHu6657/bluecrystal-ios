@@ -938,7 +938,73 @@ do {
     vcheck(waiting.value == 70 && waiting.hasSignal,
            "来源交接：再次切到画面、画面还没有新鲜样本时接着用声音（\(waiting.value)）")
     let flowing = h.blend(motion: 40, confidence: 1, motionSignal: true, audio: 70, audioSignal: true, dt: 0.3)
-    vcheck(flowing.value == 40, "来源交接：画面有新鲜样本且已热身 → 只用画面（\(flowing.value)）")
+    vcheck(flowing.value > 60 && flowing.value <= 70,
+           "来源交接：画面刚有新鲜样本时不立刻整段换成画面（algo-opt-2，\(flowing.value)）")
+}
+
+// algo-opt-2：同一个视频第二次（及以后每次）切到画面，声音补的那部分平滑交给画面，不再一拍掉光
+func vsSecondSwitch(_ h: inout SourceHandover) -> [Double] {
+    h.begin(.motion)
+    // 前 3 拍新装的分析器还没出样本；之后画面平滑值从 0 爬到 40（归一化早已热身，confidence = 1）
+    let motion: [Double] = [0, 0, 0, 0, 15, 30, 40]
+    var out: [Double] = []
+    for k in 0..<20 {
+        let flowing = k >= 3
+        let m = k < motion.count ? motion[k] : 40
+        out.append(h.blend(motion: m, confidence: 1, motionSignal: flowing, audio: 70, audioSignal: true, dt: 0.3).value)
+    }
+    return out
+}
+
+do {
+    var h = SourceHandover()
+    let first = vsSecondSwitch(&h)
+    var maxDrop = 0.0
+    for k in 1..<first.count { maxDrop = max(maxDrop, first[k - 1] - first[k]) }
+    // 以前：第 4 拍（画面一有样本）直接 = 画面 0，从约 60 一拍掉到 0
+    vcheck(first[3] > 50, "来源交接：再次切到画面，画面刚有样本那一拍仍接着声音（\(first[3])）")
+    vcheck(maxDrop <= 15, "来源交接：再次切到画面时每拍最多降 15（以前一拍降约 60；最大 \(maxDrop)）")
+    var bounded = true
+    for k in 0..<first.count {
+        let m = k < 7 ? [0.0, 0, 0, 0, 15, 30, 40][k] : 40
+        let cap = max(k >= 3 ? m : 0, 70)
+        if first[k] < 0 || first[k] > cap + 1e-9 { bounded = false }
+    }
+    vcheck(bounded, "来源交接：平滑交接中不高于 max(画面, 声音)")
+    vcheck(abs(first[9] - 40) < 1e-6 && !h.isFading && first.last == 40,
+           "来源交接：画面有样本 1.5 秒后完全交给画面，交接结束后和原路径相同（\(first[9])）")
+    let again = vsSecondSwitch(&h)
+    vcheck(again == first, "来源交接：每次切到画面都同样平滑（第三次和第二次逐拍相同）")
+}
+
+do {
+    // 随机交接：任意信号组合下都在 0 ~ max(有信号的画面, 有信号的声音) 之间，交接一定结束
+    // 自己的随机序列：不改变后面测试用的 vsRandom 序列
+    var seed: UInt64 = 0xBEEF
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    var h = SourceHandover()
+    var bounded = true
+    var ended = true
+    for round in 0..<200 {
+        h.begin(.motion)
+        var ticks = 0
+        while h.isFading && ticks < 60 {
+            let m = rnd() * 100
+            let a = rnd() * 100
+            let ms = rnd() < 0.7
+            let au = rnd() < 0.7
+            let r = h.blend(motion: m, confidence: rnd(), motionSignal: ms, audio: a, audioSignal: au,
+                            dt: round % 9 == 0 ? Double.nan : 0.1 + rnd() * 0.4)
+            if r.value < 0 || r.value > max(ms ? m : 0, au ? a : 0) + 1e-9 { bounded = false }
+            ticks += 1
+        }
+        if h.isFading { ended = false }
+    }
+    vcheck(bounded, "来源交接：随机信号下不高于 max(有信号的画面, 有信号的声音)、不低于 0")
+    vcheck(ended, "来源交接：随机信号下交接都会结束")
 }
 
 // 轻柔声音：每段 4800 点 × 3（0.3 秒）的均匀噪声，振幅可按样本序号变
