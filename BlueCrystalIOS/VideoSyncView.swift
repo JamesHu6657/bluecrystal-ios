@@ -100,6 +100,9 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-context P3（默认关）：动作识别只改交给频率跟随器 / 相位锁的那份窗口副本（强度那条路不看）；
     /// 撞击声相位校正只给脉动的相位加一个有界偏移（RhythmPulseDriver.phaseOffset）。都不新增发送路径
     private var actionContext = ActionContext()
+    /// 调试记录（默认关）：只记数字，不存画面；只读不改控制路径，关着时不做任何事
+    let debugLog = MotionDebugLog()
+    var debugRecording = false
     private var onsetDetector = AudioOnsetDetector()
     private var audioAnchor = AudioPhaseAnchor()
     /// Timer 间隔：平时 0.3 秒（和以前逐位相同）；相位脉动打开时 0.1 秒，每 3 次里 1 次走完整拍
@@ -1043,6 +1046,13 @@ final class VideoSyncPlayer: ObservableObject {
         }
         let shown = vals.max() ?? 0
         intensity = shown
+        if debugRecording {
+            debugLog.append(t: t, window: window, normalizer: motionNormalizer, target: target,
+                            shapedLevel: shaped.level, value: value, hasSignal: hasSignal,
+                            kind: actionContext.kind.rawValue, context: contextStatus,
+                            rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
+                            activity: rhythmActivity, rateLevel: rateLevel, out: vals)
+        }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
             needsResync = false
@@ -1269,6 +1279,10 @@ struct VideoSyncView: View {
     @State private var showSourceChoice = false
     /// 相册视频正在拷出来（iCloud 视频可能要下载一会儿）
     @State private var photoImporting = false
+    /// 调试记录（默认关，只记数字）
+    @AppStorage("bcMotionDebugLog") private var debugLogOn = false
+    @State private var debugExportURL: URL?
+    @State private var debugRows = 0
     /// 苹果播放器自己的全屏：onDisappear 不把全屏误判成离开页面
     @State private var systemFullScreen = false
     @Environment(\.scenePhase) private var scenePhase
@@ -1454,6 +1468,14 @@ struct VideoSyncView: View {
             vm.applySettings(audioSettings)
             vm.applyVisualSettings(visualSettings)
             vm.attachPrivacy(privacy)
+            vm.debugRecording = debugLogOn
+        }
+        .onChange(of: debugLogOn) { on in
+            vm.debugRecording = on
+            if !on { vm.debugLog.clear(); debugRows = 0 }
+        }
+        .sheet(isPresented: Binding(get: { debugExportURL != nil }, set: { if !$0 { debugExportURL = nil } })) {
+            if let url = debugExportURL { ActivityShareSheet(items: [url]) }
         }
         // 设备那边处理好了：钉着的"先处理设备卡片"立刻收掉
         .onChange(of: pickerBlocked) { blocked in
@@ -1744,6 +1766,7 @@ struct VideoSyncView: View {
                 }
                 .tint(Velvet.gold)
                 rhythmControls
+                debugLogControls
             }
         } else {
             VStack(alignment: .leading, spacing: 14) {
@@ -1793,6 +1816,39 @@ struct VideoSyncView: View {
                 }
                 .tint(Velvet.gold)
             }
+        }
+    }
+
+    /// 调试记录：画面联动每一拍的数字（运动量、归一化、动作类型、节奏、输出）存成表格导出；不存画面
+    @ViewBuilder private var debugLogControls: some View {
+        Toggle(isOn: $debugLogOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("调试记录")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("播放时把每一拍的运动量、识别结果和输出强度记成表格（只有数字，没有画面），最多约 10 分钟")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+        if debugLogOn {
+            HStack {
+                Button("导出表格") {
+                    debugRows = vm.debugLog.count
+                    debugExportURL = vm.debugLog.writeCSV()
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                Button("清空", role: .destructive) {
+                    vm.debugLog.clear()
+                    debugRows = 0
+                }
+                .buttonStyle(.borderless)
+            }
+            .font(.subheadline)
+            .frame(minHeight: 44)
         }
     }
 
@@ -2309,4 +2365,74 @@ struct DocumentPicker: UIViewControllerRepresentable {
             onPick(url)
         }
     }
+}
+
+
+/// 画面联动调试记录：每一拍一行数字，环形缓冲（最多 maxRows 行），只在主线程用。不存画面，不参与控制
+final class MotionDebugLog {
+    static let maxRows = 6000
+    static let header = "video_t,host_t,frames,mean_energy,peak_energy,coverage,near_field,cut_count,"
+        + "subject_score,subject_hz,pose_frames,pose_present,pose_score,pose_conf,pose_trust,"
+        + "pose_rhythm_hz,pose_rhythm_conf,pose_rhythm_part,subject_follow_hz,roi_valid,roi_x0,roi_y0,roi_x1,roi_y1,roi_hz,roi_share,"
+        + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
+        + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1"
+    private var rows: [String] = []
+    private var start = 0
+
+    var count: Int { rows.count }
+
+    func clear() {
+        rows.removeAll(keepingCapacity: false)
+        start = 0
+    }
+
+    func append(t: Double, window w: MotionWindow, normalizer n: MotionNormalizer, target: Double,
+                shapedLevel: Double, value: Double, hasSignal: Bool, kind: Int, context: String?,
+                rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
+                rateLevel: Int?, out: [Int]) {
+        func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
+        let r = w.roi.region
+        let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
+        let fields: [String] = [
+            f(t), f(CACurrentMediaTime()), String(w.frames), f(w.meanEnergy), f(w.peakEnergy), f(w.coverage),
+            f(w.nearField), String(w.cutCount), f(w.subjectScore), f(w.subjectHz), String(w.poseFrames),
+            String(w.posePresentFrames), f(w.poseScore), f(w.poseConfidence), f(w.poseTrust),
+            f(w.poseRhythmHz), f(w.poseRhythmConfidence), String(w.poseRhythmPart), f(w.subjectFollowHz),
+            r.valid ? "1" : "0", f(r.x0), f(r.y0), f(r.x1), f(r.y1), f(r.hz), f(r.share),
+            f(n.refLow), f(n.refHigh), f(n.confidence), f(n.poseWeight), f(target), f(shapedLevel), f(value),
+            hasSignal ? "1" : "0", String(kind), ctx,
+            f(rhythmHz), f(rhythmWeight), rhythmLocked ? "1" : "0", f(activity), rateLevel.map(String.init) ?? "",
+            String(out.count > 0 ? out[0] : 0), String(out.count > 1 ? out[1] : 0)
+        ]
+        let line = fields.joined(separator: ",")
+        if rows.count < Self.maxRows {
+            rows.append(line)
+        } else {
+            rows[start] = line
+            start = (start + 1) % Self.maxRows
+        }
+    }
+
+    /// 写到临时目录，返回文件地址（失败 nil）
+    func writeCSV() -> URL? {
+        var text = Self.header + "\n"
+        for i in 0..<rows.count { text += rows[(start + i) % rows.count] + "\n" }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("bluecrystal-motion-\(stamp).csv")
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+}
+
+/// 系统分享面板（导出调试表格）
+struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
