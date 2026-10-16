@@ -5741,6 +5741,9 @@ struct ActionContext {
             }
         } else {
             part = 0
+            // 复审：没采用这个部位的节奏（refHz == 0）时也不拿它判断往里方向——
+            // 否则会按手 / 脸的位置去翻原来那份（可能是髋的）姿态相位
+            if refHz <= 0 { moving = nil }
         }
 
         // 往里方向：朝目标髋
