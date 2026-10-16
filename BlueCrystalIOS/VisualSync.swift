@@ -2397,15 +2397,17 @@ struct PoseMotionTracker {
             let dy = p.y[a.rawValue] - p.y[b.rawValue]
             return (dx * dx + dy * dy).squareRoot()
         }
+        let torso = (ok(.neck) && ok(.root)) || (ok(.leftShoulder) && ok(.rightShoulder) && ok(.leftHip) && ok(.rightHip))
+        let shoulders = ok(.leftShoulder) && ok(.rightShoulder)
+        let partial = !torso && !shoulders
+        // 躯干 / 肩宽量得到：就是 bodyScale（髋宽 × 2 在髋抖时可能略超躯干长，完整的人不改尺度）
+        guard partial else { return (base, false) }
         var s = base
         if ok(.leftHip) && ok(.rightHip) { s = max(s, hipWidthTorso * dist(.leftHip, .rightHip)) }
         if ok(.leftHip) && ok(.leftKnee) { s = max(s, thighTorso * dist(.leftHip, .leftKnee)) }
         if ok(.rightHip) && ok(.rightKnee) { s = max(s, thighTorso * dist(.rightHip, .rightKnee)) }
-        let torso = (ok(.neck) && ok(.root)) || (ok(.leftShoulder) && ok(.rightShoulder) && ok(.leftHip) && ok(.rightHip))
-        let shoulders = ok(.leftShoulder) && ok(.rightShoulder)
-        let partial = !torso && !shoulders
-        if partial { s = max(s, partialScaleShare * max(0, frameHeight)) }
-        return (s.isFinite ? s : base, partial)
+        s = max(s, partialScaleShare * max(0, frameHeight))
+        return (s.isFinite ? s : base, true)
     }
 
     /// 尺度：actionTuned 时按 tunedBodyScale，否则原来的 bodyScale

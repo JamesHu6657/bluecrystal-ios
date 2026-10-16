@@ -5138,7 +5138,7 @@ do {
            "动作调优（真机 a 复现）：92681ea 把摸胸口认成撸动、锁 1.2 Hz（输出 \(Int(oldPeak))、伸缩 \(Int(oldThrust))）")
     vcheck(new.kinds.last == .caress && new.locked.suffix(10).allSatisfy { !$0 } && newMax <= 20
            && (new.values.suffix(15).max() ?? 99) <= 20 + 1e-9,
-           "动作调优（真机 a）：摸自己胸口认成轻抚，不跟节奏、输出 ≤ 20（最高 \(newMax)）")
+           "动作调优（真机 a）：摸自己胸口认成轻抚，不跟节奏、输出 ≤ 20（最高 \(newMax)；kind \(String(describing: new.kinds.last))；locked \(new.locked.suffix(10))；value \(new.values.suffix(15).max() ?? -1)；kinds \(new.kinds.map { $0.rawValue })）")
     var ac = ActionContext()
     var t = 10.0
     while t < 12.5 {
