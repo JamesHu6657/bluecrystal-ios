@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import AVKit
 import UniformTypeIdentifiers
+import PhotosUI
 import Combine
 
 /// 视频联动播放器（ViewModel）：本地视频 + 声音 / 画面联动。
@@ -1262,6 +1263,12 @@ struct VideoSyncView: View {
     @StateObject private var vm = VideoSyncPlayer()
     /// 文件选择器（只有视频一种素材）
     @State private var showPicker = false
+    /// 相册选择器（PHPicker，只列视频，不需要相册权限）
+    @State private var showPhotoPicker = false
+    /// 选来源：相册 / 文件
+    @State private var showSourceChoice = false
+    /// 相册视频正在拷出来（iCloud 视频可能要下载一会儿）
+    @State private var photoImporting = false
     /// 苹果播放器自己的全屏：onDisappear 不把全屏误判成离开页面
     @State private var systemFullScreen = false
     @Environment(\.scenePhase) private var scenePhase
@@ -1356,7 +1363,18 @@ struct VideoSyncView: View {
             return
         }
         vm.stopBeforePicker()
-        showPicker = true
+        showSourceChoice = true
+    }
+
+    /// 相册视频拷出来之后（主线程）：和文件选择器同一条 loadVideo
+    private func loadPhotoVideo(_ url: URL?) {
+        photoImporting = false
+        guard let url else {
+            vm.videoName = "导入失败：相册视频"
+            vm.statusLine = "相册视频无法读取（iCloud 视频请先在相册里下载），请重新选择"
+            return
+        }
+        vm.loadVideo(url: url)
     }
 
     /// 被拦下的说明只显示一小会儿（3 秒）；减弱动态效果时只淡入淡出
@@ -1462,6 +1480,28 @@ struct VideoSyncView: View {
                                onCancel: { showPicker = false }) { url in
                     showPicker = false
                     vm.loadVideo(url: url)
+                }
+                pickerStopBar
+            }
+            .privacyCover()
+            .environmentObject(privacy)
+            .environmentObject(ble)
+        }
+        // 选来源：相册 / 文件
+        .confirmationDialog("选择视频来源", isPresented: $showSourceChoice, titleVisibility: .visible) {
+            Button("从相册选择") { if !pickerBlocked { showPhotoPicker = true } }
+            Button("从文件选择") { if !pickerBlocked { showPicker = true } }
+            Button("取消", role: .cancel) {}
+        }
+        .sheet(isPresented: $showPhotoPicker) {
+            VStack(spacing: 0) {
+                PhotoVideoPicker(onCancel: { showPhotoPicker = false }) { url in
+                    showPhotoPicker = false
+                    loadPhotoVideo(url)
+                } onStart: {
+                    showPhotoPicker = false
+                    photoImporting = true
+                    vm.statusLine = "正在从相册导入视频…"
                 }
                 pickerStopBar
             }
@@ -2170,6 +2210,68 @@ private struct ReadinessChip: View {
         .background(Capsule().fill(fill))
         .overlay(Capsule().strokeBorder(stroke, lineWidth: 1))
         .contentShape(Capsule())
+    }
+}
+
+/// 系统相册选择器（PHPicker：只列视频、不需要相册权限）。
+/// loadFileRepresentation 给的临时文件在回调返回后就删，所以在回调里同步拷到自己的临时目录，
+/// 再回主线程交给 loadVideo（它会再移进 SyncVideos 目录）。
+struct PhotoVideoPicker: UIViewControllerRepresentable {
+    var onCancel: () -> Void = {}
+    /// 拷好后（主线程）；nil = 读不出来
+    let onPick: (URL?) -> Void
+    /// 选中后、开始拷贝前（主线程）
+    var onStart: () -> Void = {}
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var config = PHPickerConfiguration()
+        config.filter = .videos
+        config.selectionLimit = 1
+        config.preferredAssetRepresentationMode = .current
+        let vc = PHPickerViewController(configuration: config)
+        vc.delegate = context.coordinator
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel, onStart: onStart) }
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let onPick: (URL?) -> Void
+        let onCancel: () -> Void
+        let onStart: () -> Void
+        init(onPick: @escaping (URL?) -> Void, onCancel: @escaping () -> Void, onStart: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+            self.onStart = onStart
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            guard let provider = results.first?.itemProvider else {
+                onCancel()
+                return
+            }
+            let types = [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie]
+            guard let type = types.first(where: { provider.hasItemConformingToTypeIdentifier($0.identifier) }) else {
+                onPick(nil)
+                return
+            }
+            onStart()
+            let done = onPick
+            provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, _ in
+                var copied: URL?
+                if let url {
+                    let fm = FileManager.default
+                    let dir = fm.temporaryDirectory.appendingPathComponent("PhotoImports", isDirectory: true)
+                    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                    let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+                    let dest = dir.appendingPathComponent("相册视频-" + String(UUID().uuidString.prefix(8)) + "." + ext)
+                    if (try? fm.copyItem(at: url, to: dest)) != nil { copied = dest }
+                }
+                DispatchQueue.main.async { done(copied) }
+            }
+        }
     }
 }
 
