@@ -1643,11 +1643,16 @@ struct StrokeRhythm {
             bestK = k
         }
         guard best > 0.05 else { return Estimate() }
+        // 周期不是整数格时（2 Hz = 7.5 格）整数滞后上的峰偏低，两倍周期（15 格）反而接近 1：
+        // 用抛物线插值后的峰值和最高峰比，免得把一下一下的往复当成慢一倍
         var pick = bestK
-        for k in Self.minLag...kMax where corr[k] >= corr[k - 1] && corr[k] >= corr[k + 1]
-            && corr[k] >= Self.octaveShare * best {
-            pick = k
-            break
+        for k in Self.minLag...kMax where corr[k] >= corr[k - 1] && corr[k] >= corr[k + 1] {
+            let den = corr[k - 1] - 2 * corr[k] + corr[k + 1]
+            let lift = den < -1e-12 ? min(0.25, -(corr[k - 1] - corr[k + 1]) * (corr[k - 1] - corr[k + 1]) / (8 * den)) : 0
+            if corr[k] + lift >= Self.octaveShare * best {
+                pick = k
+                break
+            }
         }
         let a = corr[pick - 1]
         let b = corr[pick]

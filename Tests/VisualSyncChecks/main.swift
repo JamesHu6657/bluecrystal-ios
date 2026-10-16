@@ -1265,6 +1265,323 @@ do {
            "稳态不分配：热身一轮后再跑 180 帧，复用缓冲的存储地址都没变（\(samples) 个样本）")
 }
 
+// MARK: - algo-opt-3：主体运动（块运动 / 相机补偿 / 往复节奏）、人体姿态
+
+func vs3Hash(_ i: Int, _ j: Int, _ salt: Int) -> Double {
+    var h = UInt64(truncatingIfNeeded: i &* 374_761_393 &+ j &* 668_265_263 &+ salt &* 1_442_695_041)
+    h = (h ^ (h >> 13)) &* 1_274_126_177
+    h ^= h >> 16
+    return Double(h % 1024) / 1023
+}
+
+/// 值噪声（格距 3 像素，亮度 40~220）
+func vs3Value(_ x: Double, _ y: Double, salt: Int) -> Double {
+    let gx = x / 3
+    let gy = y / 3
+    let i = floor(gx)
+    let j = floor(gy)
+    let fx = gx - i
+    let fy = gy - j
+    let ii = Int(i)
+    let jj = Int(j)
+    let a = vs3Hash(ii, jj, salt)
+    let b = vs3Hash(ii + 1, jj, salt)
+    let c = vs3Hash(ii, jj + 1, salt)
+    let d = vs3Hash(ii + 1, jj + 1, salt)
+    let v = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+    return 40 + 180 * v
+}
+
+/// 合成画面：有纹理的静止背景 + 一块带着自己纹理水平往复的主体（peak：峰值速度，分析帧像素 / 帧），
+/// shake：手持抖动（约 ±5 像素的平移 + 2% 缩放）
+struct VS3Scene {
+    var rect: (x: Double, y: Double, w: Double, h: Double)? = nil
+    var hz: Double = 1
+    var peak: Double = 1
+    var shake = false
+
+    func frame(_ k: Int) -> LumaFrame {
+        let t = Double(k) * vsDt
+        var ox = 0.0
+        if rect != nil {
+            ox = peak * 15 / (2 * Double.pi * hz) * sin(2 * Double.pi * hz * t)
+        }
+        var sx = 0.0
+        var sy = 0.0
+        var zoom = 1.0
+        if shake {
+            sx = 3.5 * sin(2 * Double.pi * 1.3 * t) + 1.5 * sin(2 * Double.pi * 2.9 * t + 1)
+            sy = 3.0 * sin(2 * Double.pi * 1.1 * t + 0.5) + 2.0 * sin(2 * Double.pi * 2.3 * t + 2)
+            zoom = 1 + 0.02 * sin(2 * Double.pi * 0.7 * t)
+        }
+        var px = [UInt8](repeating: 0, count: 64 * 36)
+        for y in 0..<36 {
+            for x in 0..<64 {
+                let qx = (Double(x) + 0.5 - 32 - sx) / zoom + 32
+                let qy = (Double(y) + 0.5 - 18 - sy) / zoom + 18
+                var v: Double
+                if let r = rect, qx >= r.x + ox, qx < r.x + ox + r.w, qy >= r.y, qy < r.y + r.h {
+                    v = vs3Value(qx - ox + 100, qy + 100, salt: 2)
+                } else {
+                    v = vs3Value(qx + 200, qy + 200, salt: 1)
+                }
+                px[y * 64 + x] = UInt8(min(255, max(0, v.rounded())))
+            }
+        }
+        return LumaFrame(width: 64, height: 36, pixels: px)
+    }
+}
+
+struct VS3Analysis {
+    var windows: [MotionWindow] = []
+    var samples = 0
+    var cameraFrames = 0
+    /// 后一半样本的平均往复频率
+    var hz: Double = 0
+}
+
+/// 15 fps 跑分析器，每 5 帧取一个窗口（1/3 秒）
+func vs3Analyze(_ scene: VS3Scene, seconds: Double = 14) -> VS3Analysis {
+    var an = MotionAnalyzer()
+    var acc = MotionWindowAccumulator()
+    var r = VS3Analysis()
+    var hzSum = 0.0
+    var hzCount = 0
+    let frames = Int(seconds * 15)
+    for k in 0..<frames {
+        if let s = an.analyze(scene.frame(k), time: Double(k) * vsDt) {
+            acc.add(s)
+            r.samples += 1
+            if an.lastBlockMotion.cameraActive { r.cameraFrames += 1 }
+            if k >= frames / 2 {
+                hzSum += s.subject.hz
+                hzCount += 1
+            }
+        }
+        if k % 5 == 4 { r.windows.append(acc.drain()) }
+    }
+    r.hz = hzCount > 0 ? hzSum / Double(hzCount) : 0
+    return r
+}
+
+/// 窗口 → 归一化 → 平滑 → 出口（上限 cap）：后一半的平均值、全程最大值、单拍最大升幅
+func vs3Output(_ windows: [MotionWindow], cap: Double = 100, auto: Bool = true) -> (mean: Double, max: Int, rise: Int) {
+    var chain = VSChain()
+    var stage = SyncOutputStage()
+    let settings = AudioSyncSettings(maxPercent: cap)
+    var outs: [Int] = []
+    for w in windows {
+        outs.append(stage.step(chain.step(w, auto: auto), settings: settings, hasSignal: true)[0])
+    }
+    let tail = outs.suffix(outs.count / 2)
+    let mean = tail.isEmpty ? 0 : Double(tail.reduce(0, +)) / Double(tail.count)
+    var rise = 0
+    for i in 1..<max(1, outs.count) { rise = max(rise, outs[i] - outs[i - 1]) }
+    return (mean, outs.max() ?? 0, rise)
+}
+
+let vs3Big = (x: 7.0, y: 4.5, w: 50.0, h: 27.0)      // 约 60% 画面
+let vs3Small = (x: 30.0, y: 12.0, w: 15.0, h: 15.0)  // 约 10%
+let vs3Mid = (x: 20.0, y: 9.0, w: 26.0, h: 18.0)     // 约 20%
+let vs3Slow60 = vs3Analyze(VS3Scene(rect: vs3Big, hz: 0.5, peak: 1))
+let vs3Fast60 = vs3Analyze(VS3Scene(rect: vs3Big, hz: 2, peak: 4))
+let vs3Light10 = vs3Analyze(VS3Scene(rect: vs3Small, hz: 1, peak: 1))
+let vs3Strong20 = vs3Analyze(VS3Scene(rect: vs3Mid, hz: 2, peak: 4))
+let vs3Shake = vs3Analyze(VS3Scene(shake: true))
+let vs3ShakeStrong = vs3Analyze(VS3Scene(rect: vs3Mid, hz: 2, peak: 4, shake: true))
+let vs3Static = vs3Analyze(VS3Scene(), seconds: 6)
+
+do {
+    let slow = vs3Output(vs3Slow60.windows)
+    let fast = vs3Output(vs3Fast60.windows)
+    vcheck(slow.mean <= 0.5 * fast.mean && fast.mean - slow.mean >= 25,
+           "主体：60% 画面慢动（0.5 Hz、约 1 px/帧）明显低于快动（2 Hz、约 4 px/帧）（\(Int(slow.mean)) vs \(Int(fast.mean))）")
+    let light = vs3Output(vs3Light10.windows)
+    vcheck(light.mean <= 30, "主体：80% 静止 + 10% 轻动（1 Hz、约 1 px/帧）判为轻（\(Int(light.mean))）")
+    let strong = vs3Output(vs3Strong20.windows)
+    let strong60 = vs3Output(vs3Strong20.windows, cap: 60)
+    vcheck(strong.mean >= 70 && strong60.mean >= 0.7 * 60,
+           "主体：静止背景 + 20% 快速往复（2 Hz、4 px/帧）热身后 > 上限的 70%（上限 100：\(Int(strong.mean))，上限 60：\(Int(strong60.mean))）")
+    vcheck(strong.mean >= max(slow.mean, light.mean) + 30,
+           "主体：20% 快速往复明显高于大面积慢动 / 小面积轻动（\(Int(strong.mean)) vs \(Int(slow.mean)) / \(Int(light.mean))）")
+    let strongFixed = vs3Output(vs3Strong20.windows, auto: false)
+    vcheck(strong.mean >= 70 && abs(strong.mean - strongFixed.mean) <= 10,
+           "主体：自动适应不压持续的快速往复（开 \(Int(strong.mean)) / 关 \(Int(strongFixed.mean))）")
+    let shake = vs3Output(vs3Shake.windows)
+    let still = vs3Output(vs3Static.windows)
+    vcheck(shake.mean <= 10 && shake.max <= 20 && still.max <= 3,
+           "相机：有纹理的静止画面 + 手持抖动（±5 px + 轻微缩放）接近最低（均值 \(Int(shake.mean))、最高 \(shake.max)；不抖 \(still.max)）")
+    let shakeStrong = vs3Output(vs3ShakeStrong.windows)
+    vcheck(shakeStrong.mean >= shake.mean + 30,
+           "相机：抖动 + 主体快速往复明显高于只抖动（\(Int(shakeStrong.mean)) vs \(Int(shake.mean))）")
+    let rises = [slow, fast, light, strong, strong60, strongFixed, shake, shakeStrong].map { $0.rise }
+    vcheck(rises.allSatisfy { $0 <= 20 }, "出口：主体运动各场景单拍升幅 ≤ 20（\(rises)）")
+    vcheck(vs3Shake.cameraFrames * 10 >= vs3Shake.samples * 7 && vs3Strong20.cameraFrames * 20 <= vs3Strong20.samples
+           && vs3Fast60.cameraFrames * 5 <= vs3Fast60.samples,
+           "相机：抖动画面 ≥ 70% 的帧判为相机在动，固定镜头的 20% / 60% 主体几乎不误判（\(vs3Shake.cameraFrames)/\(vs3Shake.samples)、\(vs3Strong20.cameraFrames)、\(vs3Fast60.cameraFrames)）")
+    vcheck(abs(vs3Strong20.hz - 2) <= 0.25 && abs(vs3Slow60.hz - 0.5) <= 0.15 && abs(vs3Light10.hz - 1) <= 0.2,
+           "节奏：往复频率估得准（2 Hz → \(String(format: "%.2f", vs3Strong20.hz))，0.5 Hz → \(String(format: "%.2f", vs3Slow60.hz))，1 Hz → \(String(format: "%.2f", vs3Light10.hz))）")
+}
+
+do {
+    let a = CameraTransform(m0: 1.01, m1: 0.02, t0: 1.5, t1: -0.5)
+    let b = CameraTransform(m0: 0.99, m1: -0.01, t0: -2, t1: 3)
+    let p = a.then(b).apply(x: 12, y: 7)
+    let q0 = a.apply(x: 12, y: 7)
+    let q = b.apply(x: q0.x, y: q0.y)
+    vcheck(abs(p.x - q.x) < 1e-12 && abs(p.y - q.y) < 1e-12 && CameraTransform.identity.then(a) == a,
+           "相机：连续几段相机运动合成 = 依次作用")
+}
+
+/// 合成骨架（64×36 分析帧，躯干约 10 像素）：hipX 髋（连带膝盖 60%）水平偏移，headY 头上下偏移，
+/// shiftX / shiftY 全身平移，k 整体缩放（绕原点）
+func vs3Skeleton(k: Double = 1, shiftX: Double = 0, shiftY: Double = 0, hipX: Double = 0, headY: Double = 0,
+                 confidence: Double = 0.9) -> PoseCandidate {
+    var p = PoseCandidate()
+    p.confidence = confidence
+    let joints: [(PoseJoint, Double, Double)] = [
+        (.nose, 32, 7 + headY), (.neck, 32, 10 + 0.5 * headY), (.leftShoulder, 28, 11), (.rightShoulder, 36, 11),
+        (.root, 32 + hipX, 20), (.leftHip, 29.5 + hipX, 20), (.rightHip, 34.5 + hipX, 20),
+        (.leftKnee, 29 + 0.6 * hipX, 27), (.rightKnee, 35 + 0.6 * hipX, 27), (.leftWrist, 26, 18), (.rightWrist, 38, 18),
+    ]
+    for (j, x, y) in joints { p.set(j, x: (x + shiftX) * k, y: (y + shiftY) * k, confidence: confidence) }
+    return p
+}
+
+struct VS3PoseRun {
+    /// 每拍：归一化 × 热身 × 平滑后的 0~100，以及出口值
+    var outs: [Double] = []
+    var stage: [Int] = []
+    var readings: [PoseReading] = []
+    var maxWeight = 0.0
+}
+
+/// 15 Hz 画面样本（块运动主体分数固定为 flow）+ 每 5 帧 3 次姿态估计（约 9 Hz，间隔不均匀），每 5 帧一拍。
+/// pose(i, t) 返回 nil = 第 i 次估计没检测到人；camera(t0, t1)：两次估计之间的相机运动
+func vs3PoseRun(seconds: Double = 14, flow: Double, frameHeight: Double = 36,
+                pose: (Int, Double) -> PoseCandidate?,
+                camera: (Double, Double) -> CameraTransform = { _, _ in .identity }) -> VS3PoseRun {
+    var tracker = PoseMotionTracker()
+    var acc = MotionWindowAccumulator()
+    var chain = VSChain()
+    var stage = SyncOutputStage()
+    let settings = AudioSyncSettings(maxPercent: 100)
+    var r = VS3PoseRun()
+    var last = 0.0
+    var i = 0
+    for k in 0..<Int(seconds * 15) {
+        let t = Double(k) * vsDt
+        acc.add(MotionSample(time: t, energy: 1, coverage: 0.2, isCut: false, isHeld: false,
+                             subject: SubjectReading(valid: true, score: flow)))
+        if k % 5 == 0 || k % 5 == 2 || k % 5 == 4 {
+            let found = pose(i, t).map { [$0] } ?? []
+            let reading = tracker.update(time: t, candidates: found, camera: camera(last, t), continuous: true,
+                                         frameHeight: frameHeight)
+            r.readings.append(reading)
+            acc.addPose(reading)
+            last = t
+            i += 1
+        }
+        if k % 5 == 4 {
+            let v = chain.step(acc.drain())
+            r.outs.append(v)
+            r.stage.append(stage.step(v, settings: settings, hasSignal: true)[0])
+            r.maxWeight = max(r.maxWeight, chain.normalizer.poseWeight)
+        }
+    }
+    return r
+}
+
+func vs3Late(_ a: [Double]) -> Double {
+    let tail = a.suffix(a.count / 2)
+    return tail.isEmpty ? 0 : tail.reduce(0, +) / Double(tail.count)
+}
+
+func vs3HipWave(_ t: Double) -> Double { 2.0 * sin(2 * Double.pi * 2 * t) }        // 2 Hz、约 0.2 躯干
+func vs3NodWave(_ t: Double) -> Double { 0.3 * sin(2 * Double.pi * 0.5 * t) }      // 0.5 Hz、约 0.03 躯干
+func vs3ShakeX(_ t: Double) -> Double { 4 * sin(2 * Double.pi * 1.3 * t) + 2 * sin(2 * Double.pi * 2.9 * t + 1) }
+func vs3ShakeY(_ t: Double) -> Double { 3 * sin(2 * Double.pi * 1.1 * t + 0.5) }
+
+let vs3PoseNone = vs3PoseRun(flow: 0.2) { _, _ in nil }
+let vs3PoseHips = vs3PoseRun(flow: 0.2) { _, t in vs3Skeleton(hipX: vs3HipWave(t)) }
+let vs3PoseNod = vs3PoseRun(flow: 0.2) { _, t in vs3Skeleton(headY: vs3NodWave(t)) }
+let vs3PosePanCam = vs3PoseRun(flow: 0, pose: { _, t in vs3Skeleton(shiftX: vs3ShakeX(t), shiftY: vs3ShakeY(t)) },
+                               camera: { a, b in
+                                   CameraTransform(t0: vs3ShakeX(b) - vs3ShakeX(a), t1: vs3ShakeY(b) - vs3ShakeY(a))
+                               })
+let vs3PoseLinear = vs3PoseRun(flow: 0) { _, t in vs3Skeleton(shiftX: -20 + 4 * t) }
+let vs3PoseHips2x = vs3PoseRun(flow: 0.2, frameHeight: 72) { _, t in vs3Skeleton(k: 2, hipX: vs3HipWave(t)) }
+let vs3PoseFlicker = vs3PoseRun(flow: 0.2) { i, t in i % 6 < 3 ? vs3Skeleton(hipX: vs3HipWave(t)) : nil }
+let vs3PoseBlip = vs3PoseRun(flow: 0.2) { i, t in i % 27 < 3 ? vs3Skeleton(hipX: 3 * vs3HipWave(t)) : nil }
+
+do {
+    let hips = vs3Late(vs3PoseHips.outs)
+    let hz = vs3PoseHips.readings.last(where: { $0.present })?.hz ?? 0
+    vcheck(hips >= 70 && abs(hz - 2) <= 0.2,
+           "姿态：髋部 2 Hz 大幅往复（约 0.2 躯干）→ 强（\(Int(hips))，\(String(format: "%.2f", hz)) Hz；块运动分数只有 0.2）")
+    let nod = vs3Late(vs3PoseNod.outs)
+    vcheck(nod <= 20 && nod <= hips - 50, "姿态：头部 0.5 Hz 小幅点头（约 0.03 躯干）→ 轻（\(Int(nod))）")
+    let pan = vs3PosePanCam.outs.max() ?? 99
+    let linear = vs3PoseLinear.outs.max() ?? 99
+    vcheck(pan <= 5 && linear <= 10,
+           "姿态：全身一起平移（手持抖动且给了相机运动 / 匀速摇镜头）→ 接近最低（最高 \(Int(pan)) / \(Int(linear))）")
+    var scoreDiff = 0.0
+    for (a, b) in zip(vs3PoseHips.readings, vs3PoseHips2x.readings) { scoreDiff = max(scoreDiff, abs(a.score - b.score)) }
+    var outDiff = 0.0
+    for (a, b) in zip(vs3PoseHips.outs, vs3PoseHips2x.outs) { outDiff = max(outDiff, abs(a - b)) }
+    vcheck(vs3PoseHips.readings.count == vs3PoseHips2x.readings.count && scoreDiff <= 1e-9 && outDiff <= 1e-9,
+           "姿态：同一动作放大 2 倍（坐标和帧高一起）分数完全一样（差 \(scoreDiff) / \(outDiff)）")
+    let flicker = vs3PoseFlicker.outs
+    var jump = 0.0
+    for k in max(1, flicker.count / 2)..<flicker.count { jump = max(jump, abs(flicker[k] - flicker[k - 1])) }
+    let hipsMax = vs3PoseHips.outs.max() ?? 0
+    var rise = 0
+    for k in 1..<vs3PoseFlicker.stage.count { rise = max(rise, vs3PoseFlicker.stage[k] - vs3PoseFlicker.stage[k - 1]) }
+    vcheck((flicker.max() ?? 99) <= hipsMax + 2 && jump <= 10 && rise <= 20,
+           "姿态：检测一闪一闪（有 3 次、没 3 次）不出尖峰（最高 \(Int(flicker.max() ?? 0)) ≤ 稳定检测 \(Int(hipsMax))，后半段单拍变化 \(String(format: "%.1f", jump))）")
+    let blip = vs3PoseBlip.outs.max() ?? 99
+    let none = vs3PoseNone.outs.max() ?? 0
+    vcheck(blip <= none + 3 && vs3PoseBlip.maxWeight == 0,
+           "姿态：偶尔 0.3 秒的误检（剧烈动作）不起作用（最高 \(Int(blip)) vs 没人 \(Int(none))）")
+}
+
+do {
+    // AVAssetTrack.preferredTransform（缓冲 16×9）→ 显示坐标 → Vision 归一化（左下角原点）→ bufferPoint 应该回到原点
+    let w = 16.0
+    let h = 9.0
+    let cases: [(PoseOrientation, Double, Double, Double, Double, Double, Double, Double, Double)] = [
+        (.up, 1, 0, 0, 1, 0, 0, w, h),
+        (.right, 0, 1, -1, 0, h, 0, h, w),
+        (.left, 0, -1, 1, 0, 0, w, h, w),
+        (.down, -1, 0, 0, -1, w, h, w, h),
+    ]
+    var ok = true
+    for (o, a, b, c, d, tx, ty, dw, dh) in cases {
+        ok = ok && PoseOrientation.from(a: a, b: b, c: c, d: d) == o
+        for (bx, by) in [(2.0, 1.0), (13.0, 7.5), (8.0, 4.5)] {
+            let dx = a * bx + c * by + tx
+            let dy = b * bx + d * by + ty
+            let p = o.bufferPoint(visionX: dx / dw, visionY: 1 - dy / dh)
+            ok = ok && abs(p.x - bx / w) < 1e-12 && abs(p.y - by / h) < 1e-12
+        }
+    }
+    ok = ok && PoseOrientation.from(a: 0.5, b: 0.2, c: 0, d: 1) == .up
+    vcheck(ok, "姿态：视频轨方向（竖拍 / 倒拍）→ Vision 方向，检测结果换回缓冲坐标正确")
+}
+
+do {
+    // 稳态不分配（algo-opt-3）：块运动 / 主体跟踪的缓冲也在 scratchAddresses 里，抖动 + 主体往复跑一轮后地址不变
+    let scene = VS3Scene(rect: vs3Mid, hz: 2, peak: 4, shake: true)
+    var an = MotionAnalyzer()
+    for k in 0..<45 { _ = an.analyze(scene.frame(k), time: Double(k) * vsDt) }
+    // 新缓冲排在 scratchAddresses 末尾（块运动 + 主体跟踪 / 往复节奏）
+    let extra = BlockMotionEstimator().scratchAddresses.count + SubjectFlowTracker().scratchAddresses.count
+    let warm = Array(an.scratchAddresses.suffix(extra))
+    for k in 45..<120 { _ = an.analyze(scene.frame(k), time: Double(k) * vsDt) }
+    vcheck(extra >= 20 && an.scratchAddresses.count >= extra + 5 && Array(an.scratchAddresses.suffix(extra)) == warm,
+           "稳态不分配：块运动 / 主体跟踪的 \(extra) 个缓冲在抖动 + 往复画面里地址不变")
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)
