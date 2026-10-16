@@ -124,6 +124,8 @@ struct MotionSample: Equatable {
     /// 只用来让 MotionNormalizer 少放大、少学习：同一拍里只降不升；不学参考值会让之后的正常画面比不跳过时略高，
     /// 但仍在 上限 / 升幅限速 / 夹紧 之内
     var nearField: Double = 0
+    /// 主体运动读数（algo-opt-3）：块运动扣掉相机运动后的速度 + 往复节奏。手搭的样本不填 = 无效，走原来的能量映射
+    var subject = SubjectReading()
 }
 
 /// 整体位移搜索的结果
@@ -252,6 +254,16 @@ struct MotionAnalyzer {
     private var diffHistogram = [Int](repeating: 0, count: MotionAnalyzer.diffBins)
     private var medianScratch: [Double] = []
 
+    // 主体运动（algo-opt-3）
+    private var blocks = BlockMotionEstimator()
+    private var subjectTracker = SubjectFlowTracker()
+    /// 上一次 analyze 那个帧间隔的相机运动（algo-opt-3；姿态估计用它扣掉镜头运动）。没判为相机在动时 identity
+    private(set) var lastCamera = CameraTransform.identity
+    /// lastCamera 和上一帧连得上：参考帧 / 切镜 / 保持期 / reset 之后为 false（姿态不跨这些点算速度）
+    private(set) var cameraContinuous = false
+    /// 上一次块运动的结果（VisualSyncChecks 用）
+    private(set) var lastBlockMotion = BlockMotionResult()
+
     /// 整体对比度补偿开关：只给 VisualSyncChecks 做对照（App 里一直开着）
     var compensatesContrast = true
 
@@ -265,7 +277,7 @@ struct MotionAnalyzer {
         return [address(previous), address(previousHistogram), address(historyTimes), address(historyEnergies),
                 address(suspectReference), address(suspectTexture), address(histogram), address(cellSums),
                 address(cellSumsAlt), address(cellScratch), address(shiftScratch), address(diffHistogram),
-                address(medianScratch)]
+                address(medianScratch)] + blocks.scratchAddresses + subjectTracker.scratchAddresses
     }
 
     init() {
@@ -287,6 +299,10 @@ struct MotionAnalyzer {
         softRun = 0
         shiftRate = 0
         residualRatio = 0
+        subjectTracker.reset()
+        lastCamera = .identity
+        cameraContinuous = false
+        lastBlockMotion = BlockMotionResult()
     }
 
     private static func sigmoid(_ x: Double, _ center: Double, _ width: Double) -> Double {
@@ -465,16 +481,23 @@ struct MotionAnalyzer {
         var out = energy
         var held = false
         var near = 0.0
+        var subject: SubjectReading
         if isCut {
             // 不出尖峰，也不突然掉到 0
             out = median(within: Self.substituteWindow, now: time)
             holdRemaining = Self.holdSamples
             noteCutForBackground(sharpness: sharp, gap: gap)
+            // 主体读数保持切镜前的，新镜头重新攒（algo-opt-3）
+            subjectTracker.noteCut()
+            subject = subjectTracker.reading
+            noteCameraBreak()
         } else if holdRemaining > 0 {
             out = median(within: Self.substituteWindow, now: time)
             holdRemaining -= 1
             held = true
             noteCutForBackground(sharpness: sharp, gap: gap)
+            subject = subjectTracker.reading
+            noteCameraBreak()
         } else {
             record(energy, at: time)
             var soft = false
@@ -482,9 +505,26 @@ struct MotionAnalyzer {
                 soft = isSoftCut(pixels, mean: mean, sharpness: sharp, jump: jump, distance: distance, energy: energy)
             }
             near = updateNearField(coverage: coverage, sharpness: sharp, shift: shift, gap: gap, softCut: soft)
+            // 块运动：扣掉相机运动后主体自己的速度 / 节奏（algo-opt-3）
+            let flow = previous.withUnsafeBufferPointer { prev in
+                pixels.withUnsafeBufferPointer { cur in
+                    blocks.estimate(cur: cur, prev: prev, width: w, height: h, gap: gap)
+                }
+            }
+            lastBlockMotion = flow
+            lastCamera = flow.camera
+            cameraContinuous = true
+            subject = subjectTracker.update(time: time, speed: flow.speed, vx: flow.vx, vy: flow.vy)
         }
         remember(pixels, width: w, height: h, mean: mean, sharpness: sharp, time: time)
-        return MotionSample(time: time, energy: out, coverage: coverage, isCut: isCut, isHeld: held, nearField: near)
+        return MotionSample(time: time, energy: out, coverage: coverage, isCut: isCut, isHeld: held, nearField: near,
+                            subject: subject)
+    }
+
+    private mutating func noteCameraBreak() {
+        lastCamera = .identity
+        cameraContinuous = false
+        lastBlockMotion = BlockMotionResult()
     }
 
     /// 近场 / 遮挡分数（algo-opt-1）：
@@ -722,7 +762,10 @@ struct MotionAnalyzer {
             record(0, at: time)
         }
         let out = held ? median(within: Self.substituteWindow, now: time) : 0
-        return MotionSample(time: time, energy: out, coverage: 0, isCut: false, isHeld: held)
+        // 画面没变：相机不动、主体速度 0（保持期内读数不变）
+        lastCamera = .identity
+        let subject = held ? subjectTracker.reading : subjectTracker.update(time: time, speed: 0, vx: 0, vy: 0)
+        return MotionSample(time: time, energy: out, coverage: 0, isCut: false, isHeld: held, subject: subject)
     }
 
     /// 整体位移（内容从上一帧移动了 (dx, dy)：cur[x, y] ≈ prev[x − dx, y − dy]）。
@@ -854,6 +897,1254 @@ struct MotionAnalyzer {
     }
 }
 
+// MARK: - algo-opt-3：主体运动（块运动 + 相机运动扣除 + 往复节奏 + 人体姿态辅助）
+
+/// 小数组统计（algo-opt-3）：只排调用方缓冲的前 n 个（插入排序，n ≤ 48），不分配
+enum MotionStats {
+    static func sortPrefix(_ a: inout [Double], _ n: Int) {
+        let n = min(n, a.count)
+        guard n > 1 else { return }
+        for i in 1..<n {
+            let v = a[i]
+            var j = i - 1
+            while j >= 0 && a[j] > v {
+                a[j + 1] = a[j]
+                j -= 1
+            }
+            a[j + 1] = v
+        }
+    }
+
+    /// 前 n 个的 q 分位（线性插值）；n == 0 时 0。会打乱前 n 个的顺序
+    static func quantile(_ a: inout [Double], _ n: Int, _ q: Double) -> Double {
+        let n = min(n, a.count)
+        guard n > 0 else { return 0 }
+        sortPrefix(&a, n)
+        let pos = min(1, max(0, q)) * Double(n - 1)
+        let i = Int(pos)
+        let f = pos - Double(i)
+        return i + 1 < n ? a[i] * (1 - f) + a[i + 1] * f : a[i]
+    }
+
+    static func clamp01(_ v: Double) -> Double { v.isFinite ? min(1, max(0, v)) : 0 }
+}
+
+/// 相机运动（algo-opt-3）：分析帧像素坐标（左上角原点，像素 i 的中心在 i + 0.5）上的复数相似变换 z' = m·z + t，
+/// 即平移 + 轻微缩放 / 旋转。apply 给出上一帧里的一点在这一帧应该在的位置
+struct CameraTransform: Equatable {
+    var m0: Double = 1
+    var m1: Double = 0
+    var t0: Double = 0
+    var t1: Double = 0
+
+    static let identity = CameraTransform()
+
+    func apply(x: Double, y: Double) -> (x: Double, y: Double) {
+        (m0 * x - m1 * y + t0, m1 * x + m0 * y + t1)
+    }
+
+    /// 先做 self、再做 next（连续几帧的相机运动合成一段）
+    func then(_ next: CameraTransform) -> CameraTransform {
+        CameraTransform(m0: next.m0 * m0 - next.m1 * m1,
+                        m1: next.m0 * m1 + next.m1 * m0,
+                        t0: next.m0 * t0 - next.m1 * t1 + next.t0,
+                        t1: next.m1 * t0 + next.m0 * t1 + next.t1)
+    }
+
+    var isUsable: Bool { m0.isFinite && m1.isFinite && t0.isFinite && t1.isFinite }
+}
+
+/// 一帧的块运动结果（algo-opt-3）
+struct BlockMotionResult: Equatable {
+    /// 主体残差速度：在动的块的 P80（分析帧像素 / 名义帧间隔 1/15 s），已乘面积门、相机降权、按真实间隔校正
+    var speed: Double = 0
+    /// 在动的块的平均残差速度（分析帧像素 / 秒，带方向，节奏用）
+    var vx: Double = 0
+    var vy: Double = 0
+    var movingBlocks = 0
+    /// 判为相机在动（平移 / 缩放 / 旋转被扣掉）
+    var cameraActive = false
+    /// 符合相机模型的块的比例（分母：可靠块 + 2 × 一个位移解释不了的块）
+    var cameraShare: Double = 0
+    /// 这一帧间隔的相机运动（没判为相机在动时 identity）
+    var camera = CameraTransform.identity
+}
+
+/// 块运动（algo-opt-3）：8×6 块，每块（加 2 像素边）在上一帧里搜 ±8 像素（先隔一个点粗搜，再 ±1 细搜 + 抛物线亚像素），
+/// 去均值 SSD（局部变亮变暗不算动）。没纹理 / 只有一条边 / 对不上的块按「法向流」估速度（只给大小）。
+/// 相机：可靠块的中位数平移 → 内点 → 最小二乘相似变换（缩放 / 旋转 ≤ 8%）→ 再取内点重拟合；
+/// 多数块一致地动（且不是多数块不动）才判为相机在动并扣掉。主体速度 = 扣掉相机后在动的块的 P80：
+/// 和「多少面积在动」无关（至少 3 块才满额，1~2 块的噪声不算），大半画面一致地动时再降一点权
+struct BlockMotionEstimator {
+    static let columns = MotionAnalyzer.gridColumns
+    static let rows = MotionAnalyzer.gridRows
+    static let blockCount = MotionAnalyzer.gridColumns * MotionAnalyzer.gridRows
+    static let searchRadius = 8
+    static let margin = 2
+    /// 零位移去均值 SSD 的 rms ≤ 3：这一块没动（压缩噪声）；纹理 rms ≥ 6 的静止块（藏不住 0.5 像素以上的位移）
+    /// 当作可靠的零向量参加相机拟合
+    static let staticRms: Double = 3
+    static let staticTextureRms: Double = 6
+    /// 可靠向量：最小曲率（每像素 SSD）≥ 4、两个方向曲率比 ≥ 0.1（不是一条边）、最好的匹配能解释大半变化、没顶到搜索边界
+    static let minCurvature: Double = 4
+    static let minCurvatureRatio: Double = 0.1
+    static let explainRatio: Double = 0.5
+    static let explainFloor: Double = 9
+    static let maxNormalFlow: Double = 6
+    /// 混合块（静止背景 + 一小块在动的东西，整块对不上）：只拿「变了的像素」（|帧差| > 12）再搜一次，
+    /// 截断平方差（≤ 40²）+ 位移的小惩罚；能把变化解释掉一半以上就用这个位移（只算主体速度，不参加相机拟合）
+    static let maskGate = 12
+    static let minMaskPixels = 6
+    static let maskTruncation = 40 * 40
+    static let maskAcceptRatio: Double = 0.5
+    static let maskShiftPenalty: Double = 0.005
+    static let maskCapacity = 512
+    static let minCameraBlocks = 8
+    static let inlierTolerance: Double = 1
+    static let inlierSlope: Double = 0.1
+    static let maxZoomRotation: Double = 0.08
+    static let minCameraMotion: Double = 0.6
+    static let minCameraShare: Double = 0.6
+    static let cameraMargin: Double = 0.2
+    /// 残差 > 0.75 + 0.2 × 相机位移 才算在动
+    static let movingThreshold: Double = 0.75
+    static let movingSlope: Double = 0.2
+    static let speedPercentile: Double = 0.8
+    static let cameraDownWeight: Double = 0.35
+    static let secondaryShare: Double = 1.25
+    /// 可靠块里完全不动的超过 15%：镜头是固定的（大面积主体在动），不当相机运动扣
+    static let maxStaticShare: Double = 0.15
+    /// 相机内点比例的分母里，「一个位移解释不了」的块按 2 个可靠块算
+    static let contestedWeight = 2
+
+    private static let tableSide = 2 * BlockMotionEstimator.searchRadius + 1
+
+    private struct Window {
+        var x0: Int
+        var x1: Int
+        var y0: Int
+        var y1: Int
+        var minCount: Int
+    }
+
+    private var centerX = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var centerY = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var vx = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var vy = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var normalFlow = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    /// 0 静止（没纹理）、1 可靠向量、2 只有法向流、3 静止且有纹理（零向量，参加相机拟合）、4 混合块（只用变了的像素对上的位移）
+    private var kind = [Int](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var residual = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var residualX = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var residualY = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var maskX = [Int](repeating: 0, count: BlockMotionEstimator.maskCapacity)
+    private var maskY = [Int](repeating: 0, count: BlockMotionEstimator.maskCapacity)
+    private var inlier = [Bool](repeating: false, count: BlockMotionEstimator.blockCount)
+    /// 整块找不到一个位移能解释大半变化（静止背景 + 独立在动的东西）：说明画面里有不跟着相机走的部分
+    private var unexplained = [Bool](repeating: false, count: BlockMotionEstimator.blockCount)
+    private var table = [Double](repeating: .nan, count: BlockMotionEstimator.tableSide * BlockMotionEstimator.tableSide)
+    private var sortA = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+    private var sortB = [Double](repeating: 0, count: BlockMotionEstimator.blockCount)
+
+    var scratchAddresses: [Int] {
+        func address<T>(_ a: [T]) -> Int { a.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) } }
+        return [address(centerX), address(centerY), address(vx), address(vy), address(normalFlow), address(kind),
+                address(inlier), address(table), address(sortA), address(sortB), address(maskX), address(maskY), address(residual), address(residualX),
+                address(residualY), address(unexplained)]
+    }
+
+    /// cur[x, y] ≈ prev[x − u, y − v]：内容从上一帧移动了 (u, v)。gap：两帧间隔（秒）
+    mutating func estimate(cur: UnsafeBufferPointer<UInt8>, prev: UnsafeBufferPointer<UInt8>, width w: Int, height h: Int,
+                           gap: Double) -> BlockMotionResult {
+        let cols = Self.columns
+        let rows = Self.rows
+        guard w >= 2 * cols, h >= 2 * rows, cur.count >= w * h, prev.count >= w * h, gap.isFinite, gap > 0 else {
+            return BlockMotionResult()
+        }
+        for r in 0..<rows {
+            for c in 0..<cols {
+                let b = r * cols + c
+                let bx0 = c * w / cols
+                let bx1 = (c + 1) * w / cols
+                let by0 = r * h / rows
+                let by1 = (r + 1) * h / rows
+                centerX[b] = Double(bx0 + bx1) / 2
+                centerY[b] = Double(by0 + by1) / 2
+                let x0 = max(0, bx0 - Self.margin)
+                let x1 = min(w, bx1 + Self.margin)
+                let y0 = max(0, by0 - Self.margin)
+                let y1 = min(h, by1 + Self.margin)
+                let full = max(0, x1 - x0) * max(0, y1 - y0)
+                measure(block: b, cur: cur, prev: prev, width: w, height: h,
+                        window: Window(x0: x0, x1: x1, y0: y0, y1: y1, minCount: (full + 1) / 2))
+            }
+        }
+
+        // 相机：中位数平移 → 内点 → 相似变换 → 再取内点重拟合
+        let cx0 = Double(w) / 2
+        let cy0 = Double(h) / 2
+        var k = 0
+        for b in 0..<Self.blockCount where kind[b] == 1 || kind[b] == 3 {
+            sortA[k] = vx[b]
+            sortB[k] = vy[b]
+            k += 1
+        }
+        var model = (tx: 0.0, ty: 0.0, a: 0.0, b: 0.0)
+        var active = false
+        var share = 0.0
+        if k >= Self.minCameraBlocks {
+            model.tx = MotionStats.quantile(&sortA, k, 0.5)
+            model.ty = MotionStats.quantile(&sortB, k, 0.5)
+            for _ in 0..<2 {
+                _ = markInliers(model, cx0: cx0, cy0: cy0)
+                if let fit = fitSimilarity(cx0: cx0, cy0: cy0) { model = fit }
+            }
+            let count = markInliers(model, cx0: cx0, cy0: cy0)
+            // 分母还算上「一个位移解释不了」的块：大面积主体在固定镜头前动时，主体边上全是这种块，
+            // 不能只因为可靠块都朝一个方向走就当成相机在动
+            var contested = 0
+            for b in 0..<Self.blockCount where unexplained[b] { contested += 1 }
+            share = Double(count) / Double(k + Self.contestedWeight * contested)
+            var zero = 0
+            for b in 0..<Self.blockCount where (kind[b] == 1 || kind[b] == 3)
+                && (vx[b] * vx[b] + vy[b] * vy[b]).squareRoot() <= Self.inlierTolerance {
+                zero += 1
+            }
+            let zeroShare = Double(zero) / Double(k)
+            var maxDisp = 0.0
+            for b in 0..<Self.blockCount {
+                let d = Self.displacement(model, x: centerX[b] - cx0, y: centerY[b] - cy0)
+                maxDisp = max(maxDisp, (d.x * d.x + d.y * d.y).squareRoot())
+            }
+            active = maxDisp >= Self.minCameraMotion && share >= Self.minCameraShare
+                && share >= zeroShare + Self.cameraMargin && zeroShare <= Self.maxStaticShare
+        }
+        if !active || !model.tx.isFinite || !model.ty.isFinite || !model.a.isFinite || !model.b.isFinite {
+            model = (0, 0, 0, 0)
+            active = false
+        }
+
+        // 扣掉相机后的残差：在动的块的 P80 + 带方向的平均（节奏用）。
+        // 有 ≥ 2 个可靠块在动时，混合块 / 法向流块的速度不超过可靠块最大值的 1.25 倍（边缘块的整数位移 / 偶然对上不放大）
+        var reliableMoving = 0
+        var reliableMax = 0.0
+        for b in 0..<Self.blockCount {
+            let d = Self.displacement(model, x: centerX[b] - cx0, y: centerY[b] - cy0)
+            let dm = (d.x * d.x + d.y * d.y).squareRoot()
+            var r = 0.0
+            residualX[b] = 0
+            residualY[b] = 0
+            switch kind[b] {
+            case 1, 4:
+                residualX[b] = vx[b] - d.x
+                residualY[b] = vy[b] - d.y
+                r = (residualX[b] * residualX[b] + residualY[b] * residualY[b]).squareRoot()
+            case 2:
+                r = max(0, normalFlow[b] - dm)
+            default:
+                // 画面里不动的块（含镜头跟着主体走时的主体、台标）不算在动
+                r = 0
+            }
+            let isMoving = r.isFinite && r > Self.movingThreshold + Self.movingSlope * dm
+            residual[b] = isMoving ? r : 0
+            if isMoving && kind[b] == 1 {
+                reliableMoving += 1
+                reliableMax = max(reliableMax, r)
+            }
+        }
+        let secondaryLimit = reliableMoving >= 2 ? Self.secondaryShare * reliableMax : Double.infinity
+        var moving = 0
+        var vectors = 0
+        var sumX = 0.0
+        var sumY = 0.0
+        for b in 0..<Self.blockCount where residual[b] > 0 {
+            var r = residual[b]
+            var scale = 1.0
+            if kind[b] != 1, r > secondaryLimit {
+                scale = secondaryLimit / r
+                r = secondaryLimit
+            }
+            sortA[moving] = r
+            moving += 1
+            if kind[b] == 1 || kind[b] == 4 {
+                sumX += residualX[b] * scale
+                sumY += residualY[b] * scale
+                vectors += 1
+            }
+        }
+        let p80 = MotionStats.quantile(&sortA, moving, Self.speedPercentile)
+        let area = min(1, max(0, Double(moving - 1) / 2))
+        let camWeight = active ? 1 - Self.cameraDownWeight * MotionStats.clamp01((share - 0.6) / 0.4) : 1
+        let correction = min(MotionAnalyzer.rateCorrection.upperBound,
+                             max(MotionAnalyzer.rateCorrection.lowerBound, MotionAnalyzer.nominalInterval / gap))
+        var out = BlockMotionResult()
+        let speed = p80 * area * camWeight * correction
+        out.speed = speed.isFinite ? max(0, speed) : 0
+        if vectors > 0 {
+            let vxs = sumX / Double(vectors) / gap * area
+            let vys = sumY / Double(vectors) / gap * area
+            out.vx = vxs.isFinite ? vxs : 0
+            out.vy = vys.isFinite ? vys : 0
+        }
+        out.movingBlocks = moving
+        out.cameraActive = active
+        out.cameraShare = share.isFinite ? share : 0
+        if active {
+            out.camera = CameraTransform(m0: 1 + model.a, m1: model.b,
+                                         t0: model.tx - (model.a * cx0 - model.b * cy0),
+                                         t1: model.ty - (model.b * cx0 + model.a * cy0))
+        }
+        return out
+    }
+
+    private static func displacement(_ m: (tx: Double, ty: Double, a: Double, b: Double),
+                                      x: Double, y: Double) -> (x: Double, y: Double) {
+        (m.tx + m.a * x - m.b * y, m.ty + m.b * x + m.a * y)
+    }
+
+    private mutating func markInliers(_ m: (tx: Double, ty: Double, a: Double, b: Double), cx0: Double, cy0: Double) -> Int {
+        var count = 0
+        for b in 0..<Self.blockCount {
+            inlier[b] = false
+            guard kind[b] == 1 || kind[b] == 3 else { continue }
+            let d = Self.displacement(m, x: centerX[b] - cx0, y: centerY[b] - cy0)
+            let ex = vx[b] - d.x
+            let ey = vy[b] - d.y
+            let dm = (d.x * d.x + d.y * d.y).squareRoot()
+            if (ex * ex + ey * ey).squareRoot() <= Self.inlierTolerance + Self.inlierSlope * dm {
+                inlier[b] = true
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// 内点上的最小二乘相似变换（以画面中心为原点）：d(p) = t + [a −b; b a]·p。内点 < 4 个只拟合平移
+    private func fitSimilarity(cx0: Double, cy0: Double) -> (tx: Double, ty: Double, a: Double, b: Double)? {
+        var n = 0.0
+        var spx = 0.0
+        var spy = 0.0
+        var svx = 0.0
+        var svy = 0.0
+        for b in 0..<Self.blockCount where inlier[b] {
+            n += 1
+            spx += centerX[b] - cx0
+            spy += centerY[b] - cy0
+            svx += vx[b]
+            svy += vy[b]
+        }
+        guard n >= 1 else { return nil }
+        let px = spx / n
+        let py = spy / n
+        let mvx = svx / n
+        let mvy = svy / n
+        var a = 0.0
+        var rot = 0.0
+        if n >= 4 {
+            var den = 0.0
+            var numA = 0.0
+            var numB = 0.0
+            for b in 0..<Self.blockCount where inlier[b] {
+                let qx = centerX[b] - cx0 - px
+                let qy = centerY[b] - cy0 - py
+                let ux = vx[b] - mvx
+                let uy = vy[b] - mvy
+                den += qx * qx + qy * qy
+                numA += qx * ux + qy * uy
+                numB += qx * uy - qy * ux
+            }
+            if den > 1 {
+                a = min(Self.maxZoomRotation, max(-Self.maxZoomRotation, numA / den))
+                rot = min(Self.maxZoomRotation, max(-Self.maxZoomRotation, numB / den))
+            }
+        }
+        let tx = mvx - (a * px - rot * py)
+        let ty = mvy - (rot * px + a * py)
+        guard tx.isFinite, ty.isFinite, a.isFinite, rot.isFinite else { return nil }
+        return (tx, ty, a, rot)
+    }
+
+    /// 一块：纹理、零位移残差、粗搜 + 细搜 + 亚像素，分类
+    private mutating func measure(block b: Int, cur: UnsafeBufferPointer<UInt8>, prev: UnsafeBufferPointer<UInt8>,
+                                  width w: Int, height h: Int, window win: Window) {
+        vx[b] = 0
+        vy[b] = 0
+        normalFlow[b] = 0
+        kind[b] = 0
+        unexplained[b] = false
+        guard win.x1 > win.x0 + 1, win.y1 > win.y0 + 1 else { return }
+        // 纹理：窗口内相邻像素差的均方（每个轴）
+        var grad = 0
+        var gradCount = 0
+        for y in win.y0..<win.y1 {
+            let row = y * w
+            for x in win.x0..<win.x1 {
+                let v = Int(cur[row + x])
+                if x + 1 < win.x1 {
+                    let d = Int(cur[row + x + 1]) - v
+                    grad += d * d
+                    gradCount += 1
+                }
+                if y + 1 < win.y1 {
+                    let d = Int(cur[row + w + x]) - v
+                    grad += d * d
+                    gradCount += 1
+                }
+            }
+        }
+        let gradRms = gradCount > 0 ? (Double(grad) / Double(gradCount)).squareRoot() : 0
+        let s0 = Self.zssd(cur, prev, width: w, height: h, window: win, u: 0, v: 0)
+        guard s0.isFinite else { return }
+        let gate = Self.staticRms * Self.staticRms
+        if s0 <= gate {
+            kind[b] = gradRms >= Self.staticTextureRms ? 3 : 0
+            return
+        }
+        let r = Self.searchRadius
+        let side = Self.tableSide
+        for i in 0..<table.count { table[i] = .nan }
+        table[r * side + r] = s0
+        var best = s0
+        var bu = 0
+        var bv = 0
+        var v = -r
+        while v <= r {
+            var u = -r
+            while u <= r {
+                if u != 0 || v != 0 {
+                    let s = Self.zssd(cur, prev, width: w, height: h, window: win, u: u, v: v)
+                    table[(v + r) * side + (u + r)] = s
+                    if s < best {
+                        best = s
+                        bu = u
+                        bv = v
+                    }
+                }
+                u += 2
+            }
+            v += 2
+        }
+        let cu = bu
+        let cv = bv
+        for dv in -1...1 {
+            for du in -1...1 where du != 0 || dv != 0 {
+                let s = lookup(cu + du, cv + dv, cur: cur, prev: prev, width: w, height: h, window: win)
+                if s < best {
+                    best = s
+                    bu = cu + du
+                    bv = cv + dv
+                }
+            }
+        }
+        let sl = lookup(bu - 1, bv, cur: cur, prev: prev, width: w, height: h, window: win)
+        let sr = lookup(bu + 1, bv, cur: cur, prev: prev, width: w, height: h, window: win)
+        let su = lookup(bu, bv - 1, cur: cur, prev: prev, width: w, height: h, window: win)
+        let sd = lookup(bu, bv + 1, cur: cur, prev: prev, width: w, height: h, window: win)
+        let curvX = sl + sr - 2 * best
+        let curvY = su + sd - 2 * best
+        var fx = 0.0
+        var fy = 0.0
+        if curvX.isFinite, curvX > 1e-9 { fx = min(0.5, max(-0.5, 0.5 * (sl - sr) / curvX)) }
+        if curvY.isFinite, curvY > 1e-9 { fy = min(0.5, max(-0.5, 0.5 * (su - sd) / curvY)) }
+        let border = abs(bu) >= r || abs(bv) >= r
+        let lo = min(curvX, curvY)
+        let hi = max(curvX, curvY)
+        // 抛物线插值后的最小值（亚像素位移时整数格点上的 best 偏大，不能因此当成「解释不了」）
+        var refined = best
+        if curvX.isFinite, curvX > 1e-9 { refined -= 0.5 * curvX * fx * fx }
+        if curvY.isFinite, curvY > 1e-9 { refined -= 0.5 * curvY * fy * fy }
+        let explained = max(0, refined) <= Self.explainRatio * s0 + Self.explainFloor
+        let reliable = !border && lo.isFinite && hi.isFinite && lo >= Self.minCurvature
+            && lo >= Self.minCurvatureRatio * hi && explained
+        unexplained[b] = !reliable && !explained
+        if reliable {
+            kind[b] = 1
+            vx[b] = Double(bu) + fx
+            vy[b] = Double(bv) + fy
+        } else if let m = maskedMatch(cur: cur, prev: prev, width: w, height: h, window: win) {
+            kind[b] = 4
+            vx[b] = Double(m.u)
+            vy[b] = Double(m.v)
+        } else {
+            // 法向流：|I_t| ≈ |∇I · d| → |d| ≈ rms(I_t) / rms(∇I)（扣掉噪声，纹理太弱时按 2 算，最多 6）
+            kind[b] = 2
+            let nf = max(0, s0 - gate).squareRoot() / max(gradRms, 2)
+            normalFlow[b] = nf.isFinite ? min(Self.maxNormalFlow, nf) : 0
+        }
+    }
+
+    /// 混合块：只用变了的像素搜位移（见 maskGate）。解释不了一半变化、顶到搜索边界、变了的像素太少时 nil
+    private mutating func maskedMatch(cur: UnsafeBufferPointer<UInt8>, prev: UnsafeBufferPointer<UInt8>,
+                                      width w: Int, height h: Int, window win: Window) -> (u: Int, v: Int)? {
+        var m = 0
+        for y in win.y0..<win.y1 {
+            let row = y * w
+            for x in win.x0..<win.x1 where m < Self.maskCapacity {
+                let d = Int(cur[row + x]) - Int(prev[row + x])
+                if abs(d) > Self.maskGate {
+                    maskX[m] = x
+                    maskY[m] = y
+                    m += 1
+                }
+            }
+        }
+        guard m >= Self.minMaskPixels else { return nil }
+        let cost0 = maskedCost(cur: cur, prev: prev, width: w, height: h, count: m, u: 0, v: 0)
+        guard cost0.isFinite, cost0 > 0 else { return nil }
+        let r = Self.searchRadius
+        let penalty = Self.maskShiftPenalty * cost0
+        var best = cost0
+        var bu = 0
+        var bv = 0
+        var v = -r
+        while v <= r {
+            var u = -r
+            while u <= r {
+                if u != 0 || v != 0 {
+                    let c = maskedCost(cur: cur, prev: prev, width: w, height: h, count: m, u: u, v: v)
+                        + penalty * Double(u * u + v * v)
+                    if c < best {
+                        best = c
+                        bu = u
+                        bv = v
+                    }
+                }
+                u += 2
+            }
+            v += 2
+        }
+        let cu = bu
+        let cv = bv
+        for dv in -1...1 {
+            for du in -1...1 where (du != 0 || dv != 0) && abs(cu + du) <= r && abs(cv + dv) <= r {
+                let u = cu + du
+                let v = cv + dv
+                let c = maskedCost(cur: cur, prev: prev, width: w, height: h, count: m, u: u, v: v)
+                    + penalty * Double(u * u + v * v)
+                if c < best {
+                    best = c
+                    bu = u
+                    bv = v
+                }
+            }
+        }
+        guard bu != 0 || bv != 0, abs(bu) < r, abs(bv) < r, best <= Self.maskAcceptRatio * cost0 else { return nil }
+        // 只有一条边时沿边方向的分量是随便对上的：往 0 收，代价只高 10% 以内就收
+        let limit = best * 1.1
+        for axis in 0..<2 {
+            while (axis == 0 ? bu : bv) != 0 {
+                let u = axis == 0 ? bu - bu.signum() : bu
+                let v = axis == 0 ? bv : bv - bv.signum()
+                guard u != 0 || v != 0 else { break }
+                let c = maskedCost(cur: cur, prev: prev, width: w, height: h, count: m, u: u, v: v)
+                    + penalty * Double(u * u + v * v)
+                guard c <= limit else { break }
+                bu = u
+                bv = v
+            }
+        }
+        return (bu, bv)
+    }
+
+    /// 变了的像素和上一帧平移 (u, v) 的截断平方差均值；对得上的像素不到一半时 ∞
+    private func maskedCost(cur: UnsafeBufferPointer<UInt8>, prev: UnsafeBufferPointer<UInt8>, width w: Int,
+                            height h: Int, count m: Int, u: Int, v: Int) -> Double {
+        var s = 0
+        var n = 0
+        for k in 0..<m {
+            let x = maskX[k]
+            let y = maskY[k]
+            let px = x - u
+            let py = y - v
+            guard px >= 0, px < w, py >= 0, py < h else { continue }
+            let d = Int(cur[y * w + x]) - Int(prev[py * w + px])
+            s += min(d * d, Self.maskTruncation)
+            n += 1
+        }
+        guard n > 0, 2 * n >= m else { return .infinity }
+        return Double(s) / Double(n)
+    }
+
+    private mutating func lookup(_ u: Int, _ v: Int, cur: UnsafeBufferPointer<UInt8>, prev: UnsafeBufferPointer<UInt8>,
+                                 width w: Int, height h: Int, window win: Window) -> Double {
+        let r = Self.searchRadius
+        guard abs(u) <= r, abs(v) <= r else { return .infinity }
+        let i = (v + r) * Self.tableSide + (u + r)
+        let cached = table[i]
+        if !cached.isNaN { return cached }
+        let s = Self.zssd(cur, prev, width: w, height: h, window: win, u: u, v: v)
+        table[i] = s
+        return s
+    }
+
+    /// 窗口和「上一帧平移 (u, v)」的重叠部分上的去均值 SSD（每像素）；重叠不到一半时 ∞
+    private static func zssd(_ cur: UnsafeBufferPointer<UInt8>, _ prev: UnsafeBufferPointer<UInt8>, width w: Int,
+                             height h: Int, window win: Window, u: Int, v: Int) -> Double {
+        let xa = max(win.x0, u)
+        let xb = min(win.x1, w + u)
+        let ya = max(win.y0, v)
+        let yb = min(win.y1, h + v)
+        guard xb > xa, yb > ya else { return .infinity }
+        let n = (xb - xa) * (yb - ya)
+        guard n >= win.minCount, n > 0 else { return .infinity }
+        var s = 0
+        var s2 = 0
+        for y in ya..<yb {
+            let row = y * w
+            let prow = (y - v) * w - u
+            for x in xa..<xb {
+                let d = Int(cur[row + x]) - Int(prev[prow + x])
+                s += d
+                s2 += d * d
+            }
+        }
+        let inv = 1 / Double(n)
+        let m = Double(s) * inv
+        return max(0, Double(s2) * inv - m * m)
+    }
+}
+
+/// 往复节奏（algo-opt-3）：最近 4 秒带方向的速度 → 主轴投影 → 15 Hz 重采样 → 归一化自相关找周期
+/// （滞后 4~30 格 = 3.75~0.5 Hz；取不低于最高峰 85% 的最短周期，避免把两下当一下），抛物线细化。
+/// hz：往复频率；confidence：自相关峰值 0~1；amplitude：单程幅度（速度单位 × 秒，正弦近似 √2·rms / 2πf）
+struct StrokeRhythm {
+    static let window: Double = 4
+    static let capacity = 96
+    static let gridRate: Double = 15
+    static let gridCapacity = 64
+    static let minLag = 4
+    static let maxLag = 30
+    static let minSamples = 12
+    static let minSpan: Double = 1.5
+    static let octaveShare: Double = 0.85
+
+    struct Estimate: Equatable {
+        var hz: Double = 0
+        var confidence: Double = 0
+        var amplitude: Double = 0
+    }
+
+    private var times = [Double](repeating: 0, count: StrokeRhythm.capacity)
+    private var xs = [Double](repeating: 0, count: StrokeRhythm.capacity)
+    private var ys = [Double](repeating: 0, count: StrokeRhythm.capacity)
+    private var count = 0
+    private var head = 0
+    private var projected = [Double](repeating: 0, count: StrokeRhythm.capacity)
+    private var projectedTimes = [Double](repeating: 0, count: StrokeRhythm.capacity)
+    private var grid = [Double](repeating: 0, count: StrokeRhythm.gridCapacity)
+    private var corr = [Double](repeating: 0, count: StrokeRhythm.maxLag + 2)
+    private(set) var estimate = Estimate()
+
+    var scratchAddresses: [Int] {
+        func address<T>(_ a: [T]) -> Int { a.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) } }
+        return [address(times), address(xs), address(ys), address(projected), address(projectedTimes),
+                address(grid), address(corr)]
+    }
+
+    mutating func reset() {
+        count = 0
+        head = 0
+        estimate = Estimate()
+    }
+
+    /// 时间必须递增（不递增的样本丢掉）
+    mutating func add(time t: Double, x: Double, y: Double) {
+        guard t.isFinite, x.isFinite, y.isFinite else { return }
+        let cap = Self.capacity
+        if count > 0, t <= times[(head + cap - 1) % cap] { return }
+        times[head] = t
+        xs[head] = x
+        ys[head] = y
+        head = (head + 1) % cap
+        count = min(cap, count + 1)
+        estimate = compute(now: t)
+    }
+
+    private mutating func compute(now: Double) -> Estimate {
+        let cap = Self.capacity
+        let start = (head + cap - count) % cap
+        var first = count
+        for k in 0..<count where now - times[(start + k) % cap] <= Self.window {
+            first = k
+            break
+        }
+        let n = count - first
+        guard n >= Self.minSamples else { return Estimate() }
+        var mx = 0.0
+        var my = 0.0
+        for k in 0..<n {
+            let i = (start + first + k) % cap
+            mx += xs[i]
+            my += ys[i]
+        }
+        mx /= Double(n)
+        my /= Double(n)
+        var cxx = 0.0
+        var cyy = 0.0
+        var cxy = 0.0
+        for k in 0..<n {
+            let i = (start + first + k) % cap
+            let dx = xs[i] - mx
+            let dy = ys[i] - my
+            cxx += dx * dx
+            cyy += dy * dy
+            cxy += dx * dy
+        }
+        let theta = 0.5 * atan2(2 * cxy, cxx - cyy)
+        let c = cos(theta)
+        let s = sin(theta)
+        for k in 0..<n {
+            let i = (start + first + k) % cap
+            projected[k] = (xs[i] - mx) * c + (ys[i] - my) * s
+            projectedTimes[k] = times[i]
+        }
+        let t0 = projectedTimes[0]
+        let span = projectedTimes[n - 1] - t0
+        guard span.isFinite, span >= Self.minSpan else { return Estimate() }
+        let g = min(Self.gridCapacity, Int(span * Self.gridRate) + 1)
+        var j = 0
+        for q in 0..<g {
+            let tq = t0 + Double(q) / Self.gridRate
+            while j < n - 2 && projectedTimes[j + 1] < tq { j += 1 }
+            let ta = projectedTimes[j]
+            let tb = projectedTimes[j + 1]
+            let f = tb > ta ? min(1, max(0, (tq - ta) / (tb - ta))) : 0
+            grid[q] = projected[j] + (projected[j + 1] - projected[j]) * f
+        }
+        var gm = 0.0
+        for q in 0..<g { gm += grid[q] }
+        gm /= Double(g)
+        var energy = 0.0
+        for q in 0..<g {
+            grid[q] -= gm
+            energy += grid[q] * grid[q]
+        }
+        let rms = (energy / Double(g)).squareRoot()
+        let kMax = min(Self.maxLag, g / 2)
+        guard rms.isFinite, rms > 1e-9, kMax >= Self.minLag + 1, kMax + 1 < g else { return Estimate() }
+        for k in (Self.minLag - 1)...(kMax + 1) {
+            var sab = 0.0
+            var saa = 0.0
+            var sbb = 0.0
+            for i in 0..<(g - k) {
+                let a = grid[i]
+                let b = grid[i + k]
+                sab += a * b
+                saa += a * a
+                sbb += b * b
+            }
+            let den = (saa * sbb).squareRoot()
+            corr[k] = den > 1e-18 ? sab / den : 0
+        }
+        var best = -1.0
+        var bestK = Self.minLag
+        for k in Self.minLag...kMax where corr[k] > best {
+            best = corr[k]
+            bestK = k
+        }
+        guard best > 0.05 else { return Estimate() }
+        var pick = bestK
+        for k in Self.minLag...kMax where corr[k] >= corr[k - 1] && corr[k] >= corr[k + 1]
+            && corr[k] >= Self.octaveShare * best {
+            pick = k
+            break
+        }
+        let a = corr[pick - 1]
+        let b = corr[pick]
+        let cc = corr[pick + 1]
+        let den = a - 2 * b + cc
+        let delta = den < -1e-12 ? min(0.5, max(-0.5, 0.5 * (a - cc) / den)) : 0
+        let lag = Double(pick) + delta
+        let hz = Self.gridRate / lag
+        let amplitude = 2.0.squareRoot() * rms / (2 * Double.pi * hz)
+        guard hz.isFinite, amplitude.isFinite else { return Estimate() }
+        return Estimate(hz: hz, confidence: MotionStats.clamp01(b), amplitude: amplitude)
+    }
+}
+
+/// 主体强度分数 0~1（algo-opt-3）：速度为主（对数刻度），往复节奏（频率够快 + 自相关可信 + 幅度够大）再往上推。
+/// 一直快但没节奏 ≈ 0.72 × 速度分；又快又有节奏 → 1
+enum StrokeScore {
+    /// 画面块运动：分析帧像素 / 名义帧（1/15 s）；幅度：分析帧像素
+    static let flowSpeedLow: Double = 0.7
+    static let flowSpeedHigh: Double = 4.5
+    static let flowAmplitudeLow: Double = 1
+    static let flowAmplitudeHigh: Double = 6
+    /// 人体姿态：躯干长度 / 秒；幅度：躯干长度
+    static let poseSpeedLow: Double = 0.12
+    static let poseSpeedHigh: Double = 2.2
+    static let poseAmplitudeLow: Double = 0.03
+    static let poseAmplitudeHigh: Double = 0.25
+    static let tempoLow: Double = 0.6
+    static let tempoHigh: Double = 1.8
+    static let confidenceLow: Double = 0.3
+    static let confidenceHigh: Double = 0.7
+    static let baseShare: Double = 0.72
+    static let rhythmBonus: Double = 0.15
+
+    static func logRamp(_ v: Double, low: Double, high: Double) -> Double {
+        guard v.isFinite, low > 0, high > low, v > low else { return 0 }
+        return min(1, log(v / low) / log(high / low))
+    }
+
+    static func ramp(_ v: Double, low: Double, high: Double) -> Double {
+        guard high > low else { return 0 }
+        return MotionStats.clamp01((v - low) / (high - low))
+    }
+
+    /// 节奏分 0~1
+    static func rhythm(_ r: StrokeRhythm.Estimate, amplitudeLow: Double, amplitudeHigh: Double) -> Double {
+        let tempo = ramp(r.hz, low: tempoLow, high: tempoHigh)
+        let conf = ramp(r.confidence, low: confidenceLow, high: confidenceHigh)
+        let amp = logRamp(r.amplitude, low: amplitudeLow, high: amplitudeHigh)
+        return MotionStats.clamp01(conf * tempo * (0.4 + 0.6 * amp))
+    }
+
+    static func combine(speedScore s: Double, rhythm r: Double) -> Double {
+        let s = MotionStats.clamp01(s)
+        let r = MotionStats.clamp01(r)
+        return MotionStats.clamp01(s * (baseShare + (1 - baseShare) * r) + rhythmBonus * r * s)
+    }
+
+    static func flow(speed: Double, rhythm r: StrokeRhythm.Estimate) -> Double {
+        combine(speedScore: logRamp(speed, low: flowSpeedLow, high: flowSpeedHigh),
+                rhythm: rhythm(r, amplitudeLow: flowAmplitudeLow, amplitudeHigh: flowAmplitudeHigh))
+    }
+
+    static func pose(speed: Double, rhythm r: StrokeRhythm.Estimate) -> Double {
+        combine(speedScore: logRamp(speed, low: poseSpeedLow, high: poseSpeedHigh),
+                rhythm: rhythm(r, amplitudeLow: poseAmplitudeLow, amplitudeHigh: poseAmplitudeHigh))
+    }
+}
+
+/// 一帧的主体运动读数（algo-opt-3，随 MotionSample 带出）
+struct SubjectReading: Equatable {
+    /// 这一帧有读数（分析器出的样本都有；老调用方手搭的样本没有 = 走原来的能量映射）
+    var valid = false
+    /// 主体强度分数 0~1
+    var score: Double = 0
+    /// 最近 1.2 秒残差速度的 P80（分析帧像素 / 名义帧）
+    var speed: Double = 0
+    var hz: Double = 0
+    /// 节奏可信度 0~1
+    var rhythm: Double = 0
+    /// 单程幅度（分析帧像素）
+    var amplitude: Double = 0
+}
+
+/// 块运动 → 主体读数（algo-opt-3）：最近 1.2 秒每帧主体速度的 P80 + 往复节奏 → StrokeScore.flow
+struct SubjectFlowTracker {
+    static let speedWindow: Double = 1.2
+    static let capacity = 32
+
+    private var times = [Double](repeating: 0, count: SubjectFlowTracker.capacity)
+    private var speeds = [Double](repeating: 0, count: SubjectFlowTracker.capacity)
+    private var scratch = [Double](repeating: 0, count: SubjectFlowTracker.capacity)
+    private var count = 0
+    private var head = 0
+    private(set) var rhythm = StrokeRhythm()
+    private(set) var reading = SubjectReading()
+
+    var scratchAddresses: [Int] {
+        func address<T>(_ a: [T]) -> Int { a.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) } }
+        return [address(times), address(speeds), address(scratch)] + rhythm.scratchAddresses
+    }
+
+    mutating func reset() {
+        count = 0
+        head = 0
+        rhythm.reset()
+        reading = SubjectReading()
+    }
+
+    /// 切镜：新镜头重新攒历史；读数先保持切镜前的（不出尖峰，也不突然掉到 0）
+    mutating func noteCut() {
+        count = 0
+        head = 0
+        rhythm.reset()
+    }
+
+    mutating func update(time: Double, speed: Double, vx: Double, vy: Double) -> SubjectReading {
+        guard time.isFinite else { return reading }
+        let cap = Self.capacity
+        if count > 0, time <= times[(head + cap - 1) % cap] {
+            count = 0
+            head = 0
+        }
+        times[head] = time
+        speeds[head] = speed.isFinite ? max(0, speed) : 0
+        head = (head + 1) % cap
+        count = min(cap, count + 1)
+        rhythm.add(time: time, x: vx, y: vy)
+        let start = (head + cap - count) % cap
+        var n = 0
+        for k in 0..<count {
+            let i = (start + k) % cap
+            if time - times[i] <= Self.speedWindow {
+                scratch[n] = speeds[i]
+                n += 1
+            }
+        }
+        let p = MotionStats.quantile(&scratch, n, 0.8)
+        let est = rhythm.estimate
+        reading = SubjectReading(valid: true, score: StrokeScore.flow(speed: p, rhythm: est), speed: p,
+                                 hz: est.hz, rhythm: est.confidence, amplitude: est.amplitude)
+        return reading
+    }
+}
+
+/// 人体关键点（algo-opt-3，Vision VNDetectHumanBodyPoseRequest 的一部分）
+enum PoseJoint: Int, CaseIterable {
+    case nose, neck, leftShoulder, rightShoulder, root, leftHip, rightHip, leftKnee, rightKnee, leftWrist, rightWrist
+
+    static let count = 11
+}
+
+/// 一个人的关键点：分析帧像素坐标（左上角原点，和 CameraTransform 同一套），c 是每个点的置信度 0~1（0 = 没检测到）
+struct PoseCandidate: Equatable {
+    var confidence: Double = 0
+    var x = [Double](repeating: 0, count: PoseJoint.count)
+    var y = [Double](repeating: 0, count: PoseJoint.count)
+    var c = [Double](repeating: 0, count: PoseJoint.count)
+
+    mutating func set(_ j: PoseJoint, x px: Double, y py: Double, confidence conf: Double) {
+        guard px.isFinite, py.isFinite, conf.isFinite, x.count == PoseJoint.count, y.count == PoseJoint.count,
+              c.count == PoseJoint.count else { return }
+        x[j.rawValue] = px
+        y[j.rawValue] = py
+        c[j.rawValue] = min(1, max(0, conf))
+    }
+
+    var isWellFormed: Bool {
+        x.count == PoseJoint.count && y.count == PoseJoint.count && c.count == PoseJoint.count && confidence.isFinite
+    }
+}
+
+/// 视频轨方向（AVAssetTrack.preferredTransform）：交给 Vision 摆正后检测，结果再换回缓冲（分析帧）坐标
+enum PoseOrientation: Int, Equatable {
+    case up, down, left, right
+
+    static func from(a: Double, b: Double, c: Double, d: Double) -> PoseOrientation {
+        func near(_ v: Double, _ t: Double) -> Bool { abs(v - t) < 0.01 }
+        if near(a, 0) && near(b, 1) && near(c, -1) && near(d, 0) { return .right }
+        if near(a, 0) && near(b, -1) && near(c, 1) && near(d, 0) { return .left }
+        if near(a, -1) && near(b, 0) && near(c, 0) && near(d, -1) { return .down }
+        return .up
+    }
+
+    /// Vision 归一化坐标（摆正后的画面、左下角原点）→ 缓冲归一化坐标（左上角原点）
+    func bufferPoint(visionX vx: Double, visionY vy: Double) -> (x: Double, y: Double) {
+        let ux = vx
+        let uy = 1 - vy
+        switch self {
+        case .up: return (ux, uy)
+        case .down: return (1 - ux, 1 - uy)
+        case .right: return (uy, 1 - ux)
+        case .left: return (1 - uy, ux)
+        }
+    }
+}
+
+/// 一次姿态估计的读数（algo-opt-3）
+struct PoseReading: Equatable {
+    var time: Double = 0
+    /// 这一帧有人、且最近 1.2 秒攒够了速度样本
+    var present = false
+    /// 姿态强度分数 0~1（没人时保持上一次的）
+    var score: Double = 0
+    /// 这个人的检测置信度 0~1（没人时 0）
+    var confidence: Double = 0
+    var hz: Double = 0
+}
+
+/// 姿态 → 主体强度（algo-opt-3）：关节速度按躯干长度（或肩宽、关节包围框对角线）归一（远近 / 缩放无关），
+/// 先扣掉相机运动（块运动给的相似变换），再扣掉全身一致的平移（中位数，只留 40%），
+/// 髋和头权重最高；最近 1.2 秒的 P80 + 髋 / 头的往复节奏 → StrokeScore.pose。
+/// 没人时读数 present = false、分数保持（由 MotionNormalizer 的 PoseBlend 做滞回和保持）
+struct PoseMotionTracker {
+    static let minJointConfidence: Double = 0.3
+    static let minPersonConfidence: Double = 0.3
+    static let minJoints = 4
+    static let minMovingJoints = 4
+    static let scaleSeconds: Double = 0.8
+    static let minScaleShare: Double = 0.06
+    static let minGap: Double = 0.02
+    static let maxGap: Double = 0.4
+    static let maxJointSpeed: Double = 8
+    static let speedWindow: Double = 1.2
+    static let minSpeedSamples = 3
+    /// 全身一致的平移只算 40%（镜头跟拍 / 没扣干净的相机运动）
+    static let rigidShare: Double = 0.4
+    /// 换人判定：和上一帧（按相机运动预测）的中心距离超过 1.5 个身体尺度就按置信度 × 尺度重选
+    static let continuityLimit: Double = 1.5
+    static let rhythmGapLimit: Double = 1
+    static let capacity = 24
+    static let groups: [[PoseJoint]] = [[.nose, .neck], [.leftShoulder, .rightShoulder], [.root, .leftHip, .rightHip],
+                                        [.leftKnee, .rightKnee], [.leftWrist, .rightWrist]]
+    static let groupWeights: [Double] = [1.0, 0.7, 1.0, 0.6, 0.35]
+    static let headGroup = 0
+    static let hipGroup = 2
+
+    private var previous = PoseCandidate()
+    private var hasPrevious = false
+    private var previousTime: Double = 0
+    private var scale: Double = 0
+    private var ux = [Double](repeating: 0, count: PoseJoint.count)
+    private var uy = [Double](repeating: 0, count: PoseJoint.count)
+    private var usable = [Bool](repeating: false, count: PoseJoint.count)
+    private var sortX = [Double](repeating: 0, count: PoseJoint.count)
+    private var sortY = [Double](repeating: 0, count: PoseJoint.count)
+    private var speedTimes = [Double](repeating: 0, count: PoseMotionTracker.capacity)
+    private var speeds = [Double](repeating: 0, count: PoseMotionTracker.capacity)
+    private var scratch = [Double](repeating: 0, count: PoseMotionTracker.capacity)
+    private var speedCount = 0
+    private var speedHead = 0
+    private var hips = StrokeRhythm()
+    private var head = StrokeRhythm()
+    private(set) var reading = PoseReading()
+
+    mutating func reset() {
+        hasPrevious = false
+        scale = 0
+        speedCount = 0
+        speedHead = 0
+        hips.reset()
+        head.reset()
+        reading = PoseReading()
+    }
+
+    /// 身体尺度（分析帧像素）：max(躯干长度, 1.3 × 肩宽, 0.3 × 关节包围框对角线, 0.06 × 画面高)
+    static func bodyScale(_ p: PoseCandidate, frameHeight: Double) -> Double {
+        var s = minScaleShare * max(0, frameHeight)
+        guard p.isWellFormed else { return s }
+        func ok(_ j: PoseJoint) -> Bool { p.c[j.rawValue] >= minJointConfidence }
+        func dist(_ ax: Double, _ ay: Double, _ bx: Double, _ by: Double) -> Double {
+            ((ax - bx) * (ax - bx) + (ay - by) * (ay - by)).squareRoot()
+        }
+        let n = PoseJoint.neck.rawValue
+        let r = PoseJoint.root.rawValue
+        let ls = PoseJoint.leftShoulder.rawValue
+        let rs = PoseJoint.rightShoulder.rawValue
+        let lh = PoseJoint.leftHip.rawValue
+        let rh = PoseJoint.rightHip.rawValue
+        if ok(.neck) && ok(.root) {
+            s = max(s, dist(p.x[n], p.y[n], p.x[r], p.y[r]))
+        } else if ok(.leftShoulder) && ok(.rightShoulder) && ok(.leftHip) && ok(.rightHip) {
+            s = max(s, dist((p.x[ls] + p.x[rs]) / 2, (p.y[ls] + p.y[rs]) / 2,
+                            (p.x[lh] + p.x[rh]) / 2, (p.y[lh] + p.y[rh]) / 2))
+        }
+        if ok(.leftShoulder) && ok(.rightShoulder) { s = max(s, 1.3 * dist(p.x[ls], p.y[ls], p.x[rs], p.y[rs])) }
+        var minX = Double.infinity
+        var maxX = -Double.infinity
+        var minY = Double.infinity
+        var maxY = -Double.infinity
+        for j in 0..<PoseJoint.count where p.c[j] >= minJointConfidence {
+            minX = min(minX, p.x[j])
+            maxX = max(maxX, p.x[j])
+            minY = min(minY, p.y[j])
+            maxY = max(maxY, p.y[j])
+        }
+        if maxX >= minX, maxY >= minY { s = max(s, 0.3 * dist(minX, minY, maxX, maxY)) }
+        return s.isFinite ? s : minScaleShare * max(0, frameHeight)
+    }
+
+    private static func jointCount(_ p: PoseCandidate) -> Int {
+        var n = 0
+        for j in 0..<PoseJoint.count where p.c[j] >= minJointConfidence { n += 1 }
+        return n
+    }
+
+    private static func center(_ p: PoseCandidate) -> (x: Double, y: Double) {
+        var sx = 0.0
+        var sy = 0.0
+        var n = 0.0
+        for j in 0..<PoseJoint.count where p.c[j] >= minJointConfidence {
+            sx += p.x[j]
+            sy += p.y[j]
+            n += 1
+        }
+        return n > 0 ? (sx / n, sy / n) : (0, 0)
+    }
+
+    private func select(_ candidates: [PoseCandidate], camera: CameraTransform, continuous: Bool,
+                        frameHeight: Double) -> Int? {
+        var bestIndex: Int?
+        var bestValue = -Double.infinity
+        var nearIndex: Int?
+        var nearDistance = Double.infinity
+        var predicted: (x: Double, y: Double)?
+        if hasPrevious && continuous {
+            let c = Self.center(previous)
+            predicted = camera.apply(x: c.x, y: c.y)
+        }
+        for (i, p) in candidates.enumerated() {
+            guard p.isWellFormed, p.confidence >= Self.minPersonConfidence, Self.jointCount(p) >= Self.minJoints else {
+                continue
+            }
+            let size = Self.bodyScale(p, frameHeight: frameHeight)
+            let value = p.confidence * size
+            if value > bestValue {
+                bestValue = value
+                bestIndex = i
+            }
+            if let q = predicted, size > 0 {
+                let c = Self.center(p)
+                let d = ((c.x - q.x) * (c.x - q.x) + (c.y - q.y) * (c.y - q.y)).squareRoot() / size
+                if d < nearDistance {
+                    nearDistance = d
+                    nearIndex = i
+                }
+            }
+        }
+        if let i = nearIndex, nearDistance <= Self.continuityLimit { return i }
+        return bestIndex
+    }
+
+    private mutating func absent(_ time: Double) -> PoseReading {
+        reading = PoseReading(time: time, present: false, score: reading.score, confidence: 0, hz: reading.hz)
+        return reading
+    }
+
+    /// candidates：这一帧检测到的人（分析帧像素）；camera：上一次 update 那帧到这一帧的相机运动；
+    /// continuous == false：中间断过（seek / 切镜 / 参考帧），不和上一帧算速度
+    mutating func update(time: Double, candidates: [PoseCandidate], camera: CameraTransform, continuous: Bool,
+                         frameHeight: Double) -> PoseReading {
+        guard time.isFinite, frameHeight.isFinite, frameHeight > 0 else {
+            hasPrevious = false
+            return absent(time.isFinite ? time : reading.time)
+        }
+        let cam = camera.isUsable ? camera : .identity
+        guard let pick = select(candidates, camera: cam, continuous: continuous, frameHeight: frameHeight) else {
+            hasPrevious = false
+            return absent(time)
+        }
+        let person = candidates[pick]
+        let size = Self.bodyScale(person, frameHeight: frameHeight)
+        let dt = time - previousTime
+        let linked = hasPrevious && continuous && dt > Self.minGap && dt <= Self.maxGap && scale > 0
+        if linked {
+            scale += (size - scale) * (1 - exp(-dt / Self.scaleSeconds))
+            var n = 0
+            for j in 0..<PoseJoint.count {
+                usable[j] = false
+                guard person.c[j] >= Self.minJointConfidence, previous.c[j] >= Self.minJointConfidence else { continue }
+                let p = cam.apply(x: previous.x[j], y: previous.y[j])
+                let vx = (person.x[j] - p.x) / scale / dt
+                let vy = (person.y[j] - p.y) / scale / dt
+                guard vx.isFinite, vy.isFinite, (vx * vx + vy * vy).squareRoot() <= Self.maxJointSpeed else { continue }
+                ux[j] = vx
+                uy[j] = vy
+                usable[j] = true
+                sortX[n] = vx
+                sortY[n] = vy
+                n += 1
+            }
+            if n >= Self.minMovingJoints {
+                let cx = MotionStats.quantile(&sortX, n, 0.5)
+                let cy = MotionStats.quantile(&sortY, n, 0.5)
+                var speed = 0.0
+                for g in 0..<Self.groups.count {
+                    var sx = 0.0
+                    var sy = 0.0
+                    var m = 0
+                    for joint in Self.groups[g] where usable[joint.rawValue] {
+                        sx += ux[joint.rawValue]
+                        sy += uy[joint.rawValue]
+                        m += 1
+                    }
+                    guard m > 0 else { continue }
+                    let ex = sx / Double(m) - (1 - Self.rigidShare) * cx
+                    let ey = sy / Double(m) - (1 - Self.rigidShare) * cy
+                    speed = max(speed, Self.groupWeights[g] * (ex * ex + ey * ey).squareRoot())
+                    if g == Self.hipGroup { hips.add(time: time, x: ex, y: ey) }
+                    if g == Self.headGroup { head.add(time: time, x: ex, y: ey) }
+                }
+                pushSpeed(time: time, speed: speed)
+            }
+        } else {
+            scale = size
+            // 断过（seek / 切镜）或者人丢了超过 1 秒：节奏重新攒；短暂丢失（检测一闪）不清
+            if !continuous || !(time - previousTime <= Self.rhythmGapLimit) {
+                hips.reset()
+                head.reset()
+            }
+        }
+        previous = person
+        previousTime = time
+        hasPrevious = true
+        let cap = Self.capacity
+        let start = (speedHead + cap - speedCount) % cap
+        var n = 0
+        for k in 0..<speedCount {
+            let i = (start + k) % cap
+            if time - speedTimes[i] <= Self.speedWindow, time >= speedTimes[i] {
+                scratch[n] = speeds[i]
+                n += 1
+            }
+        }
+        guard n >= Self.minSpeedSamples else { return absent(time) }
+        let p80 = MotionStats.quantile(&scratch, n, 0.8)
+        let byHips = StrokeScore.pose(speed: p80, rhythm: hips.estimate)
+        let byHead = StrokeScore.pose(speed: p80, rhythm: head.estimate)
+        let score = max(byHips, byHead)
+        reading = PoseReading(time: time, present: true, score: MotionStats.clamp01(score),
+                              confidence: MotionStats.clamp01(person.confidence),
+                              hz: byHips >= byHead ? hips.estimate.hz : head.estimate.hz)
+        return reading
+    }
+
+    private mutating func pushSpeed(time: Double, speed: Double) {
+        let cap = Self.capacity
+        speedTimes[speedHead] = time
+        speeds[speedHead] = speed.isFinite ? max(0, speed) : 0
+        speedHead = (speedHead + 1) % cap
+        speedCount = min(cap, speedCount + 1)
+    }
+}
+
+/// 姿态和块运动的融合（algo-opt-3，MotionNormalizer 里每拍一次）：累计有人 ≥ 0.55 秒（至少 2 拍）才开始用姿态，
+/// 没人 0.9 秒内保持上一次的姿态分数，权重 1 秒升到最多 0.8、1.5 秒降回 0（检测一闪一闪不出尖峰）
+struct PoseBlend {
+    static let confirmSeconds: TimeInterval = 0.55
+    static let holdSeconds: TimeInterval = 0.9
+    static let rampUpSeconds: TimeInterval = 1.0
+    static let rampDownSeconds: TimeInterval = 1.5
+    static let maxWeight: Double = 0.8
+
+    private(set) var weight: Double = 0
+    private(set) var heldScore: Double = 0
+    private var heldConfidence: Double = 0
+    private var presentRun: TimeInterval = 0
+    private var absentRun: TimeInterval = .infinity
+
+    mutating func reset() {
+        self = PoseBlend()
+    }
+
+    mutating func step(_ w: MotionWindow, flow: Double, dt: TimeInterval) -> Double {
+        let flow = MotionStats.clamp01(flow)
+        if w.posePresentFrames > 0, w.poseScore.isFinite {
+            presentRun += dt
+            absentRun = 0
+            heldScore = MotionStats.clamp01(w.poseScore)
+            heldConfidence = MotionStats.clamp01(w.poseConfidence)
+        } else {
+            absentRun += dt
+            if absentRun > Self.holdSeconds { presentRun = 0 }
+        }
+        let confFactor = 0.5 + 0.5 * MotionStats.clamp01((heldConfidence - 0.3) / 0.3)
+        let target = presentRun >= Self.confirmSeconds && absentRun <= Self.holdSeconds ? Self.maxWeight * confFactor : 0
+        let rate = Self.maxWeight / (target > weight ? Self.rampUpSeconds : Self.rampDownSeconds)
+        if target > weight {
+            weight = min(target, weight + rate * dt)
+        } else {
+            weight = max(target, weight - rate * dt)
+        }
+        if !weight.isFinite { weight = 0 }
+        return MotionStats.clamp01(weight * heldScore + (1 - weight) * flow)
+    }
+}
+
 /// 一拍（约 0.3 秒）的画面窗口。frames == 0 表示这段没有画面样本（暂停 / 缓冲 / 无视频轨 / 分析暂停）
 struct MotionWindow: Equatable {
     var meanEnergy: Double = 0
@@ -864,6 +2155,16 @@ struct MotionWindow: Equatable {
     /// 窗口内样本的平均覆盖率 / 平均近场分数（algo-opt-1；老调用方不填 = 0，行为不变）
     var coverage: Double = 0
     var nearField: Double = 0
+    /// 主体运动（algo-opt-3）：有效主体读数的样本数、平均主体分数 0~1、最后一个的往复频率。
+    /// subjectFrames > 0 时 MotionNormalizer 按主体分数映射（不再看画面变化的面积 / 整幅均值）
+    var subjectFrames: Int = 0
+    var subjectScore: Double = 0
+    var subjectHz: Double = 0
+    /// 人体姿态（algo-opt-3，Vision 辅助）：这一拍跑了几次、几次有人；最后一次有人时的分数 / 置信度
+    var poseFrames: Int = 0
+    var posePresentFrames: Int = 0
+    var poseScore: Double = 0
+    var poseConfidence: Double = 0
 
     static let empty = MotionWindow()
 
@@ -882,6 +2183,13 @@ struct MotionWindowAccumulator {
     private(set) var heldCount = 0
     private var coverageSum: Double = 0
     private var nearSum: Double = 0
+    private var subjectSum: Double = 0
+    private(set) var subjectFrames = 0
+    private var subjectHz: Double = 0
+    private var poseFrames = 0
+    private var posePresentFrames = 0
+    private var poseScore: Double = 0
+    private var poseConfidence: Double = 0
 
     mutating func add(_ s: MotionSample) {
         guard s.energy.isFinite, s.energy >= 0 else { return }
@@ -892,14 +2200,38 @@ struct MotionWindowAccumulator {
         frames += 1
         if s.isCut { cutCount += 1 }
         if s.isHeld { heldCount += 1 }
+        if s.subject.valid, s.subject.score.isFinite {
+            subjectSum += min(1, max(0, s.subject.score))
+            subjectFrames += 1
+            subjectHz = s.subject.hz.isFinite ? s.subject.hz : 0
+        }
+    }
+
+    /// 一次姿态估计（algo-opt-3）：只记次数和最后一次有人时的分数（姿态本身已经按 1.2 秒平滑）
+    mutating func addPose(_ r: PoseReading) {
+        poseFrames += 1
+        guard r.present, r.score.isFinite, r.confidence.isFinite else { return }
+        posePresentFrames += 1
+        poseScore = min(1, max(0, r.score))
+        poseConfidence = min(1, max(0, r.confidence))
     }
 
     mutating func drain() -> MotionWindow {
-        let window = frames > 0
-            ? MotionWindow(meanEnergy: sum / Double(frames), peakEnergy: peak, frames: frames,
-                           cutCount: cutCount, heldCount: heldCount,
-                           coverage: coverageSum / Double(frames), nearField: nearSum / Double(frames))
-            : .empty
+        var window = MotionWindow.empty
+        if frames > 0 {
+            window = MotionWindow(meanEnergy: sum / Double(frames), peakEnergy: peak, frames: frames,
+                                  cutCount: cutCount, heldCount: heldCount,
+                                  coverage: coverageSum / Double(frames), nearField: nearSum / Double(frames))
+            if subjectFrames > 0 {
+                window.subjectFrames = subjectFrames
+                window.subjectScore = subjectSum / Double(subjectFrames)
+                window.subjectHz = subjectHz
+            }
+        }
+        window.poseFrames = poseFrames
+        window.posePresentFrames = posePresentFrames
+        window.poseScore = poseScore
+        window.poseConfidence = poseConfidence
         self = MotionWindowAccumulator()
         return window
     }
@@ -935,21 +2267,42 @@ struct MotionNormalizer {
     static let nearFieldFixedShare: Double = 0.6
     static let nearFieldLearnLimit: Double = 0.5
 
+    /// 主体分数映射（algo-opt-3）：近场时往 0.3 收；自动适应只做两件事——减掉这个视频安静时的底（最多 0.08），
+    /// 动作一直偏小的视频最多放大 1.25 倍（「动得多」0.7 以上不放大）。从不压低：持续的快速抽插不会被压到中档
+    static let subjectNearFloor: Double = 0.3
+    static let subjectBaseLimit: Double = 0.08
+    static let subjectTargetHigh: Double = 0.7
+    static let subjectMaxStretch: Double = 1.25
+    static let subjectInitialHigh: Double = 0.7
+    static let subjectInitialLow: Double = 0.08
+
     private(set) var refHigh: Double = MotionNormalizer.initialHigh
     private(set) var refLow: Double = MotionNormalizer.initialLow
     private(set) var warmElapsed: TimeInterval = 0
+    /// 主体分数的参考值（algo-opt-3；同 refHigh / refLow 的快升慢降 / 快降慢升）
+    private(set) var scoreHigh: Double = MotionNormalizer.subjectInitialHigh
+    private(set) var scoreLow: Double = MotionNormalizer.subjectInitialLow
+    private(set) var pose = PoseBlend()
 
     /// 热身置信度：换视频后 3 秒内从 0 线性升到 1（只会让输出偏低，安全方向）
     var confidence: Double { min(1, max(0, warmElapsed / Self.warmUpSeconds)) }
+    /// 姿态在融合里的权重 0~0.8（界面提示「已识别人体」用）
+    var poseWeight: Double { pose.weight }
 
-    /// 暂停 / seek：平滑状态在 MotionShaper；参考值和热身保留（照 AudioReactiveShaper.reset 不清 refDb）
-    mutating func reset() {}
+    /// 暂停 / seek：平滑状态在 MotionShaper；参考值和热身保留（照 AudioReactiveShaper.reset 不清 refDb）。
+    /// 姿态融合从头确认（algo-opt-3：seek 后可能已经不是同一个人）
+    mutating func reset() {
+        pose.reset()
+    }
 
     /// 换视频：重新学习运动范围、重新热身
     mutating func resetAdaptation() {
         refHigh = Self.initialHigh
         refLow = Self.initialLow
         warmElapsed = 0
+        scoreHigh = Self.subjectInitialHigh
+        scoreLow = Self.subjectInitialLow
+        pose.reset()
     }
 
     mutating func step(_ w: MotionWindow, gainDb: Double, auto: Bool, dt: TimeInterval) -> Double {
@@ -957,12 +2310,12 @@ struct MotionNormalizer {
         guard w.frames > 0 else { return 0 }
         warmElapsed = min(Self.warmUpSeconds, warmElapsed + step)
         let e = w.representative
-        guard e.isFinite, e >= Self.absoluteGate else { return 0 }
-        let l = log(1 + e)
         // 开关关着也一直学：中途打开自动适应时参考值已经是这个视频的（同声音侧）
         let near = w.nearField.isFinite ? min(1, max(0, w.nearField)) : 0
+        let gated = e.isFinite && e >= Self.absoluteGate
+        let l = gated ? log(1 + e) : 0
         // 手贴镜头 / 大面积遮挡不训练「这个视频平时动多大」，否则之后真正的动作会被压低
-        if w.settled, near < Self.nearFieldLearnLimit, l.isFinite {
+        if gated, w.settled, near < Self.nearFieldLearnLimit, l.isFinite {
             let highTau = l > refHigh ? Self.highRiseSeconds : Self.highFallSeconds
             refHigh += (l - refHigh) * (1 - exp(-step / highTau))
             refHigh = max(Self.minHigh, refHigh)
@@ -970,6 +2323,11 @@ struct MotionNormalizer {
             refLow += (l - refLow) * (1 - exp(-step / lowTau))
             if !refHigh.isFinite || !refLow.isFinite { resetAdaptation() }
         }
+        // algo-opt-3：分析器给了主体读数就按主体分数映射（画面变化的面积 / 整幅均值不再决定强度）
+        if w.subjectFrames > 0 {
+            return subjectStep(w, near: near, gainDb: gainDb, auto: auto, dt: step)
+        }
+        guard gated else { return 0 }
         // 固定尺度也封顶（0 dB 时自动模式最高约 81%）：手贴镜头这类极端画面变化不顶满，要更强靠灵敏度 / 上限
         let fixedRatio = min(Self.fixedRatioCap, (l - Self.fixedLow) / (Self.fixedHigh - Self.fixedLow))
         var ratio = fixedRatio
@@ -991,6 +2349,37 @@ struct MotionNormalizer {
             : 0
         let g = pow(10, clampedGain / 20)
         let out = ratio * g * Self.targetPercent
+        return out.isFinite ? min(100, max(0, out)) : 0
+    }
+
+    /// 主体分数 → 0~100（algo-opt-3）：块运动分数和姿态分数融合（PoseBlend）→ 近场收拢 → 自动适应（只减底 / 小幅放大）→ 灵敏度
+    private mutating func subjectStep(_ w: MotionWindow, near: Double, gainDb: Double, auto: Bool,
+                                      dt: TimeInterval) -> Double {
+        let flow = MotionStats.clamp01(w.subjectScore)
+        var s = pose.step(w, flow: flow, dt: dt)
+        if near > 0 { s -= near * max(0, s - Self.subjectNearFloor) }
+        s = MotionStats.clamp01(s)
+        if w.settled, near < Self.nearFieldLearnLimit {
+            let highTau = s > scoreHigh ? Self.highRiseSeconds : Self.highFallSeconds
+            scoreHigh += (s - scoreHigh) * (1 - exp(-dt / highTau))
+            let lowTau = s < scoreLow ? Self.lowFallSeconds : Self.lowRiseSeconds
+            scoreLow += (s - scoreLow) * (1 - exp(-dt / lowTau))
+            if !scoreHigh.isFinite || !scoreLow.isFinite {
+                scoreHigh = Self.subjectInitialHigh
+                scoreLow = Self.subjectInitialLow
+            }
+        }
+        var ratio = s
+        if auto {
+            let base = min(max(0, scoreLow), Self.subjectBaseLimit)
+            ratio = max(0, (s - base) / (1 - base))
+            let stretch = min(Self.subjectMaxStretch, max(1, Self.subjectTargetHigh / max(scoreHigh, 0.05)))
+            ratio *= stretch
+        }
+        let clampedGain = gainDb.isFinite
+            ? min(VisualSyncSettings.motionGainRange.upperBound, max(VisualSyncSettings.motionGainRange.lowerBound, gainDb))
+            : 0
+        let out = ratio * pow(10, clampedGain / 20) * 100
         return out.isFinite ? min(100, max(0, out)) : 0
     }
 }
