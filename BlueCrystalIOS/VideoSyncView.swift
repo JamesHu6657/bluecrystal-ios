@@ -30,6 +30,8 @@ final class VideoSyncPlayer: ObservableObject {
     @Published private(set) var motionStatus: VideoMotionTap.Status = .none
     /// rhythm-follow P1：伸缩跟随动作频率时的状态（没打开 / 没在跟画面时 nil）
     @Published private(set) var rhythmStatus: String?
+    /// rhythm-phase P2：相位脉动的状态（没打开时 nil）
+    @Published private(set) var pulseStatus: String?
     @Published private var scrubber = PlaybackScrubber()
 
     var displaySeconds: Double { scrubber.position ?? currentSeconds }
@@ -87,6 +89,12 @@ final class VideoSyncPlayer: ObservableObject {
     private var visualSettings = VisualSyncSettings()
     /// rhythm-follow P1：画面里的往复频率 → 伸缩档位（设置里打开才用；只改目标档位，出口 / 发送路径不变）
     private var rhythm = RhythmFollower()
+    /// rhythm-phase P2：画面往复的相位锁（PLL）+ 0.1 秒子拍脉动（设置里打开才用；没锁上 / 没标定 = P1 原样）。
+    /// 子拍只在 tick() 里、只经 outputStage（上限 / 升幅按时间折算 ≤ +20 / 0.3 秒 / 归零保持）→ sendTick，不新增发送路径
+    private var phaseLock = RhythmPhaseLock()
+    private var pulse = RhythmPulseDriver()
+    /// Timer 间隔：平时 0.3 秒（和以前逐位相同）；相位脉动打开时 0.1 秒，每 3 次里 1 次走完整拍
+    private var tickInterval: TimeInterval = AudioReactiveShaper.interval
     /// 播放中切换来源的交接（algo-opt-1）：声音→画面 4 秒内用声音补画面热身的空档（只淡出），
     /// 画面→声音先走出口限速追上声音直出（最多 10 拍）。不新增发送路径，仍只在 tick 里 sendTick
     private var handover = SourceHandover()
@@ -137,9 +145,13 @@ final class VideoSyncPlayer: ObservableObject {
     func applyVisualSettings(_ v: VisualSyncSettings) {
         let previous = visualSettings.source
         let previousRhythm = visualSettings.rhythmFollow
+        let previousPulse = visualSettings.rhythmPulse
         visualSettings = v
         // 打开 / 关掉频率跟随：从头确认节奏（打开后 weight 1 秒内交接，关掉时伸缩回到按动作强度，降不限速）
         if v.rhythmFollow != previousRhythm { resetRhythm() }
+        // P2：打开 / 关掉相位脉动从头锁相位；Timer 间隔跟着换（只重建 Timer，不动其余状态）
+        if v.rhythmPulse != previousPulse { resetPulse() }
+        retimeIfNeeded(v.tickInterval)
         if v.source != previous {
             switch v.source {
             case .motion:
@@ -678,13 +690,28 @@ final class VideoSyncPlayer: ObservableObject {
         motionFlow.reset()
         // 普通播放从头监视；seek 等待不因点播放或重建 Timer 被清掉
         progressWatch.startPlayback(at: player?.currentTime().seconds ?? .nan, now: Self.now())
+        tickInterval = visualSettings.tickInterval
+        installTickTimer()
+        motionTap?.setActive(true)
+    }
+
+    private func installTickTimer() {
         // 用 common modes，滚动页面时 tick 不暂停
-        let t = Timer(timeInterval: AudioReactiveShaper.interval, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: tickInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
-        motionTap?.setActive(true)
+    }
+
+    /// P2：播放中开关相位脉动 → 只换 Timer 间隔（0.3 ↔ 0.1 秒），不发帧、不清样本、不动 lastTickAt
+    private func retimeIfNeeded(_ interval: TimeInterval) {
+        guard interval != tickInterval else { return }
+        tickInterval = interval
+        pulse.reset()
+        guard let old = timer else { return }
+        old.invalidate()
+        installTickTimer()
     }
 
     private func stopTimer(sendZero: Bool) {
@@ -704,6 +731,14 @@ final class VideoSyncPlayer: ObservableObject {
         guard let p = player, let ble = ble else { return }
         // 拖进度条期间界面是活的，心跳照发，避免长时间拖动误触看门狗
         ble.heartbeat()
+        // P2 子拍（Timer 0.1 秒时，完整拍之间的两次）：只按相位锁的预测改伸缩，过同一个出口，变化才发
+        let host = CACurrentMediaTime()
+        if tickInterval == AudioReactiveShaper.interval {
+            pulse.noteFullBeat(at: host)
+        } else if !pulse.takesFullBeat(at: host) {
+            pulseSubTick(p, ble: ble)
+            return
+        }
         guard !isSeeking, isPlaying else { return }
         // 心跳只证明 Timer 活着；播放器已停而 vm 仍以为在播时立即停机
         let t = p.currentTime().seconds
@@ -794,6 +829,33 @@ final class VideoSyncPlayer: ObservableObject {
     private func resetRhythm() {
         rhythm.reset()
         if rhythmStatus != nil { rhythmStatus = nil }
+        resetPulse()
+    }
+
+    /// rhythm-phase P2：相位从头锁、脉动停掉（下一个完整拍按 P1 出口规则继续）
+    private func resetPulse() {
+        phaseLock.reset()
+        pulse.reset()
+        if pulseStatus != nil { pulseStatus = nil }
+    }
+
+    /// rhythm-phase P2 子拍：播放器确实在播、联动开着、跟随画面 + 频率跟随 + 相位脉动都开着，且上一个完整拍在脉动，
+    /// 才按相位锁预测的这一刻相位改伸缩（震动 / 通道 3、4 不变），经 outputStage 按时间限速后变化才发。
+    /// 其余任何情况都不发：暂停 / 缓冲 / seek / 播完 / 停止由下一个完整拍（≤ 0.3 秒）照旧处理
+    private func pulseSubTick(_ p: AVPlayer, ble: BLEManager) {
+        guard isPlaying, !isSeeking, settings.enabled, visualSettings.usesPulseTiming,
+              p.timeControlStatus == .playing,
+              let vals = pulse.subBeat(lock: phaseLock, settings: settings, now: CACurrentMediaTime(),
+                                       stage: &outputStage) else { return }
+        let shown = vals.max() ?? 0
+        if shown != intensity { intensity = shown }
+        let active = ActiveChannels(values: vals)
+        if needsResync || active != lastActive {
+            needsResync = false
+            lastActive = active
+            // 同完整拍：只走不开闸的 sendTick
+            ble.sendTick(levels: vals)
+        }
     }
 
     /// rhythm-follow P1：这一拍的节奏档位（没打开 / 没锁定 / 没有新鲜画面时 nil = 伸缩照旧按动作强度）。
@@ -806,6 +868,15 @@ final class VideoSyncPlayer: ObservableObject {
             return nil
         }
         if motionSignal { rhythm.step(window, dt: dt, active: activity > 0) } else { rhythm.reset() }
+        if visualSettings.rhythmPulse {
+            // P2：相位锁跟在频率跟随器后面（跟随器没锁 / 镜头切换 / 不动 2 拍 → 相位锁立刻放开）
+            if motionSignal {
+                phaseLock.step(window, followerHz: rhythm.hz, followerLocked: rhythm.locked,
+                               followerSource: rhythm.source, now: CACurrentMediaTime(), dt: dt, active: activity > 0)
+            } else {
+                phaseLock.reset()
+            }
+        }
         return rhythm.weight > 0 && rhythm.hz > 0 ? visualSettings.rateMap.level(forHz: rhythm.hz) : nil
     }
 
@@ -866,7 +937,16 @@ final class VideoSyncPlayer: ObservableObject {
             // 伸缩按动作频率（weight × 画面强度交接），震动照旧；同一个出口：上限 / 升幅 ≤ +20 / 归零保持
             let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
                                              rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
-            vals = outputStage.step(levels: levels, settings: settings)
+            if visualSettings.rhythmPulse {
+                // P2：锁上相位才在 P1 档位上叠加脉动（往里时加强）；没锁 / 没标定 / 太快 / 太弱 = P1 原样
+                vals = pulse.beat(levels: levels, lock: phaseLock, visual: visualSettings, settings: settings,
+                                  hasSignal: hasSignal, value: value, activity: motionActivity,
+                                  followerWeight: rhythm.weight, now: CACurrentMediaTime(), stage: &outputStage)
+                let text = pulse.statusText(lock: phaseLock, visual: visualSettings)
+                if text != pulseStatus { pulseStatus = text }
+            } else {
+                vals = outputStage.step(levels: levels, settings: settings)
+            }
             updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: vals[0],
                                value: value, hasSignal: hasSignal)
         } else {
@@ -1118,6 +1198,11 @@ struct VideoSyncView: View {
     // rhythm-follow P1：伸缩跟随动作频率（默认关）+ 设备档位→每秒往复次数标定表（docs/rhythm-calibration.md）
     @AppStorage(VisualSyncSettings.Keys.rhythmFollow) private var rhythmFollow = VisualSyncSettings.defaultRhythmFollow
     @AppStorage(VisualSyncSettings.Keys.rateTable) private var rateTable = VisualSyncSettings.defaultRateTable
+    // rhythm-phase P2：相位脉动（实验，默认关）+ 深度 / 延迟补偿 / 方向反转（真机标定见 docs/rhythm-calibration.md）
+    @AppStorage(VisualSyncSettings.Keys.rhythmPulse) private var rhythmPulse = VisualSyncSettings.defaultRhythmPulse
+    @AppStorage(VisualSyncSettings.Keys.pulseDepth) private var pulseDepth = VisualSyncSettings.defaultPulseDepth
+    @AppStorage(VisualSyncSettings.Keys.pulseLatencyMs) private var pulseLatencyMs = VisualSyncSettings.defaultPulseLatencyMs
+    @AppStorage(VisualSyncSettings.Keys.pulseInvert) private var pulseInvert = VisualSyncSettings.defaultPulseInvert
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -1136,7 +1221,8 @@ struct VideoSyncView: View {
 
     private var visualSettings: VisualSyncSettings {
         VisualSyncSettings(source: visualSource, motionGainDb: motionGainDb, autoMotion: autoMotion,
-                           rhythmFollow: rhythmFollow, rateTable: rateTable)
+                           rhythmFollow: rhythmFollow, rateTable: rateTable, rhythmPulse: rhythmPulse,
+                           pulseDepth: pulseDepth, pulseLatencyMs: pulseLatencyMs, pulseInvert: pulseInvert)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -1460,6 +1546,12 @@ struct VideoSyncView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if rhythmFollow, rhythmPulse, let pulse = vm.pulseStatus {
+                    Text(pulse)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
                          valueText: "\(Int(vm.level.rounded()))")
@@ -1602,6 +1694,72 @@ struct VideoSyncView: View {
                     .font(.caption2)
                     .foregroundColor(rateTableIsBad ? Velvet.warning : Velvet.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            pulseControls
+        }
+    }
+
+    private var pulseDepthText: String { "\(Int(pulseDepth.rounded())) 档" }
+    private var pulseLatencyText: String { "\(Int(pulseLatencyMs.rounded())) ms" }
+
+    /// rhythm-phase P2：相位脉动（实验，默认关；只在频率跟随打开时显示）
+    @ViewBuilder private var pulseControls: some View {
+        Toggle(isOn: $rhythmPulse) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("相位脉动（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("对上画面往复的时机后，画面往里时伸缩加强、往外时减弱。开环预测，设备没有位置反馈；"
+                     + "需要先标定，没标定 / 没对上 / 动作太快（每秒 2.5 下以上）时只跟频率")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+        if rhythmPulse {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("脉动深度（峰谷差）")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Spacer()
+                    Text(pulseDepthText)
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(Velvet.textSecondary)
+                }
+                Slider(value: $pulseDepth, in: VisualSyncSettings.pulseDepthRange, step: 5)
+                    .tint(Velvet.rose)
+                    .accessibilityLabel("脉动深度")
+                    .accessibilityValue(pulseDepthText)
+                HStack {
+                    Text("延迟补偿")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Spacer()
+                    Text(pulseLatencyText)
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(Velvet.textSecondary)
+                }
+                Slider(value: $pulseLatencyMs, in: VisualSyncSettings.pulseLatencyRange, step: 20)
+                    .tint(Velvet.rose)
+                    .accessibilityLabel("延迟补偿")
+                    .accessibilityValue(pulseLatencyText)
+                Text("设备总比画面晚就往大调，总比画面早就往小调（按标定文档用慢动作视频对一次）")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $pulseInvert) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("方向反转")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Text("画面往里时设备反而在减弱就打开")
+                            .font(.caption2)
+                            .foregroundColor(Velvet.textMuted)
+                    }
+                }
+                .tint(Velvet.gold)
             }
         }
     }

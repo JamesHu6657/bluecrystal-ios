@@ -230,12 +230,31 @@ final class ManualControlVM: ObservableObject {
     }
 }
 
+/// rhythm-phase P2：FFA2 通知的被动观察（NotifyPeriodProbe 的界面壳）。只记录收到的通知、最多每秒算一次摘要；
+/// 不发帧、不改 BLEManager。用来在真机上判断 FFA2 有没有带位置 / 行程信息（docs/rhythm-calibration.md）
+final class NotifyProbeMonitor: ObservableObject {
+    @Published private(set) var summary = "FFA2 观察：还没有收到通知"
+    private var probe = NotifyPeriodProbe()
+    private var lastRefresh: TimeInterval = -.infinity
+
+    func note(_ hex: String) {
+        let now = ProcessInfo.processInfo.systemUptime
+        probe.add(time: now, hex: hex)
+        guard now - lastRefresh >= 1 else { return }
+        lastRefresh = now
+        let text = NotifyPeriodProbe.summary(probe.report(now: now))
+        if text != summary { summary = text }
+    }
+}
+
 /// 手感：两通道强度滑杆 / 技能 / 变频 + 常驻停止
 struct ManualControlView: View {
     @EnvironmentObject var ble: BLEManager
     @EnvironmentObject var privacy: PrivacyLock
     @StateObject private var vm = ManualControlVM()
     @StateObject private var favorites = FavoriteStore()
+    /// rhythm-phase P2：FFA2 通知的被动周期观察（只显示，不参与控制）
+    @StateObject private var notifyProbe = NotifyProbeMonitor()
     /// 「隐私与设备」默认收起：面容 ID 开关、最后一帧、FFA2、版本都不抢主角
     @State private var showDetails = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -356,6 +375,8 @@ struct ManualControlView: View {
         }
         // 解锁页上的停止：和本页停止键同一个 stopAll
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
+        // P2：每条 FFA2 通知记一笔（只读 lastNotifyHex，不发任何帧）
+        .onReceive(ble.$lastNotifyHex) { notifyProbe.note($0) }
     }
 
     /// 连上之后：心、模式、滑杆（主角，尽量不用滚动就够得着）、空闲说明
@@ -532,6 +553,11 @@ struct ManualControlView: View {
             Text("设备通知（FFA2）：\(ble.lastNotifyHex)")
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundColor(Velvet.textMuted)
+            // rhythm-phase P2：最近 20 秒通知的周期分析（标定用：固定伸缩档位跑 10 秒，看有没有和往复同频的字节）
+            Text(notifyProbe.summary)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundColor(Velvet.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
             Text(modeProtocolNote)
                 .font(.caption2).foregroundColor(Velvet.textMuted)
             Text("旋转通道官方 mizzzee 配置未使用，已隐藏（恒发 0）")

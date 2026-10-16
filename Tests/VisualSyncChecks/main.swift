@@ -2985,6 +2985,946 @@ do {
     }
 }
 
+// MARK: - rhythm-phase P2：相位对齐（相位锁 + 0.1 秒子拍脉动，默认关）
+
+/// main（dfbfc8e）的 SyncOutputStage 原样拷贝（只改名）：钉住「关掉 P2 时出口逐位不变」
+struct BaseSyncOutputStageP1 {
+    static let maxRisePerTick = 20
+    static let zeroHoldTicks = 2
+    private(set) var last: [Int] = [0, 0, 0, 0]
+    private var zeroAge: [Int] = [Int](repeating: BaseSyncOutputStageP1.zeroHoldTicks, count: 4)
+
+    mutating func reset() {
+        last = [0, 0, 0, 0]
+        zeroAge = [Int](repeating: Self.zeroHoldTicks, count: 4)
+    }
+
+    mutating func seed(_ levels: [Int]) {
+        for ch in 0..<4 {
+            let v = ch < 2 && ch < levels.count ? max(0, min(BCProtocol.maxManualLevel, levels[ch])) : 0
+            last[ch] = v
+            zeroAge[ch] = v > 0 ? Self.zeroHoldTicks : 0
+        }
+    }
+
+    static func floorPercent(settings s: AudioSyncSettings, hasSignal: Bool) -> Double {
+        hasSignal ? min(s.maxPercent, s.minPercent) : 0
+    }
+
+    static func hardCap(_ s: AudioSyncSettings) -> Int {
+        guard s.maxPercent.isFinite else { return 0 }
+        return max(0, min(Int(s.maxPercent.rounded(.down)), BCProtocol.maxManualLevel))
+    }
+
+    static func map(_ value: Double, cap: Double, floor: Double) -> Int {
+        guard cap.isFinite, floor.isFinite else { return 0 }
+        let smoothed = value.isFinite ? min(100, max(0, value)) : 0
+        let percent: Int
+        if floor >= 1 {
+            let scaled = floor + smoothed * (cap - floor) / 100
+            percent = min(Int(cap.rounded(.down)), max(Int(floor.rounded()), Int(scaled.rounded())))
+        } else {
+            let scaled = smoothed * cap / 100
+            percent = scaled < 1 ? 0 : min(Int(cap.rounded(.down)), Int(scaled.rounded()))
+        }
+        return max(0, min(100, percent))
+    }
+
+    mutating func step(_ value: Double, settings s: AudioSyncSettings, hasSignal: Bool) -> [Int] {
+        let mapped = Self.map(value, cap: s.maxPercent, floor: Self.floorPercent(settings: s, hasSignal: hasSignal))
+        return limit(s.channels.levels(percent: mapped), cap: Self.hardCap(s))
+    }
+
+    mutating func step(levels target: [Int], settings s: AudioSyncSettings) -> [Int] {
+        limit(target, cap: Self.hardCap(s))
+    }
+
+    private mutating func limit(_ target: [Int], cap: Int) -> [Int] {
+        var out = [0, 0, 0, 0]
+        for ch in 0..<2 {
+            let prev = last[ch]
+            var p = ch < target.count ? target[ch] : 0
+            p = min(p, prev + Self.maxRisePerTick)
+            if p > 0, prev == 0, zeroAge[ch] < Self.zeroHoldTicks { p = 0 }
+            p = max(0, min(cap, p))
+            if p == 0 {
+                zeroAge[ch] = prev > 0 ? 0 : min(Self.zeroHoldTicks, zeroAge[ch] + 1)
+            } else {
+                zeroAge[ch] = Self.zeroHoldTicks
+            }
+            out[ch] = p
+        }
+        last = out
+        return out
+    }
+}
+
+func p2Settings() -> AudioSyncSettings {
+    let ch: AudioSyncChannels = [.both, .thrust, .vibration][Int(vsRandom() * 3) % 3]
+    let cap = vsRandom() < 0.1 ? 100 : (vsRandom() * 100).rounded()
+    let minP = vsRandom() < 0.5 ? 0 : (vsRandom() * 40).rounded()
+    return AudioSyncSettings(enabled: true, maxPercent: cap, channels: ch, minPercent: minP)
+}
+
+func p2Levels() -> [Int] {
+    if vsRandom() < 0.15 { return [0, 0, 0, 0] }
+    let a = Int(vsRandom() * 110) - 5
+    let b = Int(vsRandom() * 110) - 5
+    return [a, b, Int(vsRandom() * 99), Int(vsRandom() * 99)]
+}
+
+do {
+    // 关掉 P2：出口逐位等于 main 的 SyncOutputStage（3000 组随机序列：step(value) / step(levels:) / seed / reset 混用）
+    var same = true
+    var steps = 0
+    for _ in 0..<3000 {
+        var a = SyncOutputStage()
+        var b = BaseSyncOutputStageP1()
+        for _ in 0..<(4 + Int(vsRandom() * 12)) {
+            let s = p2Settings()
+            let r = vsRandom()
+            if r < 0.4 {
+                let v = vsRandom() < 0.05 ? Double.nan : vsRandom() * 120 - 10
+                let sig = vsRandom() < 0.7
+                same = same && a.step(v, settings: s, hasSignal: sig) == b.step(v, settings: s, hasSignal: sig)
+            } else if r < 0.88 {
+                let l = p2Levels()
+                same = same && a.step(levels: l, settings: s) == b.step(levels: l, settings: s)
+            } else if r < 0.95 {
+                let l = p2Levels()
+                a.seed(l)
+                b.seed(l)
+            } else {
+                a.reset()
+                b.reset()
+            }
+            same = same && a.last == b.last
+            steps += 1
+        }
+    }
+    vcheck(same, "P2 关闭：出口和 main 的 SyncOutputStage 逐位相同（3000 组随机序列 \(steps) 步）")
+
+    // 按时间的出口在 elapsed = 0.3 秒时和按拍的逐位相同（含归零保持 / seed / reset）
+    var timedSame = true
+    for _ in 0..<1500 {
+        var a = SyncOutputStage()
+        var b = SyncOutputStage()
+        for _ in 0..<(4 + Int(vsRandom() * 14)) {
+            let s = p2Settings()
+            let r = vsRandom()
+            if r < 0.9 {
+                let l = p2Levels()
+                timedSame = timedSame && a.step(levels: l, settings: s, elapsed: 0.3) == b.step(levels: l, settings: s)
+            } else if r < 0.96 {
+                let l = p2Levels()
+                a.seed(l)
+                b.seed(l)
+            } else {
+                a.reset()
+                b.reset()
+            }
+        }
+    }
+    vcheck(timedSame, "P2 出口：按时间限速在间隔 0.3 秒时和原来按拍的逐位相同")
+
+    // 按时间的出口随机安全性：任意两刻之间升幅 ≤ 20 × 间隔 / 0.3 + 1，单步 ≤ 20，≤ 上限，通道 3 / 4 恒 0，归零后 ≥ 0.85 秒才再升
+    var safe = true
+    var worst = 0.0
+    for _ in 0..<600 {
+        var stage = SyncOutputStage()
+        let s = AudioSyncSettings(enabled: true, maxPercent: (40 + vsRandom() * 60).rounded(), channels: .both)
+        var t = 0.0
+        var times: [Double] = []
+        var outs: [[Int]] = []
+        var zeroAt: [Double?] = [nil, nil]
+        var prev = [0, 0, 0, 0]
+        for _ in 0..<80 {
+            let r = vsRandom()
+            let dt = r < 0.7 ? 0.1 + (vsRandom() - 0.5) * 0.03 : (r < 0.85 ? 0.3 : (r < 0.95 ? vsRandom() * 0.05 : 0.2))
+            t += dt
+            let l = vsRandom() < 0.1 ? [0, 0, 0, 0] : [Int(vsRandom() * 99), Int(vsRandom() * 99), 50, 50]
+            let o = stage.step(levels: l, settings: s, elapsed: dt)
+            safe = safe && o[2] == 0 && o[3] == 0 && o[0] <= SyncOutputStage.hardCap(s) && o[1] <= SyncOutputStage.hardCap(s)
+            for ch in 0..<2 {
+                safe = safe && o[ch] - prev[ch] <= 20
+                if o[ch] == 0, prev[ch] > 0 { zeroAt[ch] = t }
+                if o[ch] > 0, prev[ch] == 0, let z = zeroAt[ch] { safe = safe && t - z >= 0.85 - 1e-9 }
+            }
+            prev = o
+            times.append(t)
+            outs.append(o)
+        }
+        for i in 0..<outs.count {
+            for j in (i + 1)..<outs.count {
+                for ch in 0..<2 {
+                    let allowed = 20 * (times[j] - times[i]) / 0.3 + 1
+                    let rise = Double(outs[j][ch] - outs[i][ch])
+                    worst = max(worst, rise - allowed)
+                    if rise > allowed + 1e-9 { safe = false }
+                }
+            }
+        }
+    }
+    vcheck(safe, "P2 出口：0.1 秒子拍随机间隔下升幅按时间 ≤ +20 / 0.3 秒、单步 ≤ 20、≤ 上限、通道 3/4 恒 0、归零保持 ≥ 0.85 秒"
+           + "（最紧处余量 \(String(format: "%.2f", -worst + 0))）")
+}
+
+/// 位移 x(t) = A·cos(2πf·t + φ0) 沿方向 (ux, uy)，按 rate 采样（±jitter 秒抖动）后差分成速度喂给 StrokeRhythm
+func p2Rhythm(hz: Double, phase0: Double = 0.4, amp: Double = 4, rate: Double = 15, seconds: Double = 4,
+              ux: Double = 1, uy: Double = 0, jitter: Double = 0, noise: Double = 0,
+              wobble: Double = 0, start: Double = 10) -> (r: StrokeRhythm, tN: Double) {
+    var r = StrokeRhythm()
+    var prevT = start
+    func pos(_ t: Double) -> Double { amp * cos(2 * Double.pi * hz * t + phase0) }
+    var prevX = pos(prevT)
+    var t = start
+    while t < start + seconds {
+        t += 1 / rate + (vsRandom() - 0.5) * 2 * jitter
+        let x = pos(t)
+        let v = (x - prevX) / (t - prevT) + (vsRandom() - 0.5) * 2 * noise
+        let a = wobble * sin(2 * Double.pi * 0.2 * t)
+        let cx = ux * cos(a) - uy * sin(a)
+        let cy = ux * sin(a) + uy * cos(a)
+        r.add(time: t, x: v * cx, y: v * cy)
+        prevT = t
+        prevX = x
+    }
+    return (r, prevT)
+}
+
+func p2Err(_ a: Double, _ b: Double) -> Double { abs(StrokeRhythm.wrapPhase(a - b)) }
+
+do {
+    // 相位拟合：0.5 / 1 / 2 / 3 Hz、采样抖动、横 / 竖 / 斜方向，相位误差小、拟合好
+    var worst = 0.0
+    var minQ = 1.0
+    var minLin = 1.0
+    for hz in [0.5, 1.0, 2.0, 3.0] {
+        for (ux, uy) in [(1.0, 0.0), (0.0, 1.0), (cos(0.5), sin(0.5))] {
+            var (r, tN) = p2Rhythm(hz: hz, rate: 15, ux: ux, uy: uy, jitter: 0.006)
+            let f = r.phaseFit(hz: hz)
+            let truth = 2 * Double.pi * hz * tN + 0.4
+            worst = max(worst, p2Err(f.phase, truth))
+            minQ = min(minQ, f.quality)
+            minLin = min(minLin, f.linearity)
+            if !(f.isValid && abs(f.time - tN) < 1e-9) { worst = .infinity }
+        }
+    }
+    vcheck(worst <= 0.15 && minQ >= 0.9 && minLin >= 0.95,
+           "P2 相位拟合：0.5~3 Hz、15 Hz 抖动采样、横竖斜方向，误差 ≤ \(String(format: "%.0f", worst * 180 / .pi))°"
+           + "（拟合 ≥ \(String(format: "%.2f", minQ))，线性 ≥ \(String(format: "%.2f", minLin))）")
+
+    // 约定方向：竖直分量大取向下、否则向右；反方向运动 → 相位差 180°
+    var (up, tU) = p2Rhythm(hz: 1, ux: 0, uy: -1)
+    var (left, tL) = p2Rhythm(hz: 1, ux: -1, uy: 0)
+    let fu = up.phaseFit(hz: 1)
+    let fl = left.phaseFit(hz: 1)
+    vcheck(p2Err(fu.phase, 2 * Double.pi * tU + 0.4 + Double.pi) <= 0.15
+           && p2Err(fl.phase, 2 * Double.pi * tL + 0.4 + Double.pi) <= 0.15,
+           "P2 相位拟合：往上 / 往左的运动按约定方向（向下 / 向右）算，相位差半个周期")
+
+    // 给的频率差 5%：细化后仍对得上
+    var (mis, tM) = p2Rhythm(hz: 1.05)
+    let fm = mis.phaseFit(hz: 1.0)
+    vcheck(p2Err(fm.phase, 2 * Double.pi * 1.05 * tM + 0.4) <= 0.25 && abs(fm.hz - 1.05) <= 0.03,
+           "P2 相位拟合：跟随频率差 5% 时细化到 \(String(format: "%.3f", fm.hz)) Hz，相位误差 "
+           + "\(String(format: "%.0f", p2Err(fm.phase, 2 * Double.pi * 1.05 * tM + 0.4) * 180 / .pi))°")
+
+    // 主轴 ±20° 慢慢晃：方向不翻、代次不变、相位照样对
+    var wob = StrokeRhythm()
+    var epochs = Set<Int>()
+    var wobWorst = 0.0
+    do {
+        var prevT = 10.0
+        var prevX = 4 * cos(2 * Double.pi * 1.2 * prevT)
+        var t = prevT
+        var k = 0
+        while t < 18 {
+            t += 1.0 / 15
+            let x = 4 * cos(2 * Double.pi * 1.2 * t)
+            let v = (x - prevX) / (t - prevT)
+            let a = 0.35 * sin(2 * Double.pi * 0.15 * t)
+            wob.add(time: t, x: v * cos(a), y: v * sin(a))
+            prevT = t
+            prevX = x
+            k += 1
+            if k >= 30 {
+                let f = wob.phaseFit(hz: 1.2)
+                epochs.insert(f.epoch)
+                wobWorst = max(wobWorst, p2Err(f.phase, 2 * Double.pi * 1.2 * t))
+            }
+        }
+    }
+    vcheck(epochs.count == 1 && wobWorst <= 0.3,
+           "P2 相位拟合：主轴 ±20° 晃动不翻方向（代次 \(epochs.count) 个），误差 ≤ \(String(format: "%.0f", wobWorst * 180 / .pi))°")
+
+    // 纯噪声拟合差；画圈（没有主方向）线性低；样本不够 / NaN 频率不给
+    var noiseR = StrokeRhythm()
+    for k in 0..<60 { noiseR.add(time: Double(k) / 15, x: vsRandom() - 0.5, y: 0.1 * (vsRandom() - 0.5)) }
+    let fn = noiseR.phaseFit(hz: 1)
+    var circle = StrokeRhythm()
+    for k in 0..<60 {
+        let t = Double(k) / 15
+        circle.add(time: t, x: cos(2 * Double.pi * t), y: sin(2 * Double.pi * t))
+    }
+    let fc = circle.phaseFit(hz: 1)
+    var few = StrokeRhythm()
+    for k in 0..<5 { few.add(time: Double(k) / 15, x: 1, y: 0) }
+    vcheck(fn.quality < RhythmPhaseLock.releaseQuality && fc.linearity < RhythmPhaseLock.minLinearity
+           && !few.phaseFit(hz: 1).isValid && !circle.phaseFit(hz: .nan).isValid,
+           "P2 相位拟合：纯噪声拟合 \(String(format: "%.2f", fn.quality))、画圈线性 \(String(format: "%.2f", fc.linearity))，"
+           + "样本不够 / 频率无效不给")
+
+    // 只读：拟合不改 estimate / followEstimate（频率跟随和分数逐位不变）
+    var plain = StrokeRhythm()
+    var probed = StrokeRhythm()
+    var untouched = true
+    var prevX = 0.0
+    for k in 1..<200 {
+        let t = Double(k) / 15 + (vsRandom() - 0.5) * 0.01
+        let x = 3 * sin(2 * Double.pi * 1.3 * t) + 0.5 * (vsRandom() - 0.5)
+        let v = (x - prevX) * 15
+        prevX = x
+        plain.add(time: t, x: v, y: 0.2 * v)
+        probed.add(time: t, x: v, y: 0.2 * v)
+        _ = probed.phaseFit(hz: 1.3)
+        untouched = untouched && plain.estimate == probed.estimate && plain.followEstimate == probed.followEstimate
+    }
+    vcheck(untouched, "P2 相位拟合：只读节奏缓冲，estimate / followEstimate 逐位不变")
+
+    // 姿态平滑滞后：jitterSeconds 指数平滑的滞后补偿后，平滑过的位移也对得上
+    var ema = StrokeRhythm()
+    var sm = 4 * cos(2 * Double.pi * 1.5 * 10.0)
+    var prevS = sm
+    var tt = 10.0
+    let alpha = 1 - exp(-(1.0 / 9) / PoseMotionTracker.jitterSeconds)
+    while tt < 14 {
+        tt += 1.0 / 9
+        sm += alpha * (4 * cos(2 * Double.pi * 1.5 * tt) - sm)
+        ema.add(time: tt, x: 0, y: (sm - prevS) * 9)
+        prevS = sm
+    }
+    let lag = PoseMotionTracker.smoothingLag(hz: 1.5, rate: 9)
+    let raw = ema.phaseFit(hz: 1.5)
+    let comp = ema.phaseFit(hz: 1.5, lag: lag)
+    let truthE = 2 * Double.pi * 1.5 * tt
+    vcheck(p2Err(comp.phase, truthE) <= 0.12 && p2Err(raw.phase, truthE) > p2Err(comp.phase, truthE) && lag > 0,
+           "P2 相位拟合：姿态平滑滞后 \(Int((lag * 1000).rounded())) ms 补上后误差 "
+           + "\(String(format: "%.0f", p2Err(comp.phase, truthE) * 180 / .pi))°（不补 \(String(format: "%.0f", p2Err(raw.phase, truthE) * 180 / .pi))°）")
+}
+
+do {
+    // 端到端：合成画面里的块左右往复 ox = A·sin(2πft)（向右为正）→ 窗口里的主体相位对得上 θ = 2πft − 90°
+    func flowPhaseError(_ windows: [MotionWindow], hz: Double) -> (worst: Double, n: Int) {
+        var worst = 0.0
+        var n = 0
+        for w in windows.suffix(windows.count / 2) where w.subjectPhase.isValid {
+            let truth = 2 * Double.pi * hz * w.subjectPhase.time - Double.pi / 2
+            worst = max(worst, p2Err(w.subjectPhase.phase, truth))
+            n += 1
+        }
+        return (worst, n)
+    }
+    let one = flowPhaseError(rf1Hz.windows, hz: 1)
+    let two = flowPhaseError(vs3Strong20.windows, hz: 2)
+    vcheck(one.n >= 15 && two.n >= 15 && one.worst <= 0.45 && two.worst <= 0.6,
+           "P2 端到端：块运动 1 Hz / 2 Hz 往复的相位误差 ≤ \(String(format: "%.0f", one.worst * 180 / .pi))° / "
+           + "\(String(format: "%.0f", two.worst * 180 / .pi))°（\(one.n) / \(two.n) 拍有读数）")
+    let stillPhase = vs3Static.windows.filter { $0.subjectPhase.isValid && $0.subjectPhase.quality >= RhythmPhaseLock.lockQuality }
+    vcheck(stillPhase.isEmpty, "P2 端到端：静止画面没有合格的相位读数")
+
+    // 锁相环吃端到端窗口：锁上、预测相位对得上
+    var follower = RhythmFollower()
+    var lock = RhythmPhaseLock()
+    var lockErr = 0.0
+    var lockedLate = 0
+    for (i, w) in rf1Hz.windows.enumerated() {
+        follower.step(w, dt: 5.0 / 15)
+        let now = Double(i * 5 + 4) * vsDt + 0.01
+        lock.step(w, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source,
+                  now: now, dt: 5.0 / 15, active: true)
+        if i >= rf1Hz.windows.count / 2, lock.locked, let p = lock.phase(at: now) {
+            lockedLate += 1
+            lockErr = max(lockErr, p2Err(p, 2 * Double.pi * now - Double.pi / 2))
+        }
+    }
+    vcheck(lockedLate >= rf1Hz.windows.count / 2 - 1 && lockErr <= 0.45,
+           "P2 端到端：相位锁跟着合成 1 Hz 往复锁上（后一半 \(lockedLate) 拍），预测误差 ≤ \(String(format: "%.0f", lockErr * 180 / .pi))°")
+}
+
+/// 相位锁测试用窗口：块运动主体的相位读数（真值 2πf·t + φ0，加噪声）
+func plWindow(time: Double, hz: Double, phase0: Double = 0.3, noise: Double = 0, quality: Double = 0.9,
+              linearity: Double = 0.95, amp: Double = 3, frames: Int = 5, valid: Bool = true, cut: Bool = false,
+              offset: Double = 0) -> MotionWindow {
+    var w = MotionWindow()
+    w.frames = frames
+    if cut { w.cutCount = 1 }
+    guard frames > 0 else { return w }
+    w.subjectFrames = frames
+    w.subjectScore = 0.5
+    if valid {
+        let ph = 2 * Double.pi * hz * time + phase0 + offset + (vsRandom() - 0.5) * 2 * noise
+        w.subjectPhase = StrokeRhythm.PhaseFit(time: time, phase: StrokeRhythm.wrapPhase(ph), hz: hz, quality: quality,
+                                               linearity: linearity, amplitude: amp, epoch: 0)
+    }
+    return w
+}
+
+func plTruth(_ t: Double, hz: Double, phase0: Double = 0.3) -> Double { 2 * Double.pi * hz * t + phase0 }
+
+do {
+    // 锁定：2 个一致的读数锁上，weight 1 秒升满；稳态误差小
+    var lock = RhythmPhaseLock()
+    var lockedAt: Int?
+    var fullAt: Int?
+    var steadyErr = 0.0
+    for k in 0..<40 {
+        let now = 10 + Double(k) * 0.3
+        lock.step(plWindow(time: now - 0.03, hz: 1.2), followerHz: 1.2, followerLocked: true, followerSource: .flow,
+                  now: now, dt: 0.3, active: true)
+        if lock.locked, lockedAt == nil { lockedAt = k }
+        if lock.weight >= 1, fullAt == nil { fullAt = k }
+        if k >= 10, let p = lock.phase(at: now + 0.2) { steadyErr = max(steadyErr, p2Err(p, plTruth(now + 0.2, hz: 1.2))) }
+    }
+    vcheck(lockedAt == 1 && fullAt == 4 && steadyErr <= 0.02 && lock.source == .flow,
+           "P2 相位锁：第 2 个一致读数锁上（第 \(lockedAt ?? -1) 拍）、weight 约 1 秒升满（第 \(fullAt ?? -1) 拍），"
+           + "外推 0.2 秒误差 ≤ \(String(format: "%.1f", steadyErr * 180 / .pi))°")
+
+    // 噪声 ±25°：滤波后误差均方根明显小于读数
+    var noisy = RhythmPhaseLock()
+    var se = 0.0
+    var n = 0
+    for k in 0..<120 {
+        let now = 10 + Double(k) * 0.3
+        noisy.step(plWindow(time: now - 0.03, hz: 1, noise: 25 * Double.pi / 180), followerHz: 1, followerLocked: true,
+                   followerSource: .flow, now: now, dt: 0.3, active: true)
+        if k >= 20, let p = noisy.phase(at: now) {
+            let e = p2Err(p, plTruth(now, hz: 1))
+            se += e * e
+            n += 1
+        }
+    }
+    let rms = n > 0 ? (se / Double(n)).squareRoot() : .infinity
+    vcheck(noisy.locked && rms <= 10 * Double.pi / 180,
+           "P2 相位锁：读数 ±25° 噪声时预测误差均方根 \(String(format: "%.1f", rms * 180 / .pi))°")
+
+    // 跟随频率比实际低 5%：频率微调追上，误差收敛
+    var mis = RhythmPhaseLock()
+    var misErr = 0.0
+    for k in 0..<100 {
+        let now = 10 + Double(k) * 0.3
+        mis.step(plWindow(time: now - 0.03, hz: 1.05), followerHz: 1.0, followerLocked: true, followerSource: .flow,
+                 now: now, dt: 0.3, active: true)
+        if k >= 60, let p = mis.phase(at: now) { misErr = max(misErr, p2Err(p, plTruth(now, hz: 1.05))) }
+    }
+    vcheck(mis.locked && misErr <= 0.1 && abs(mis.omega - 2 * Double.pi * 1.05) <= 0.05,
+           "P2 相位锁：跟随频率差 5% 时微调到 \(String(format: "%.3f", mis.omega / (2 * Double.pi))) Hz，"
+           + "误差 ≤ \(String(format: "%.1f", misErr * 180 / .pi))°")
+
+    // 单个 180° 离群读数不跟；连续 2 个一致的翻转读数才重新对齐
+    var flip = RhythmPhaseLock()
+    for k in 0..<10 {
+        let now = 10 + Double(k) * 0.3
+        flip.step(plWindow(time: now - 0.03, hz: 1), followerHz: 1, followerLocked: true, followerSource: .flow,
+                  now: now, dt: 0.3, active: true)
+    }
+    var now = 10 + 10 * 0.3
+    flip.step(plWindow(time: now - 0.03, hz: 1, offset: .pi), followerHz: 1, followerLocked: true, followerSource: .flow,
+              now: now, dt: 0.3, active: true)
+    let afterOne = flip.phase(at: now).map { p2Err($0, plTruth(now, hz: 1)) } ?? 9
+    now += 0.3
+    flip.step(plWindow(time: now - 0.03, hz: 1), followerHz: 1, followerLocked: true, followerSource: .flow,
+              now: now, dt: 0.3, active: true)
+    let backOk = flip.phase(at: now).map { p2Err($0, plTruth(now, hz: 1)) } ?? 9
+    for _ in 0..<2 {
+        now += 0.3
+        flip.step(plWindow(time: now - 0.03, hz: 1, offset: .pi), followerHz: 1, followerLocked: true,
+                  followerSource: .flow, now: now, dt: 0.3, active: true)
+    }
+    let flipped = flip.phase(at: now).map { p2Err($0, plTruth(now, hz: 1) + .pi) } ?? 9
+    vcheck(afterOne <= 0.01 && backOk <= 0.01 && flipped <= 0.01 && flip.locked && flip.weight == 1,
+           "P2 相位锁：单个 180° 离群读数不跟、漏掉之后照常；连续 2 个一致的翻转读数才重新对齐（不掉锁）")
+
+    // 漏拍 / 抖动：每隔一拍没读数、读数时间抖 ±50 ms，照样锁住、误差小
+    var gappy = RhythmPhaseLock()
+    var gapErr = 0.0
+    for k in 0..<60 {
+        let now = 10 + Double(k) * 0.3 + (vsRandom() - 0.5) * 0.04
+        let t = now - 0.03 - vsRandom() * 0.1
+        gappy.step(plWindow(time: t, hz: 1.5, valid: k % 2 == 0 || k < 4), followerHz: 1.5, followerLocked: true,
+                   followerSource: .flow, now: now, dt: 0.3, active: true)
+        if k >= 10, let p = gappy.phase(at: now) { gapErr = max(gapErr, p2Err(p, plTruth(now, hz: 1.5))) }
+    }
+    vcheck(gappy.locked && gappy.weight == 1 && gapErr <= 0.05,
+           "P2 相位锁：隔拍漏读数 + 时间抖动照样锁住，误差 ≤ \(String(format: "%.1f", gapErr * 180 / .pi))°")
+}
+
+/// 先锁好的相位锁（1 Hz 默认）
+func plLocked(hz: Double = 1, until: Double = 13) -> RhythmPhaseLock {
+    var lock = RhythmPhaseLock()
+    var now = 10.0
+    while now < until {
+        lock.step(plWindow(time: now - 0.03, hz: hz), followerHz: hz, followerLocked: true, followerSource: .flow,
+                  now: now, dt: 0.3, active: true)
+        now += 0.3
+    }
+    return lock
+}
+
+do {
+    let base = plLocked()
+    // 一拍一帧都没分析到：不解锁
+    var frameless = base
+    frameless.step(plWindow(time: 13, hz: 1, frames: 0), followerHz: 1, followerLocked: true, followerSource: .flow,
+                   now: 13.1, dt: 0.3, active: false)
+    // 镜头切换：立刻放开、weight 0
+    var cut = base
+    cut.step(plWindow(time: 13, hz: 1, cut: true), followerHz: 1, followerLocked: true, followerSource: .flow,
+             now: 13.1, dt: 0.3, active: true)
+    // 画面不动：1 拍保持，连续 2 拍（有帧）放开、weight 0
+    var idle = base
+    idle.step(plWindow(time: 13, hz: 1), followerHz: 1, followerLocked: true, followerSource: .flow,
+              now: 13.1, dt: 0.3, active: false)
+    let idleOne = idle.locked && idle.weight == 1
+    idle.step(plWindow(time: 13.3, hz: 1), followerHz: 1, followerLocked: true, followerSource: .flow,
+              now: 13.4, dt: 0.3, active: false)
+    // 跟随器解锁：立刻 0
+    var lostFollower = base
+    lostFollower.step(plWindow(time: 13, hz: 1), followerHz: 1, followerLocked: false, followerSource: .flow,
+                      now: 13.1, dt: 0.3, active: true)
+    vcheck(frameless.locked && frameless.weight == 1 && cut.weight == 0 && !cut.locked && cut.phase(at: 13.1) == nil
+           && idleOne && !idle.locked && idle.weight == 0 && lostFollower.weight == 0,
+           "P2 相位锁：没帧的一拍不解锁；切镜 / 画面连续 2 拍不动 / 频率跟随解锁 → 立刻放开（weight 0）")
+
+    // 读数没了：保持 1 秒后放开，weight 0.5 秒降到 0
+    var lost = base
+    var unlockAt: Double?
+    var zeroAt: Double?
+    var now = 13.0
+    while now < 16 {
+        lost.step(plWindow(time: now - 0.03, hz: 1, valid: false), followerHz: 1, followerLocked: true,
+                  followerSource: .flow, now: now, dt: 0.3, active: true)
+        if !lost.locked, unlockAt == nil { unlockAt = now }
+        if lost.weight == 0, zeroAt == nil { zeroAt = now }
+        now += 0.3
+    }
+    let u = (unlockAt ?? 99) - 13
+    let z = (zeroAt ?? 99) - (unlockAt ?? 0)
+    vcheck(u > 0.85 && u <= 1.25 && z <= 0.65 && z >= 0.25,
+           "P2 相位锁：读数没了约 1 秒（这里第 \(String(format: "%.1f", u)) 秒）才放开、weight \(String(format: "%.1f", z)) 秒内降到 0")
+
+    // 跟随频率跳变 > 15%：重新锁（旧相位外推不再可信）；小变化在当前时刻接上、相位连续
+    var jump = base
+    jump.step(plWindow(time: 13, hz: 1.3, valid: false), followerHz: 1.3, followerLocked: true, followerSource: .flow,
+              now: 13.1, dt: 0.3, active: true)
+    var small = base
+    let before = small.phase(at: 13.1) ?? 9
+    small.step(plWindow(time: 13, hz: 1.05, valid: false), followerHz: 1.05, followerLocked: true, followerSource: .flow,
+               now: 13.1, dt: 0.3, active: true)
+    let after = small.phase(at: 13.1) ?? 0
+    vcheck(!jump.locked && small.locked && p2Err(before, after) <= 1e-9 && abs(small.hz - 1.05) < 1e-9,
+           "P2 相位锁：跟随频率跳 30% 重新锁；变 5% 在这一刻接上（相位连续）")
+
+    // 读数门：拟合差 / 线性低（画圈）/ 幅度太小 / 频率对不上 / 太旧 都不锁
+    func locks(_ make: (Double) -> MotionWindow, follower: Double = 1, source: RhythmCandidate.Source = .flow) -> Bool {
+        var l = RhythmPhaseLock()
+        var now = 10.0
+        for _ in 0..<12 {
+            l.step(make(now), followerHz: follower, followerLocked: true, followerSource: source, now: now, dt: 0.3,
+                   active: true)
+            now += 0.3
+        }
+        return l.locked
+    }
+    let good = locks { plWindow(time: $0 - 0.03, hz: 1) }
+    let lowQ = locks { plWindow(time: $0 - 0.03, hz: 1, quality: 0.4) }
+    let circ = locks { plWindow(time: $0 - 0.03, hz: 1, linearity: 0.55) }
+    let tiny = locks { plWindow(time: $0 - 0.03, hz: 1, amp: 0.5) }
+    let offHz = locks({ plWindow(time: $0 - 0.03, hz: 1.3) }, follower: 1)
+    let stale = locks { plWindow(time: $0 - 0.8, hz: 1) }
+    let wrongSource = locks({ plWindow(time: $0 - 0.03, hz: 1) }, source: .pose)
+    vcheck(good && !lowQ && !circ && !tiny && !offHz && !stale && !wrongSource,
+           "P2 相位锁：拟合 < 0.5 / 线性 < 0.65（画圈）/ 幅度太小 / 频率差 > 15% / 读数旧于 0.6 秒 / 来源不对 都不锁")
+
+    // 姿态读数：采样率 < max(4 × 频率, 6) 不用（慢设备上的混叠），够才用
+    func poseWindow(_ t: Double, rate: Double) -> MotionWindow {
+        var w = MotionWindow()
+        w.frames = 5
+        w.poseFrames = 3
+        w.posePresentFrames = 3
+        w.poseRhythmRate = rate
+        w.posePhase = StrokeRhythm.PhaseFit(time: t, phase: StrokeRhythm.wrapPhase(plTruth(t, hz: 1)), hz: 1, quality: 0.9,
+                                            linearity: 0.95, amplitude: 0.1, epoch: 0)
+        return w
+    }
+    let poseSlow = locks({ poseWindow($0 - 0.03, rate: 3) }, source: .pose)
+    let poseOk = locks({ poseWindow($0 - 0.03, rate: 9) }, source: .pose)
+    vcheck(!poseSlow && poseOk, "P2 相位锁：姿态采样 3 次/秒的读数不用（混叠），9 次/秒照常锁")
+}
+
+do {
+    // 波形：峰 1、30% 周期降到谷、70% 周期升回峰（慢升快降）
+    vcheck(abs(RhythmPulse.wave(0) - 1) < 1e-12 && abs(RhythmPulse.wave(0.3)) < 1e-12
+           && abs(RhythmPulse.wave(0.65) - 0.5) < 1e-12 && abs(RhythmPulse.wave(1.15) - 0.5) < 1e-12
+           && abs(RhythmPulse.wave(-0.35) - 0.5) < 1e-12 && RhythmPulse.wave(.nan) == 0,
+           "P2 脉动波形：峰 → 30% 周期降到谷 → 70% 周期升回峰，周期延拓")
+
+    // 深度：设置 / 升幅允许（66.7 × 0.7 / 频率）取小，2~2.5 Hz 淡出，× weight × activity × 强度斜坡（20 → 30）
+    let d1 = RhythmPulse.depth(setting: 20, hz: 1, weight: 1, activity: 1, intensity: 60)
+    let d40 = RhythmPulse.depth(setting: 40, hz: 1.5, weight: 1, activity: 1, intensity: 60)
+    let dFade = RhythmPulse.depth(setting: 20, hz: 2.25, weight: 1, activity: 1, intensity: 60)
+    let dFast = RhythmPulse.depth(setting: 20, hz: 2.5, weight: 1, activity: 1, intensity: 60)
+    let dHalf = RhythmPulse.depth(setting: 20, hz: 1, weight: 0.5, activity: 1, intensity: 60)
+    let dAct = RhythmPulse.depth(setting: 20, hz: 1, weight: 1, activity: 0.25, intensity: 60)
+    let dWeak = RhythmPulse.depth(setting: 20, hz: 1, weight: 1, activity: 1, intensity: 20)
+    let dMid = RhythmPulse.depth(setting: 20, hz: 1, weight: 1, activity: 1, intensity: 25)
+    let dTiny = RhythmPulse.depth(setting: 20, hz: 1, weight: 0.05, activity: 1, intensity: 60)
+    let dNan = RhythmPulse.depth(setting: .nan, hz: 1, weight: 1, activity: 1, intensity: 60)
+    vcheck(abs(d1 - 20) < 1e-9 && abs(d40 - 200.0 / 3 * 0.7 / 1.5) < 1e-6 && abs(dFade - 10) < 1e-9 && dFast == 0
+           && abs(dHalf - 10) < 1e-9 && abs(dAct - 5) < 1e-9 && dWeak == 0 && abs(dMid - 10) < 1e-9 && dTiny == 0
+           && dNan == 0,
+           "P2 脉动深度：1 Hz 20 档、1.5 Hz 设 40 只给 \(String(format: "%.1f", d40))（升幅限速）、2.25 Hz 减半、≥ 2.5 Hz 0、"
+           + "随 weight / activity / 强度斜坡缩小、< 2 档不脉动")
+
+    // 档位：以 P1 档位为中心 ±d/2；谷 ≥ max(最低强度, 8)；顶到上限整体往下挪；P1 档位低于谷值不脉动
+    let peak = RhythmPulse.thrust(base: 50, depth: 20, phase: RhythmPulse.peakPhase, cap: 99, floor: 0)
+    let trough = RhythmPulse.thrust(base: 50, depth: 20, phase: RhythmPulse.peakPhase + 0.3 * 2 * .pi, cap: 99, floor: 0)
+    let lowPeak = RhythmPulse.thrust(base: 15, depth: 20, phase: RhythmPulse.peakPhase, cap: 99, floor: 0)
+    let lowTrough = RhythmPulse.thrust(base: 15, depth: 20, phase: RhythmPulse.peakPhase + 0.6, cap: 99, floor: 0)
+    let floorTrough = RhythmPulse.thrust(base: 30, depth: 20, phase: RhythmPulse.peakPhase + 0.3 * 2 * .pi, cap: 99, floor: 25)
+    let capPeak = RhythmPulse.thrust(base: 50, depth: 20, phase: RhythmPulse.peakPhase, cap: 55, floor: 0)
+    let capTrough = RhythmPulse.thrust(base: 70, depth: 20, phase: RhythmPulse.peakPhase + 0.3 * 2 * .pi, cap: 55, floor: 0)
+    let under = RhythmPulse.thrust(base: 5, depth: 20, phase: RhythmPulse.peakPhase, cap: 99, floor: 0)
+    var allIn = true
+    for _ in 0..<5000 {
+        let b = Int(vsRandom() * 100)
+        let cap = 10 + Int(vsRandom() * 90)
+        let fl = Int(vsRandom() * 30)
+        let v = RhythmPulse.thrust(base: b, depth: vsRandom() * 45, phase: (vsRandom() - 0.5) * 2 * .pi, cap: cap, floor: fl)
+        let lo = max(fl, RhythmPulse.troughFloor)
+        allIn = allIn && (v == b || (v >= lo && v <= min(cap, 99)))
+    }
+    vcheck(peak == 60 && trough == 40 && lowPeak == 22 && lowTrough >= 8 && floorTrough == 25 && capPeak == 55
+           && capTrough == 35 && under == 5 && allIn,
+           "P2 脉动档位：50 ± 10；低档谷 ≥ 8（15 → 8~22）；谷 ≥ 最低强度；上限 55 时 35~55（只往下脉动）；"
+           + "低于谷值不脉动；随机 5000 组都在 [max(最低, 8), 上限]")
+
+    // 指令相位：现在 + 延迟补偿那一刻的画面相位，反转 +180°
+    let lock = plLocked()
+    let c0 = RhythmPulse.commandPhase(lock, at: 13, latency: 0.25, invert: false) ?? 9
+    let c1 = RhythmPulse.commandPhase(lock, at: 13, latency: 0.25, invert: true) ?? 9
+    vcheck(p2Err(c0, plTruth(13.25, hz: 1)) <= 0.01 && p2Err(c1, plTruth(13.25, hz: 1) + .pi) <= 0.01
+           && RhythmPulse.commandPhase(RhythmPhaseLock(), at: 13, latency: 0.2, invert: false) == nil,
+           "P2 指令相位：按延迟补偿提前、方向反转差 180°；没锁时没有")
+}
+
+/// 0.1 秒 Timer 整段模拟：timer 抖动 ±jitter；完整拍更新相位锁 + beat，子拍 subBeat。
+/// activeUntil 之后画面不动（activity 0），cutAt 那一拍切镜
+struct P2Sim {
+    var times: [Double] = []
+    var outs: [[Int]] = []
+    var states: [RhythmPulseDriver.State] = []
+    var subOuts = 0
+    var fullOuts: [[Int]] = []
+    var fullTimes: [Double] = []
+    var p1Outs: [[Int]] = []
+    var stopFirstFull: Double?
+    var subAfterStop = 0
+}
+
+func p2Simulate(hz: Double = 1, seconds: Double = 14, visual: VisualSyncSettings, settings: AudioSyncSettings,
+                levels: [Int] = [50, 40, 0, 0], value: Double = 60, activeUntil: Double = .infinity,
+                cutAt: Double? = nil, jitter: Double = 0.01) -> P2Sim {
+    var sim = P2Sim()
+    var lock = RhythmPhaseLock()
+    var driver = RhythmPulseDriver()
+    var stage = SyncOutputStage()
+    var p1 = SyncOutputStage()
+    var t = 10.0
+    let end = 10 + seconds
+    var lastFull: Double?
+    while t < end {
+        t += 0.1 + (vsRandom() - 0.5) * 2 * jitter
+        if driver.takesFullBeat(at: t) {
+            let active = t < activeUntil
+            let cut = cutAt.map { abs($0 - t) < 0.15 } ?? false
+            let dt = lastFull.map { t - $0 } ?? 0.3
+            lastFull = t
+            let w = plWindow(time: t - 0.04, hz: hz, cut: cut)
+            lock.step(w, followerHz: hz, followerLocked: true, followerSource: .flow, now: t, dt: dt, active: active)
+            let lv = active ? levels : [0, 0, 0, 0]
+            let o = driver.beat(levels: lv, lock: lock, visual: visual, settings: settings, hasSignal: true, value: value,
+                                activity: active ? 1 : 0, followerWeight: 1, now: t, stage: &stage)
+            sim.fullOuts.append(o)
+            sim.fullTimes.append(t)
+            sim.p1Outs.append(p1.step(levels: lv, settings: settings))
+            sim.states.append(driver.state)
+            sim.times.append(t)
+            sim.outs.append(o)
+            if !active, sim.stopFirstFull == nil { sim.stopFirstFull = t }
+        } else if let o = driver.subBeat(lock: lock, settings: settings, now: t, stage: &stage) {
+            sim.subOuts += 1
+            sim.times.append(t)
+            sim.outs.append(o)
+            if let s = sim.stopFirstFull, t > s { sim.subAfterStop += 1 }
+        }
+    }
+    return sim
+}
+
+/// 任意两刻之间伸缩 / 震动的升幅 ≤ 20 × 间隔 / 0.3 + 1、单步 ≤ 20、通道 3 / 4 恒 0、≤ 上限
+func p2Envelope(_ sim: P2Sim, cap: Int) -> (ok: Bool, margin: Double) {
+    var ok = true
+    var margin = Double.infinity
+    var prev = [0, 0, 0, 0]
+    for (i, o) in sim.outs.enumerated() {
+        ok = ok && o[2] == 0 && o[3] == 0 && o[0] <= cap && o[1] <= cap && o[0] - prev[0] <= 20 && o[1] - prev[1] <= 20
+        prev = o
+        for j in (i + 1)..<sim.outs.count where sim.times[j] - sim.times[i] <= 2 {
+            for ch in 0..<2 {
+                let allowed = 20 * (sim.times[j] - sim.times[i]) / 0.3 + 1
+                let rise = Double(sim.outs[j][ch] - o[ch])
+                margin = min(margin, allowed - rise)
+                if rise > allowed + 1e-9 { ok = false }
+            }
+        }
+    }
+    return (ok, margin)
+}
+
+do {
+    let st = AudioSyncSettings(enabled: true, maxPercent: 100, channels: .both)
+    let cal = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: "20:0.6, 60:1.8, 99:2.8", rhythmPulse: true)
+    let sim = p2Simulate(visual: cal, settings: st)
+    // 稳态：伸缩在 40~60 之间脉动（震动不变），峰在指令相位 −45° 附近（延迟补偿 200 ms 提前发）
+    let lateIdx = sim.times.indices.filter { sim.times[$0] >= 15 }
+    let thrust = lateIdx.map { sim.outs[$0][0] }
+    let vib = Set(lateIdx.map { sim.outs[$0][1] })
+    var peakErr = 0.0
+    var peaks = 0
+    for k in lateIdx.dropFirst().dropLast() where sim.outs[k][0] > sim.outs[k - 1][0] && sim.outs[k][0] >= sim.outs[k + 1][0] {
+        let cmd = plTruth(sim.times[k] + 0.2, hz: 1)
+        peakErr = max(peakErr, p2Err(cmd, RhythmPulse.peakPhase))
+        peaks += 1
+    }
+    let env = p2Envelope(sim, cap: 99)
+    vcheck(sim.states.suffix(20).allSatisfy { $0 == .active } && (thrust.max() ?? 0) >= 58 && (thrust.min() ?? 99) <= 42
+           && vib == [40] && peaks >= 7 && peakErr <= 2 * Double.pi * 0.12 && sim.subOuts > 50 && env.ok,
+           "P2 子拍模拟：1 Hz 锁上后伸缩 \(thrust.min() ?? 0)~\(thrust.max() ?? 0) 脉动、震动不变；"
+           + "\(peaks) 个峰都在指令相位 −45° ± \(String(format: "%.0f", peakErr * 180 / .pi))°；升幅包络余量 \(String(format: "%.2f", env.margin))")
+
+    // 动作一停：下一个完整拍（≤ 0.3 秒）起不再脉动、伸缩降到 0（降不限速）
+    let stop = p2Simulate(visual: cal, settings: st, activeUntil: 18)
+    let stopIdx = stop.times.indices.filter { stop.times[$0] >= (stop.stopFirstFull ?? 99) }
+    let fallTime = stopIdx.first.map { stop.times[$0] - 18 } ?? 9
+    vcheck(stop.subAfterStop == 0 && stopIdx.allSatisfy { stop.outs[$0] == [0, 0, 0, 0] } && fallTime <= 0.5
+           && p2Envelope(stop, cap: 99).ok,
+           "P2 子拍模拟：动作停了 \(String(format: "%.2f", fallTime)) 秒内归零、之后没有子拍")
+
+    // 切镜：那一拍起不脉动，重新锁上后再脉动；全程升幅包络不破
+    let cut = p2Simulate(visual: cal, settings: st, cutAt: 17)
+    let resumed = cut.states.suffix(10).allSatisfy { $0 == .active }
+    let cutStates = cut.fullTimes.indices.filter { abs(cut.fullTimes[$0] - 17) < 0.15 }.map { cut.states[$0] }
+    let cutSubs = cut.times.filter { $0 > 17.1 && $0 < 17.5 }.count - cut.fullTimes.filter { $0 > 17.1 && $0 < 17.5 }.count
+    vcheck(cutStates == [.unlocked] && cutSubs == 0 && resumed && p2Envelope(cut, cap: 99).ok,
+           "P2 子拍模拟：切镜那一拍起不脉动（之后的子拍不出）、重新锁上后继续，切换前后升幅包络不破")
+
+    // 上限 55：只往下脉动（峰 ≤ 55），频率差异不被压没
+    let capped = p2Simulate(visual: cal, settings: AudioSyncSettings(enabled: true, maxPercent: 55, channels: .both),
+                            levels: [70, 40, 0, 0])
+    let cThrust = capped.times.indices.filter { capped.times[$0] >= 15 }.map { capped.outs[$0][0] }
+    vcheck((cThrust.max() ?? 99) <= 55 && (cThrust.max() ?? 0) >= 53 && (cThrust.min() ?? 99) <= 37
+           && p2Envelope(capped, cap: 55).ok,
+           "P2 子拍模拟：上限 55 时伸缩 \(cThrust.min() ?? 0)~\(cThrust.max() ?? 0)（只往下脉动）")
+
+    // 没标定 / 开关关着 / 仅震动 / 太快：完整拍和 P1 的 step(levels:) 逐位相同、没有子拍输出
+    let uncal = p2Simulate(visual: VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true), settings: st)
+    let off = p2Simulate(visual: VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: "20:0.6, 99:2.8"),
+                         settings: st)
+    let vibOnly = p2Simulate(visual: cal, settings: AudioSyncSettings(enabled: true, maxPercent: 100, channels: .vibration),
+                             levels: [0, 40, 0, 0])
+    let fast = p2Simulate(hz: 2.6, visual: cal, settings: st)
+    let fade = p2Simulate(hz: 2.3, visual: cal, settings: st)
+    vcheck(uncal.fullOuts == uncal.p1Outs && uncal.subOuts == 0 && uncal.states.allSatisfy { $0 == .uncalibrated }
+           && off.fullOuts == off.p1Outs && off.subOuts == 0 && off.states.allSatisfy { $0 == .off }
+           && vibOnly.fullOuts == vibOnly.p1Outs && vibOnly.subOuts == 0 && vibOnly.states.allSatisfy { $0 == .vibrationOnly }
+           && fast.fullOuts == fast.p1Outs && fast.subOuts == 0 && fast.states.suffix(10).allSatisfy { $0 == .tooFast },
+           "P2 子拍模拟：没标定 / 开关关着 / 仅震动 / ≥ 2.5 Hz 时完整拍和 P1 逐位相同、没有子拍输出")
+    let fThrust = fade.times.indices.filter { fade.times[$0] >= 15 }.map { fade.outs[$0][0] }
+    vcheck((fThrust.max() ?? 0) - (fThrust.min() ?? 0) <= 10 && (fThrust.max() ?? 0) - (fThrust.min() ?? 0) >= 3
+           && p2Envelope(fade, cap: 99).ok,
+           "P2 子拍模拟：2.3 Hz 时脉动减弱（峰谷差 \((fThrust.max() ?? 0) - (fThrust.min() ?? 0))）")
+
+    // 弱动作（强度 20、手势 / 点头）：不脉动、和 P1 相同
+    let weak = p2Simulate(visual: cal, settings: st, levels: [30, 20, 0, 0], value: 20)
+    vcheck(weak.fullOuts == weak.p1Outs && weak.subOuts == 0 && weak.states.suffix(10).allSatisfy { $0 == .weak },
+           "P2 子拍模拟：动作强度 20（手势 / 点头）不脉动，和 P1 相同")
+
+    // 延迟补偿 / 方向反转：峰提前 / 晚半个周期
+    let early = p2Simulate(visual: VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: "20:0.6, 99:2.8",
+                                                      rhythmPulse: true, pulseLatencyMs: 0, pulseInvert: true), settings: st)
+    var invErr = 0.0
+    var invPeaks = 0
+    let eIdx = early.times.indices.filter { early.times[$0] >= 15 }
+    for k in eIdx.dropFirst().dropLast() where early.outs[k][0] > early.outs[k - 1][0] && early.outs[k][0] >= early.outs[k + 1][0] {
+        invErr = max(invErr, p2Err(plTruth(early.times[k], hz: 1) + .pi, RhythmPulse.peakPhase))
+        invPeaks += 1
+    }
+    vcheck(invPeaks >= 7 && invErr <= 2 * Double.pi * 0.12,
+           "P2 子拍模拟：延迟补偿 0 + 方向反转时峰在画面相位 135°（± \(String(format: "%.0f", invErr * 180 / .pi))°）")
+}
+
+do {
+    // 完整拍 / 子拍调度：0.1 秒 Timer 每 3 次 1 个完整拍；抖动 ±15 ms 不丢拍；reset 不清计时；disarm 后子拍不出
+    var d = RhythmPulseDriver()
+    var pattern: [Bool] = []
+    var t = 100.0
+    for _ in 0..<30 {
+        t += 0.1 + (vsRandom() - 0.5) * 0.03
+        pattern.append(d.takesFullBeat(at: t))
+    }
+    let fulls = pattern.filter { $0 }.count
+    var gaps: [Double] = []
+    var e = RhythmPulseDriver()
+    var last: Double?
+    t = 0
+    for _ in 0..<300 {
+        t += 0.1 + (vsRandom() - 0.5) * 0.03
+        if e.takesFullBeat(at: t) {
+            if let l = last { gaps.append(t - l) }
+            last = t
+        }
+    }
+    var r = RhythmPulseDriver()
+    _ = r.takesFullBeat(at: 5)
+    r.reset()
+    let afterReset = r.takesFullBeat(at: 5.1)
+    var n = RhythmPulseDriver()
+    n.noteFullBeat(at: 7)
+    let afterNote = n.takesFullBeat(at: 7.1)
+    let thenFull = n.takesFullBeat(at: 7.3)
+    vcheck(fulls == 10 && (gaps.min() ?? 0) >= 0.265 && (gaps.max() ?? 1) <= 0.4 + 1e-9 && !afterReset && !afterNote && thenFull,
+           "P2 调度：0.1 秒 Timer 每 3 次一个完整拍（间隔 \(String(format: "%.2f", gaps.min() ?? 0))~\(String(format: "%.2f", gaps.max() ?? 0)) 秒）；"
+           + "reset / 0.3 秒 Timer 记下的完整拍之后 0.1 秒不再算完整拍")
+
+    let st = AudioSyncSettings(enabled: true, maxPercent: 100, channels: .both)
+    let cal = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: "20:0.6, 99:2.8", rhythmPulse: true)
+    let lock = plLocked()
+    var drv = RhythmPulseDriver()
+    var stage = SyncOutputStage()
+    _ = drv.takesFullBeat(at: 13)
+    _ = drv.beat(levels: [50, 40, 0, 0], lock: lock, visual: cal, settings: st, hasSignal: true, value: 60, activity: 1,
+                 followerWeight: 1, now: 13, stage: &stage)
+    let engaged = drv.engaged && drv.subBeat(lock: lock, settings: st, now: 13.1, stage: &stage) != nil
+    _ = drv.takesFullBeat(at: 13.3)
+    let disarmed = !drv.engaged && drv.subBeat(lock: lock, settings: st, now: 13.4, stage: &stage) == nil
+    vcheck(engaged && disarmed && drv.timedLast,
+           "P2 调度：完整拍一开始先停子拍（这一拍提前返回时不再按旧档位脉动），但下一拍仍按时间限速")
+
+    // 状态行：关着 nil；各状态有说明
+    var texts = Set<String>()
+    for (v, s, lv, val) in [(cal, st, [50, 40, 0, 0], 60.0),
+                            (VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true), st, [50, 40, 0, 0], 60.0),
+                            (cal, AudioSyncSettings(enabled: true, channels: .vibration), [0, 40, 0, 0], 60.0),
+                            (cal, st, [30, 20, 0, 0], 20.0)] {
+        var dd = RhythmPulseDriver()
+        var ss = SyncOutputStage()
+        _ = dd.beat(levels: lv, lock: lock, visual: v, settings: s, hasSignal: true, value: val, activity: 1,
+                    followerWeight: 1, now: 13, stage: &ss)
+        if let t = dd.statusText(lock: lock, visual: v) { texts.insert(t) }
+    }
+    var unl = RhythmPulseDriver()
+    var us = SyncOutputStage()
+    _ = unl.beat(levels: [50, 40, 0, 0], lock: RhythmPhaseLock(), visual: cal, settings: st, hasSignal: true, value: 60,
+                 activity: 1, followerWeight: 1, now: 13, stage: &us)
+    if let t = unl.statusText(lock: RhythmPhaseLock(), visual: cal) { texts.insert(t) }
+    vcheck(texts.count == 5 && RhythmPulseDriver().statusText(lock: lock, visual: cal) == nil,
+           "P2 状态行：已对上 / 没标定 / 仅震动 / 动作偏弱 / 没对上各有说明，关着时没有")
+}
+
+do {
+    // 设置：默认关、深度 20、延迟 200 ms、不反转；键名不带点；越界夹紧、NaN 回默认；只有三个开关都开才用 0.1 秒 Timer
+    let def = VisualSyncSettings()
+    let keys = [VisualSyncSettings.Keys.rhythmPulse, VisualSyncSettings.Keys.pulseDepth,
+                VisualSyncSettings.Keys.pulseLatencyMs, VisualSyncSettings.Keys.pulseInvert]
+    let clampHi = VisualSyncSettings(pulseDepth: 100, pulseLatencyMs: 5000)
+    let clampLo = VisualSyncSettings(pulseDepth: -5, pulseLatencyMs: -10)
+    let nanS = VisualSyncSettings(pulseDepth: .nan, pulseLatencyMs: .infinity)
+    vcheck(!def.rhythmPulse && def.pulseDepth == 20 && def.pulseLatencyMs == 200 && !def.pulseInvert
+           && keys.allSatisfy { !$0.contains(".") } && Set(keys).count == 4
+           && clampHi.pulseDepth == 40 && clampHi.pulseLatencyMs == 600 && clampLo.pulseDepth == 0
+           && clampLo.pulseLatencyMs == 0 && nanS.pulseDepth == 20 && nanS.pulseLatencyMs == 200,
+           "P2 设置：默认关 / 20 档 / 200 ms / 不反转，键名不带点，越界夹紧、NaN 回默认")
+    let all = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true)
+    let audio = VisualSyncSettings(source: .audio, rhythmFollow: true, rhythmPulse: true)
+    let noFollow = VisualSyncSettings(source: .motion, rhythmFollow: false, rhythmPulse: true)
+    let p1 = VisualSyncSettings(source: .motion, rhythmFollow: true)
+    vcheck(all.tickInterval == 0.1 && audio.tickInterval == AudioReactiveShaper.interval
+           && noFollow.tickInterval == AudioReactiveShaper.interval && p1.tickInterval == AudioReactiveShaper.interval
+           && def.tickInterval == AudioReactiveShaper.interval && AudioReactiveShaper.interval == 0.3,
+           "P2 设置：只有跟随画面 + 频率跟随 + 相位脉动都开才用 0.1 秒 Timer，其余仍 0.3 秒")
+    let suite = "bc.visualsync.pulse.checks"
+    if let d = UserDefaults(suiteName: suite) {
+        d.removePersistentDomain(forName: suite)
+        let fresh = VisualSyncSettings.load(from: d)
+        d.set("yes", forKey: VisualSyncSettings.Keys.rhythmPulse)
+        d.set("deep", forKey: VisualSyncSettings.Keys.pulseDepth)
+        d.set(true, forKey: VisualSyncSettings.Keys.pulseLatencyMs)
+        let bad = VisualSyncSettings.load(from: d)
+        d.set(true, forKey: VisualSyncSettings.Keys.rhythmPulse)
+        d.set(35.0, forKey: VisualSyncSettings.Keys.pulseDepth)
+        d.set(320.0, forKey: VisualSyncSettings.Keys.pulseLatencyMs)
+        d.set(true, forKey: VisualSyncSettings.Keys.pulseInvert)
+        let stored = VisualSyncSettings.load(from: d)
+        vcheck(fresh == def && !bad.rhythmPulse && bad.pulseDepth == 20 && bad.pulseLatencyMs == 200 && stored.rhythmPulse
+               && stored.pulseDepth == 35 && stored.pulseLatencyMs == 320 && stored.pulseInvert,
+               "P2 设置：没存过 = 默认；坏值回默认；读回存的值")
+        d.removePersistentDomain(forName: suite)
+    } else {
+        vcheck(false, "P2 设置：创建测试用 UserDefaults")
+    }
+}
+
+do {
+    // FFA2 被动观察：解析、周期字节、计数器字节、不变的内容、条数太少
+    vcheck(NotifyPeriodProbe.parseHex("AA08") == [0xAA, 0x08] && NotifyPeriodProbe.parseHex(" aa 08 ff ") == [0xAA, 0x08, 0xFF]
+           && NotifyPeriodProbe.parseHex("—") == nil && NotifyPeriodProbe.parseHex("（空）") == nil
+           && NotifyPeriodProbe.parseHex("ABC") == nil && NotifyPeriodProbe.parseHex("") == nil
+           && NotifyPeriodProbe.parseHex("订阅失败：x") == nil,
+           "P2 FFA2 观察：十六进制解析，「—」「（空）」「订阅失败」不算")
+    var periodic = NotifyPeriodProbe()
+    var counter = NotifyPeriodProbe()
+    var constant = NotifyPeriodProbe()
+    var few = NotifyPeriodProbe()
+    for k in 0..<150 {
+        let t = 50 + Double(k) * 0.1
+        let pos = UInt8(128 + 90 * sin(2 * Double.pi * 1.2 * t))
+        periodic.add(time: t, hex: String(format: "AA%02X%02X00", 7, pos))
+        counter.add(time: t, hex: String(format: "AA%02X", UInt8(k % 256)))
+        constant.add(time: t, hex: "AA0100")
+        if k < 5 { few.add(time: t, hex: String(format: "AA%02X", k)) }
+    }
+    let pr = periodic.report(now: 65)
+    let cr = counter.report(now: 65)
+    let kr = constant.report(now: 65)
+    let fr = few.report(now: 50.5)
+    vcheck(pr.periodicByte == 2 && abs(pr.periodicHz - 1.2) <= 0.06 && pr.periodicQuality >= 0.9 && pr.changingBytes == [2]
+           && abs(pr.rate - 10) < 0.1 && cr.counterByte == 1 && abs(cr.counterRate - 10) <= 0.5
+           && kr.changingBytes.isEmpty && kr.distinct == 1 && kr.periodicByte == nil && kr.counterByte == nil
+           && NotifyPeriodProbe.summary(kr).contains("一直不变") && NotifyPeriodProbe.summary(fr).contains("太少")
+           && NotifyPeriodProbe.summary(pr).contains("1.2") && NotifyPeriodProbe.summary(NotifyPeriodProbe.Report()).contains("没有收到"),
+           "P2 FFA2 观察：1.2 Hz 周期变化的字节认出来（\(String(format: "%.2f", pr.periodicHz)) Hz）、计数器认出来、"
+           + "不变 / 太少各有说明")
+    var back = NotifyPeriodProbe()
+    back.add(time: 10, hex: "AA01")
+    back.add(time: 11, hex: "AA02")
+    back.add(time: 5, hex: "AA03")
+    var old = NotifyPeriodProbe()
+    for k in 0..<500 { old.add(time: Double(k) * 0.02, hex: "AA01") }
+    vcheck(back.times == [5] && old.times.count <= NotifyPeriodProbe.capacity && old.report(now: 100).samples == 0,
+           "P2 FFA2 观察：时间倒退重来、最多存 400 条、超过 20 秒的不算")
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)
