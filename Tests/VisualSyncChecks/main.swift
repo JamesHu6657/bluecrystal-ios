@@ -1343,6 +1343,7 @@ struct VS3Analysis {
 /// 15 fps 跑分析器，每 5 帧取一个窗口（1/3 秒）
 func vs3Analyze(_ scene: VS3Scene, seconds: Double = 14) -> VS3Analysis {
     var an = MotionAnalyzer()
+    an.phaseFitEnabled = true  // P3 L1：相位拟合只在相位脉动开着时算；这些窗口按「开着」造
     var acc = MotionWindowAccumulator()
     var r = VS3Analysis()
     var hzSum = 0.0
@@ -3803,9 +3804,12 @@ do {
     n.noteFullBeat(at: 7)
     let afterNote = n.takesFullBeat(at: 7.1)
     let thenFull = n.takesFullBeat(at: 7.3)
-    vcheck(fulls == 10 && (gaps.min() ?? 0) >= 0.265 && (gaps.max() ?? 1) <= 0.4 + 1e-9 && !afterReset && !afterNote && thenFull,
-           "P2 调度：0.1 秒 Timer 每 3 次一个完整拍（间隔 \(String(format: "%.2f", gaps.min() ?? 0))~\(String(format: "%.2f", gaps.max() ?? 0)) 秒）；"
-           + "reset / 0.3 秒 Timer 记下的完整拍之后 0.1 秒不再算完整拍")
+    // P3 L3：完整拍按 0.3 秒网格对齐（允许提前 50 ms、两拍至少隔 0.2 秒），抖动不再把平均间隔拖长
+    let meanGap = gaps.isEmpty ? 0 : gaps.reduce(0, +) / Double(gaps.count)
+    vcheck((9...11).contains(fulls) && (gaps.min() ?? 0) >= RhythmPulseDriver.minFullBeatGap - 1e-9 && (gaps.max() ?? 1) <= 0.4 + 1e-9
+           && abs(meanGap - 0.3) <= 0.01 && !afterReset && !afterNote && thenFull,
+           "P2 调度：0.1 秒 Timer 每 3 次一个完整拍（间隔 \(String(format: "%.2f", gaps.min() ?? 0))~\(String(format: "%.2f", gaps.max() ?? 0)) 秒，"
+           + "平均 \(String(format: "%.3f", meanGap)) 秒）；reset / 0.3 秒 Timer 记下的完整拍之后 0.1 秒不再算完整拍")
 
     let st = AudioSyncSettings(enabled: true, maxPercent: 100, channels: .both)
     let cal = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: "20:0.6, 99:2.8", rhythmPulse: true)
@@ -3924,6 +3928,735 @@ do {
     for k in 0..<500 { old.add(time: Double(k) * 0.02, hex: "AA01") }
     vcheck(back.times == [5] && old.times.count <= NotifyPeriodProbe.capacity && old.report(now: 100).samples == 0,
            "P2 FFA2 观察：时间倒退重来、最多存 400 条、超过 20 秒的不算")
+}
+
+// MARK: - rhythm-context P3：动作识别（手 / 头 / 髋 + 周期区域 + 撞击声相位校正，默认关）+ P2 L1–L3
+
+do {
+    // L2：带 now 的出口入口，从来没按时间限速过时和 dfbfc8e 的基准副本逐位相同（随机设置 / 目标 / 间隔 / reset / seed）
+    var same = true
+    var steps = 0
+    for _ in 0..<200 {
+        var stage = SyncOutputStage()
+        var base = BaseSyncOutputStageP1()
+        var now = 100 + vsRandom() * 50
+        for _ in 0..<60 {
+            let s = p2Settings()
+            now += vsRandom() < 0.1 ? vsRandom() * 3 : 0.05 + vsRandom() * 0.5
+            let r = vsRandom()
+            if r < 0.04 {
+                stage.reset()
+                base.reset()
+            } else if r < 0.07 {
+                let lv = p2Levels()
+                stage.seed(lv)
+                base.seed(lv)
+            } else if r < 0.5 {
+                let v = vsRandom() < 0.05 ? Double.nan : vsRandom() * 120 - 10
+                let sig = vsRandom() < 0.7
+                same = same && stage.step(v, settings: s, hasSignal: sig, now: now) == base.step(v, settings: s, hasSignal: sig)
+            } else {
+                let lv = p2Levels()
+                same = same && stage.step(levels: lv, settings: s, now: now, timed: false) == base.step(levels: lv, settings: s)
+            }
+            steps += 1
+        }
+        same = same && !stage.pendingTimed
+    }
+    vcheck(same, "P3 L2：带 now 的出口在没按时间限速过时和 P1 出口逐位相同（\(steps) 步随机）")
+
+    // L2：按时间限速（子拍）→ 按拍的路径交替：任意两刻升幅 ≤ 20 × 间隔 / 0.3 + 1；间隔满 0.3 秒后交回按拍
+    var sim = P2Sim()
+    var stage = SyncOutputStage()
+    var t = 50.0
+    var released = false
+    for k in 0..<400 {
+        let st = AudioSyncSettings(enabled: true, maxPercent: 100, channels: .both)
+        let target = [k % 7 == 0 ? 0 : 30 + Int(vsRandom() * 70), 20 + Int(vsRandom() * 80), 0, 0]
+        let o: [Int]
+        let mode = Int(vsRandom() * 4)
+        // 按拍的路径（没在按时间限速时）本来就是 0.3 秒一次（P1 的节拍）；按时间限速中才会 0.1 秒后来一次按拍
+        let legacy = (mode == 1 || mode == 2) && !stage.pendingTimed
+        t += mode == 3 || legacy ? 0.3 : 0.1 + (vsRandom() - 0.5) * 0.02
+        switch mode {
+        case 0: o = stage.step(levels: target, settings: st, now: t, timed: true)
+        case 1: o = stage.step(levels: target, settings: st, now: t, timed: false)
+        case 2: o = stage.step(vsRandom() * 100, settings: st, hasSignal: true, now: t)
+        default:
+            let wasPending = stage.pendingTimed
+            o = stage.step(levels: target, settings: st, now: t, timed: false)
+            if wasPending && !stage.pendingTimed { released = true }
+        }
+        sim.times.append(t)
+        sim.outs.append(o)
+    }
+    let env = p2Envelope(sim, cap: 100)
+    // P2 时的问题：子拍后 0.1 秒的按拍出口还按「一拍」给 +20
+    var old = SyncOutputStage()
+    _ = old.step(levels: [0, 0, 0, 0], settings: AudioSyncSettings(maxPercent: 100), now: 10, timed: false)
+    _ = old.step(levels: [0, 0, 0, 0], settings: AudioSyncSettings(maxPercent: 100), now: 10.3, timed: false)
+    _ = old.step(levels: [0, 0, 0, 0], settings: AudioSyncSettings(maxPercent: 100), now: 10.6, timed: false)
+    let a = old.step(levels: [60, 60, 0, 0], settings: AudioSyncSettings(maxPercent: 100), now: 10.7, timed: true)
+    let b = old.step(levels: [60, 60, 0, 0], settings: AudioSyncSettings(maxPercent: 100), now: 10.8, timed: false)
+    let c = old.step(levels: [60, 60, 0, 0], settings: AudioSyncSettings(maxPercent: 100), now: 11.1, timed: false)
+    vcheck(env.ok && released && a[0] <= 7 && b[0] - a[0] <= 7 && c[0] - b[0] <= 20 && !old.pendingTimed,
+           "P3 L2：子拍 / 完整拍 / 交接追赶混着走，任意两刻升幅包络不破（余量 \(String(format: "%.2f", env.margin))）；"
+           + "子拍后 0.1 秒的完整拍只给 +\(b[0] - a[0])，满 0.3 秒交回按拍")
+}
+
+do {
+    // L3：Timer 系统性偏慢 / 偏快时完整拍仍按 0.3 秒网格，平均间隔不被拖长
+    func meanGap(_ step: Double, jitter: Double = 0) -> (mean: Double, min: Double, max: Double) {
+        var d = RhythmPulseDriver()
+        var t = 0.0
+        var last: Double?
+        var gaps: [Double] = []
+        for _ in 0..<600 {
+            t += step + (vsRandom() - 0.5) * 2 * jitter
+            if d.takesFullBeat(at: t) {
+                if let l = last { gaps.append(t - l) }
+                last = t
+            }
+        }
+        return (gaps.reduce(0, +) / Double(max(1, gaps.count)), gaps.min() ?? 0, gaps.max() ?? 0)
+    }
+    let slow = meanGap(0.112)
+    let fast = meanGap(0.095)
+    let noisy = meanGap(0.1, jitter: 0.03)
+    vcheck(abs(slow.mean - 0.3) <= 0.01 && abs(fast.mean - 0.3) <= 0.01 && abs(noisy.mean - 0.3) <= 0.012
+           && slow.min >= RhythmPulseDriver.minFullBeatGap - 1e-9 && noisy.min >= RhythmPulseDriver.minFullBeatGap - 1e-9
+           && slow.max <= 0.45 && noisy.max <= 0.45,
+           "P3 L3：Timer 每次 112 / 95 ms / 抖 ±30 ms 时完整拍平均间隔 \(String(format: "%.3f / %.3f / %.3f", slow.mean, fast.mean, noisy.mean)) 秒"
+           + "（P2 会被拖到约 0.336 秒），最短 \(String(format: "%.2f", min(slow.min, noisy.min))) 秒")
+}
+
+do {
+    // L1：相位拟合只在开着时算；关着时相位无效，其余读数逐位相同
+    var on = MotionAnalyzer()
+    on.phaseFitEnabled = true
+    var off = MotionAnalyzer()
+    let scene = VS3Scene(rect: vs3Mid, hz: 1, peak: 4)
+    var same = true
+    var phases = 0
+    var offPhases = 0
+    for k in 0..<150 {
+        let f = scene.frame(k)
+        let a = on.analyze(f, time: Double(k) * vsDt)
+        let b = off.analyze(f, time: Double(k) * vsDt)
+        if let x = a, x.subject.phase.isValid { phases += 1 }
+        if let y = b, y.subject.phase.isValid { offPhases += 1 }
+        var x = a
+        x?.subject.phase = StrokeRhythm.PhaseFit()
+        same = same && x == b
+    }
+    var pOn = PoseMotionTracker()
+    pOn.phaseFitEnabled = true
+    var pOff = PoseMotionTracker()
+    var poseSame = true
+    var posePhases = 0
+    for i in 0..<120 {
+        let t = Double(i) / 9
+        let c = [vs3Skeleton(hipX: vs3HipWave(t))]
+        var a = pOn.update(time: t, candidates: c, camera: .identity, continuous: true, frameHeight: 36)
+        let b = pOff.update(time: t, candidates: c, camera: .identity, continuous: true, frameHeight: 36)
+        if a.rhythmPhase.isValid { posePhases += 1 }
+        poseSame = poseSame && !b.rhythmPhase.isValid
+        a.rhythmPhase = StrokeRhythm.PhaseFit()
+        poseSame = poseSame && a == b
+    }
+    vcheck(same && poseSame && phases > 50 && posePhases > 40 && offPhases == 0 && !MotionAnalyzer().phaseFitEnabled
+           && !PoseMotionTracker().phaseFitEnabled,
+           "P3 L1：相位拟合默认关；关着时块运动 / 姿态都不算相位（开着时 \(phases) / \(posePhases) 次有相位），其余读数逐位相同")
+}
+
+do {
+    // 设置：默认关、键名、读回、只有对应的上级开关都开才生效
+    let d = VisualSyncSettings()
+    let keys = [VisualSyncSettings.Keys.rhythmContext, VisualSyncSettings.Keys.rhythmAudioAnchor]
+    let suite = "bc.visualsync.p3checks"
+    let ud = UserDefaults(suiteName: suite)!
+    ud.removePersistentDomain(forName: suite)
+    let fresh = VisualSyncSettings.load(from: ud)
+    ud.set(true, forKey: VisualSyncSettings.Keys.rhythmContext)
+    ud.set(true, forKey: VisualSyncSettings.Keys.rhythmAudioAnchor)
+    let stored = VisualSyncSettings.load(from: ud)
+    ud.set("x", forKey: VisualSyncSettings.Keys.rhythmContext)
+    let bad = VisualSyncSettings.load(from: ud)
+    ud.removePersistentDomain(forName: suite)
+    let all = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true, rhythmContext: true,
+                                 rhythmAudioAnchor: true)
+    var noFollow = all
+    noFollow.rhythmFollow = false
+    var noPulse = all
+    noPulse.rhythmPulse = false
+    var audio = all
+    audio.source = .audio
+    vcheck(!d.rhythmContext && !d.rhythmAudioAnchor && !d.usesRhythmContext && !d.usesAudioAnchor
+           && keys.allSatisfy { !$0.contains(".") && $0.hasPrefix("bcVisualSync") } && Set(keys).count == 2
+           && !fresh.rhythmContext && !fresh.rhythmAudioAnchor && stored.rhythmContext && stored.rhythmAudioAnchor
+           && !bad.rhythmContext && all.usesRhythmContext && all.usesAudioAnchor
+           && !noFollow.usesRhythmContext && !noFollow.usesAudioAnchor && noPulse.usesRhythmContext && !noPulse.usesAudioAnchor
+           && !audio.usesRhythmContext && !audio.usesAudioAnchor,
+           "P3 设置：动作识别 / 撞击声校正默认关，键名不带点；动作识别要跟随画面 + 频率跟随，撞击声校正还要相位脉动")
+}
+
+do {
+    // 动作识别关着：分析器不攒周期区域、窗口里没有区域 / 上下文；开着时分析器其余输出逐位相同；
+    // 窗口里没有上下文时 ActionContext 不改窗口（= P2）
+    var plain = MotionAnalyzer()
+    var ctx = MotionAnalyzer()
+    ctx.contextEnabled = true
+    let scene = VS3Scene(rect: vs3Small, hz: 1.2, peak: 3)
+    var same = true
+    var roiSeen = false
+    var accOff = MotionWindowAccumulator()
+    var windowsEmpty = true
+    for k in 0..<150 {
+        let f = scene.frame(k)
+        let a = plain.analyze(f, time: Double(k) * vsDt)
+        let b = ctx.analyze(f, time: Double(k) * vsDt)
+        same = same && a == b
+        if ctx.periodicity.roi.valid { roiSeen = true }
+        if let s = a { accOff.add(s) }
+        if k % 5 == 4 {
+            let w = accOff.drain()
+            windowsEmpty = windowsEmpty && w.roi == RoiReading() && w.roiFrames == 0 && w.context == PoseContext()
+        }
+    }
+    var identity = true
+    var ac = ActionContext()
+    for (i, w) in rf1Hz.windows.enumerated() {
+        identity = identity && ac.refine(w, now: Double(i * 5 + 4) * vsDt + 0.01) == w
+    }
+    for (i, w) in vs3Strong20.windows.enumerated() {
+        identity = identity && ac.refine(w, now: Double(i * 5 + 4) * vsDt + 0.01) == w
+    }
+    var flipOff = ctx
+    flipOff.contextEnabled = false
+    vcheck(same && roiSeen && !plain.periodicity.roi.valid && windowsEmpty && identity && ac.kind == .unknown
+           && !ac.directionKnown && !flipOff.periodicity.roi.valid && !MotionAnalyzer().contextEnabled,
+           "P3 关着 = P2：分析器默认不算周期区域、开着时其余读数逐位相同；没有上下文的窗口 ActionContext 原样返回")
+}
+
+/// 两块区域：左边一块按 hz 水平往复（周期），右边一块随机游走（不周期）；背景静止
+func p3TwoBlobs(_ k: Int, hz: Double, periodicLeft: Bool = true) -> LumaFrame {
+    let t = Double(k) * vsDt
+    let ox = 3 * sin(2 * Double.pi * hz * t)
+    var walk = 0.0
+    for j in 0...k { walk += (vs3Hash(j, 7, 9) - 0.5) * 2.4 }
+    walk = max(-5, min(5, walk.truncatingRemainder(dividingBy: 10)))
+    let pr = periodicLeft ? (x: 6.0, y: 10.0) : (x: 42.0, y: 10.0)
+    let dr = periodicLeft ? (x: 42.0, y: 12.0) : (x: 6.0, y: 12.0)
+    var px = [UInt8](repeating: 0, count: 64 * 36)
+    for y in 0..<36 {
+        for x in 0..<64 {
+            let qx = Double(x) + 0.5
+            let qy = Double(y) + 0.5
+            var v: Double
+            if qx >= pr.x + ox, qx < pr.x + ox + 12, qy >= pr.y, qy < pr.y + 12 {
+                v = vs3Value(qx - ox + 100, qy + 100, salt: 2)
+            } else if qx >= dr.x + walk, qx < dr.x + walk + 12, qy >= dr.y, qy < dr.y + 12 {
+                v = vs3Value(qx - walk + 300, qy + 300, salt: 3)
+            } else {
+                v = vs3Value(qx + 200, qy + 200, salt: 1)
+            }
+            px[y * 64 + x] = UInt8(min(255, max(0, v.rounded())))
+        }
+    }
+    return LumaFrame(width: 64, height: 36, pixels: px)
+}
+
+do {
+    // 周期区域：往复的那块被框出来（不框随机游走的干扰块）、只占一小块画面；整幅都在动 / 静止时没有区域
+    func run(_ gen: (Int) -> LumaFrame, seconds: Double = 8) -> (roi: PeriodicityROI, validLate: Int, n: Int) {
+        var an = MotionAnalyzer()
+        an.contextEnabled = true
+        var valid = 0
+        var n = 0
+        let frames = Int(seconds * 15)
+        for k in 0..<frames {
+            _ = an.analyze(gen(k), time: Double(k) * vsDt)
+            if k >= frames / 2 {
+                n += 1
+                if an.periodicity.roi.valid { valid += 1 }
+            }
+        }
+        return (an.periodicity.roi, valid, n)
+    }
+    let left = run { p3TwoBlobs($0, hz: 1.2) }
+    let right = run { p3TwoBlobs($0, hz: 1.2, periodicLeft: false) }
+    let still = run { _ in VS3Scene().frame(0) }
+    let big = run { VS3Scene(rect: (x: 1, y: 1, w: 62, h: 34), hz: 1, peak: 3).frame($0) }
+    let l = left.roi
+    let r = right.roi
+    vcheck(l.valid && l.centerX < 0.45 && l.x0 <= 12.0 / 64 && l.x1 >= 12.0 / 64 && l.share > 0.3 && l.blocks <= 16
+           && r.valid && r.centerX > 0.55 && left.validLate >= left.n * 3 / 4 && !still.roi.valid && still.validLate == 0
+           && !big.roi.valid,
+           "P3 周期区域：往复块被框出（左 \(String(format: "%.2f~%.2f", l.x0, l.x1))、右 \(String(format: "%.2f~%.2f", r.x0, r.x1))，"
+           + "\(l.blocks) 块），随机游走的干扰块不算；静止 / 整幅都在动时没有区域")
+}
+
+do {
+    // 裁剪降采样：框内按面积平均、框外不读；同尺寸复用缓冲；缓冲不够 / 尺寸不对返回 false
+    let src = vsSource(width: 640, height: 360, padding: 8) { x, y in UInt8((x * 255 / 639 + (y < 180 ? 0 : 0)) & 0xFF) }
+    var cropper = LumaCropDownscaler()
+    var out = LumaFrame()
+    let half = CropRect(x0: 0.5, y0: 0.25, x1: 1, y1: 0.75)
+    let ok = src.withUnsafeBytes { cropper.downscale($0, width: 640, height: 360, bytesPerRow: 648, crop: half,
+                                                     outWidth: 64, outHeight: 36, into: &out) }
+    let firstCol = out.pixels.isEmpty ? 0 : Int(out.pixels[0])
+    let lastCol = out.pixels.isEmpty ? 0 : Int(out.pixels[63])
+    var monotonic = out.pixels.count == 64 * 36
+    if monotonic { for x in 1..<64 { monotonic = monotonic && out.pixels[x] >= out.pixels[x - 1] } }
+    var rowsSame = monotonic
+    if rowsSame { for y in 1..<36 { rowsSame = rowsSame && Array(out.pixels[(y * 64)..<(y * 64 + 64)]) == Array(out.pixels[0..<64]) } }
+    let addr = out.pixels.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
+    let ok2 = src.withUnsafeBytes { cropper.downscale($0, width: 640, height: 360, bytesPerRow: 648, crop: half,
+                                                      outWidth: 64, outHeight: 36, into: &out) }
+    let addr2 = out.pixels.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
+    let short = [UInt8](repeating: 0, count: 1000)
+    let bad = short.withUnsafeBytes { cropper.downscale($0, width: 640, height: 360, bytesPerRow: 648, crop: half,
+                                                        outWidth: 64, outHeight: 36, into: &out) }
+    let span = LumaCropDownscaler.span(0.2, 0.1, size: 100)
+    let empty = LumaCropDownscaler.span(0.5, 0.5, size: 100)
+    let nanSpan = LumaCropDownscaler.span(.nan, 1, size: 100)
+    vcheck(ok && ok2 && !bad && abs(firstCol - 128) <= 3 && lastCol >= 250 && monotonic && rowsSame && addr == addr2
+           && span == (10, 10) && empty.length == 1 && nanSpan == (0, 100),
+           "P3 裁剪降采样：右半幅放大到 64×36（\(firstCol)~\(lastCol)，单调、各行相同），稳态不重新分配，缓冲不够返回 false")
+}
+
+do {
+    // 放大框：区域 → 同宽高比、放大 1.5~4 倍、不出画面；小变化不挪框，大变化 1 秒后才挪；区域没了 1 秒后不跟
+    func roi(_ cx: Double, _ cy: Double, _ size: Double, time: Double = 0) -> PeriodicityROI {
+        var r = PeriodicityROI()
+        r.valid = true
+        r.time = time
+        r.hz = 1.2
+        r.x0 = cx - size / 2
+        r.x1 = cx + size / 2
+        r.y0 = cy - size / 2
+        r.y1 = cy + size / 2
+        r.blocks = 4
+        return r
+    }
+    let small = RoiFlowTracker.desiredCrop(roi(0.5, 0.5, 0.1))
+    let edge = RoiFlowTracker.desiredCrop(roi(0.95, 0.05, 0.2))
+    let tooBig = RoiFlowTracker.desiredCrop(roi(0.5, 0.5, 0.6))
+    var tr = RoiFlowTracker()
+    let c0 = tr.plan(roi(0.3, 0.4, 0.15), now: 10)
+    let c1 = tr.plan(roi(0.32, 0.41, 0.15), now: 10.5)
+    let c2 = tr.plan(roi(0.7, 0.6, 0.15), now: 10.6)
+    let c3 = tr.plan(roi(0.7, 0.6, 0.15), now: 11.1)
+    let c4 = tr.plan(PeriodicityROI(), now: 11.5)
+    let c5 = tr.plan(PeriodicityROI(), now: 12.2)
+    let e = edge?.0
+    vcheck(small?.1 == RoiFlowTracker.maxZoom && abs((small?.0.width ?? 0) - 0.25) < 1e-9
+           && e.map { $0.x1 <= 1 + 1e-9 && $0.y0 >= -1e-9 && abs($0.width - $0.height) < 1e-9 } == true
+           && tooBig == nil && c0 != nil && c1 == c0 && c2 == c0 && c3 != c0 && (c3?.x0 ?? 0) > 0.5
+           && c4 == c3 && c5 == nil,
+           "P3 放大框：放大 \(String(format: "%.1f", small?.1 ?? 0)) 倍、贴边不出画面、区域太大不放大；"
+           + "小变化不挪、大变化 1 秒后才挪、区域没了 1 秒后不跟")
+
+    // 放大后的块运动：裁剪小图里的往复 → 频率对得上，速度 / 幅度换回分析帧像素（÷ 放大倍数）
+    var rt = RoiFlowTracker()
+    _ = rt.plan(roi(0.5, 0.5, 0.12), now: 0)
+    let zoom = 1 / (rt.plan(roi(0.5, 0.5, 0.12), now: 0)?.width ?? 1)
+    let scene = VS3Scene(rect: (x: 12, y: 6, w: 40, h: 24), hz: 1.5, peak: 3)
+    var reading = RoiReading()
+    var hzLate: [Double] = []
+    var bigAmp = 0.0
+    for k in 0..<150 {
+        let t = Double(k) * vsDt
+        reading = rt.update(time: t, frame: scene.frame(k), camera: .identity, cameraContinuous: true,
+                            analysisWidth: 64, analysisHeight: 36)
+        if k >= 90, reading.valid, reading.subject.followHz > 0 { hzLate.append(reading.subject.followHz) }
+        bigAmp = max(bigAmp, reading.subject.followAmplitude)
+    }
+    var full = MotionAnalyzer()
+    var fullAmp = 0.0
+    for k in 0..<150 {
+        if let s = full.analyze(scene.frame(k), time: Double(k) * vsDt) { fullAmp = max(fullAmp, s.subject.followAmplitude) }
+    }
+    let meanHz = hzLate.isEmpty ? 0 : hzLate.reduce(0, +) / Double(hzLate.count)
+    var cutTr = rt
+    cutTr.noteCut()
+    let afterCut = cutTr.update(time: 10.1, frame: scene.frame(151), camera: .identity, cameraContinuous: true,
+                                analysisWidth: 64, analysisHeight: 36)
+    vcheck(zoom > 3.9 && hzLate.count >= 40 && abs(meanHz - 1.5) <= 0.08 && reading.valid && reading.zoom > 3.9
+           && fullAmp > 0 && abs(bigAmp * zoom / fullAmp - 1) < 0.35 && !afterCut.valid,
+           "P3 放大跟踪：裁剪小图里 1.5 Hz 往复读出 \(String(format: "%.2f", meanHz)) Hz、"
+           + "幅度换回分析帧后是整幅的 \(String(format: "%.2f", fullAmp > 0 ? bigAmp * zoom / fullAmp : 0)) 倍（÷ 放大 \(String(format: "%.1f", zoom))）；切镜后重新攒")
+}
+
+do {
+    // 手 / 脸跟踪：9 Hz 检测、1.5 Hz 往复 → 频率对得上；镜头同时平移（给了相机运动）照样对；
+    // 另一个更大的手不抢（连续性优先）；相位只在开着时算；低置信度 / 空帧不出读数
+    func run(pan: Bool, phase: Bool, distractor: Bool = false) -> (hz: Double, conf: Double, phaseOK: Bool, x: Double) {
+        var tr = PartMotionTracker()
+        tr.phaseFitEnabled = phase
+        var r = PartReading()
+        var hzs: [Double] = []
+        var phaseOK = true
+        var lastPan = 0.0
+        for i in 0..<120 {
+            let t = Double(i) / 9 + (i % 3 == 1 ? 0.01 : 0)
+            let p = pan ? 12 * sin(2 * Double.pi * 0.7 * t) + 3 * t : 0
+            var c = [PartCandidate(x: 20 + 4 * sin(2 * Double.pi * 1.5 * t) + p, y: 18, size: 8, confidence: 0.8)]
+            if distractor, i >= 30 { c.append(PartCandidate(x: 50, y: 10 + 3 * sin(2 * Double.pi * 0.6 * t), size: 14, confidence: 0.9)) }
+            let cam = CameraTransform(t0: p - lastPan)
+            lastPan = p
+            r = tr.update(time: t, candidates: c, camera: cam, continuous: true)
+            if i >= 60, r.present, r.rhythm.follow.hz > 0 { hzs.append(r.rhythm.follow.hz) }
+            if i >= 60 { phaseOK = phaseOK && (phase ? r.rhythm.phase.isValid : !r.rhythm.phase.isValid) }
+        }
+        return (hzs.isEmpty ? 0 : hzs.reduce(0, +) / Double(hzs.count), r.rhythm.follow.confidence, phaseOK && hzs.count >= 50, r.x)
+    }
+    let still = run(pan: false, phase: true)
+    let panned = run(pan: true, phase: false)
+    let busy = run(pan: false, phase: false, distractor: true)
+    var low = PartMotionTracker()
+    let lowR = low.update(time: 1, candidates: [PartCandidate(x: 1, y: 1, size: 5, confidence: 0.2)], camera: .identity,
+                          continuous: true)
+    let none = low.update(time: 1.1, candidates: [], camera: .identity, continuous: true)
+    vcheck(abs(still.hz - 1.5) <= 0.08 && abs(panned.hz - 1.5) <= 0.08 && abs(busy.hz - 1.5) <= 0.08 && busy.x < 30
+           && still.conf >= 0.5 && still.phaseOK && panned.phaseOK && !lowR.present && !none.present,
+           "P3 手 / 脸跟踪：1.5 Hz 往复读出 \(String(format: "%.2f", still.hz)) Hz，镜头平移时 \(String(format: "%.2f", panned.hz)) Hz，"
+           + "旁边更大的手不抢；相位只在开着时算")
+}
+
+do {
+    // 窗口：区域读数 / 上下文跟着样本走；切镜清掉、切镜前的上下文不认；取走后清零
+    var acc = MotionWindowAccumulator()
+    var s = MotionSample(time: 1, energy: 2, coverage: 0.1, isCut: false, isHeld: false)
+    s.roi = RoiReading(valid: true, time: 1, zoom: 2)
+    acc.add(s)
+    var ctx = PoseContext()
+    ctx.valid = true
+    ctx.time = 1.02
+    acc.addContext(ctx)
+    let w1 = acc.drain()
+    let w2 = acc.drain()
+    acc.add(s)
+    acc.addContext(ctx)
+    acc.add(MotionSample(time: 1.1, energy: 2, coverage: 0.1, isCut: true, isHeld: false))
+    var late = ctx
+    late.time = 1.05
+    acc.addContext(late)
+    var held = s
+    held.isHeld = true
+    held.time = 1.15
+    acc.add(held)
+    let w3 = acc.drain()
+    vcheck(w1.roiFrames == 1 && w1.roi.zoom == 2 && w1.context.valid && w2.roiFrames == 0 && !w2.context.valid
+           && w3.roiFrames == 0 && !w3.roi.valid && !w3.context.valid,
+           "P3 窗口：区域读数 / 手脸身体上下文跟着样本走；切镜清掉、切镜前算出来的不认、保持期不带；取走后清零")
+}
+
+/// 一拍的窗口 + 上下文：手 / 脸 / 髋的节奏（hz、置信度、幅度），位置（分析帧像素，64×36）
+func p3Window(time: Double, hand: (hz: Double, conf: Double, amp: Double)? = nil,
+              face: (hz: Double, conf: Double, amp: Double)? = nil, hips: (hz: Double, conf: Double, amp: Double)? = nil,
+              subjectHz: Double = 1.5, handAt: (Double, Double) = (30, 22), faceAt: (Double, Double) = (30, 10),
+              axis: (Double, Double) = (0, 1), otherHip: (Double, Double)? = nil, cut: Bool = false,
+              roi: PeriodicityROI? = nil) -> MotionWindow {
+    var w = plWindow(time: time - 0.03, hz: subjectHz, cut: cut)
+    w.subjectFollowHz = subjectHz
+    w.subjectFollowRhythm = 0.7
+    w.subjectFollowAmplitude = 3
+    w.subjectPhase.axisX = axis.0
+    w.subjectPhase.axisY = axis.1
+    var c = PoseContext()
+    c.valid = true
+    c.time = time - 0.05
+    c.frameWidth = 64
+    c.frameHeight = 36
+    func rhythm(_ r: (hz: Double, conf: Double, amp: Double)) -> PartRhythm {
+        var p = PartRhythm()
+        p.follow = StrokeRhythm.FollowEstimate(hz: r.hz, confidence: r.conf, amplitude: r.amp, sampleRate: 9)
+        p.phase = StrokeRhythm.PhaseFit(time: time - 0.05, phase: 0.5, hz: r.hz, quality: 0.9, linearity: 0.95,
+                                        amplitude: r.amp, epoch: 0)
+        p.phase.axisX = axis.0
+        p.phase.axisY = axis.1
+        return p
+    }
+    if let h = hand {
+        c.hand = PartReading(present: true, time: c.time, x: handAt.0, y: handAt.1, size: 6, confidence: 0.8, rhythm: rhythm(h))
+    }
+    if let f = face {
+        c.face = PartReading(present: true, time: c.time, x: faceAt.0, y: faceAt.1, size: 6, confidence: 0.8, rhythm: rhythm(f))
+    }
+    c.body.present = true
+    c.body.time = c.time
+    c.body.scale = 16
+    c.body.hasHip = true
+    c.body.hipX = 32
+    c.body.hipY = 20
+    c.body.hasHead = true
+    c.body.headX = 32
+    c.body.headY = 7
+    if let hp = hips { c.body.hips = rhythm(hp) }
+    if let o = otherHip {
+        c.body.hasOtherHip = true
+        c.body.otherHipX = o.0
+        c.body.otherHipY = o.1
+        c.body.otherScale = 16
+    }
+    w.context = c
+    if let r = roi {
+        w.roi.region = r
+    }
+    return w
+}
+
+do {
+    // 动作识别：手在和画面同频地往复、髋几乎不动 → 撸动（看手）；髋同频往复、手 / 脸不动 → 插入（看髋）；
+    // 脸同频往复 → 口交（看脸）。改判要连续 0.9 秒；一拍不一样不改；切镜立刻回未知；依据没了 1.5 秒回未知
+    func settle(_ make: (Double) -> MotionWindow, from: Double = 10, seconds: Double = 2.4) -> (ActionContext, MotionWindow) {
+        var ac = ActionContext()
+        var t = from
+        var out = MotionWindow()
+        while t < from + seconds {
+            out = ac.refine(make(t), now: t)
+            t += 0.3
+        }
+        return (ac, out)
+    }
+    let stroke = settle { p3Window(time: $0, hand: (1.5, 0.8, 0.3), hips: (1.5, 0.5, 0.05)) }
+    let insert = settle { p3Window(time: $0, hips: (1.5, 0.8, 0.3)) }
+    let oral = settle { p3Window(time: $0, face: (1.5, 0.8, 0.3), faceAt: (32, 26)) }
+    let offFreq = settle { p3Window(time: $0, hand: (0.7, 0.8, 0.3)) }
+    // 刚满足 0.6 秒还不改；一拍插入不改判
+    var ac = ActionContext()
+    var kinds: [ActionContext.Kind] = []
+    for i in 0..<12 {
+        let t = 10 + Double(i) * 0.3
+        let w = i == 7 ? p3Window(time: t, hips: (1.5, 0.8, 0.3)) : p3Window(time: t, hand: (1.5, 0.8, 0.3))
+        _ = ac.refine(w, now: t)
+        kinds.append(ac.kind)
+    }
+    var cutAc = stroke.0
+    _ = cutAc.refine(p3Window(time: 12.5, hand: (1.5, 0.8, 0.3), cut: true), now: 12.5)
+    var gone = stroke.0
+    var goneKinds: [ActionContext.Kind] = []
+    for i in 1...7 {
+        let t = 12.4 + Double(i) * 0.3
+        _ = gone.refine(p3Window(time: t), now: t)
+        goneKinds.append(gone.kind)
+    }
+    vcheck(stroke.0.kind == .stroke && stroke.1.poseRhythmPart == 3 && abs(stroke.1.poseRhythmHz - 1.5) < 1e-9
+           && insert.0.kind == .insertion && insert.1.poseRhythmPart == 1
+           && oral.0.kind == .oral && oral.1.poseRhythmPart == 2 && oral.0.statusText().contains("脸")
+           && offFreq.0.kind == .unknown && offFreq.1.poseRhythmHz == p3Window(time: 12.1, hand: (0.7, 0.8, 0.3)).poseRhythmHz
+           && kinds[1] == .unknown && kinds[2] == .unknown && kinds[3] == .stroke && kinds[8...].allSatisfy { $0 == .stroke }
+           && cutAc.kind == .unknown && goneKinds.first == .stroke && goneKinds.last == .unknown,
+           "P3 动作识别：手 / 髋 / 脸同频往复分别认成撸动 / 插入 / 口交，用那个部位的节奏；频率对不上不认；"
+           + "0.9 秒才改判、一拍不一样不改；切镜立刻回未知、依据没了 1.5 秒回未知")
+
+    // 方向：手往复的主轴朝着髋 = 往里，相位不翻；主轴背着髋 → 翻 180°（主轴也反过来）；判断不了时不改
+    let toward = settle { p3Window(time: $0, hand: (1.5, 0.8, 0.3), handAt: (32, 8), axis: (0, 1)) }
+    let away = settle { p3Window(time: $0, hand: (1.5, 0.8, 0.3), handAt: (32, 8), axis: (0, -1)) }
+    let side = settle { p3Window(time: $0, hand: (1.5, 0.8, 0.3), handAt: (32, 8), axis: (1, 0)) }
+    let src = p3Window(time: 12.1, hand: (1.5, 0.8, 0.3), handAt: (32, 8), axis: (0, -1))
+    vcheck(toward.0.directionKnown && abs(toward.1.posePhase.phase - 0.5) < 1e-9 && abs(toward.1.subjectPhase.phase - src.subjectPhase.phase) < 1e-9
+           && away.0.directionKnown && abs(StrokeRhythm.wrapPhase(away.1.posePhase.phase - 0.5 - Double.pi)) < 1e-9
+           && away.1.posePhase.axisY > 0
+           && abs(StrokeRhythm.wrapPhase(away.1.subjectPhase.phase - src.subjectPhase.phase - Double.pi)) < 1e-9
+           && !side.0.directionKnown && abs(side.1.posePhase.phase - 0.5) < 1e-9,
+           "P3 动作方向：主轴朝着髋 = 往里（不翻），背着髋 → 相位翻 180°，和往里垂直时判断不了（不改）")
+}
+
+/// 48 kHz 合成声音：clicks 时刻（秒）各一个 15 ms 衰减的宽带撞击 + 背景（noise 幅度的白噪声 + hum 幅度的 120 Hz）
+func p3Audio(seconds: Double, clicks: [Double], noise: Double = 0.01, hum: Double = 0, rate: Double = 48_000,
+             start: Double = 0) -> [AudioBandFrame] {
+    var sp = AudioBandSplitter()
+    sp.configure(sampleRate: rate)
+    var out: [AudioBandFrame] = []
+    let n = Int(seconds * rate)
+    var ci = 0
+    var seed: UInt64 = 0xC0FFEE
+    func rnd() -> Double {
+        seed = seed &* 6364136223846793005 &+ 1442695040888963407
+        return Double(seed >> 11) / Double(1 << 53) - 0.5
+    }
+    let chunk = 1024
+    var i = 0
+    while i < n {
+        let m = min(chunk, n - i)
+        sp.begin(start: start + Double(i) / rate, frames: m)
+        for j in 0..<m {
+            let t = Double(i + j) / rate
+            while ci + 1 < clicks.count, clicks[ci + 1] <= t { ci += 1 }
+            var x = noise * rnd() * 2 + hum * sin(2 * Double.pi * 120 * t)
+            if ci < clicks.count, t >= clicks[ci], t - clicks[ci] < 0.06 {
+                x += 0.8 * exp(-(t - clicks[ci]) / 0.015) * rnd() * 2
+            }
+            if let f = sp.add(x, at: start + t) { out.append(f) }
+        }
+        i += m
+    }
+    return out
+}
+
+do {
+    // 频带分离：10 毫秒一块、时间是块中点；低频哼声进低频带、白噪声主要在高频带；采样率认不出不出块；接不上的回调丢掉半块
+    let hum = p3Audio(seconds: 1, clicks: [], noise: 0, hum: 0.5)
+    let hiss = p3Audio(seconds: 1, clicks: [], noise: 0.3)
+    var bad = AudioBandSplitter()
+    bad.configure(sampleRate: 500)
+    bad.begin(start: 0, frames: 100)
+    var none = 0
+    for k in 0..<1000 { if bad.add(0.5, at: Double(k) / 500) != nil { none += 1 } }
+    var sk = AudioBandSplitter()
+    sk.configure(sampleRate: 48_000)
+    sk.begin(start: 0, frames: 240)
+    for k in 0..<240 { _ = sk.add(0.1, at: Double(k) / 48_000) }
+    sk.begin(start: 5, frames: 480)
+    var firstAfterSkip: AudioBandFrame?
+    for k in 0..<480 where firstAfterSkip == nil { firstAfterSkip = sk.add(0.1, at: 5 + Double(k) / 48_000) }
+    let humLate = hum.suffix(50)
+    let hissLate = hiss.suffix(50)
+    let humLow = humLate.map { Double($0.low) }.reduce(0, +)
+    let humHigh = humLate.map { Double($0.high) + Double($0.mid) }.reduce(0, +)
+    let hissHigh = hissLate.map { Double($0.high) }.reduce(0, +)
+    let hissLow = hissLate.map { Double($0.low) }.reduce(0, +)
+    vcheck(hum.count == 100 && abs(hum[0].time - 0.005) < 1e-6 && humLow > 2 * humHigh && hissHigh > 5 * hissLow
+           && none == 0 && firstAfterSkip.map { abs($0.time - 5.005) < 1e-6 } == true,
+           "P3 撞击声频带：10 毫秒一块（时间是块中点）、哼声进低频带、白噪声主要在高频带；采样率不对不出块；seek 后丢掉半块")
+}
+
+do {
+    // 撞击检测：1.6 Hz 的撞击（有背景噪声）→ 时刻误差 ≤ 20 ms、声音节奏 1.6 Hz；
+    // 稳定的白噪声 / 哼声没有撞击；时间倒退重来
+    let clicks = (0..<14).map { 0.3 + Double($0) / 1.6 + (vsRandom() - 0.5) * 0.02 }
+    let frames = p3Audio(seconds: 9, clicks: clicks, noise: 0.02)
+    var det = AudioOnsetDetector()
+    for f in frames { det.add(f) }
+    let found = det.onsets(since: 0)
+    var worst = 0.0
+    var matched = 0
+    for c in clicks where c > 0.5 {
+        if let best = found.min(by: { abs($0 - c) < abs($1 - c) }), abs(best - c) <= 0.03 {
+            matched += 1
+            worst = max(worst, abs(best - c))
+        }
+    }
+    let rhythm = det.rhythm()
+    var quiet = AudioOnsetDetector()
+    for f in p3Audio(seconds: 6, clicks: [], noise: 0.05, hum: 0.2) { quiet.add(f) }
+    var back = det
+    back.add(AudioBandFrame(time: 1, low: 0.1, mid: 0.1, high: 0.1))
+    vcheck(matched >= 12 && found.count <= 15 && worst <= 0.02 && abs(rhythm.hz - 1.6) <= 0.08 && rhythm.confidence >= 0.3
+           && quiet.onsets(since: 0).count <= 1 && quiet.rhythm().confidence < 0.3 && back.onsets(since: 0).isEmpty,
+           "P3 撞击检测：1.6 Hz 撞击认出 \(matched) / 13 次（共 \(found.count) 次，误差 ≤ \(Int((worst * 1000).rounded())) ms）、"
+           + "声音节奏 \(String(format: "%.2f", rhythm.hz)) Hz（置信度 \(String(format: "%.2f", rhythm.confidence))）；稳定噪声没有撞击")
+}
+
+do {
+    // 撞击声相位校正：撞击总在画面相位 μ → 偏移收敛到 −μ（撞击对到最深点）；方向已判断时只到 ±60°；
+    // 声音频率和画面差 > 15% / 撞击时刻散乱 / 没锁 → 0（保持 2 秒后慢慢回 0、没锁立刻 0）
+    let lock = plLocked(hz: 1, until: 13)
+    func onsets(mu: Double, until now: Double, scatter: Bool = false) -> [Double] {
+        var out: [Double] = []
+        var k = 0
+        while true {
+            let base = (mu - 0.3) / (2 * Double.pi) + Double(k)
+            let t = scatter ? base + vs3Hash(k, 3, 5) : base
+            k += 1
+            if t > now { break }
+            if t >= now - 4.5 { out.append(t) }
+            if k > 100 { break }
+        }
+        return out.sorted()
+    }
+    func run(mu: Double, audioHz: Double = 1, known: Bool = false, scatter: Bool = false, beats: Int = 30,
+             start anchor: AudioPhaseAnchor = AudioPhaseAnchor(), from: Double = 13) -> (AudioPhaseAnchor, Double) {
+        var a = anchor
+        var off = 0.0
+        for i in 0..<beats {
+            let now = from + Double(i) * 0.3
+            off = a.step(onsets: onsets(mu: mu, until: now, scatter: scatter), audioHz: audioHz, audioConfidence: 0.7,
+                         lock: lock, directionKnown: known, now: now, dt: 0.3)
+        }
+        return (a, off)
+    }
+    let free = run(mu: 2.0)
+    let known = run(mu: 2.0, known: true)
+    let small = run(mu: -0.4, known: true)
+    let wrongHz = run(mu: 2.0, audioHz: 1.4)
+    let scattered = run(mu: 2.0, scatter: true)
+    // 对上之后声音没了：2 秒内保持，之后按 2 秒时间常数回 0
+    let (held1, _) = run(mu: 2.0, audioHz: 1.4, beats: 5, start: free.0, from: 22)
+    let (held2, _) = run(mu: 2.0, audioHz: 1.4, beats: 25, start: free.0, from: 22)
+    var unlocked = free.0
+    let zero = unlocked.step(onsets: [], audioHz: 1, audioConfidence: 0.7, lock: RhythmPhaseLock(), directionKnown: false,
+                             now: 30, dt: 0.3)
+    vcheck(abs(free.1 + AudioPhaseAnchor.unknownLimit) < 1e-3 && free.0.active && abs(known.1 + Double.pi / 3) < 1e-3 && abs(small.1 - 0.4) < 0.05
+           && wrongHz.1 == 0 && !wrongHz.0.active && scattered.1 == 0 && abs(held1.offset - free.1) < 1e-9
+           && abs(held2.offset) < abs(free.1) * 0.35 && zero == 0 && unlocked.offset == 0
+           && free.0.statusText(lockHz: 1).contains("已对齐") && wrongHz.0.statusText(lockHz: 1).contains("没听到"),
+           "P3 撞击声校正：偏移收敛到 \(String(format: "%.2f", free.1))（撞击在 2.0 rad，方向未判断时限 ±90°）、方向已判断时限 ±60°（\(String(format: "%.2f", known.1))）；"
+           + "频率对不上 / 撞击散乱不校正；声音没了 2 秒后慢慢回 0（\(String(format: "%.2f", held2.offset))）、没锁立刻 0")
+}
+
+do {
+    // 脉动相位偏移：offset = Δ 时和「相位锁本身提前 Δ」逐位相同（只挪时机，出口规则不变）；offset 0 = P2
+    func lockAt(_ phase0: Double) -> RhythmPhaseLock {
+        var lock = RhythmPhaseLock()
+        var now = 10.0
+        while now < 13 {
+            lock.step(plWindow(time: now - 0.03, hz: 1, phase0: phase0), followerHz: 1, followerLocked: true,
+                      followerSource: .flow, now: now, dt: 0.3, active: true)
+            now += 0.3
+        }
+        return lock
+    }
+    let st = AudioSyncSettings(enabled: true, maxPercent: 100, channels: .both)
+    let cal = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: "20:0.6, 60:1.8, 99:2.8", rhythmPulse: true)
+    func run(lock: RhythmPhaseLock, offset: Double) -> [[Int]] {
+        var d = RhythmPulseDriver()
+        d.phaseOffset = offset
+        var stage = SyncOutputStage()
+        var out: [[Int]] = []
+        var t = 13.0
+        _ = d.takesFullBeat(at: t)
+        for _ in 0..<30 {
+            t += 0.1
+            if d.takesFullBeat(at: t) {
+                out.append(d.beat(levels: [50, 40, 0, 0], lock: lock, visual: cal, settings: st, hasSignal: true, value: 60,
+                                  activity: 1, followerWeight: 1, now: t, stage: &stage))
+            } else if let o = d.subBeat(lock: lock, settings: st, now: t, stage: &stage) {
+                out.append(o)
+            }
+        }
+        return out
+    }
+    let shifted = run(lock: lockAt(0.3), offset: 1.1)
+    let early = run(lock: lockAt(1.4), offset: 0)
+    let plain = run(lock: lockAt(0.3), offset: 0)
+    let distinct = Set(shifted.map { $0[0] }).count
+    vcheck(shifted.count >= 25 && shifted == early && shifted != plain && distinct >= 5
+           && shifted.allSatisfy { $0[2] == 0 && $0[3] == 0 } && shifted.suffix(20).allSatisfy { $0[1] == 40 } && RhythmPulseDriver().phaseOffset == 0,
+           "P3 脉动相位偏移：偏移 1.1 rad 和相位锁本身提前 1.1 rad 逐位相同（震动不变、通道 3 / 4 恒 0），默认 0 = P2")
+}
+
+do {
+    // 姿态上下文：开着时给出髋 / 头 / 腕位置和三组节奏，另一个人的髋 / 头也带上；关着时一直是空的
+    var on = PoseMotionTracker()
+    on.contextEnabled = true
+    var off = PoseMotionTracker()
+    var sameReading = true
+    for i in 0..<90 {
+        let t = Double(i) / 9
+        let c = [vs3Skeleton(hipX: vs3HipWave(t)), vs3Skeleton(shiftX: 20, confidence: 0.6)]
+        let a = on.update(time: t, candidates: c, camera: .identity, continuous: true, frameHeight: 36)
+        let b = off.update(time: t, candidates: c, camera: .identity, continuous: true, frameHeight: 36)
+        sameReading = sameReading && a == b
+    }
+    let bc = on.bodyContext
+    vcheck(sameReading && bc.present && bc.hasHip && bc.hasHead && bc.hasWrist && abs(bc.headY - 7) < 1e-9
+           && abs(bc.hips.follow.hz - 2) <= 0.15 && bc.hasOtherHip && abs(bc.otherHipX - 52) < 1e-9 && bc.hasOtherHead
+           && !bc.hips.phase.isValid && off.bodyContext == PoseBodyContext(),
+           "P3 姿态上下文：髋 / 头 / 腕位置 + 节奏（髋 \(String(format: "%.2f", bc.hips.follow.hz)) Hz）、另一个人的髋 / 头；"
+           + "关着时是空的，姿态读数和关着逐位相同")
 }
 
 if vsFailures > 0 {
