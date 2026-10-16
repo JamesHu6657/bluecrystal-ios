@@ -1766,6 +1766,69 @@ do {
            + "\(String(format: "%.2f", paused.poseWeight))；只空 1 拍保持 \(String(format: "%.2f", blip.poseWeight))）")
 }
 
+do {
+    // 第 3 轮复审 M1：块运动很强（0.9）时，Vision 认到的人是静止的（多人画面里清楚的那个不动），
+    // 或者髋 / 膝置信度只有 0.2（不可用、只剩静止的上半身）：姿态不能把输出压没，至少保留只看块运动时的 0.6
+    let flowOnly = vs3Late(vs3PoseRun(flow: 0.9) { _, _ in nil }.outs)
+    let still = vs3PoseRun(flow: 0.9) { _, _ in vs3Skeleton() }
+    let stillLate = vs3Late(still.outs)
+    let lowHips = vs3Late(vs3PoseRun(flow: 0.9) { _, t in
+        var p = vs3Skeleton(hipX: vs3HipWave(t))
+        for j in [PoseJoint.root, .leftHip, .rightHip, .leftKnee, .rightKnee] { p.c[j.rawValue] = 0.2 }
+        return p
+    }.outs)
+    let floorOK: Bool = stillLate >= 0.6 * flowOnly && lowHips >= 0.6 * flowOnly
+    vcheck(flowOnly >= 80 && still.maxWeight >= 0.7 && floorOK,
+           "姿态：块运动 0.9 + 认到静止的人 / 髋部不可用，不否决强运动（只看块运动 \(Int(flowOnly))，"
+           + "静止的人 \(Int(stillLate))，髋置信度 0.2 \(Int(lowHips))）")
+}
+
+do {
+    // 第 3 轮复审 L1：切镜在一拍中间，同一拍里还有切镜前的有人读数、切镜后才回来的旧帧读数（Vision 异步）：
+    // 这一拍按「切镜、没人」处理，直接降权重；下一拍迟到的旧帧读数也不算；切镜后的新读数照常算
+    var acc = MotionWindowAccumulator()
+    var blend = PoseBlend()
+    let cutTime = 12 * 0.3 + 2 * 0.06
+    func window(_ k: Int, cutAt: Int? = nil, persons: Bool = true, extra: PoseReading? = nil) -> MotionWindow {
+        let t0 = Double(k) * 0.3
+        for j in 0..<5 {
+            let t = t0 + Double(j) * 0.06
+            acc.add(MotionSample(time: t, energy: 1, coverage: 0.2, isCut: j == cutAt, isHeld: false,
+                                 subject: SubjectReading(valid: true, score: 0)))
+            guard j % 2 == 0 else { continue }
+            if let c = cutAt {
+                if j < c {
+                    acc.addPose(PoseReading(time: t, present: true, score: 1, confidence: 0.9))
+                } else if j == c {
+                    acc.addPose(PoseReading(time: t - 0.11, present: true, score: 1, confidence: 0.9))
+                } else {
+                    acc.addPose(PoseReading(time: t, present: false))
+                }
+            } else {
+                acc.addPose(PoseReading(time: t, present: persons, score: persons ? 1 : 0, confidence: persons ? 0.9 : 0))
+            }
+        }
+        if let r = extra { acc.addPose(r) }
+        return acc.drain()
+    }
+    for k in 0..<11 { _ = blend.step(window(k), flow: 0, dt: 0.3) }
+    let peak = blend.step(window(11), flow: 0, dt: 0.3)
+    let cutWindow = window(12, cutAt: 2)
+    let cutOut = blend.step(cutWindow, flow: 0, dt: 0.3)
+    let lateWindow = window(13, persons: false,
+                            extra: PoseReading(time: cutTime - 0.02, present: true, score: 1, confidence: 0.9))
+    let lateOut = blend.step(lateWindow, flow: 0, dt: 0.3)
+    let postWindow = window(14, persons: false,
+                            extra: PoseReading(time: 14 * 0.3 + 0.2, present: true, score: 0.2, confidence: 0.8))
+    let windowsOK: Bool = cutWindow.cutCount == 1 && cutWindow.posePresentFrames == 0
+        && lateWindow.posePresentFrames == 0 && postWindow.posePresentFrames == 1
+    let blendOK: Bool = peak >= 0.75 && cutOut <= peak - 0.1 && lateOut < cutOut
+    vcheck(windowsOK && blendOK,
+           "姿态：切镜在一拍中间、同拍有切镜前的读数，照样直接降权重（\(String(format: "%.2f", peak)) → "
+           + "\(String(format: "%.2f", cutOut)) → \(String(format: "%.2f", lateOut))；切镜后的读数 "
+           + "\(postWindow.posePresentFrames) 次照常算）")
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)

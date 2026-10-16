@@ -1871,6 +1871,9 @@ struct PoseReading: Equatable {
     /// 这个人的检测置信度 0~1（没人时 0）
     var confidence: Double = 0
     var hz: Double = 0
+    /// 这次读数用到的关节可信度 0~1（algo-opt-3 复审 M1）：最近一次算速度时髋这组有可用关节 = 1，
+    /// 只有头这组 = 0.5，都没有 = 0。手搭的读数不填 = 1（行为不变）
+    var trust: Double = 1
 }
 
 /// 姿态 → 主体强度（algo-opt-3）：关节速度按躯干长度（或肩宽、关节包围框对角线）归一（远近 / 缩放无关），
@@ -1908,6 +1911,8 @@ struct PoseMotionTracker {
     static let groupWeights: [Double] = [1.0, 0.7, 1.0, 0.6, 0.35]
     static let headGroup = 0
     static let hipGroup = 2
+    /// 只有头这组关节可用（髋 / 膝被挡住或置信度 < 0.3）时的读数可信度
+    static let headOnlyTrust: Double = 0.5
 
     private var previous = PoseCandidate()
     private var hasPrevious = false
@@ -1928,6 +1933,8 @@ struct PoseMotionTracker {
     private var speedHead = 0
     private var hips = StrokeRhythm()
     private var head = StrokeRhythm()
+    /// 最近一次算速度时的关节可信度（见 PoseReading.trust）
+    private var trust: Double = 0
     private(set) var reading = PoseReading()
 
     mutating func reset() {
@@ -1937,6 +1944,7 @@ struct PoseMotionTracker {
         speedHead = 0
         hips.reset()
         head.reset()
+        trust = 0
         reading = PoseReading()
     }
 
@@ -2113,6 +2121,9 @@ struct PoseMotionTracker {
                     if g == Self.hipGroup { hips.add(time: time, x: ex, y: ey) }
                     if g == Self.headGroup { head.add(time: time, x: ex, y: ey) }
                 }
+                let hipUsable = Self.groups[Self.hipGroup].contains { usable[$0.rawValue] }
+                let headUsable = Self.groups[Self.headGroup].contains { usable[$0.rawValue] }
+                trust = hipUsable ? 1 : (headUsable ? Self.headOnlyTrust : 0)
                 pushSpeed(time: time, speed: speed)
             }
         } else {
@@ -2130,6 +2141,7 @@ struct PoseMotionTracker {
             if !continuous || pick.switched {
                 speedCount = 0
                 speedHead = 0
+                trust = 0
             }
         }
         previous = person
@@ -2155,7 +2167,8 @@ struct PoseMotionTracker {
         let score = max(byHips, byHead)
         reading = PoseReading(time: time, present: true, score: MotionStats.clamp01(score),
                               confidence: MotionStats.clamp01(person.confidence),
-                              hz: byHips >= byHead ? hipsRhythm.hz : headRhythm.hz)
+                              hz: byHips >= byHead ? hipsRhythm.hz : headRhythm.hz,
+                              trust: MotionStats.clamp01(trust))
         return reading
     }
 
@@ -2169,17 +2182,24 @@ struct PoseMotionTracker {
 }
 
 /// 姿态和块运动的融合（algo-opt-3，MotionNormalizer 里每拍一次）：累计有人 ≥ 0.55 秒（至少 2 拍）才开始用姿态，
-/// 没人 0.9 秒内保持上一次的姿态分数，权重 1 秒升到最多 0.8、1.5 秒降回 0（检测一闪一闪不出尖峰）
+/// 没人 0.9 秒内保持上一次的姿态分数，权重 1 秒升到最多 0.8、1.5 秒降回 0（检测一闪一闪不出尖峰）。
+/// 复审 M1：姿态只能细化、不能否决强的块运动——认到的人可能不是在动的那个（多人画面里静止的更清楚），
+/// 或者髋 / 膝置信度不够、只剩静止的上半身。输出不低于 flow × (1 − 0.4 × 权重)（满权重时 0.68 × flow），
+/// 读数可信度低（没有可用的髋关节）时权重再按 0.5 + 0.5 × 可信度收
 struct PoseBlend {
     static let confirmSeconds: TimeInterval = 0.55
     static let holdSeconds: TimeInterval = 0.9
     static let rampUpSeconds: TimeInterval = 1.0
     static let rampDownSeconds: TimeInterval = 1.5
     static let maxWeight: Double = 0.8
+    /// 姿态最多把块运动分数往下拉 0.4 × 权重
+    static let flowFloorShare: Double = 0.4
+    static let minTrustFactor: Double = 0.5
 
     private(set) var weight: Double = 0
     private(set) var heldScore: Double = 0
     private var heldConfidence: Double = 0
+    private var heldTrust: Double = 1
     private var presentRun: TimeInterval = 0
     private var absentRun: TimeInterval = .infinity
 
@@ -2194,13 +2214,15 @@ struct PoseBlend {
             absentRun = 0
             heldScore = MotionStats.clamp01(w.poseScore)
             heldConfidence = MotionStats.clamp01(w.poseConfidence)
+            heldTrust = w.poseTrust.isFinite ? MotionStats.clamp01(w.poseTrust) : 0
         } else {
             // 切了镜头、新画面里没人：不保持切镜前的姿态分数，直接开始降权重
             if w.cutCount > 0 { absentRun = max(absentRun, Self.holdSeconds) }
             absentRun += dt
             if absentRun > Self.holdSeconds { presentRun = 0 }
         }
-        let confFactor = 0.5 + 0.5 * MotionStats.clamp01((heldConfidence - 0.3) / 0.3)
+        let trustFactor = Self.minTrustFactor + (1 - Self.minTrustFactor) * heldTrust
+        let confFactor = (0.5 + 0.5 * MotionStats.clamp01((heldConfidence - 0.3) / 0.3)) * trustFactor
         let target = presentRun >= Self.confirmSeconds && absentRun <= Self.holdSeconds ? Self.maxWeight * confFactor : 0
         let rate = Self.maxWeight / (target > weight ? Self.rampUpSeconds : Self.rampDownSeconds)
         if target > weight {
@@ -2209,7 +2231,8 @@ struct PoseBlend {
             weight = max(target, weight - rate * dt)
         }
         if !weight.isFinite { weight = 0 }
-        return MotionStats.clamp01(weight * heldScore + (1 - weight) * flow)
+        let blended = weight * heldScore + (1 - weight) * flow
+        return MotionStats.clamp01(max(blended, flow * (1 - Self.flowFloorShare * weight)))
     }
 }
 
@@ -2233,6 +2256,8 @@ struct MotionWindow: Equatable {
     var posePresentFrames: Int = 0
     var poseScore: Double = 0
     var poseConfidence: Double = 0
+    /// 最后一次有人时的关节可信度（PoseReading.trust；手搭的窗口不填 = 1）
+    var poseTrust: Double = 1
 
     static let empty = MotionWindow()
 
@@ -2258,9 +2283,21 @@ struct MotionWindowAccumulator {
     private var posePresentFrames = 0
     private var poseScore: Double = 0
     private var poseConfidence: Double = 0
+    private var poseTrust: Double = 1
+    /// 最近一个切镜样本的时间（复审 L1）：跨拍保留（drain 不清；seek 时 VideoMotionMeter.reset 整个换新）。
+    /// 比它早的帧算出来的姿态读数（Vision 异步，切镜后才回来）不算有人
+    private var lastCutTime: Double = -.infinity
 
     mutating func add(_ s: MotionSample) {
         guard s.energy.isFinite, s.energy >= 0 else { return }
+        if s.isCut {
+            // 同一拍里切镜前的姿态读数作废：这一拍按「切镜、新画面还没人」处理，PoseBlend 不保持旧人的分数
+            if s.time.isFinite { lastCutTime = max(lastCutTime, s.time) }
+            posePresentFrames = 0
+            poseScore = 0
+            poseConfidence = 0
+            poseTrust = 1
+        }
         sum += s.energy
         if s.coverage.isFinite { coverageSum += min(1, max(0, s.coverage)) }
         if s.nearField.isFinite { nearSum += min(1, max(0, s.nearField)) }
@@ -2279,9 +2316,12 @@ struct MotionWindowAccumulator {
     mutating func addPose(_ r: PoseReading) {
         poseFrames += 1
         guard r.present, r.score.isFinite, r.confidence.isFinite else { return }
+        // 切镜前那些帧的读数（切镜样本之后才回来的）不算
+        guard !(r.time < lastCutTime) else { return }
         posePresentFrames += 1
         poseScore = min(1, max(0, r.score))
         poseConfidence = min(1, max(0, r.confidence))
+        poseTrust = r.trust.isFinite ? min(1, max(0, r.trust)) : 0
     }
 
     mutating func drain() -> MotionWindow {
@@ -2300,7 +2340,10 @@ struct MotionWindowAccumulator {
         window.posePresentFrames = posePresentFrames
         window.poseScore = poseScore
         window.poseConfidence = poseConfidence
+        window.poseTrust = poseTrust
+        let cut = lastCutTime
         self = MotionWindowAccumulator()
+        lastCutTime = cut
         return window
     }
 }

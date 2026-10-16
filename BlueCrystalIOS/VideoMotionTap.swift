@@ -79,11 +79,18 @@ private final class PoseWorker {
     /// 提交间隔：15 Hz 拉帧时大约每 5 帧提交 3 帧
     static let interval: Double = 1.0 / 9
     static let maxFailures = 3
+    /// 慢设备节流（复审 L2）：一次 Vision 跑完后至少空闲「这次耗时 × 0.5」再提交下一次（最多空 1 秒），
+    /// 单次超过 1/9 秒时姿态队列最多约 2/3 的时间在跑，不会一直满负荷。
+    /// 不取 × 1：单次 0.2 秒时间隔就到 0.4 秒以上，超过 PoseMotionTracker.maxGap，姿态就一直连不上
+    static let idleShare: Double = 0.5
+    static let maxIdle: Double = 1
 
     private let queue = DispatchQueue(label: "com.bluecrystal.motion.pose", qos: .utility)
-    /// inFlight / thermalOK / orientation / failures 跨队列读写，锁保护
+    /// inFlight / thermalOK / orientation / failures / idleUntil 跨队列读写，锁保护
     private let lock: UnsafeMutablePointer<os_unfair_lock>
     private var inFlight = false
+    /// host 时间（CACurrentMediaTime）：上一次跑完 + 空闲时间，之前不提交
+    private var idleUntil: CFTimeInterval = 0
     private var thermalOK = true
     private var failures = 0
     private var orientation = PoseOrientation.up
@@ -123,23 +130,29 @@ private final class PoseWorker {
         os_unfair_lock_unlock(lock)
     }
 
-    /// workQueue：能提交就提交（返回 true），上一次还在跑 / 发热 / 已停用就返回 false。
+    /// workQueue：能提交就提交（返回 true），上一次还在跑 / 还在空闲期 / 发热 / 已停用就返回 false。
     /// camera：上一次提交的那帧到这一帧的相机运动（分析帧像素）；continuous == false：中间断过
     func submit(_ buffer: CVPixelBuffer, time: Double, camera: CameraTransform, continuous: Bool,
                 frameWidth: Int, frameHeight: Int, generation: Int, meter: VideoMotionMeter) -> Bool {
         guard frameWidth > 0, frameHeight > 0, time.isFinite else { return false }
+        let now = CACurrentMediaTime()
         os_unfair_lock_lock(lock)
-        let go = !inFlight && thermalOK && failures < Self.maxFailures
+        let go = !inFlight && now >= idleUntil && thermalOK && failures < Self.maxFailures
         if go { inFlight = true }
         let o = orientation
         os_unfair_lock_unlock(lock)
         guard go else { return false }
         queue.async { [weak self] in
             guard let self = self else { return }
+            let start = CACurrentMediaTime()
             self.run(buffer, time: time, camera: camera, continuous: continuous, orientation: o,
                      frameWidth: frameWidth, frameHeight: frameHeight, generation: generation, meter: meter)
+            let end = CACurrentMediaTime()
+            let took = end - start
+            let idle = took.isFinite ? min(Self.maxIdle, max(0, took * Self.idleShare)) : 0
             os_unfair_lock_lock(self.lock)
             self.inFlight = false
+            self.idleUntil = end + idle
             os_unfair_lock_unlock(self.lock)
         }
         return true
