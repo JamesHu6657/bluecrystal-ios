@@ -725,14 +725,19 @@ VideoMotionTap（workQueue，15 Hz）── 64×36 亮度帧 ──▶ MotionAna
 #### 数据流
 
 ```
-VideoMotionTap ─ MotionAnalyzer（块运动主体：subjectHz / 自相关 subjectRhythm / 单程幅度 subjectAmplitude）
-               └ PoseMotionTracker（髋 / 头 / 腕三组 StrokeRhythm → rhythmPick → rhythmHz / rhythmConfidence / rhythmPart）
-        → MotionWindowAccumulator.drain() → MotionWindow（新增 4 个字段，最后一个有效值）
+VideoMotionTap ─ MotionAnalyzer（块运动主体：StrokeRhythm.estimate → subjectHz / 分数（不变）；
+               │                 StrokeRhythm.followEstimate → followHz / followRhythm / followAmplitude）
+               └ PoseMotionTracker（髋 / 头 / 腕三组 StrokeRhythm.followEstimate → rhythmPick → rhythmHz / rhythmConfidence /
+                                    rhythmPart / rhythmRate；score / hz 仍用 estimate）
+        → MotionWindowAccumulator.drain() → MotionWindow（subjectFollow* 三个、poseRhythm* 四个字段，最后一个有效值；
+                                                       切镜 / 保持期样本不带跟随值）
         → VideoSyncPlayer.motionTick：
-             RhythmFollower.step(window, dt)            # 合成「现在的动作频率」+ weight
+             activity = RhythmOutput.activity(画面自己的强度)        # ≤ 2 → 0，≥ 15 → 1
+             RhythmFollower.step(window, dt, active: activity > 0)  # 合成「现在的动作频率」+ weight
              DeviceRateMap.level(forHz:)                # 频率 → 伸缩档位（标定表 / 估计值）
-             RhythmOutput.target(value, …, rateLevel, weight)   # 伸缩按频率、震动照旧按强度
+             RhythmOutput.target(value, …, rateLevel, weight, activity)   # 伸缩按频率（weight × activity）、震动照旧按强度
              SyncOutputStage.step(levels:)              # 同一套：上限 / 升幅 ≤ +20 / 拍 / 归零保持
+             RhythmOutput.statusText(…, thrust: 实际发出的伸缩档位)       # 状态行
         → ble.sendTick（仍只在 tick 里，变化才发）
 ```
 
@@ -740,24 +745,35 @@ VideoMotionTap ─ MotionAnalyzer（块运动主体：subjectHz / 自相关 subj
 
 | 类型 | 作用 | 关键参数 |
 | --- | --- | --- |
-| `DeviceRateMap` | 档位 ↔ 次/秒的单调分段线性表；`parse` 认「档位:次数」，全角符号 / 换行也认 | 2~12 点，档位 1~99、0.1~8 Hz，严格递增；`uncalibrated` = 10:0.5, 99:3.0 |
+| `DeviceRateMap` | 档位 ↔ 次/秒的单调分段线性表；`parse` 认「档位:次数」，逗号 / 分号 / 顿号 / 空白 / 换行分隔，全角冒号逗号分号也认，冒号两边可有空格 | 2~12 点，档位 1~99、0.1~8 Hz，严格递增，≤ 400 字；`uncalibrated` = 10:0.5, 99:3.0 |
 | `RhythmCandidate` | 一拍的频率候选（flow / pose / both） | — |
-| `RhythmFollower` | 候选 → 锁定 / 平滑 / 跳变确认 / 丢失保持 → `hz`、`weight` | 0.4~4 Hz；块运动要主体分数 ≥ 0.05、幅度 ≥ 1 px；两路差 ≤ 15% 合并（置信度 +0.1），否则取高的（姿态 +0.05）；锁定 0.40 / 释放 0.30；log 域平滑 τ 1.5 s；跳变 > 30% 连续 0.6 s 才接受；丢失保持 1.5 s；weight 1 s 升 / 1.5 s 降 |
-| `RhythmOutput.target` | 原来的映射 + 通道分配，伸缩通道按 weight 插值到 `min(上限, max(最低强度, 节奏档位))` | 「仅震动」、没信号、没节奏档位时与原路径逐位相同 |
+| `RhythmFollower` | 候选 → 锁定 / 平滑 / 跳变确认 / 丢失保持 → `hz`、`weight` | 0.4~4 Hz；块运动要主体分数 ≥ 0.05、幅度 ≥ 1 px；姿态要姿态分数 ≥ 0.1（挑中腕时 ≥ 0.2）；两路差 ≤ 15% 合并（置信度 +0.1）；差 ≥ 1.6 倍且块运动频率 > 姿态采样率 × 0.4（或不知道采样率）时取块运动；其余取高的（姿态 +0.05）；锁定 0.40 / 释放 0.30；log 域平滑 τ 1.5 s（±30% 以内）；读数连续 ≥ 2 拍、累计 ≥ 0.6 s（每拍最多算 0.3 s）同方向偏离 > 15% 就跳到这几拍的对数平均；画面还在动时丢失保持 1.5 s；画面不动（`active` = false）或切镜马上解锁；weight 1 s 升 / 1.5 s 降（不动 / 切镜 0.3 s） |
+| `RhythmOutput.target` | 原来的映射 + 通道分配，伸缩通道按 **weight × activity** 插值到 `min(上限, max(最低强度, 节奏档位))` | activity：画面自己的强度 ≤ 2 → 0、≥ 15 → 1；画面强度为 0 时伸缩就是原来的档位（节奏不加任何伸缩）；「仅震动」、没信号、没节奏档位、activity 0 时与原路径逐位相同 |
+| `RhythmOutput.statusText` | 状态行（纯展示，可测） | 显示实际发出的伸缩档位；按 weight > 0 判断节奏是否起作用；「比设备最快 / 最慢」和「已到上限」各自独立提示 |
 | `SyncOutputStage.step(levels:)` | 和 `step(value)` 共用 `limit`（上限、升幅、归零保持） | 不变 |
 | `VisualSyncSettings` | `rhythmFollow`（`bcVisualSyncRhythmFollow`，默认 false）、`rateTable`（`bcVisualSyncRateTable`，默认 ""，≤ 400 字） | `rateMap` 填错 / 没填 → 估计值 |
 
-姿态侧新增腕组（`wristGroup`，只给节奏、不进 score），`PoseReading.rhythmPart`：0 无 / 1 髋 / 2 头 / 3 腕。
+姿态侧新增腕组（`wristGroup`，只给节奏、不进 score），`PoseReading.rhythmPart`：0 无 / 1 髋 / 2 头 / 3 腕；`rhythmRate`：挑出的那组最近 4 秒的实际采样率。
 
-**`StrokeRhythm` 修正（影响 algo-opt-3 的 subjectHz）**：真实视频的 2 Hz 在 15 fps 上是 7.5 格一个周期，块匹配速度有量化、
+**`StrokeRhythm` 的减半只给频率跟随（r1 复审 M1 / L7）**：真实视频的 2 Hz 在 15 fps 上是 7.5 格一个周期，块匹配速度有量化、
 相邻两下形状不同，自相关 7/8 格只有 ~0.67、15 / 30 格 1.0，原来 85% 的规则会报 1 Hz（用生成的 2 Hz 视频和 1→2 Hz 阶跃复现）。
-现在选中周期后再看「正好一半处」（插值后 ±0.75 格）有没有 ≥ 最高峰 55% 的峰，有就减半（可连续）。
-推拉不对称的真 1 Hz 在半周期上是负相关，不受影响（有测试钉住）。
+`estimate`（进 StrokeScore 的 hz / 置信度 / 幅度）**保持 algo-opt-3 的算法不变**；另给一个 `followEstimate`：选中周期后再看
+「正好一半处」（插值后 ±0.75 格）有没有 ≥ **最高峰** 55%、且自相关本身 ≥ 0.3 的峰，有就减半，**最多一次**（`halvedLag`，纯函数）。
+推拉不对称的真 1 Hz 在半周期上是负相关，不受影响（有测试钉住）。`followEstimate` 还带窗口里样本的实际采样率，
+跟随频率高于采样率 × 0.4 时不给（L3：慢设备上 Vision 节流到约 3 Hz 时，1.2 Hz 以上看不清）。
+
+**开关关着时与 algo-opt-3 逐位相同**：分数路径的 `estimate` 算法没变（测试里放了 07ac4d4 `StrokeRhythm` 的原样拷贝逐位比对，
+`SubjectFlowTracker` 的分数 / hz / 置信度 / 幅度也逐位比对）；VideoSyncPlayer 关着时仍走 `SyncOutputStage.step(value)` 和 `preview`
+（和 07ac4d4 `SyncOutputStage` 原样拷贝随机比对 3000 组）。腕组的 StrokeRhythm 关着时也在算，但只进 rhythm* 字段，不影响输出。
 
 #### 界面（`VideoSyncView.swift`）
 
 - 「画面」灵敏度区：开关「伸缩跟随动作频率」；打开后显示「设备标定表」输入框 + 提示（已标定范围 / 没标定 / 格式不对）。
-- 仪表区：`rhythmStatus` 一行，例如「动作节奏 1.8 次/秒 → 伸缩 46 档」「（比设备最快的 2.8 次/秒还快）」「（已到上限 60）」「；设备还没标定，档位是估计值」。
+  输入框编辑的是草稿（`rateTableDraft`），按「完成」、收起键盘或输入框消失时才写回 `rateTable`：打字过程中半截的表（如「…, 99:2」）不会生效；
+  提示按草稿算，没写回时注明「按「完成」或收起键盘后生效」。
+- 仪表区：`rhythmStatus` 一行（`RhythmOutput.statusText`），显示这一拍实际发出的伸缩档位（联动关着时是预览值），例如
+  「动作节奏 1.8 次/秒 → 伸缩 46 档」「（节奏丢了，正在交回动作强度）」「（画面没在动，伸缩不跟节奏）」「（比设备最快的 2.8 次/秒还快）」「（已到上限 60）」「；设备还没标定，档位是估计值」。
+  联动关着时强度条预览也算上节奏（开关关着时预览照旧）。
 - 所有 `motionShaper.reset()` 处同时 `resetRhythm()`（seek、缓冲、切来源、关联动、新视频、拆取帧）；开关切换时也从头确认。
 - 频率按画面帧的显示时刻（host 时间轴）算，倍速播放时已是实际看到的快慢，不再乘倍速。
 
@@ -765,24 +781,40 @@ VideoMotionTap ─ MotionAnalyzer（块运动主体：subjectHz / 自相关 subj
 
 不改 BLEManager / SafetyLedger / Protocol / AIProgram / 工程文件；只换伸缩的**目标档位**，出口照旧上限夹紧、升幅 ≤ +20 / 0.3 s、归零保持 2 拍、STOP / 看门狗 / 关联动归零不变；仍只在 `tick()` 里 `sendTick`。
 
-#### 测试（`Tests/VisualSyncChecks/main.swift`「rhythm-follow P1」，本地 Linux 235 项全部 PASS）
+#### 测试（`Tests/VisualSyncChecks/main.swift`「rhythm-follow P1」）
 
 标定表解析 / 校验 / 插值单调 / 反查；候选合并与冲突、相机抖动 / 小幅度 / 越界 / NaN 不算；跟随器稳态、±10% 抖动、1→2 Hz 阶跃 0.6 s 确认后到位、
 单拍倍频误检不跟、回差、丢失保持 1.5 s、weight 斜率、NaN dt；3000 组随机输入经 `step(levels:)` 后 ≤ 上限、升幅 ≤ 20、归零保持、只用两个通道；
-没有节奏档位时与 `step(value)` 逐位一致；合成画面 1 / 2 Hz 端到端锁定并给出不同档位、静止 / 纯抖动不锁定、抖动 + 主体照样锁定；
-腕 1.5 Hz → 取腕、髋 2 Hz → 取髋；半整数周期 2 Hz 不当 1 Hz；设置默认值 / 坏值 / 超长 / 键名。
-另外用 `make-rhythm-test-videos.sh` 生成的 6 个视频缩到 64×36、15 fps 离线跑：常频 0.5 / 1 / 2 / 3 Hz 均锁到 ±1%，阶跃 4 s 内跟上，扫频跟上（滞后 1~3 s，有一次短暂跳到 1/3 频率）。
-`VideoSyncView.swift` 的 SwiftUI 部分 Linux 编不了，需要 Xcode 编译确认。
+没有节奏档位 / activity 0 时与 `step(value)` 逐位一致；合成画面 1 / 2 Hz 端到端锁定并给出不同档位、静止 / 纯抖动不锁定、抖动 + 主体照样锁定；
+腕 1.5 Hz → 取腕（采样率约 9 次/秒）、髋 2 Hz → 取髋；设置默认值 / 坏值 / 超长 / 键名。
+
+r1 复审新增：
+- M1：`estimate` 和 07ac4d4 `StrokeRhythm` 原样拷贝逐位相同（半整数周期 2 Hz、推拉不对称 1 Hz、带噪声的二维信号、约 9 Hz 不均匀采样），
+  `SubjectFlowTracker` 的分数 / hz / 置信度 / 幅度逐位相同；`followEstimate` 上半整数周期 2 Hz ≈ 2 Hz；开关关着的出口 / 预览和 07ac4d4 原样拷贝逐位相同。
+- M2：画面强度 0 时伸缩为原来的档位（没有最低强度就是 0）；强度 8.5 交接一半；动作停了（窗口里还留着旧节奏）伸缩 ≤ 0.5 s 归零、不重新锁定；
+  切镜后 ≤ 0.5 s 回到按强度；画面不动不锁定；姿态分数 < 0.1（腕 < 0.2）不算；切镜 / 保持期样本不带跟随频率。
+- M3：锁在 1.4 Hz、读数 2.0 / 2.4 交替 → ≤ 1.5 s 跟到 ≈ 2.19 Hz；1.7 / 2.4 交替 → ≈ 2.02 Hz；单拍离群不跟。
+- L2：dt 0.65 s 的单拍离群不跟；0.1 s 一拍时第 6 拍（0.6 s）才确认。
+- L3：姿态 3 Hz 采样、和块运动差一个八度时取块运动；15 Hz 采样的 1.4 Hz 照常给，3 Hz 采样时 > 1.2 Hz 一律不给。
+- L4：状态行（实际档位、超速与上限同时提示、交接期 / 画面不动的说明）。
+- L5：空白 / 顿号 / 全角分隔、冒号两边空格。
+- L7：`halvedLag` 直接喂自相关：真 2 Hz 减半到 7.5 格；0.5 Hz 最多减一次；弱峰 < 0.3、不到最高峰 55% 不减；带噪声 / 量化的 0.5 / 1 Hz 一次都不减；
+  随机噪声里跟随频率不超过基础估计的 2.5 倍。
+
+`make-rhythm-test-videos.sh` 的 6 个视频离线跑（常频 0.5 / 1 / 2 / 3 Hz 锁到 ±1%，阶跃 4 s 内跟上，扫频滞后 1~3 s、有一次短暂跳到 1/3 频率）是 r1 之前的版本，
+减半规则改成「最多一次、按最高峰、≥ 0.3」后需要重跑确认。`VideoSyncView.swift` 的 SwiftUI 部分 Linux 编不了，需要 Xcode 编译确认。
 
 #### 真机验证清单
 
 1. P0 标定做完、表填进 App，输入框下面显示「已标定：…」。
 2. 测试视频 const-1hz / 2hz：状态行 3~6 s 内显示 ≈ 1.0 / 2.0 次/秒，设备实际往复次数与视频接近（±15%）。
 3. step-1to2hz：20 s 后 2~4 s 内设备明显变快；中途不来回跳。
-4. 真实视频：快慢变化能跟上；人离开 / 切镜后 1.5 s 内状态回到「还没找到稳定的动作节奏」，伸缩平滑回到按强度。
+4. 真实视频：快慢变化能跟上；动作停下（画面强度归零）或切镜后 0.5 s 内伸缩回到按强度、状态回到「还没找到稳定的动作节奏」；
+   人还在、检测一闪而过时节奏保持 1.5 s 不掉。光说话比划手势（没有主体动作）时伸缩不按节奏走。
 5. 上限 60 / 最低强度 20：伸缩档位不超过 60、不低于 20；「仅震动」时不跟频率。
-6. 关掉开关：行为与 algo-opt-3 完全一样。
-7. 安全回归：STOP、看门狗、断连、关联动立刻归零。
+6. 关掉开关：行为与 algo-opt-3 完全一样（分数 / 出口逐位相同，测试钉住）。
+7. 标定表：播放中改表，打字过程中设备不变，按「完成」后才按新表出档。
+8. 安全回归：STOP、看门狗、断连、关联动立刻归零。
 
 ## 11. 风险与待定
 

@@ -797,40 +797,24 @@ final class VideoSyncPlayer: ObservableObject {
     }
 
     /// rhythm-follow P1：这一拍的节奏档位（没打开 / 没锁定 / 没有新鲜画面时 nil = 伸缩照旧按动作强度）。
+    /// activity：画面自己的强度能让节奏用几成（RhythmOutput.activity）；0 = 画面没在动，跟随器马上解锁、不保持。
     /// 频率按画面帧的显示时刻（host 时间轴）算，倍速播放时已经是实际看到的快慢，不再乘倍速
-    private func rhythmLevel(_ window: MotionWindow, motionSignal: Bool, dt: TimeInterval) -> Int? {
+    private func rhythmLevel(_ window: MotionWindow, motionSignal: Bool, activity: Double, dt: TimeInterval) -> Int? {
         guard visualSettings.rhythmFollow else {
             if rhythmStatus != nil { resetRhythm() }
             return nil
         }
-        if motionSignal { rhythm.step(window, dt: dt) } else { rhythm.reset() }
-        let map = visualSettings.rateMap
-        let calibrated = visualSettings.calibratedRateMap != nil
-        let level: Int? = rhythm.weight > 0 && rhythm.hz > 0 ? map.level(forHz: rhythm.hz) : nil
-        let text = Self.rhythmText(locked: rhythm.locked, hz: rhythm.hz, level: level, map: map,
-                                   calibrated: calibrated, settings: settings)
-        if text != rhythmStatus { rhythmStatus = text }
-        return level
+        if motionSignal { rhythm.step(window, dt: dt, active: activity > 0) } else { rhythm.reset() }
+        return rhythm.weight > 0 && rhythm.hz > 0 ? visualSettings.rateMap.level(forHz: rhythm.hz) : nil
     }
 
-    /// 界面上的一行节奏状态（频率保留一位小数，变化才刷新）
-    static func rhythmText(locked: Bool, hz: Double, level: Int?, map: DeviceRateMap, calibrated: Bool,
-                           settings s: AudioSyncSettings) -> String {
-        let note = calibrated ? "" : "；设备还没标定，档位是估计值"
-        guard locked, let level else { return "还没找到稳定的动作节奏，伸缩先按动作强度" + note }
-        let cap = SyncOutputStage.hardCap(s)
-        let shown = s.channels == .vibration ? 0 : min(cap, max(Int(min(s.maxPercent, s.minPercent).rounded()), level))
-        var text = String(format: "动作节奏 %.1f 次/秒 → 伸缩 %d 档", hz, shown)
-        if s.channels == .vibration {
-            text = String(format: "动作节奏 %.1f 次/秒（「仅震动」时不跟频率）", hz)
-        } else if hz > map.maxHz * 1.05 {
-            text += String(format: "（比设备最快的 %.1f 次/秒还快）", map.maxHz)
-        } else if hz < map.minHz * 0.95 {
-            text += String(format: "（比设备最慢的 %.1f 次/秒还慢）", map.minHz)
-        } else if level > cap {
-            text += "（已到上限 \(cap)）"
-        }
-        return text + note
+    /// 界面上的一行节奏状态（thrust：这一拍伸缩实际发出 / 预览的档位；变化才刷新）
+    private func updateRhythmStatus(rateLevel: Int?, activity: Double, thrust: Int) {
+        let text = RhythmOutput.statusText(hz: rhythm.hz, weight: rhythm.weight, locked: rhythm.locked,
+                                           rateLevel: rateLevel, activity: activity, thrust: thrust,
+                                           map: visualSettings.rateMap,
+                                           calibrated: visualSettings.calibratedRateMap != nil, settings: settings)
+        if text != rhythmStatus { rhythmStatus = text }
     }
 
     /// 跟随画面的一拍：画面窗口 → 自适应归一化 → 门 / 平滑 → 出口（最低强度 / 上限 / 升幅限速 / 归零保持 / 夹紧）
@@ -854,21 +838,30 @@ final class VideoSyncPlayer: ObservableObject {
                                      motionSignal: motionSignal, audio: shaper.smoothed, audioSignal: audioSignal, dt: dt)
         let value = blended.value
         let hasSignal = blended.hasSignal
-        // 节奏只认画面自己的新鲜样本（交接期间声音补的那部分没有频率）
-        let rateLevel = rhythmLevel(window, motionSignal: motionSignal, dt: dt)
+        // 节奏只认画面自己的新鲜样本和画面自己的强度（交接期间声音补的那部分没有频率，也不算「在动」）
+        let motionActivity = RhythmOutput.activity(motionSignal ? motionNormalizer.confidence * shaped.smoothed : 0)
+        let rateLevel = rhythmLevel(window, motionSignal: motionSignal, activity: motionActivity, dt: dt)
         guard settings.enabled else {
             // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
             outputStage.reset()
             handover.cancel()
-            intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
+            if visualSettings.rhythmFollow {
+                let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
+                                                 rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
+                intensity = min(SyncOutputStage.hardCap(settings), levels.max() ?? 0)
+                updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: levels[0])
+            } else {
+                intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
+            }
             return
         }
         let vals: [Int]
         if visualSettings.rhythmFollow {
-            // 伸缩按动作频率（weight 交接），震动照旧；同一个出口：上限 / 升幅 ≤ +20 / 归零保持
+            // 伸缩按动作频率（weight × 画面强度交接），震动照旧；同一个出口：上限 / 升幅 ≤ +20 / 归零保持
             let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
-                                             rateLevel: rateLevel, weight: rhythm.weight)
+                                             rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
             vals = outputStage.step(levels: levels, settings: settings)
+            updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: vals[0])
         } else {
             vals = outputStage.step(value, settings: settings, hasSignal: hasSignal)
         }
@@ -1118,6 +1111,9 @@ struct VideoSyncView: View {
     // rhythm-follow P1：伸缩跟随动作频率（默认关）+ 设备档位→每秒往复次数标定表（docs/rhythm-calibration.md）
     @AppStorage(VisualSyncSettings.Keys.rhythmFollow) private var rhythmFollow = VisualSyncSettings.defaultRhythmFollow
     @AppStorage(VisualSyncSettings.Keys.rateTable) private var rateTable = VisualSyncSettings.defaultRateTable
+    /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
+    @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
+    @FocusState private var rateTableFocused: Bool
 
     private var audioSettings: AudioSyncSettings {
         AudioSyncSettings(enabled: syncEnabled, sensitivityDb: sensitivityDb,
@@ -1575,13 +1571,24 @@ struct VideoSyncView: View {
                 Text("设备标定表（档位:每秒往复次数）")
                     .font(.subheadline)
                     .foregroundColor(Velvet.text)
-                TextField("例 20:0.6, 60:1.8, 99:2.8", text: $rateTable)
+                // 编辑稿：打字过程中半截的表（如「…, 99:2」）不生效，按「完成」/ 收起键盘 / 输入框消失时才写回
+                TextField("例 20:0.6, 60:1.8, 99:2.8", text: $rateTableDraft)
                     .font(.caption.monospacedDigit())
                     .keyboardType(.numbersAndPunctuation)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .foregroundColor(Velvet.text)
                     .submitLabel(.done)
+                    .focused($rateTableFocused)
+                    .onSubmit { commitRateTable() }
+                    .onChange(of: rateTableFocused) { focused in
+                        if !focused { commitRateTable() }
+                    }
+                    .onChange(of: rateTable) { stored in
+                        if !rateTableFocused { rateTableDraft = stored }
+                    }
+                    .onAppear { rateTableDraft = rateTable }
+                    .onDisappear { commitRateTable() }
                     .frame(minHeight: 44)
                     .accessibilityLabel("设备标定表")
                 Text(rateTableHint)
@@ -1592,18 +1599,26 @@ struct VideoSyncView: View {
         }
     }
 
-    private var rateTableIsBad: Bool {
-        !rateTable.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && DeviceRateMap.parse(rateTable) == nil
+    /// 编辑稿写回存储（只有这里改 rateTable；VideoSyncPlayer 经 onChange(of: visualSettings) 下一拍用新表）
+    private func commitRateTable() {
+        if rateTableDraft != rateTable { rateTable = rateTableDraft }
     }
 
+    private var rateTableIsBad: Bool {
+        !rateTableDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && DeviceRateMap.parse(rateTableDraft) == nil
+    }
+
+    /// 提示按编辑稿算（打字时就能看到格式对不对）；还没写回时注明
     private var rateTableHint: String {
-        if let map = DeviceRateMap.parse(rateTable) {
+        let pending = rateTableDraft != rateTable ? "（按「完成」或收起键盘后生效）" : ""
+        if let map = DeviceRateMap.parse(rateTableDraft) {
             return String(format: "已标定：%d~%d 档 ≈ 每秒 %.1f~%.1f 次", map.minLevel, map.maxLevel, map.minHz, map.maxHz)
+                + pending
         }
         let guess = DeviceRateMap.uncalibrated
         let head = rateTableIsBad ? "格式不对（2~12 组「档位:次数」，档位和次数都要递增），先按" : "还没标定，先按"
         return head + String(format: "估计值 %d 档 %.1f 次 ~ %d 档 %.1f 次；在手动页每档跑 10 秒数一下每秒几次再填",
-                              guess.minLevel, guess.minHz, guess.maxLevel, guess.maxHz)
+                              guess.minLevel, guess.minHz, guess.maxLevel, guess.maxHz) + pending
     }
 
     /// 当前来源的状态提示（没有音轨 / 画面轨、分析不可用、发热降频）
