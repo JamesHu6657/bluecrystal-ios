@@ -1545,6 +1545,76 @@ do {
            "姿态：偶尔 0.3 秒的误检（剧烈动作）不起作用（最高 \(Int(blip)) vs 没人 \(Int(none))）")
 }
 
+/// 15 Hz 直接喂 StrokeRhythm，记下每一步的估计
+func vs3Rhythm(seconds: Double, _ v: (Double) -> (x: Double, y: Double)) -> [StrokeRhythm.Estimate] {
+    var r = StrokeRhythm()
+    var out: [StrokeRhythm.Estimate] = []
+    for k in 0..<Int(seconds * 15) {
+        let t = Double(k) * vsDt
+        let p = v(t)
+        r.add(time: t, x: p.x, y: p.y)
+        out.append(r.estimate)
+    }
+    return out
+}
+
+do {
+    // 慢于 0.5 Hz：自相关从最短滞后一路往下走，最高点在搜索边界上，不是峰 → 没有节奏（以前会报 3.75~4.3 Hz）
+    var falseBeats: [String] = []
+    for f in [0.3, 0.35, 0.4] {
+        let e = vs3Rhythm(seconds: 12) { t in
+            let v = cos(2 * Double.pi * f * t)
+            return (0.8 * v, 0.6 * v)
+        }
+        if let bad = e.first(where: { $0.confidence != 0 || $0.hz != 0 }) {
+            falseBeats.append("\(f) Hz → \(String(format: "%.2f", bad.hz)) Hz")
+        }
+    }
+    // 平滑的随机漂移（每个轴 3 个 0.05~0.2 Hz、随机相位 / 幅度的分量）：没有往复 → 没有节奏
+    let drift = vs3Rhythm(seconds: 20) { t in
+        var x = 0.0
+        var y = 0.0
+        for j in 0..<3 {
+            x += (0.5 + vs3Hash(j, 0, 7)) * sin(2 * Double.pi * (0.05 + 0.15 * vs3Hash(j, 1, 7)) * t
+                                               + 2 * Double.pi * vs3Hash(j, 2, 7))
+            y += (0.5 + vs3Hash(j, 0, 8)) * sin(2 * Double.pi * (0.05 + 0.15 * vs3Hash(j, 1, 8)) * t
+                                               + 2 * Double.pi * vs3Hash(j, 2, 8))
+        }
+        return (x, y)
+    }
+    if let bad = drift.first(where: { $0.confidence != 0 || $0.hz != 0 }) {
+        falseBeats.append("漂移 → \(String(format: "%.2f", bad.hz)) Hz")
+    }
+    vcheck(falseBeats.isEmpty, "节奏：0.3~0.4 Hz 慢往复 / 平滑随机漂移不判成快节奏（\(falseBeats)）")
+
+    // 0.7 Hz：头 2 秒历史太短、够不到真周期，不能报快节奏；攒够以后照样认出 0.7 Hz
+    let slow = vs3Rhythm(seconds: 8) { t in
+        let v = sin(2 * Double.pi * 0.7 * t)
+        return (v, 0)
+    }
+    let early = slow.prefix(30).map { $0.hz }.max() ?? 99
+    let last = slow.last ?? StrokeRhythm.Estimate()
+    vcheck(early < 1 && abs(last.hz - 0.7) <= 0.1 && last.confidence >= 0.5,
+           "节奏：0.7 Hz 头 2 秒没有假快节奏（最高 \(String(format: "%.2f", early)) Hz），之后认出 \(String(format: "%.2f", last.hz)) Hz")
+}
+
+do {
+    // 换人（原来的人不见了，另一个人在 2 个身体尺度外）不算关节速度、不进节奏：
+    // Vision 慢（0.3 秒一次）时以前会把 20 像素 / 0.3 秒的跳变当成约 6 躯干 / 秒的动作
+    var tracker = PoseMotionTracker()
+    var maxScore = 0.0
+    var present = 0
+    for i in 0..<40 {
+        let t = Double(i) * 0.3
+        let person = vs3Skeleton(shiftX: i % 2 == 0 ? -10 : 10)
+        let r = tracker.update(time: t, candidates: [person], camera: .identity, continuous: true, frameHeight: 36)
+        maxScore = max(maxScore, r.score)
+        if r.present { present += 1 }
+    }
+    vcheck(maxScore <= 1e-9 && present == 0,
+           "姿态：两个人轮流出现（每次都是换人）不算速度（最高分 \(String(format: "%.3f", maxScore))，有读数 \(present) 次）")
+}
+
 do {
     // AVAssetTrack.preferredTransform（缓冲 16×9）→ 显示坐标 → Vision 归一化（左下角原点）→ bufferPoint 应该回到原点
     let w = 16.0

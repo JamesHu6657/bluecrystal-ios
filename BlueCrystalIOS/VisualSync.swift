@@ -1657,9 +1657,12 @@ struct StrokeRhythm {
         let a = corr[pick - 1]
         let b = corr[pick]
         let cc = corr[pick + 1]
+        // 必须是真的峰：慢于 0.5 Hz / 没有周期的平滑运动，自相关从最短滞后一路往下走，
+        // 最高点落在搜索边界上（不是峰），不能当成 3.75 Hz 以上的快节奏
+        guard b >= a, b >= cc else { return Estimate() }
         let den = a - 2 * b + cc
         let delta = den < -1e-12 ? min(0.5, max(-0.5, 0.5 * (a - cc) / den)) : 0
-        let lag = Double(pick) + delta
+        let lag = min(Double(kMax), max(Double(Self.minLag), Double(pick) + delta))
         let hz = Self.gridRate / lag
         let amplitude = 2.0.squareRoot() * rms / (2 * Double.pi * hz)
         guard hz.isFinite, amplitude.isFinite else { return Estimate() }
@@ -1971,8 +1974,9 @@ struct PoseMotionTracker {
         return n > 0 ? (sx / n, sy / n) : (0, 0)
     }
 
+    /// switched：有上一帧可以对、但没有候选人在它附近（换了人 / 原来的人不见了），这一帧不能和上一帧算速度
     private func select(_ candidates: [PoseCandidate], camera: CameraTransform, continuous: Bool,
-                        frameHeight: Double) -> Int? {
+                        frameHeight: Double) -> (index: Int, switched: Bool)? {
         var bestIndex: Int?
         var bestValue = -Double.infinity
         var nearIndex: Int?
@@ -2001,8 +2005,9 @@ struct PoseMotionTracker {
                 }
             }
         }
-        if let i = nearIndex, nearDistance <= Self.continuityLimit { return i }
-        return bestIndex
+        if let i = nearIndex, nearDistance <= Self.continuityLimit { return (index: i, switched: false) }
+        guard let i = bestIndex else { return nil }
+        return (index: i, switched: predicted != nil)
     }
 
     private mutating func absent(_ time: Double) -> PoseReading {
@@ -2023,10 +2028,10 @@ struct PoseMotionTracker {
             hasPrevious = false
             return absent(time)
         }
-        let person = candidates[pick]
+        let person = candidates[pick.index]
         let size = Self.bodyScale(person, frameHeight: frameHeight)
         let dt = time - previousTime
-        let linked = hasPrevious && continuous && dt > Self.minGap && dt <= Self.maxGap && scale > 0
+        let linked = !pick.switched && hasPrevious && continuous && dt > Self.minGap && dt <= Self.maxGap && scale > 0
         if linked {
             scale += (size - scale) * (1 - exp(-dt / Self.scaleSeconds))
             var n = 0
@@ -2068,8 +2073,8 @@ struct PoseMotionTracker {
             }
         } else {
             scale = size
-            // 断过（seek / 切镜）或者人丢了超过 1 秒：节奏重新攒；短暂丢失（检测一闪）不清
-            if !continuous || !(time - previousTime <= Self.rhythmGapLimit) {
+            // 断过（seek / 切镜）、换了人或者人丢了超过 1 秒：节奏重新攒；短暂丢失（检测一闪）不清
+            if !continuous || pick.switched || !(time - previousTime <= Self.rhythmGapLimit) {
                 hips.reset()
                 head.reset()
             }
