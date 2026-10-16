@@ -1517,11 +1517,25 @@ struct StrokeRhythm {
     static let minSamples = 12
     static let minSpan: Double = 1.5
     static let octaveShare: Double = 0.85
+    /// rhythm-follow（只影响 followEstimate，estimate / 分数与 algo-opt-3 逐位相同）：选中周期正好一半处（插值后 ±0.75 格）
+    /// 的峰 ≥ 最高峰的 55%、且自相关本身 ≥ 0.3，就按两倍频率算；最多减半一次
+    static let harmonicShare: Double = 0.55
+    static let harmonicFloor: Double = 0.3
+    /// rhythm-follow：高于实际采样率 0.4 倍的频率不可信（慢设备上姿态约 3 Hz 采样，看不清 1.2 Hz 以上），不给
+    static let aliasShare: Double = 0.4
 
     struct Estimate: Equatable {
         var hz: Double = 0
         var confidence: Double = 0
         var amplitude: Double = 0
+    }
+
+    /// rhythm-follow：给 RhythmFollower 的估计（可能是 estimate 的两倍频率）+ 窗口里样本的实际采样率（次 / 秒）
+    struct FollowEstimate: Equatable {
+        var hz: Double = 0
+        var confidence: Double = 0
+        var amplitude: Double = 0
+        var sampleRate: Double = 0
     }
 
     private var times = [Double](repeating: 0, count: StrokeRhythm.capacity)
@@ -1534,6 +1548,8 @@ struct StrokeRhythm {
     private var grid = [Double](repeating: 0, count: StrokeRhythm.gridCapacity)
     private var corr = [Double](repeating: 0, count: StrokeRhythm.maxLag + 2)
     private(set) var estimate = Estimate()
+    /// rhythm-follow：只给频率跟随用（见 follow），不进 StrokeScore
+    private(set) var followEstimate = FollowEstimate()
 
     var scratchAddresses: [Int] {
         func address<T>(_ a: [T]) -> Int { a.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) } }
@@ -1545,6 +1561,7 @@ struct StrokeRhythm {
         count = 0
         head = 0
         estimate = Estimate()
+        followEstimate = FollowEstimate()
     }
 
     /// 时间必须递增（不递增的样本丢掉）
@@ -1557,6 +1574,8 @@ struct StrokeRhythm {
         ys[head] = y
         head = (head + 1) % cap
         count = min(cap, count + 1)
+        // compute 只在得出基础估计时才填 followEstimate
+        followEstimate = FollowEstimate()
         estimate = compute(now: t)
     }
 
@@ -1565,6 +1584,13 @@ struct StrokeRhythm {
         guard count > 0, now.isFinite else { return Estimate() }
         let last = times[(head + Self.capacity - 1) % Self.capacity]
         return now - last <= maxAge ? estimate : Estimate()
+    }
+
+    /// 同 freshEstimate，给频率跟随
+    func freshFollowEstimate(at now: Double, maxAge: Double) -> FollowEstimate {
+        guard count > 0, now.isFinite else { return FollowEstimate() }
+        let last = times[(head + Self.capacity - 1) % Self.capacity]
+        return now - last <= maxAge ? followEstimate : FollowEstimate()
     }
 
     private mutating func compute(now: Double) -> Estimate {
@@ -1673,7 +1699,48 @@ struct StrokeRhythm {
         let hz = Self.gridRate / lag
         let amplitude = 2.0.squareRoot() * rms / (2 * Double.pi * hz)
         guard hz.isFinite, amplitude.isFinite else { return Estimate() }
-        return Estimate(hz: hz, confidence: MotionStats.clamp01(b), amplitude: amplitude)
+        let result = Estimate(hz: hz, confidence: MotionStats.clamp01(b), amplitude: amplitude)
+        followEstimate = follow(result, pick: pick, best: best, kMax: kMax, rms: rms, samples: n, span: span)
+        return result
+    }
+
+    /// rhythm-follow：在基础估计的周期上最多减半一次，只给频率跟随用（estimate 不变）。
+    /// 真实视频 2 Hz 在 15 fps 上是 7.5 格一个周期，块匹配的速度有量化、相邻两下形状不同，7/8 格只有 ~0.67、15 / 30 格 ~1.0，
+    /// 基础规则（85%）会报 1 Hz。门槛按最高峰 best 算（不随减半一路降低）、只减一次、自相关本身 ≥ 0.3。
+    /// 推拉不对称的真 1 Hz 在半周期上是负相关，不受影响。采样率太低时（见 aliasShare）不给
+    private func follow(_ e: Estimate, pick: Int, best: Double, kMax: Int, rms: Double, samples n: Int,
+                        span: Double) -> FollowEstimate {
+        let rate = n > 1 && span > 0 ? Double(n - 1) / span : 0
+        var out = FollowEstimate(hz: e.hz, confidence: e.confidence, amplitude: e.amplitude, sampleRate: rate)
+        if let half = Self.halvedLag(corr, pick: pick, best: best) {
+            let lag = min(Double(kMax), max(Double(Self.minLag), half.lag))
+            let hz = Self.gridRate / lag
+            let amplitude = 2.0.squareRoot() * rms / (2 * Double.pi * hz)
+            if hz.isFinite, amplitude.isFinite {
+                out.hz = hz
+                out.confidence = MotionStats.clamp01(half.peak)
+                out.amplitude = amplitude
+            }
+        }
+        guard rate.isFinite, rate > 0, out.hz <= Self.aliasShare * rate else { return FollowEstimate(sampleRate: rate) }
+        return out
+    }
+
+    /// rhythm-follow：基础周期 pick（格）正好一半处（插值后 ±0.75 格）有没有够格的峰：局部峰、自相关 ≥ harmonicFloor、
+    /// 插值后 ≥ harmonicShare × best（best = 整个搜索范围的最高峰，不是 pick 处的值）。有就返回插值后的滞后和那个峰的自相关，
+    /// 没有 nil。只看一次（调用方不再拿结果继续减半）。纯函数：corr 下标 = 滞后格数，minLag − 1 … pick 都要有值
+    static func halvedLag(_ corr: [Double], pick: Int, best: Double) -> (lag: Double, peak: Double)? {
+        guard pick > minLag, pick < corr.count, best.isFinite else { return nil }
+        for k in minLag..<pick where corr[k] >= corr[k - 1] && corr[k] >= corr[k + 1] {
+            let den = corr[k - 1] - 2 * corr[k] + corr[k + 1]
+            let diff = corr[k - 1] - corr[k + 1]
+            let lift = den < -1e-12 ? min(0.25, -diff * diff / (8 * den)) : 0
+            let offset = den < -1e-12 ? min(0.5, max(-0.5, 0.5 * diff / den)) : 0
+            guard abs(2 * (Double(k) + offset) - Double(pick)) <= 1.5, corr[k] >= harmonicFloor,
+                  corr[k] + lift >= harmonicShare * best else { continue }
+            return (Double(k) + offset, corr[k])
+        }
+        return nil
     }
 }
 
@@ -1746,6 +1813,10 @@ struct SubjectReading: Equatable {
     var rhythm: Double = 0
     /// 单程幅度（分析帧像素）
     var amplitude: Double = 0
+    /// rhythm-follow：StrokeRhythm.followEstimate 的频率 / 置信度 / 单程幅度，只给 RhythmFollower，不进 score
+    var followHz: Double = 0
+    var followRhythm: Double = 0
+    var followAmplitude: Double = 0
 }
 
 /// 块运动 → 主体读数（algo-opt-3）：最近 1.2 秒每帧主体速度的 P80 + 往复节奏 → StrokeScore.flow
@@ -1803,8 +1874,11 @@ struct SubjectFlowTracker {
         }
         let p = MotionStats.quantile(&scratch, n, 0.8)
         let est = rhythm.estimate
+        let follow = rhythm.followEstimate
         reading = SubjectReading(valid: true, score: StrokeScore.flow(speed: p, rhythm: est), speed: p,
-                                 hz: est.hz, rhythm: est.confidence, amplitude: est.amplitude)
+                                 hz: est.hz, rhythm: est.confidence, amplitude: est.amplitude,
+                                 followHz: follow.hz, followRhythm: follow.confidence,
+                                 followAmplitude: follow.amplitude)
         return reading
     }
 }
@@ -1874,6 +1948,15 @@ struct PoseReading: Equatable {
     /// 这次读数用到的关节可信度 0~1（algo-opt-3 复审 M1）：最近一次算速度时髋这组有可用关节 = 1，
     /// 只有头这组 = 0.5，都没有 = 0。手搭的读数不填 = 1（行为不变）
     var trust: Double = 1
+    /// 往复频率跟随（rhythm-follow P1）：髋 / 头 / 腕三组里节奏最可信、幅度够大的那组的频率和自相关置信度
+    /// （插入看髋、口交看头、撸动看腕；用 StrokeRhythm.followEstimate）。只给 RhythmFollower 用，不影响 score / hz；
+    /// 没人或都不可信时为 0
+    var rhythmHz: Double = 0
+    var rhythmConfidence: Double = 0
+    /// 0 = 没有，1 = 髋，2 = 头，3 = 腕
+    var rhythmPart: Int = 0
+    /// 挑出的那组最近 4 秒的实际采样率（次 / 秒；慢设备上 Vision 节流时会低到 3 左右，见 RhythmFollower.candidate）
+    var rhythmRate: Double = 0
 }
 
 /// 姿态 → 主体强度（algo-opt-3）：关节速度按躯干长度（或肩宽、关节包围框对角线）归一（远近 / 缩放无关），
@@ -1913,6 +1996,7 @@ struct PoseMotionTracker {
     static let hipGroup = 2
     /// 只有头这组关节可用（髋 / 膝被挡住或置信度 < 0.3）时的读数可信度
     static let headOnlyTrust: Double = 0.5
+    static let wristGroup = 4
 
     private var previous = PoseCandidate()
     private var hasPrevious = false
@@ -1935,6 +2019,8 @@ struct PoseMotionTracker {
     private var head = StrokeRhythm()
     /// 最近一次算速度时的关节可信度（见 PoseReading.trust）
     private var trust: Double = 0
+    /// 腕（rhythm-follow P1）：只用来给 rhythmHz（撸动时手腕在往复），不进 score
+    private var wrists = StrokeRhythm()
     private(set) var reading = PoseReading()
 
     mutating func reset() {
@@ -1945,6 +2031,7 @@ struct PoseMotionTracker {
         hips.reset()
         head.reset()
         trust = 0
+        wrists.reset()
         reading = PoseReading()
     }
 
@@ -2120,6 +2207,7 @@ struct PoseMotionTracker {
                     speed = max(speed, Self.groupWeights[g] * (ex * ex + ey * ey).squareRoot())
                     if g == Self.hipGroup { hips.add(time: time, x: ex, y: ey) }
                     if g == Self.headGroup { head.add(time: time, x: ex, y: ey) }
+                    if g == Self.wristGroup { wrists.add(time: time, x: ex, y: ey) }
                 }
                 let hipUsable = Self.groups[Self.hipGroup].contains { usable[$0.rawValue] }
                 let headUsable = Self.groups[Self.headGroup].contains { usable[$0.rawValue] }
@@ -2136,6 +2224,7 @@ struct PoseMotionTracker {
             if !continuous || pick.switched || !(time - previousTime <= Self.rhythmGapLimit) {
                 hips.reset()
                 head.reset()
+                wrists.reset()
             }
             // 断过 / 换了人：上一个人的速度历史也不算（新的人重新攒够样本才有读数）
             if !continuous || pick.switched {
@@ -2169,7 +2258,38 @@ struct PoseMotionTracker {
                               confidence: MotionStats.clamp01(person.confidence),
                               hz: byHips >= byHead ? hipsRhythm.hz : headRhythm.hz,
                               trust: MotionStats.clamp01(trust))
+        // 频率跟随用 followEstimate（可能减半过、采样率太低时没有），score / hz 仍是上面的基础估计
+        let hipsFollow = hips.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
+        let headFollow = head.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
+        let wristFollow = wrists.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
+        let part = Self.rhythmPick(hips: hipsFollow, head: headFollow, wrists: wristFollow)
+        if part > 0 {
+            let r = part == 1 ? hipsFollow : (part == 2 ? headFollow : wristFollow)
+            reading.rhythmHz = r.hz
+            reading.rhythmConfidence = MotionStats.clamp01(r.confidence)
+            reading.rhythmPart = part
+            reading.rhythmRate = r.sampleRate.isFinite ? max(0, r.sampleRate) : 0
+        }
         return reading
+    }
+
+    /// rhythm-follow P1：三组里挑「自相关置信度 × 幅度够不够」最高的一组（1 髋 / 2 头 / 3 腕，0 = 都不行）。
+    /// 幅度低于 StrokeScore.poseAmplitudeLow（0.03 躯干长度）的是抖动 / 点头，不算往复
+    static func rhythmPick(hips: StrokeRhythm.FollowEstimate, head: StrokeRhythm.FollowEstimate,
+                           wrists: StrokeRhythm.FollowEstimate) -> Int {
+        var best = 0
+        var bestValue = 0.0
+        for (i, r) in [hips, head, wrists].enumerated() {
+            guard r.hz.isFinite, r.hz > 0, r.confidence.isFinite, r.amplitude.isFinite,
+                  r.amplitude >= StrokeScore.poseAmplitudeLow else { continue }
+            let v = r.confidence * (0.6 + 0.4 * StrokeScore.ramp(r.amplitude, low: StrokeScore.poseAmplitudeLow,
+                                                                  high: StrokeScore.poseAmplitudeHigh))
+            if v > bestValue {
+                bestValue = v
+                best = i + 1
+            }
+        }
+        return best
     }
 
     private mutating func pushSpeed(time: Double, speed: Double) {
@@ -2258,6 +2378,17 @@ struct MotionWindow: Equatable {
     var poseConfidence: Double = 0
     /// 最后一次有人时的关节可信度（PoseReading.trust；手搭的窗口不填 = 1）
     var poseTrust: Double = 1
+    /// 往复频率跟随（rhythm-follow P1）：块运动主体最后一个读数的跟随频率 / 置信度 / 单程幅度（分析帧像素；
+    /// SubjectReading.follow*，切镜 / 保持期样本带的是切镜前的读数，记 0），
+    /// 姿态最后一次有人时挑出的那组节奏（PoseReading.rhythmHz / rhythmConfidence / rhythmPart / rhythmRate）。
+    /// subjectHz 仍是 algo-opt-3 的基础估计，不给跟随用
+    var subjectFollowHz: Double = 0
+    var subjectFollowRhythm: Double = 0
+    var subjectFollowAmplitude: Double = 0
+    var poseRhythmHz: Double = 0
+    var poseRhythmConfidence: Double = 0
+    var poseRhythmPart: Int = 0
+    var poseRhythmRate: Double = 0
 
     static let empty = MotionWindow()
 
@@ -2287,6 +2418,13 @@ struct MotionWindowAccumulator {
     /// 最近一个切镜样本的时间（复审 L1）：跨拍保留（drain 不清；seek 时 VideoMotionMeter.reset 整个换新）。
     /// 比它早的帧算出来的姿态读数（Vision 异步，切镜后才回来）不算有人
     private var lastCutTime: Double = -.infinity
+    private var subjectFollowHz: Double = 0
+    private var subjectFollowRhythm: Double = 0
+    private var subjectFollowAmplitude: Double = 0
+    private var poseRhythmHz: Double = 0
+    private var poseRhythmConfidence: Double = 0
+    private var poseRhythmPart = 0
+    private var poseRhythmRate: Double = 0
 
     mutating func add(_ s: MotionSample) {
         guard s.energy.isFinite, s.energy >= 0 else { return }
@@ -2297,6 +2435,10 @@ struct MotionWindowAccumulator {
             poseScore = 0
             poseConfidence = 0
             poseTrust = 1
+            poseRhythmHz = 0
+            poseRhythmConfidence = 0
+            poseRhythmPart = 0
+            poseRhythmRate = 0
         }
         sum += s.energy
         if s.coverage.isFinite { coverageSum += min(1, max(0, s.coverage)) }
@@ -2309,6 +2451,11 @@ struct MotionWindowAccumulator {
             subjectSum += min(1, max(0, s.subject.score))
             subjectFrames += 1
             subjectHz = s.subject.hz.isFinite ? s.subject.hz : 0
+            // 切镜 / 保持期的样本带的是切镜前的读数：频率跟随不认（不然切到别的画面还按旧节奏重新锁定）
+            let fresh = !s.isCut && !s.isHeld
+            subjectFollowHz = fresh && s.subject.followHz.isFinite ? max(0, s.subject.followHz) : 0
+            subjectFollowRhythm = fresh && s.subject.followRhythm.isFinite ? min(1, max(0, s.subject.followRhythm)) : 0
+            subjectFollowAmplitude = fresh && s.subject.followAmplitude.isFinite ? max(0, s.subject.followAmplitude) : 0
         }
     }
 
@@ -2322,6 +2469,11 @@ struct MotionWindowAccumulator {
         poseScore = min(1, max(0, r.score))
         poseConfidence = min(1, max(0, r.confidence))
         poseTrust = r.trust.isFinite ? min(1, max(0, r.trust)) : 0
+        let ok = r.rhythmHz.isFinite && r.rhythmHz > 0 && r.rhythmConfidence.isFinite
+        poseRhythmHz = ok ? r.rhythmHz : 0
+        poseRhythmConfidence = ok ? min(1, max(0, r.rhythmConfidence)) : 0
+        poseRhythmPart = ok ? r.rhythmPart : 0
+        poseRhythmRate = ok && r.rhythmRate.isFinite ? max(0, r.rhythmRate) : 0
     }
 
     mutating func drain() -> MotionWindow {
@@ -2334,6 +2486,9 @@ struct MotionWindowAccumulator {
                 window.subjectFrames = subjectFrames
                 window.subjectScore = subjectSum / Double(subjectFrames)
                 window.subjectHz = subjectHz
+                window.subjectFollowHz = subjectFollowHz
+                window.subjectFollowRhythm = subjectFollowRhythm
+                window.subjectFollowAmplitude = subjectFollowAmplitude
             }
         }
         window.poseFrames = poseFrames
@@ -2342,6 +2497,10 @@ struct MotionWindowAccumulator {
         window.poseConfidence = poseConfidence
         window.poseTrust = poseTrust
         let cut = lastCutTime
+        window.poseRhythmHz = poseRhythmHz
+        window.poseRhythmConfidence = poseRhythmConfidence
+        window.poseRhythmPart = poseRhythmPart
+        window.poseRhythmRate = poseRhythmRate
         self = MotionWindowAccumulator()
         lastCutTime = cut
         return window
@@ -2680,6 +2839,9 @@ struct VisualSyncSettings: Equatable {
         static let source = "bcVisualSyncSource"
         static let motionGainDb = "bcVisualSyncMotionGainDb"
         static let autoMotion = "bcVisualSyncAutoMotion"
+        /// rhythm-follow P1：伸缩跟随动作频率（默认关）/ 设备档位→每秒往复次数标定表（文本，见 DeviceRateMap.parse）
+        static let rhythmFollow = "bcVisualSyncRhythmFollow"
+        static let rateTable = "bcVisualSyncRateTable"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -2688,18 +2850,30 @@ struct VisualSyncSettings: Equatable {
     static let motionGainRange: ClosedRange<Double> = -6...12
     static let defaultMotionGainDb: Double = 0
     static let defaultAutoMotion = true
+    /// 默认关。关着时画面路径的分数 / 强度 / 出口和 algo-opt-3 逐位相同：StrokeRhythm.estimate 的算法没变
+    /// （减半只进 followEstimate），VideoSyncPlayer 走原来的 SyncOutputStage.step(value) 和 preview（VisualSyncChecks 钉住）
+    static let defaultRhythmFollow = false
+    /// 空 = 没标定，用 DeviceRateMap.uncalibrated
+    static let defaultRateTable = ""
+    /// 标定表文本最长（坏值 / 超长一律当没标定）
+    static let maxRateTableLength = 400
 
     var source: VisualSyncSource
     var motionGainDb: Double
     var autoMotion: Bool
+    var rhythmFollow: Bool
+    var rateTable: String
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
-         autoMotion: Bool = defaultAutoMotion) {
+         autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
+         rateTable: String = defaultRateTable) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
             : Self.defaultMotionGainDb
         self.autoMotion = autoMotion
+        self.rhythmFollow = rhythmFollow
+        self.rateTable = rateTable.count <= Self.maxRateTableLength ? rateTable : Self.defaultRateTable
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -2712,10 +2886,16 @@ struct VisualSyncSettings: Equatable {
         return VisualSyncSettings(
             source: raw.map { resolveSource(rawValue: $0) } ?? defaultSource,
             motionGainDb: defaults.object(forKey: Keys.motionGainDb) as? Double ?? defaultMotionGainDb,
-            autoMotion: defaults.object(forKey: Keys.autoMotion) as? Bool ?? defaultAutoMotion)
+            autoMotion: defaults.object(forKey: Keys.autoMotion) as? Bool ?? defaultAutoMotion,
+            rhythmFollow: defaults.object(forKey: Keys.rhythmFollow) as? Bool ?? defaultRhythmFollow,
+            rateTable: defaults.object(forKey: Keys.rateTable) as? String ?? defaultRateTable)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
+
+    /// 用户填的标定表；空 / 填错时 nil（按 DeviceRateMap.uncalibrated 算，界面提示没标定）
+    var calibratedRateMap: DeviceRateMap? { DeviceRateMap.parse(rateTable) }
+    var rateMap: DeviceRateMap { calibratedRateMap ?? .uncalibrated }
 }
 
 /// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
@@ -2850,8 +3030,16 @@ struct SyncOutputStage {
     /// value：画面 0~100（已乘热身置信度；没有新鲜画面时调用方传 0、hasSignal = false）
     mutating func step(_ value: Double, settings s: AudioSyncSettings, hasSignal: Bool) -> [Int] {
         let mapped = Self.map(value, cap: s.maxPercent, floor: Self.floorPercent(settings: s, hasSignal: hasSignal))
-        let target = s.channels.levels(percent: mapped)
-        let cap = Self.hardCap(s)
+        return limit(s.channels.levels(percent: mapped), cap: Self.hardCap(s))
+    }
+
+    /// rhythm-follow P1：调用方直接给每通道 0~99 的目标档位（RhythmOutput.target 算好最低强度 / 通道分配），
+    /// 这里照样做同一套上限夹紧 + 升幅 ≤ +20 / 拍 + 归零保持（和 step(_:settings:hasSignal:) 共用 limit）
+    mutating func step(levels target: [Int], settings s: AudioSyncSettings) -> [Int] {
+        limit(target, cap: Self.hardCap(s))
+    }
+
+    private mutating func limit(_ target: [Int], cap: Int) -> [Int] {
         var out = [0, 0, 0, 0]
         for ch in 0..<2 {
             let prev = last[ch]
@@ -2870,5 +3058,485 @@ struct SyncOutputStage {
         }
         last = out
         return out
+    }
+}
+
+// MARK: - rhythm-follow P1：伸缩跟随动作频率（只跟频率，不对相位）
+//
+// 0x08 帧只能发档位（Protocol.swift 不改，视频路径尾字节固定 0）。设备的「伸缩」档位按速度档理解：
+// 档位越高、每秒往复越多。P1 把画面里估出来的往复频率（块运动主体 + 髋 / 头 / 腕姿态）换算成「让设备也每秒这么多下」的档位，
+// 再走同一个 SyncOutputStage（上限、最低强度、升幅 ≤ +20 / 拍、归零保持）。相位（往里对往里）不在 P1 范围。
+// 档位→频率的对应关系要真机标定（docs/rhythm-calibration.md），没标定时用 DeviceRateMap.uncalibrated 的保守猜测。
+
+/// 设备伸缩档位 ↔ 每秒往复次数（Hz）的单调分段线性表（rhythm-follow P1）
+struct DeviceRateMap: Equatable {
+    struct Point: Equatable {
+        var level: Int
+        var hz: Double
+    }
+
+    static let minPoints = 2
+    static let maxPoints = 12
+    static let hzRange: ClosedRange<Double> = 0.1...8
+    /// 没标定时的猜测：10 档约 0.5 Hz、99 档约 3 Hz（只用于还没做 P0 标定的设备，界面会提示）
+    static let uncalibrated = DeviceRateMap(points: [Point(level: 10, hz: 0.5), Point(level: 99, hz: 3.0)])!
+
+    let points: [Point]
+
+    /// 至少 2 点、最多 12 点；档位 1~99、频率 0.1~8 Hz，按档位排序后档位和频率都必须严格递增
+    init?(points raw: [Point]) {
+        guard raw.count >= Self.minPoints, raw.count <= Self.maxPoints else { return nil }
+        let sorted = raw.sorted { $0.level < $1.level }
+        for (i, p) in sorted.enumerated() {
+            guard p.level >= 1, p.level <= BCProtocol.maxManualLevel, p.hz.isFinite, Self.hzRange.contains(p.hz)
+            else { return nil }
+            if i > 0 {
+                guard p.level > sorted[i - 1].level, p.hz > sorted[i - 1].hz else { return nil }
+            }
+        }
+        points = sorted
+    }
+
+    /// 文本格式：「档位:每秒次数」，逗号 / 分号 / 顿号 / 空白（含换行、全角空格）分隔，全角冒号 / 逗号 / 分号也认，
+    /// 冒号两边可以有空格。例：「20:0.6, 40:1.1, 60:1.7, 99:2.8」「20:0.6 40:1.1」「20：0.6、40：1.1」
+    /// 空串、格式错、不单调都返回 nil（按没标定）
+    static func parse(_ text: String) -> DeviceRateMap? {
+        guard text.count <= VisualSyncSettings.maxRateTableLength else { return nil }
+        let unified = text.replacingOccurrences(of: "：", with: ":")
+            .replacingOccurrences(of: "，", with: ",")
+            .replacingOccurrences(of: "；", with: ",")
+            .replacingOccurrences(of: ";", with: ",")
+            .replacingOccurrences(of: "、", with: ",")
+        // 冒号两边的空白去掉，剩下的空白都当分隔
+        let normalized = unified.replacingOccurrences(of: "\\s*:\\s*", with: ":", options: .regularExpression)
+            .replacingOccurrences(of: "\\s+", with: ",", options: .regularExpression)
+        var pts: [Point] = []
+        for chunk in normalized.split(separator: ",") {
+            let item = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            if item.isEmpty { continue }
+            let parts = item.split(separator: ":", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            guard parts.count == 2, let level = Int(parts[0]), let hz = Double(parts[1]) else { return nil }
+            pts.append(Point(level: level, hz: hz))
+        }
+        return DeviceRateMap(points: pts)
+    }
+
+    var text: String {
+        points.map { p in "\(p.level):\(String(format: "%g", p.hz))" }.joined(separator: ", ")
+    }
+
+    var minHz: Double { points[0].hz }
+    var maxHz: Double { points[points.count - 1].hz }
+    var minLevel: Int { points[0].level }
+    var maxLevel: Int { points[points.count - 1].level }
+
+    /// 让设备每秒往复 hz 次需要的档位（四舍五入）：慢于表里最慢的一点用最低一点的档位，快于最快一点用最高一点的档位
+    func level(forHz hz: Double) -> Int {
+        guard hz.isFinite else { return minLevel }
+        if hz <= minHz { return minLevel }
+        if hz >= maxHz { return maxLevel }
+        for i in 1..<points.count where hz <= points[i].hz {
+            let a = points[i - 1]
+            let b = points[i]
+            let f = (hz - a.hz) / (b.hz - a.hz)
+            let v = Double(a.level) + f * Double(b.level - a.level)
+            return min(b.level, max(a.level, Int(v.rounded())))
+        }
+        return maxLevel
+    }
+
+    /// 档位 → 每秒往复次数；低于表里最低档 nil（死区或没测过），高于最高档按最高一点
+    func hz(forLevel level: Int) -> Double? {
+        guard level >= minLevel else { return nil }
+        if level >= maxLevel { return maxHz }
+        for i in 1..<points.count where level <= points[i].level {
+            let a = points[i - 1]
+            let b = points[i]
+            let f = Double(level - a.level) / Double(b.level - a.level)
+            return a.hz + f * (b.hz - a.hz)
+        }
+        return maxHz
+    }
+}
+
+/// 一个节奏候选（这一拍的块运动或姿态）
+struct RhythmCandidate: Equatable {
+    enum Source: Int {
+        case none = 0
+        case flow = 1
+        case pose = 2
+        case both = 3
+    }
+
+    var hz: Double
+    var confidence: Double
+    var source: Source
+}
+
+/// 每拍把块运动主体 / 姿态的往复频率合成一个「现在的动作频率」（rhythm-follow P1，r1 复审修正）：
+/// - 候选：块运动主体（主体分数 ≥ 0.05、单程幅度 ≥ 1 像素，用 StrokeRhythm.followEstimate）、
+///   姿态（髋 / 头 / 腕里最可信的一组；姿态分数 ≥ 0.1，挑中腕时 ≥ 0.2——腕不进姿态分数，光比划手势不算在动）；频率在 0.4~4 Hz；
+/// - 两路频率相差 ≤ 15% 时按置信度加权合并、置信度 +0.1；不一致、且姿态的实际采样率看不清块运动那个频率
+///   （块运动频率 > 姿态采样率 × 0.4，或不知道采样率；慢设备上 Vision 节流到约 3 Hz 时 2 Hz 会混叠成 1 Hz）时取块运动（r2：不再要求差 1.6 倍）；
+///   其余不一致时取置信度高的（姿态 +0.05 优先）；只有姿态时，姿态采样率要 ≥ max(2.5 × 读数, 6 次/秒) 才给（r2，排除混叠）；
+/// - 置信度 ≥ 0.40 才锁定，锁定后 < 0.30 才算丢（回差）；画面还在动时丢了保持 1.5 秒再解锁（检测一闪不掉）；
+/// - 画面不动（调用方给 active = false）或切镜：马上解锁，weight 0.3 秒内归零，不保持旧节奏；
+/// - 频率在 log 域平滑（τ = 1.5 秒，只跟 ±30% 以内的读数）；同方向偏离 15% 以上的读数记进待确认：≥ 2 拍、累计 ≥ 0.6 秒 − 半拍
+///   （每拍最多按 0.3 秒算，一拍来晚了也不会单拍就确认；tick 0.29 秒照样 2 拍），读数彼此一致（最大 / 最小 ≤ 1.45），
+///   且对数平均偏离当前频率 30% 以上，就直接跳到对数平均——单拍误检不跟，忽高忽低（2.0 / 2.4 交替）的读数也跟得上，
+///   ±20% 的逐拍抖动只平滑不硬跳；锁定中一拍没候选不清待确认（隔拍掉线也能确认），连续缺 0.6 秒才清（r2 复审 L1 / L2）；
+/// - weight：锁定时 1 秒升到 1、解锁后 1.5 秒降到 0（不动 / 切镜时 0.3 秒），调用方用它在「按动作强度」和「按动作频率」之间交接
+struct RhythmFollower {
+    static let hzRange: ClosedRange<Double> = 0.4...4
+    static let flowMinAmplitude: Double = StrokeScore.flowAmplitudeLow
+    /// 块运动主体分数几乎为 0（扣掉相机运动后没剩下主体动作，比如只有手持抖动）时块运动的频率不算
+    static let flowMinScore: Double = 0.05
+    /// 姿态分数（StrokeScore.pose，0~1）低于这个时姿态的频率不算（人在但没怎么动）；挑中腕时用 wristMinScore
+    static let poseMinScore: Double = 0.1
+    static let wristMinScore: Double = 0.2
+    static let lockConfidence: Double = 0.40
+    static let releaseConfidence: Double = 0.30
+    static let agreeRatio: Double = 0.15
+    static let agreeBonus: Double = 0.1
+    static let poseBias: Double = 0.05
+    /// 只有姿态、没有块运动候选时：姿态采样率要 ≥ max(2.5 × 读数, 6 次/秒) 才信（排除混叠；正常 Vision 15 / 8 Hz 都够，节流到约 3 Hz 时不给）
+    static let poseOnlyRateShare: Double = 2.5
+    static let poseOnlyMinRate: Double = 6
+    static let smoothSeconds: TimeInterval = 1.5
+    static let jumpRatio: Double = 0.3
+    static let jumpConfirmSeconds: TimeInterval = 0.6
+    static let jumpConfirmBeats = 2
+    /// 待确认读数彼此要一致（最大 / 最小 ≤ 这个倍数）才跳；不一致时从最新这一拍重新数（r2 复审 L2）
+    static let jumpAgreeSpread: Double = 1.45
+    /// 锁定中一拍没有合格候选：待确认的跳变先留着（隔拍掉线也能凑够），连续缺这么久才清掉（r2 复审 L1）
+    static let pendingGapSeconds: TimeInterval = 0.6
+    /// 跳变确认里一拍最多算这么久（名义拍长），dt 偏大的一拍不能单独凑够确认时间
+    static let beatSeconds: TimeInterval = AudioReactiveShaper.interval
+    static let holdSeconds: TimeInterval = 1.5
+    static let rampInSeconds: TimeInterval = 1.0
+    static let rampOutSeconds: TimeInterval = 1.5
+    static let fastReleaseSeconds: TimeInterval = 0.3
+    /// 锁定中「画面不动」要连续这么多拍（有分析过的帧）才解锁（r3 复审 L1：一拍闪断 / 门一拍没开不丢锁；
+    /// 输出那边 activity 照旧按即时强度，当拍就不加伸缩，所以动作停下的释放不变慢）
+    static let inactiveUnlockTicks = 2
+
+    private(set) var hz: Double = 0
+    private(set) var confidence: Double = 0
+    private(set) var locked = false
+    private(set) var weight: Double = 0
+    private(set) var source = RhythmCandidate.Source.none
+    private var lostRun: TimeInterval = 0
+    /// 待确认的跳变：方向（+1 变快 / −1 变慢）、拍数、读数的对数和、累计时间（每拍最多 beatSeconds）
+    private var pendingDirection = 0
+    private var pendingBeats = 0
+    private var pendingLogSum: Double = 0
+    private var pendingLogMin: Double = 0
+    private var pendingLogMax: Double = 0
+    private var pendingRun: TimeInterval = 0
+    /// 因画面不动 / 切镜解锁：weight 按 fastReleaseSeconds 归零
+    private var fastRelease = false
+    /// 锁定中连续「画面不动」（有帧）的拍数
+    private var inactiveTicks = 0
+
+    mutating func reset() {
+        self = RhythmFollower()
+    }
+
+    /// 这一拍的候选（不看锁定状态；置信度门在 step 里）
+    static func candidate(_ w: MotionWindow) -> RhythmCandidate? {
+        var flow: RhythmCandidate?
+        if w.subjectFrames > 0, w.subjectScore.isFinite, w.subjectScore >= flowMinScore,
+           w.subjectFollowHz.isFinite, hzRange.contains(w.subjectFollowHz), w.subjectFollowRhythm.isFinite,
+           w.subjectFollowAmplitude.isFinite, w.subjectFollowAmplitude >= flowMinAmplitude {
+            flow = RhythmCandidate(hz: w.subjectFollowHz, confidence: MotionStats.clamp01(w.subjectFollowRhythm),
+                                   source: .flow)
+        }
+        var pose: RhythmCandidate?
+        let poseFloor = w.poseRhythmPart == 3 ? wristMinScore : poseMinScore
+        if w.posePresentFrames > 0, w.poseScore.isFinite, w.poseScore >= poseFloor,
+           w.poseRhythmHz.isFinite, hzRange.contains(w.poseRhythmHz), w.poseRhythmConfidence.isFinite {
+            pose = RhythmCandidate(hz: w.poseRhythmHz, confidence: MotionStats.clamp01(w.poseRhythmConfidence),
+                                   source: .pose)
+        }
+        guard let f = flow else {
+            // 只有姿态（r2 复审 L3）：混叠总落在奈奎斯特以下，只看 hz ≤ 0.4 × 采样率挡不住
+            // （约 3 Hz 采样时真 2 Hz 会读成 1 Hz）。采样率不到 max(2.5 × hz, poseOnlyMinRate)（或不知道）就不给
+            guard let p = pose else { return nil }
+            let rate = w.poseRhythmRate
+            guard rate.isFinite, rate >= max(poseOnlyRateShare * p.hz, poseOnlyMinRate) else { return nil }
+            return p
+        }
+        guard let p = pose else { return f }
+        let apart = abs(log(f.hz / p.hz))
+        if apart <= log(1 + agreeRatio) {
+            let wf = max(1e-6, f.confidence)
+            let wp = max(1e-6, p.confidence)
+            let hz = exp((wf * log(f.hz) + wp * log(p.hz)) / (wf + wp))
+            return RhythmCandidate(hz: hz, confidence: min(1, max(f.confidence, p.confidence) + agreeBonus),
+                                   source: .both)
+        }
+        // 差一个八度以上：姿态的采样率看不清块运动那个频率（或不知道采样率）时，姿态那个频率可能是混叠，信块运动（15 Hz 采样）
+        let rate = w.poseRhythmRate
+        let poseBlind = !(rate.isFinite && rate > 0) || f.hz > StrokeRhythm.aliasShare * rate
+        // r2 复审 L3：采样率看不清时，任何超出 agreeRatio 的不一致都信块运动（不只差 1.6 倍以上；3.5 Hz 采样时 2 Hz 会读成 1.5 Hz）
+        if poseBlind { return f }
+        return p.confidence + poseBias >= f.confidence ? p : f
+    }
+
+    /// 每拍一次。没有画面信号时调用方应 reset（不保持）。
+    /// active：画面自己的强度确实在动（RhythmOutput.activity > 0）；false 时不锁定，锁定中连续 2 拍（有帧）false 才解锁、weight 快速归零；
+    /// frames == 0 的窗口不算 false（没有信息，按一拍没候选保持）
+    @discardableResult
+    mutating func step(_ w: MotionWindow, dt: TimeInterval, active: Bool = true) -> RhythmFollower {
+        let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
+        let gate = locked ? Self.releaseConfidence : Self.lockConfidence
+        // r3 复审 L1：这一拍一帧都没分析到（上一帧还在算被丢、解码卡顿）= 没有信息，不当成「画面不动」，按一拍没候选保持
+        let frameless = w.frames <= 0
+        if w.cutCount > 0 {
+            // 切镜：不保持旧节奏（新镜头重新确认），伸缩马上交回动作强度
+            unlock()
+        } else if !active && !frameless {
+            // 画面不动：没锁定时不锁（也不保持交接）；锁定中要连续 inactiveUnlockTicks 拍才解锁，之前按一拍没候选保持
+            inactiveTicks += 1
+            if !locked || inactiveTicks >= Self.inactiveUnlockTicks {
+                unlock()
+            } else {
+                holdMissing(step)
+            }
+        } else if frameless {
+            if locked { holdMissing(step) } else { clearPending() }
+        } else if let c = Self.candidate(w), c.confidence >= gate {
+            inactiveTicks = 0
+            lostRun = 0
+            confidence = c.confidence
+            source = c.source
+            if !locked || !(hz > 0) {
+                locked = true
+                fastRelease = false
+                hz = c.hz
+                clearPending()
+            } else {
+                track(c.hz, step: step)
+            }
+        } else if locked {
+            inactiveTicks = 0
+            holdMissing(step)
+        } else {
+            inactiveTicks = 0
+            clearPending()
+        }
+        if !hz.isFinite { reset() }
+        let target: Double = locked ? 1 : 0
+        if target > weight {
+            weight = min(1, weight + step / Self.rampInSeconds)
+        } else if target < weight {
+            weight = max(0, weight - step / (fastRelease ? Self.fastReleaseSeconds : Self.rampOutSeconds))
+        }
+        if weight == 0 && !locked {
+            hz = 0
+        }
+        return self
+    }
+
+    /// 锁定后的一个读数（r2 复审 L1 / L2）：
+    /// - ±30% 以内平滑跟（τ 1.5 s）；
+    /// - 偏离 15% 以上的读数按方向记进「待确认」（回到 15% 以内或方向一反就重新数）；
+    /// - 满 jumpConfirmBeats 拍、累计时间 ≥ jumpConfirmSeconds − 半拍（每拍最多按 beatSeconds 算），
+    ///   待确认读数彼此一致（最大 / 最小 ≤ jumpAgreeSpread），且它们的对数平均偏离当前频率 30% 以上，才直接跳到对数平均；
+    ///   平均只偏 15~30%（比如 ±20% 的逐拍抖动）不跳，照常平滑；读数彼此不一致时从最新这一拍重新数（不跳到谁也没读到的中间值）
+    private mutating func track(_ reading: Double, step: TimeInterval) {
+        let d = log(reading / hz)
+        if abs(d) <= log(1 + Self.jumpRatio) {
+            let a = 1 - exp(-step / Self.smoothSeconds)
+            hz = exp(log(hz) + d * a)
+        }
+        guard abs(d) > log(1 + Self.agreeRatio) else {
+            clearPending()
+            return
+        }
+        let direction = d > 0 ? 1 : -1
+        let lr = log(reading)
+        if pendingBeats == 0 || direction != pendingDirection
+            || max(pendingLogMax, lr) - min(pendingLogMin, lr) > log(Self.jumpAgreeSpread) {
+            clearPending()
+            pendingDirection = direction
+            pendingLogMin = lr
+            pendingLogMax = lr
+        }
+        pendingBeats += 1
+        pendingLogSum += lr
+        pendingLogMin = min(pendingLogMin, lr)
+        pendingLogMax = max(pendingLogMax, lr)
+        let beat = min(step, Self.beatSeconds)
+        pendingRun += beat
+        guard pendingBeats >= Self.jumpConfirmBeats,
+              pendingRun >= Self.jumpConfirmSeconds - 0.5 * beat - 1e-9 else { return }
+        let mean = pendingLogSum / Double(pendingBeats)
+        if abs(mean - log(hz)) > log(1 + Self.jumpRatio) {
+            hz = exp(mean)
+            clearPending()
+        }
+    }
+
+    /// 画面不动 / 切镜：马上解锁，weight 按 fastReleaseSeconds 归零
+    private mutating func unlock() {
+        locked = false
+        confidence = 0
+        source = .none
+        lostRun = 0
+        inactiveTicks = 0
+        fastRelease = true
+        clearPending()
+    }
+
+    /// 锁定中一拍没有可用候选（r2 复审 L1）：不清待确认的跳变，只是这拍不算；连续缺满 pendingGapSeconds 才清，
+    /// 满 holdSeconds 解锁（普通 1.5 秒降）
+    private mutating func holdMissing(_ step: TimeInterval) {
+        lostRun += step
+        if lostRun > Self.pendingGapSeconds { clearPending() }
+        if lostRun > Self.holdSeconds {
+            locked = false
+            confidence = 0
+            source = .none
+            inactiveTicks = 0
+            clearPending()
+        }
+    }
+
+    private mutating func clearPending() {
+        pendingDirection = 0
+        pendingBeats = 0
+        pendingLogSum = 0
+        pendingLogMin = 0
+        pendingLogMax = 0
+        pendingRun = 0
+    }
+}
+
+/// 伸缩跟随频率时每通道的目标档位（rhythm-follow P1，r1 复审修正；纯函数，结果再经 SyncOutputStage.step(levels:)）：
+/// - 先按原来的规则（最低强度 / 上限映射、通道分配）把画面强度 value 换成档位；
+/// - 节奏只在画面确实在动时起作用：有效 weight = weight × activity（画面自己的强度 ≤ 2 → 0，≥ 25 → 1；
+///   播放器用 motionActivity，下降跟门前即时强度走，动作一停当拍就不加伸缩）；
+///   弱动作的节奏上界 rhythmCeiling 按「上限之前」的强度（value 按上限 100、不加最低强度换算的档位）算，再和上限取小
+///   （r3 复审 M1：以前按乘过上限的档位算，上限 40 / 60 时频率完全不起作用）；强度 ≥ 30 的真动作没有这个上界，任何上限下都跟频率。
+///   画面强度为 0（门关了 / 不动了）时伸缩就是原来的档位，节奏不加任何伸缩；
+/// - 伸缩通道在用（「伸缩 + 震动」或「仅伸缩」）、有画面信号、有节奏档位时：
+///   伸缩 = 按有效 weight 在「原来的档位」和「节奏档位」之间插值；节奏档位先抬到最低强度、再压到上限；
+/// - 震动通道照旧跟画面强度；「仅震动」时节奏不起作用
+enum RhythmOutput {
+    /// 画面自己的强度（0~100，已乘热身置信度）≤ 这个算没在动
+    static let activityFloor: Double = 2
+    /// 到这个按节奏档位全权（r2 复审 L4：15 → 25，点头 / 比划手势这类弱动作只交接一部分）
+    static let activityFull: Double = 25
+    /// 弱动作的节奏上界（r2 复审 L4，r3 复审 M1 改成按上限之前的强度 m 算，和用户上限无关）：
+    /// m ≤ rhythmHeadroomKnee 时 ≤ max(m + rhythmHeadroomMin, m × rhythmHeadroomScale)（点头 / 手势：强度 10 → 22、15 → 30）；
+    /// m 在 knee ~ rhythmFreeIntensity 之间线性放开到 99；m ≥ rhythmFreeIntensity（30）的真动作没有上界，只受用户上限 / 设备上限
+    static let rhythmHeadroomMin = 12
+    static let rhythmHeadroomScale = 2
+    static let rhythmHeadroomKnee = 20
+    static let rhythmFreeIntensity = 30
+
+    /// 画面自己的强度 → 节奏档位能用几成（0~1）
+    static func activity(_ value: Double) -> Double {
+        guard value.isFinite, value > activityFloor else { return 0 }
+        return min(1, (value - activityFloor) / (activityFull - activityFloor))
+    }
+
+    /// 播放器每拍用的 activity（r2 复审 M1）：用门前的即时强度 level 和门后平滑值 smoothed 里较小的那个，再乘热身置信度。
+    /// 上升不比平滑值快（不额外放大），下降跟即时强度走：动作一停 level 落到门下，节奏马上不再加伸缩，
+    /// 不用等 0.7 秒的释放平滑把 smoothed 拖到 25 以下。motionSignal = false（没有新鲜画面）时 0
+    static func motionActivity(level: Double, smoothed: Double, confidence: Double, motionSignal: Bool) -> Double {
+        guard motionSignal, level.isFinite, smoothed.isFinite, confidence.isFinite else { return 0 }
+        return activity(MotionStats.clamp01(confidence) * min(level, smoothed))
+    }
+
+    /// 节奏档位的上界（r2 复审 L4 / r3 复审 M1）。intensity：上限之前的强度档位 0~100（intensityLevel(value)），不是乘过上限的档位
+    static func rhythmCeiling(intensity: Int) -> Int {
+        let m = max(0, min(100, intensity))
+        let full = BCProtocol.maxManualLevel
+        if m >= rhythmFreeIntensity { return full }
+        let weak = max(m + rhythmHeadroomMin, m * rhythmHeadroomScale)
+        guard m > rhythmHeadroomKnee else { return weak }
+        let kneeCeiling = max(rhythmHeadroomKnee + rhythmHeadroomMin, rhythmHeadroomKnee * rhythmHeadroomScale)
+        let f = Double(m - rhythmHeadroomKnee) / Double(rhythmFreeIntensity - rhythmHeadroomKnee)
+        return min(full, max(weak, Int((Double(kneeCeiling) + Double(full - kneeCeiling) * f).rounded())))
+    }
+
+    /// 上限之前的强度档位（按上限 100、不加最低强度换算 value；节奏上界只看动作本身有多强）
+    static func intensityLevel(_ value: Double) -> Int {
+        SyncOutputStage.map(value, cap: 100, floor: 0)
+    }
+
+    /// 节奏档位（抬到最低强度、压到上限）；ceiling：false = 不加弱动作上界（只给状态行比较用）
+    private static func rhythmTarget(value: Double, rateLevel r: Int, settings s: AudioSyncSettings, floor: Double,
+                                     ceiling: Bool) -> Int {
+        let cap = SyncOutputStage.hardCap(s)
+        let floorLevel = floor.isFinite ? max(0, Int(floor.rounded())) : 0
+        let lifted = ceiling ? min(r, Self.rhythmCeiling(intensity: Self.intensityLevel(value))) : r
+        return min(cap, max(floorLevel, lifted))
+    }
+
+    /// 弱动作上界这一拍有没有把节奏档位压低（状态行提示用；和 target 用同一套换算）
+    static func ceilingLimits(value: Double, settings s: AudioSyncSettings, hasSignal: Bool, rateLevel: Int?) -> Bool {
+        guard hasSignal, let r = rateLevel, s.channels != .vibration else { return false }
+        let floor = SyncOutputStage.floorPercent(settings: s, hasSignal: hasSignal)
+        return rhythmTarget(value: value, rateLevel: r, settings: s, floor: floor, ceiling: true)
+            < rhythmTarget(value: value, rateLevel: r, settings: s, floor: floor, ceiling: false)
+    }
+
+    /// activity：nil = 按 value 算（调用方在声音→画面交接期间传画面自己那部分的 activity）
+    static func target(value: Double, settings s: AudioSyncSettings, hasSignal: Bool,
+                       rateLevel: Int?, weight: Double, activity: Double? = nil) -> [Int] {
+        let floor = SyncOutputStage.floorPercent(settings: s, hasSignal: hasSignal)
+        let mapped = SyncOutputStage.map(value, cap: s.maxPercent, floor: floor)
+        var t = s.channels.levels(percent: mapped)
+        let a = activity.map { MotionStats.clamp01($0) } ?? Self.activity(value)
+        let w = MotionStats.clamp01(weight) * a
+        guard hasSignal, let r = rateLevel, w > 0, s.channels != .vibration else { return t }
+        let cap = SyncOutputStage.hardCap(s)
+        let rl = Self.rhythmTarget(value: value, rateLevel: r, settings: s, floor: floor, ceiling: true)
+        let blended = (Double(t[0]) + (Double(rl) - Double(t[0])) * w).rounded()
+        t[0] = blended.isFinite ? min(cap, max(0, Int(blended))) : 0
+        return t
+    }
+
+    /// 界面上的一行节奏状态（纯展示，VideoSyncPlayer 每拍刷新）。thrust：这一拍伸缩实际发出的档位（联动关着时是预览值）；
+    /// 节奏还在不在起作用看 weight > 0（不是 locked：解锁后的交接期里伸缩还有一部分按节奏）。
+    /// 「比设备最快 / 最慢」和「已到上限」各自独立提示。value / hasSignal：和 target 同一拍的输入，
+    /// 弱动作上界压低了节奏档位时提示「动作偏弱」（r3 复审 M1）
+    static func statusText(hz: Double, weight: Double, locked: Bool, rateLevel: Int?, activity: Double, thrust: Int,
+                           value: Double, hasSignal: Bool,
+                           map: DeviceRateMap, calibrated: Bool, settings s: AudioSyncSettings) -> String {
+        let note = calibrated ? "" : "；设备还没标定，档位是估计值"
+        guard weight > 0, hz.isFinite, hz > 0, let level = rateLevel else {
+            return "还没找到稳定的动作节奏，伸缩先按动作强度" + note
+        }
+        if s.channels == .vibration {
+            return String(format: "动作节奏 %.1f 次/秒（「仅震动」时不跟频率）", hz) + note
+        }
+        var text = String(format: "动作节奏 %.1f 次/秒", hz) + " → 伸缩 \(thrust) 档"
+        if !(activity > 0) {
+            text += "（画面没在动，伸缩不跟节奏）"
+        } else if !locked {
+            text += "（节奏丢了，正在交回动作强度）"
+        }
+        if activity > 0, ceilingLimits(value: value, settings: s, hasSignal: hasSignal, rateLevel: level) {
+            text += "（动作偏弱，伸缩只按节奏加快一点）"
+        }
+        if hz > map.maxHz * 1.05 {
+            text += String(format: "（比设备最快的 %.1f 次/秒还快）", map.maxHz)
+        } else if hz < map.minHz * 0.95 {
+            text += String(format: "（比设备最慢的 %.1f 次/秒还慢）", map.minHz)
+        }
+        let cap = SyncOutputStage.hardCap(s)
+        let floorPercent = SyncOutputStage.floorPercent(settings: s, hasSignal: true)
+        let floorLevel = floorPercent.isFinite ? max(0, Int(floorPercent.rounded())) : 0
+        // 弱动作上界已经压到上限以下时不算「到上限」（r3 复审 M1，提示的是「动作偏弱」）
+        let lifted = hasSignal && value.isFinite ? min(level, rhythmCeiling(intensity: intensityLevel(value))) : level
+        if max(floorLevel, lifted) > cap {
+            text += "（已到上限 \(cap)）"
+        }
+        return text + note
     }
 }
