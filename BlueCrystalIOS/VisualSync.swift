@@ -9209,10 +9209,11 @@ extension AVDebugColumns {
 /// 2. 八度消歧：两边正好差 2 倍 / 一半（八度两边各 15%）、声音是干净的单一脉冲串 → 画面频率乘 2 / 除 2
 ///    （幅度按频率反比换算；按错的八度拟合的相位作废，相位锁等下一个读数；姿态和块运动同一个八度时一起换）。
 ///    声音节奏按「最短且 ≥ 最高峰 85%」取周期，只用来消歧、不发起。一下两响（往里 / 往外各一声）的风险：
-///    两响强弱不同时按强度加权的自相关落在整周期，和撞击间隔中位数（F1 的 f_a）差一个八度 → 不算干净、不管；
+///    两响强弱不同时按幅度加权的自相关落在整周期，和撞击间隔中位数（F1 的 f_a）差一个八度 → 不算干净、不管；
 ///    两响一样强时声音和画面本来就差一倍、F1 的 A_f = 0 进不了耦合（S2 只能在声音和画面同频时建立）；
 /// 3. 跳频确认：跟随器锁着、画面读数偏离跟随频率 15% 以上、声音同方向也偏了 15% 以上、而且和画面读数差 ≤ 30% → fastJump，
-///    跟随器这一拍的跳变确认从 2 拍缩到 1 拍（RhythmFollower.step(fastJump:)）。
+///    跟随器这一拍的跳变确认从 2 拍缩到 1 拍（RhythmFollower.step(fastJump:)）。声音这边看同一个对齐窗口里最后 4 下撞击的
+///    间隔中位数（4 秒自相关要攒够新节奏才换峰，比画面晚；跳了多少仍要 ≥ 30% 才跳，由跟随器自己判断）。
 /// 声音的 4 秒窗口和画面 followEstimate 的 4 秒窗口按播放器时钟对齐：画面窗口的终点 = 最后一个相位拟合的时刻（没有时 = 现在），
 /// 换成视频时间后往前 4 秒 × 倍速。enabled == false / 不在 S2 / 条件不满足时窗口原样交回（== 而且位模式相同）、fastJump = false
 struct AVRhythmVote {
@@ -9234,11 +9235,13 @@ struct AVRhythmVote {
     static let bin: Double = 0.01
     static let harmonicShare: Double = AudioBeatGrid.harmonicShare
     static let minImpacts = 3
+    static let recentImpacts = 4
 
     private(set) var action = Action.none
     private(set) var fastJump = false
-    /// 这一拍声音节奏（host 时间上的 Hz，已乘倍速；没有 0）/ 自相关峰
+    /// 这一拍声音节奏（host 时间上的 Hz，已乘倍速；没有 0）/ 自相关峰 / 最近几下撞击间隔的频率（跳频方向用）
     private(set) var audioHz: Double = 0
+    private(set) var recentHz: Double = 0
     private(set) var audioConfidence: Double = 0
     /// 声音节奏和撞击间隔中位数一致（单一脉冲串）
     private(set) var clean = false
@@ -9252,19 +9255,21 @@ struct AVRhythmVote {
     /// 找局部峰，取最短的、不低于最高峰 85% 的那个，抛物线细化。返回视频时间上的 Hz 和那个峰（不够 3 次撞击 / 窗口不到 2 秒 0）
     static func audioRhythm(_ events: [AudioOnsetEvent], start: Double, end: Double) -> (hz: Double, confidence: Double) {
         guard start.isFinite, end.isFinite, end - start >= 2 else { return (0, 0) }
-        let hits = events.filter { $0.isImpact && $0.time > start && $0.time <= end && $0.strength.isFinite && $0.strength > 0 }
+        let hits = impacts(events, start: start, end: end)
         guard hits.count >= minImpacts else { return (0, 0) }
         let n = Int(((end - start) / bin).rounded(.up)) + 1
         var sig = [Double](repeating: 0, count: n)
         let sigma = 1.5
         for e in hits {
+            // 按幅度加权：strength 是各段上升 dB 之和，换成每段平均上升的幅度倍数（一下两响差 12 dB ≈ 4 倍；直接用 dB 只差 1.4 倍）
+            let weight = pow(10, e.strength / Double(AudioFeatureFrame.bandCount) / 20)
             let c = (e.time - start) / bin
             let lo = max(0, Int((c - 4 * sigma).rounded(.down)))
             let hi = min(n - 1, Int((c + 4 * sigma).rounded(.up)))
             guard lo <= hi else { continue }
             for k in lo...hi {
                 let d = (Double(k) - c) / sigma
-                sig[k] += e.strength * exp(-0.5 * d * d)
+                sig[k] += weight * exp(-0.5 * d * d)
             }
         }
         var mean = 0.0
@@ -9275,7 +9280,7 @@ struct AVRhythmVote {
             sig[k] -= mean
             r0 += sig[k] * sig[k]
         }
-        guard r0 > 1e-12 else { return (0, 0) }
+        guard r0.isFinite, r0 > 1e-12 else { return (0, 0) }
         let minLag = Int((1 / RhythmFollower.hzRange.upperBound / bin).rounded(.down))
         let maxLag = min(n / 2, Int((1 / RhythmFollower.hzRange.lowerBound / bin).rounded(.up)))
         guard maxLag > minLag + 2, maxLag + 1 < n else { return (0, 0) }
@@ -9306,13 +9311,24 @@ struct AVRhythmVote {
         return hz.isFinite ? (hz, MotionStats.clamp01(b)) : (0, 0)
     }
 
+    /// 窗口（视频时间 start ~ end）里的撞击（旧 → 新）
+    static func impacts(_ events: [AudioOnsetEvent], start: Double, end: Double) -> [AudioOnsetEvent] {
+        events.filter { $0.isImpact && $0.time > start && $0.time <= end && $0.strength.isFinite && $0.strength > 0 }
+    }
+
+    /// 跳频确认看的声音读数：同一个对齐窗口里最后 recentImpacts 次撞击的间隔中位数（视频时间上的 Hz；不够 0）。
+    /// 4 秒自相关在跳频后要攒够新节奏才换峰（比画面的 followEstimate 晚），方向只看窗口末尾最新的几下
+    static func recentHz(_ events: [AudioOnsetEvent], start: Double, end: Double) -> Double {
+        AVCouplingEstimator.impactHz(impacts(events, start: start, end: end).suffix(recentImpacts).map { $0.time })
+    }
+
     /// 每个完整拍、P4 前瞻之后、P3 动作识别之前。coupled：上一拍融合状态是不是 .coupled（S2）；events：融合的起音（视频时间）；
     /// impactHz：上一拍 F1 的 f_a（撞击间隔中位数 × 倍速，干净度判断用）；clock：这一拍的播放器时钟；
     /// followerHz / followerLocked：跟随器上一拍的结果（跳频确认用）
     mutating func refine(_ w: MotionWindow, enabled: Bool, coupled: Bool, events: [AudioOnsetEvent], impactHz: Double,
                          clock: MediaClockSnapshot, followerHz: Double, followerLocked: Bool) -> MotionWindow {
         guard enabled else {
-            if active || action != .none || fastJump || audioHz != 0 { reset() }
+            if active || action != .none || fastJump || audioHz != 0 || recentHz != 0 { reset() }
             return w
         }
         active = true
@@ -9320,6 +9336,7 @@ struct AVRhythmVote {
         fastJump = false
         audioHz = 0
         audioConfidence = 0
+        recentHz = 0
         clean = false
         let vf = w.subjectFollowHz
         guard coupled, clock.isValid, w.frames > 0, w.cutCount == 0, w.heldCount == 0, w.subjectFrames > 0,
@@ -9330,13 +9347,16 @@ struct AVRhythmVote {
         let start = end - Self.windowSeconds * clock.rate
         let r = Self.audioRhythm(events, start: start, end: end)
         let ha = r.hz * clock.rate
-        guard ha.isFinite, ha > 0, r.confidence >= Self.minAudioConfidence else { return w }
-        audioHz = ha
-        audioConfidence = r.confidence
-        clean = impactHz.isFinite && impactHz > 0 && abs(log(ha / impactHz)) <= log(1 + Self.agreeRatio)
+        let hr = Self.recentHz(events, start: start, end: end) * clock.rate
+        recentHz = hr.isFinite ? hr : 0
         let tol = log(1 + Self.agreeRatio)
-        let d = log(ha / vf)
         var out = w
+        if ha.isFinite, ha > 0, r.confidence >= Self.minAudioConfidence {
+            audioHz = ha
+            audioConfidence = r.confidence
+            clean = impactHz.isFinite && impactHz > 0 && abs(log(ha / impactHz)) <= tol
+        }
+        let d = audioHz > 0 ? log(audioHz / vf) : Double.infinity
         if abs(d) <= tol {
             out.subjectFollowRhythm = MotionStats.clamp01(w.subjectFollowRhythm + Self.confidenceBonus)
             action = .agree
@@ -9352,10 +9372,11 @@ struct AVRhythmVote {
             action = d > 0 ? .octaveUp : .octaveDown
         }
         let hv = out.subjectFollowHz
-        if followerLocked, followerHz.isFinite, followerHz > 0 {
+        if followerLocked, followerHz.isFinite, followerHz > 0, recentHz > 0 {
             let dv = log(hv / followerHz)
-            let da = log(ha / followerHz)
-            fastJump = abs(dv) > tol && abs(da) > tol && (dv > 0) == (da > 0) && abs(log(ha / hv)) <= log(1 + Self.jumpSpread)
+            let da = log(recentHz / followerHz)
+            fastJump = abs(dv) > tol && abs(da) > tol && (dv > 0) == (da > 0)
+                && abs(log(recentHz / hv)) <= log(1 + Self.jumpSpread)
         }
         return out
     }
