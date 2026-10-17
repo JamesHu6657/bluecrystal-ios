@@ -1159,11 +1159,49 @@ P4 + 子拍脉动整段（出口不变量 + 峰相位 + 跳频后相位误差比
 F0 的测试（`Tests/VisualSyncChecks/main.swift`「av-fusion F0」，都在函数里）：调试列表头 / 有数 / 空列列数一致、NaN / ∞ 写空、撞击时刻分号分隔；回调时间缓冲关着不记、
 满 64 条留最新且旧 → 新、有效 / 无效计数、取走清零、关掉清掉；播放器时钟互换（倍速 2、暂停 → NaN）；提前量中位数（±3 ms 抖动 + seek 离谱值，1× / 2× / 负提前量各一组，误差 < 2.5 ms）。
 
+#### F1：声音特征 + 耦合度（开关 `bcVisualSyncAVFusion`，默认关；只显示，不改输出）
+
+「跟随画面」下多一个「声画融合（实验）」开关（`VisualSyncSettings.avFusion`；`usesAVFusion = source == .motion && avFusion`，跟随声音时不显示也不生效；
+不改 `tickInterval` / 其他任何判断）。开着时只多一行「声画：」状态（耦合 / 像配乐 / 像人声 / 没声音 / 时间不可用 / 切镜考验 / 画面相位没锁 / 不耦合）
+和调试表格的 21 列 `av_state` … `av_rhythm_conf`（`AVDebugColumns.f1Header`，接在 F0 列后面；关着时整组空）。**开着时交给出口的值和关着逐位相同**（见下面的对照）。
+
+- **实时线程**（`AudioLevelTap.swift`）：`setBandsEnabled(usesAudioAnchor || usesAVFusion)`（融合要 P3 的三频带给「画面不动时仍有节奏」）；
+  扩展特征只在融合开着时算（`setFeaturesEnabled(usesAVFusion)`，关着时只多看一个布尔）：`AudioFeatureSplitter` 6 段 RBJ 二阶带通
+  （100 / 300 / 800 / 1800 / 3500 / 6000 Hz，Q = 1）每 10 毫秒一帧（均方能量 + 1 毫秒子块峰值），另把单声道一阶低通（3.4 kHz）后按 round(采样率 / 8000) 取平均降采样成 PCM。
+  时间按样本计数从这段连续声音的起点推，所以任意切块结果和一次喂完逐位相同；时间接不上（seek）丢掉没满的帧、从新位置起算，拿不到时间（NaN）这段不出帧并计数。
+  环形缓冲（特征 512 帧、PCM 16384 个）和 pending（32 / 512）都在 init 时一次分配，写入只在已有的 `os_unfair_lock` 里，回调里不分配、不阻塞。
+- **主线程每个完整拍**（`AVFusionEngine.beat`；研究页写的是 utility 队列，F1 先放在主线程：每拍只处理 0.3 秒的新数据，
+  FFT 每 20 毫秒一次 1024 点，量级在 1% 单核以内，省掉跨线程交接；真机 Instruments 超预算再挪）：
+  - `AudioFeatureExtractor`：起音候选 = ≥ 2 段比前 2 帧最小值高 6 dB（不应期 80 毫秒）；8 帧后评估每段的起音陡度（短 = 峰值 / 能量 + 衰减快）→
+    ≥ 4 段短促 = 撞击（`isImpact`），≥ 2 段 = 陡；谐波度（512 点 Hann、补零 1024 点 FFT、Boersma 归一化自相关 70~400 Hz 的局部最大 ρ，
+    h = clamp((ρ − 0.35) / 0.5)，最近 100 个不静的帧取中位数）、频谱平坦度、HPSS 简化版（17 帧 × 32 段的打击成分占比）；
+  - `AudioBeatGrid`：最近 12 秒的起音（≥ 6 秒、≥ 8 个）做高斯脉冲自相关（30~150 个 10 毫秒），取「最短且 ≥ 最高峰 85%」的周期（只消歧），
+    ±12 毫秒细调，落在网格 ±30 毫秒的强度占比 → stable = (share − 0.5) / 0.3；有 2× 细分（踩镲）→ subdivided；value = stable × subdivided；
+  - `AudioSceneEvidence`：跨切镜考验（切镜那拍有 stable ≥ 0.5 的网格就记下，之后 2 秒 ≥ 2 次起音、按强度 ≥ 75% 落在原网格 ±30 毫秒 → 跨切镜连续 = 1，保持 10 秒；
+    考验期间耦合度挂起不更新）；画面不动（activity = 0）时 P3 声音节奏置信 ≥ 0.4 → 1 秒爬满、保持 10 秒；
+    P_music = max(0.4·跨切镜 + 0.3·不动仍有节奏 + 0.2·网格 + 0.1·谐波, 0.8·跨切镜, 0.6·不动仍有节奏)，P_voice = 谐波度 × (1 − 起音陡度)；
+  - `AVCouplingEstimator`：C_raw = A_f × A_R × A_n × (1 − P_music) × (1 − P_voice)；A_f = clamp(1 − |ln(f_a / f_v)| / ln 1.15)
+    （f_a = 最近 4 秒撞击间隔中位数 × 倍速，f_v = P2 相位锁频率）；A_R = clamp((R − 0.4) / 0.4)（R = 撞击时刻在画面相位上的集中度，**要 P2 相位锁锁着**，
+    所以判断耦合要同时开「伸缩跟随动作频率」和「相位脉动」；没锁时状态写「画面相位还没锁上」）；A_n = clamp((n − 2) / 3)；
+    C 按 τ = 1 秒 EMA，≥ 0.6 持续 2 秒进入「耦合」，< 0.4 持续 1.5 秒退出。
+- **和研究页的出入**（都在 CSV 上可调，F1 只显示）：① A_n 研究页是 (n − 3) / 5：1.6 Hz 的咔哒 4 秒只有 6~7 下，A_n 到不了 1，「4 秒内 C ≥ 0.6」做不到，改成 (n − 2) / 3；
+  ② P_music 研究页是纯加权和：加权和里跨切镜只有 0.4、画面不动只有 0.3，同频配乐过了切镜考验 C 也只降到 0.4（要求 ≤ 0.3）、画面静止的配乐 P_music 到不了 0.6，
+  按研究页「这两条是最有力的证据 / 强烈上升」加了两个下限 0.8 / 0.6。
+- **频带块共用**（`AudioBandBacklog`）：融合和撞击声校正都要 P3 的频带块，电平计只有一个环形缓冲（取走就没了）。融合每拍先取走，校正开着时把取走的存进 backlog
+  （只留最新 1024 个），校正下次取的时候接在新取的前面——和校正单独从环形缓冲（满了丢最旧的）取逐位相同；seek / 换视频 / 校正重置时和环形缓冲一起清。
+  融合开着时频带一直在分，校正这时才打开要 `restartBands()`（照「频带从关到开」那样丢掉没取走的块、splitter 从头来），校正的输入还是和融合关着时一样。
+
+F1 的测试（`Tests/VisualSyncChecks/main.swift`「av-fusion F1」，固定种子 LCG 合成、24 kHz，都在函数里）：咔哒串和画面同步 → 3.6 秒 C ≥ 0.6、5.7 秒进入耦合；
+偏移 +150 毫秒仍耦合；配乐 + 画面同频 → 切镜考验后 P_music 0.8、C 0.2、退出耦合；画面静止 + 配乐 → P_music ≥ 0.6；人声样 / 呻吟样 → 0 次撞击、P_voice ≥ 0.6；
+白噪声 / 50 Hz 哼声 → 0 次撞击；画面没锁 → 不耦合；6 段 splitter 1~4096 帧随机切块和一次喂完逐位相同、seek 丢半帧；backlog 200 组随机（含溢出）和单独取逐位相同；
+设置默认关 / 键名 / 只在跟随画面生效；调试列列数 / NaN 写空。
+
 #### 融合关着 = f706431 逐位相同（`Tests/FusionOffCompare/run.sh`，PR Checks 里跑）
 
 照 `Tests/P4OffCompare` 的做法，一开始就建好：同一份只用 f706431（v1.8.3）已有接口的整条链模拟——声音模式两组（电平 → `AudioReactiveShaper` → 通道档位 / 出口限速）、
 画面 P1 / P2+切镜 / P3（动作识别）/ P3+撞击声相位校正（合成 48 kHz 声音 → `AudioBandSplitter` → `AudioOnsetDetector` → `AudioPhaseAnchor`，含声音偏 80 ms 和同频配乐 + 切镜）/
-P4 前瞻——分别和 f706431 的 `VisualSync.swift`、当前分支的 `VisualSync.swift`、当前分支加 `-D AV_FUSION_ON`（融合部件在旁边吃同样的画面 / 声音跟着跑）编译（`-O`），
+P4 前瞻——分别和 f706431 的 `VisualSync.swift`、当前分支的 `VisualSync.swift`、当前分支加 `-D AV_FUSION_ON`（融合部件在旁边吃同样的画面 / 声音跟着跑：
+6 段特征 → `AVFusionEngine`，P3 频带块照 `VideoSyncPlayer` 经 `AudioBandBacklog` 先给融合再交给撞击声校正）编译（`-O`），
 三份输出（每拍输出档位、原值、浮点位模式）必须逐字节相同。CI 的 checkout 改成 `fetch-depth: 0` 才拿得到 f706431。
 
 ## 11. 风险与待定
