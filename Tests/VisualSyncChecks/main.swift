@@ -7455,7 +7455,7 @@ struct AVF2Beat {
 /// F2 的整条链（照 VideoSyncPlayer：rhythmLevel 里 P4 / P3 之后 AVRhythmVote（这里不跑 P4 / P3；看上一拍的融合状态、跟随器上一拍的结果）→
 /// RhythmFollower（fastJumpHz）/ RhythmPhaseLock → updateFusion（AVFusionEngine.beat）→ updateAudioAnchor）。
 /// 合成声音 24 kHz → 6 段 splitter + P3 三频带；倍速 1、host 时间 = 视频时间、每 0.3 秒一拍。
-/// window(k, t)：第 k 拍（t 秒）的画面窗口；coupled：nil = 用上一拍的融合状态（S2 = .coupled），否则按给的（单元测试用）；
+/// window(k, t)：第 k 拍（t 秒）的画面窗口；coupled：nil = 用上一拍的融合状态（S2 = AVRhythmVote.isS2：耦合且相位锁锁着），否则按给的（单元测试用）；
 /// anchorGate：撞击声校正看不看耦合（= usesAVRhythmConfirm）
 struct AVF2Run {
     var beats: [AVF2Beat] = []
@@ -7511,7 +7511,7 @@ struct AVF2Run {
             drain.pcm.removeAll()
             let raw = window(k, now)
             let clock = MediaClockSnapshot(host: now, item: now, rate: 1)
-            let isCoupled = forced.map { $0(now) } ?? (last?.state == .coupled)
+            let isCoupled = forced.map { $0(now) } ?? AVRhythmVote.isS2(last)
             let input = vote.refine(raw, enabled: voteOn, coupled: isCoupled, events: engine.extractor.events,
                                     impactHz: last?.fa ?? 0, clock: clock, followerHz: follower.hz,
                                     followerLocked: follower.locked)
@@ -7822,6 +7822,31 @@ func avFusionF2Checks() {
     vcheck(still.beats.allSatisfy { !$0.followerLocked && $0.followerWeight == 0 && !$0.lockLocked }
            && stillNatural.beats.allSatisfy { !$0.followerLocked && $0.fusion.state != .coupled && $0.input == $0.raw },
            "F2 画面静止 + 有节奏的声音：不锁（activity 只看画面；给了耦合也不锁）")
+
+    // 复审 M1：画面在动、块运动候选只有 0.35（画面自己锁不上：开锁门 0.40），强制耦合、声音同频——
+    // 前 4 秒画面 0.6 先锁上，4 秒切镜（解锁）后只剩 0.35 的弱候选：投票开 / 关跟随器逐位相同，切镜后一直不锁
+    func weak(_ k: Int, _ t: Double) -> MotionWindow {
+        if abs(t - 4.2) < 0.15 { return f2Window(t, hz: 2, cut: true) }
+        return f2Window(t, hz: 2, conf: t < 4 ? 0.6 : 0.35, phaseHz: 2)
+    }
+    let weakOn = AVF2Run(seconds: 12, signals: [clicks2, AVSynth.floor()], vote: true, coupled: { _ in true }, window: weak)
+    let weakOff = AVF2Run(seconds: 12, signals: [clicks2, AVSynth.floor()], vote: false, coupled: { _ in true }, window: weak)
+    let weakSame = zip(weakOn.beats, weakOff.beats).allSatisfy {
+        $0.0.followerLocked == $0.1.followerLocked && $0.0.followerHz.bitPattern == $0.1.followerHz.bitPattern
+            && $0.0.followerWeight.bitPattern == $0.1.followerWeight.bitPattern && $0.0.lockLocked == $0.1.lockLocked
+    }
+    let weakLockedEarly = weakOn.beats.contains { $0.t < 4 && $0.followerLocked }
+    let weakAfterCut = weakOn.beats.filter { $0.t > 4.3 }.allSatisfy { !$0.followerLocked && $0.action == .none }
+    let agreedWhileLocked = weakOn.beats.contains { $0.t < 4 && $0.action == .agree }
+    var staleBeat = AVFusionBeat()
+    staleBeat.state = .coupled
+    staleBeat.fv = 0
+    var freshBeat = staleBeat
+    freshBeat.fv = 2
+    vcheck(weakSame && weakLockedEarly && weakAfterCut && agreedWhileLocked && !AVRhythmVote.isS2(staleBeat)
+           && AVRhythmVote.isS2(freshBeat) && !AVRhythmVote.isS2(nil),
+           "F2 声音不开锁（复审 M1）：画面在动、弱候选 0.35 + 强制耦合 → 投票开 / 关跟随器逐位相同、切镜后不锁；"
+           + "S2 要相位锁还锁着（耦合但 fv = 0 不算）")
 
     // 4. 跳频 1 → 1.6 Hz（12 秒），声音同样跳：耦合时跳变确认只要 1 拍，比不投票至少早 0.3 秒
     let jumpOn = f2JumpRun(vote: true)

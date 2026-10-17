@@ -225,7 +225,7 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             if vis.usesRhythmContext { input = ctx.refine(input, now: now) }
 #if AV_F2_ON
             // 照 VideoSyncPlayer.rhythmLevel：P4、P3 之后投票（复审 H1；看上一拍融合状态、跟随器上一拍的结果）
-            input = vote.refine(input, enabled: f2vis.usesAVRhythmConfirm, coupled: fusion.last?.state == .coupled,
+            input = vote.refine(input, enabled: f2vis.usesAVRhythmConfirm, coupled: AVRhythmVote.isS2(fusion.last),
                                 events: fusion.engine.extractor.events, impactHz: fusion.last?.fa ?? 0,
                                 clock: MediaClockSnapshot(host: now, item: now, rate: 1), followerHz: follower.hz,
                                 followerLocked: follower.locked)

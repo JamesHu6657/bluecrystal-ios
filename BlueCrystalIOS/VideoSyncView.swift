@@ -1232,11 +1232,11 @@ final class VideoSyncPlayer: ObservableObject {
         if voteStatus != nil { voteStatus = nil }
     }
 
-    /// av-fusion F2：这一拍的投票（P4 前瞻、P3 动作识别之后）。S2 = 上一拍融合状态是耦合（时间可用、声音在场、没在切镜考验）；
+    /// av-fusion F2：这一拍的投票（P4 前瞻、P3 动作识别之后）。S2 = AVRhythmVote.isS2（上一拍融合状态是耦合、那一拍相位锁还锁着）；
     /// 跟随器的频率 / 锁定是上一拍的。不在 S2 时窗口原样交回
     private func refineVote(_ window: MotionWindow, player p: AVPlayer) -> MotionWindow {
         let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
-        let out = rhythmVote.refine(window, enabled: true, coupled: fusionBeat?.state == .coupled,
+        let out = rhythmVote.refine(window, enabled: true, coupled: AVRhythmVote.isS2(fusionBeat),
                                     events: fusion.extractor.events, impactHz: fusionBeat?.fa ?? 0, clock: clock,
                                     followerHz: rhythm.hz, followerLocked: rhythm.locked)
         let text = rhythmVote.statusText

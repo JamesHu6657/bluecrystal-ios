@@ -9203,14 +9203,15 @@ extension AVDebugColumns {
 // 而且只纠正、不发起——activity 只看画面（声音永远不能让静止的画面动起来）、声音不能开节奏锁，只能在画面已经有候选时加置信度 /
 // 选八度 / 缩短跳变确认。每一拍按状态走（主线程，完整拍）：
 //   S0 关（开关关 / 不在跟随画面）= main；S1 只有画面（不耦合 / 没声音 / 时间不可用 / 切镜考验）= 现在的跟随画面；
-//   S2 耦合（上一拍融合状态 = coupled）= 画面结果 + 声音确认（AVRhythmVote）+ 撞击声校正的耦合条件。S2 → S1 单调退回。
+//   S2 耦合（上一拍融合状态 = coupled、那一拍画面相位锁还锁着，AVRhythmVote.isS2）= 画面结果 + 声音确认（AVRhythmVote）+ 撞击声校正的耦合条件。S2 → S1 单调退回。
 // 只改交给 RhythmFollower / RhythmPhaseLock 的那份窗口副本（P4 前瞻、P3 动作识别之后，和 P3 / P4 同一个做法；复审 H1：
 // 研究页原写「P3 之前」，但那样加的置信 / 换的八度会进动作识别的参考频率、区域取舍和轻抚判断，声音就间接改了 activity 和强度上限，
 // 所以排到 P3 之后：动作识别只看画面，投票核对的也正是跟随器这一拍拿到的读数）
 // 和跟随器这一拍的跳变确认拍数；不碰出口、不新增发送路径。
 
-/// av-fusion F2：声音给画面节奏投票（主线程每个完整拍一次）。只在 S2（coupled：上一拍 AVFusionBeat.state == .coupled，
-/// 即 C ≥ 0.6 持续 2 秒进入、时间可用、声音在场、没在切镜考验）而且这一拍有块运动节奏候选时才改窗口副本：
+/// av-fusion F2：声音给画面节奏投票（主线程每个完整拍一次）。只在 S2（coupled = AVRhythmVote.isS2：上一拍 AVFusionBeat.state ==
+/// .coupled，即 C ≥ 0.6 持续 2 秒进入、时间可用、声音在场、没在切镜考验，而且那一拍画面相位锁还锁着）而且这一拍有块运动节奏候选时
+/// 才改窗口副本；加置信 / 换八度还要跟随器（上一拍）已经被画面锁上（复审 M1：声音不开锁）：
 /// 1. 一致：声音节奏和画面跟随频率差 ≤ 15%（和 F1 的 A_f 同一个口径）→ subjectFollowRhythm + 0.1（夹 0~1）；
 /// 2. 八度消歧：两边正好差 2 倍 / 一半（八度两边各 15%）、声音是干净的单一脉冲串 → 画面频率乘 2 / 除 2
 ///    （幅度按频率反比换算；按错的八度拟合的相位作废，相位锁等下一个读数；姿态和块运动同一个八度时一起换）。
@@ -9368,10 +9369,12 @@ struct AVRhythmVote {
             clean = impactHz.isFinite && impactHz > 0 && abs(log(ha / impactHz)) <= tol
         }
         let d = audioHz > 0 ? log(audioHz / vf) : Double.infinity
-        if abs(d) <= tol {
+        // 复审 M1：加置信 / 换八度只在跟随器（上一拍）已经被画面自己锁上时做——没锁时 +0.1 会把 0.30~0.39 的候选推过 0.40 的开锁门、
+        // 换八度会替新锁选频率，那就是声音开锁了
+        if followerLocked, abs(d) <= tol {
             out.subjectFollowRhythm = MotionStats.clamp01(w.subjectFollowRhythm + Self.confidenceBonus)
             action = .agree
-        } else if clean, abs(abs(d) - log(2)) <= tol {
+        } else if followerLocked, clean, abs(abs(d) - log(2)) <= tol {
             let k: Double = d > 0 ? 2 : 0.5
             out.subjectFollowHz = vf * k
             out.subjectFollowAmplitude = w.subjectFollowAmplitude / k
@@ -9391,6 +9394,14 @@ struct AVRhythmVote {
             if fastJump { fastJumpHz = hv }
         }
         return out
+    }
+
+    /// S2（复审 M1）：上一拍融合状态是耦合，**而且**那一拍画面相位锁还锁着（fv > 0 = 耦合度这一拍有新鲜的画面证据）。
+    /// C 是 τ = 1 秒的 EMA、退出要再撑 1.5 秒，相位锁放开（跟随器解锁 / 切镜 / 不动）后「耦合」还会挂约 2.3 秒；
+    /// 切镜考验期间耦合度挂起不清，考验完新镜头头几拍也还是「耦合」——这些拍都不算 S2
+    static func isS2(_ beat: AVFusionBeat?) -> Bool {
+        guard let b = beat else { return false }
+        return b.state == .coupled && b.fv > 0
     }
 
     /// 复审 H1：rhythmLevel 里 P4 之后两步的顺序（播放器和测试共用这一个函数）：先 P3 动作识别（只看画面），再投票。
