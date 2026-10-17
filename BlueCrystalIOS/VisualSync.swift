@@ -9204,7 +9204,9 @@ extension AVDebugColumns {
 // 选八度 / 缩短跳变确认。每一拍按状态走（主线程，完整拍）：
 //   S0 关（开关关 / 不在跟随画面）= main；S1 只有画面（不耦合 / 没声音 / 时间不可用 / 切镜考验）= 现在的跟随画面；
 //   S2 耦合（上一拍融合状态 = coupled）= 画面结果 + 声音确认（AVRhythmVote）+ 撞击声校正的耦合条件。S2 → S1 单调退回。
-// 只改交给 RhythmFollower / RhythmPhaseLock 的那份窗口副本（P4 前瞻之后、P3 动作识别之前，和 P3 / P4 同一个做法）
+// 只改交给 RhythmFollower / RhythmPhaseLock 的那份窗口副本（P4 前瞻、P3 动作识别之后，和 P3 / P4 同一个做法；复审 H1：
+// 研究页原写「P3 之前」，但那样加的置信 / 换的八度会进动作识别的参考频率、区域取舍和轻抚判断，声音就间接改了 activity 和强度上限，
+// 所以排到 P3 之后：动作识别只看画面，投票核对的也正是跟随器这一拍拿到的读数）
 // 和跟随器这一拍的跳变确认拍数；不碰出口、不新增发送路径。
 
 /// av-fusion F2：声音给画面节奏投票（主线程每个完整拍一次）。只在 S2（coupled：上一拍 AVFusionBeat.state == .coupled，
@@ -9330,7 +9332,7 @@ struct AVRhythmVote {
         AVCouplingEstimator.impactHz(impacts(events, start: start, end: end).suffix(recentImpacts).map { $0.time })
     }
 
-    /// 每个完整拍、P4 前瞻之后、P3 动作识别之前。coupled：上一拍融合状态是不是 .coupled（S2）；events：融合的起音（视频时间）；
+    /// 每个完整拍、P4 前瞻和 P3 动作识别之后（复审 H1）。coupled：上一拍融合状态是不是 .coupled（S2）；events：融合的起音（视频时间）；
     /// impactHz：上一拍 F1 的 f_a（撞击间隔中位数 × 倍速，干净度判断用）；clock：这一拍的播放器时钟；
     /// followerHz / followerLocked：跟随器上一拍的结果（跳频确认用）
     mutating func refine(_ w: MotionWindow, enabled: Bool, coupled: Bool, events: [AudioOnsetEvent], impactHz: Double,
@@ -9389,6 +9391,14 @@ struct AVRhythmVote {
             if fastJump { fastJumpHz = hv }
         }
         return out
+    }
+
+    /// 复审 H1：rhythmLevel 里 P4 之后两步的顺序（播放器和测试共用这一个函数）：先 P3 动作识别（只看画面），再投票。
+    /// context / vote 为 nil = 那一步关着（窗口原样往下走）
+    static func contextThenVote(_ w: MotionWindow, context: ((MotionWindow) -> MotionWindow)?,
+                                vote: ((MotionWindow) -> MotionWindow)?) -> MotionWindow {
+        let c = context.map { $0(w) } ?? w
+        return vote.map { $0(c) } ?? c
     }
 
     var statusText: String {

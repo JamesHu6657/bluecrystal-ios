@@ -222,15 +222,15 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             let act = RhythmOutput.motionActivity(level: shaped.level, smoothed: shaped.smoothed, confidence: norm.confidence, motionSignal: true)
             let clock = RhythmLookahead.Clock(hostNow: now, itemNow: now, rate: 1)
             var input = coord.refine(w, enabled: vis.usesLookahead, timeline: tl, clock: clock, latency: latency)
+            if vis.usesRhythmContext { input = ctx.refine(input, now: now) }
 #if AV_F2_ON
-            // 照 VideoSyncPlayer.rhythmLevel：P4 之后、P3 之前投票（看上一拍融合状态、跟随器上一拍的结果）
+            // 照 VideoSyncPlayer.rhythmLevel：P4、P3 之后投票（复审 H1；看上一拍融合状态、跟随器上一拍的结果）
             input = vote.refine(input, enabled: f2vis.usesAVRhythmConfirm, coupled: fusion.last?.state == .coupled,
                                 events: fusion.engine.extractor.events, impactHz: fusion.last?.fa ?? 0,
                                 clock: MediaClockSnapshot(host: now, item: now, rate: 1), followerHz: follower.hz,
                                 followerLocked: follower.locked)
             if vote.action != .none || vote.fastJump { voted += 1 }
 #endif
-            if vis.usesRhythmContext { input = ctx.refine(input, now: now) }
 #if AV_F2_ON
             follower.step(input, dt: dt, active: act > 0, fastJumpHz: vote.fastJumpHz)
 #else

@@ -1232,7 +1232,8 @@ C ≥ 0.6 持续 2 秒进入，C < 0.4 持续 1.5 秒退出；seek / 换视频 /
 
 ```
 VideoSyncPlayer.rhythmLevel（完整拍）
-  window → P4 LookaheadCoordinator.refine → F2 AVRhythmVote.refine（usesAVRhythmConfirm 才走）→ P3 ActionContext.refine
+  window → P4 LookaheadCoordinator.refine → P3 ActionContext.refine → F2 AVRhythmVote.refine（usesAVRhythmConfirm 才走）
+         （P3 / F2 两步的顺序在 AVRhythmVote.contextThenVote 里，播放器和测试共用）
          → RhythmFollower.step(…, fastJumpHz: vote.fastJumpHz) / RhythmPhaseLock.step                      # 出口规则不变
 motionTick：updateFusion（F1，不变）→ … → updateAudioAnchor（usesAVRhythmConfirm 时 coupled = 这一拍 state == .coupled）
 输出仍只经 tick() → SyncOutputStage.limit → BLEManager.sendTick；pulseSubTick 不变；STOP / 看门狗 / 断连不变
@@ -1282,6 +1283,7 @@ motionTick：updateFusion（F1，不变）→ … → updateAudioAnchor（usesAV
 #### 安全不变
 
 - 只改交给跟随器 / 相位锁的窗口副本（锁不锁、用几成仍由 P1 / P2 的门、滞回、`activity` 决定；画面不动时声音再有节奏也不锁）和跟随器这一拍的确认拍数；
+  **投票排在 P3 动作识别之后（复审 H1，和研究页「P4 之后、P3 之前」不同）**：排在 P3 之前时，+0.1 置信会跨过动作识别的 0.3 参考门、抬高区域读数的取舍门槛，换八度会改动作识别的参考频率——声音就间接改了动作类型、轻抚判断（`suppressesRhythm` → activity）、强度上限（轻抚 20）和姿态节奏的抬升。现在动作识别只看画面（测试：800 拍随机 P3 输入，投票开 / 关时动作识别逐位相同；旧顺序同样输入 239 拍不同）。剩下的唯一联系是动作识别读跟随器**上一拍**的频率（轻抚判断「锁在别的往复上不算轻抚」），那是 F2 本来就允许改的频率；锁不锁不受声音影响（见复审 M1）；
   撞击声校正只会因为不耦合**少**对齐（偏移仍有界 ±90°、按时间回 0）。
 - 输出仍只经 `tick()` → `SyncOutputStage`（上限、每拍升幅 ≤ 20、归零保持、通道 2 / 3 为 0）→ `sendTick`；没有新的发送路径、没有新的阻塞；STOP 照旧一下就停。
 - 新值都夹在有效范围（置信 0~1、频率只乘 2 / 除 2 且仍要过跟随器的 0.4~4 Hz、非有限数不投票）；所有重置点（`resetRhythm` / `resetFusion` / 开关）都清投票。

@@ -7452,8 +7452,8 @@ struct AVF2Beat {
     var anchorOffset: Double
 }
 
-/// F2 的整条链（照 VideoSyncPlayer：rhythmLevel 里 P4 之后、P3 之前 AVRhythmVote（看上一拍的融合状态、跟随器上一拍的结果）→
-/// RhythmFollower（fastJump）/ RhythmPhaseLock → updateFusion（AVFusionEngine.beat）→ updateAudioAnchor）。
+/// F2 的整条链（照 VideoSyncPlayer：rhythmLevel 里 P4 / P3 之后 AVRhythmVote（这里不跑 P4 / P3；看上一拍的融合状态、跟随器上一拍的结果）→
+/// RhythmFollower（fastJumpHz）/ RhythmPhaseLock → updateFusion（AVFusionEngine.beat）→ updateAudioAnchor）。
 /// 合成声音 24 kHz → 6 段 splitter + P3 三频带；倍速 1、host 时间 = 视频时间、每 0.3 秒一拍。
 /// window(k, t)：第 k 拍（t 秒）的画面窗口；coupled：nil = 用上一拍的融合状态（S2 = .coupled），否则按给的（单元测试用）；
 /// anchorGate：撞击声校正看不看耦合（= usesAVRhythmConfirm）
@@ -7675,6 +7675,78 @@ func f2OffChainSame(events: [AudioOnsetEvent]) -> Bool {
     return same && steps == 3000
 }
 
+/// 复审 H1：P3 动作识别的判断（动作类型 / 证据 / 部位 / 区域取舍 / 方向 / 轻抚 = activity / 强度上限 / 慢动作压低）
+func f2ContextSame(_ a: ActionContext, _ b: ActionContext) -> Bool {
+    a.kind == b.kind && a.evidence == b.evidence && a.part == b.part && a.usesHand == b.usesHand && a.usesFace == b.usesFace
+        && a.usesRoi == b.usesRoi && a.usesOtherHips == b.usesOtherHips && a.selfPaced == b.selfPaced
+        && a.flowDirection == b.flowDirection && a.poseDirection == b.poseDirection && a.inwardKnown == b.inwardKnown
+        && a.quietSelf == b.quietSelf && a.suppressesRhythm == b.suppressesRhythm && a.intensityCeiling == b.intensityCeiling
+        && a.allowsGentle(followerLocked: true) == b.allowsGentle(followerLocked: true)
+        && a.allowsGentle(followerLocked: false) == b.allowsGentle(followerLocked: false) && a.directionKnown == b.directionKnown
+}
+
+/// 复审 H1：随机的 P3 输入（手 / 脸 / 髋的节奏、区域读数、整幅主体置信 0.15~0.5 跨过动作识别的 0.3 门），强制 S2、跟随器锁着。
+/// 照播放器的顺序（AVRhythmVote.contextThenVote：先 P3 再投票）投票开 / 关时 P3 的判断逐位相同；
+/// 旧顺序（投票在 P3 之前）同样的输入有拍不一样 = 这组输入确实碰得到（测试有牙）
+func f2ContextIndependent(events: [AudioOnsetEvent]) -> (same: Bool, oldDiffers: Int, voted: Int, beats: Int) {
+    var lcg: UInt64 = 0xf2_c0de
+    func rnd() -> Double {
+        lcg = lcg &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(lcg >> 11) / Double(1 << 53)
+    }
+    var same = true
+    var oldDiffers = 0
+    var voted = 0
+    var beats = 0
+    for _ in 0..<20 {
+        var on = ActionContext()
+        var off = ActionContext()
+        var old = ActionContext()
+        var voteOn = AVRhythmVote()
+        var voteOld = AVRhythmVote()
+        var t = 6.0
+        for _ in 0..<40 {
+            t += 0.3
+            func part() -> (hz: Double, conf: Double, amp: Double)? {
+                guard rnd() < 0.6 else { return nil }
+                let hz = rnd() < 0.4 ? 2 : (rnd() < 0.5 ? 1 : 0.5 + 2.5 * rnd())
+                return (hz, rnd(), 0.4 * rnd())
+            }
+            let subject = rnd() < 0.5 ? 2 * (0.97 + 0.06 * rnd()) : (rnd() < 0.5 ? 1 : 0.5 + 3 * rnd())
+            var w = p3Window(time: t, hand: part(), face: rnd() < 0.3 ? part() : nil, hips: part(), subjectHz: subject,
+                             handAt: rnd() < 0.5 ? (30, 22) : (32, 18))
+            w.subjectFollowRhythm = 0.15 + 0.35 * rnd()
+            if rnd() < 0.5 {
+                var s = SubjectReading()
+                s.valid = true
+                s.score = 0.5
+                s.followHz = rnd() < 0.5 ? 2 : 1 + rnd()
+                s.followRhythm = w.subjectFollowRhythm - 0.05 + 0.15 * rnd()
+                s.followAmplitude = 3
+                w.roiFrames = 1
+                w.roi.valid = true
+                w.roi.time = t - 0.05
+                w.roi.subject = s
+            }
+            let clock = MediaClockSnapshot(host: t, item: t, rate: 1)
+            let lockHz = rnd() < 0.5 ? 2.0 : 0
+            func vote(_ v: inout AVRhythmVote, _ x: MotionWindow) -> MotionWindow {
+                v.refine(x, enabled: true, coupled: true, events: events, impactHz: 2, clock: clock, followerHz: 2,
+                         followerLocked: true)
+            }
+            _ = AVRhythmVote.contextThenVote(w, context: { on.refine($0, now: t, followerHz: lockHz) },
+                                             vote: { vote(&voteOn, $0) })
+            _ = AVRhythmVote.contextThenVote(w, context: { off.refine($0, now: t, followerHz: lockHz) }, vote: nil)
+            _ = old.refine(vote(&voteOld, w), now: t, followerHz: lockHz)
+            if voteOn.action != .none || voteOn.fastJump { voted += 1 }
+            if !f2ContextSame(on, off) { same = false }
+            if !f2ContextSame(old, off) { oldDiffers += 1 }
+            beats += 1
+        }
+    }
+    return (same, oldDiffers, voted, beats)
+}
+
 func avFusionF2Checks() {
     func f2(_ x: Double?) -> String { x.map { String(format: "%.2f", $0) } ?? "—" }
     let clicks2 = AVSynth.clicks(avClickTimes(hz: 2, from: 0.3, to: 40))
@@ -7828,6 +7900,12 @@ func avFusionF2Checks() {
 
     // 6. 开关关着 / 不在 S2：3000 组随机窗口逐位等于 P4 的链（跟随器 / 相位锁 / 撞击声校正），窗口副本原样、fastJump 恒 false
     vcheck(f2OffChainSame(events: flakyOn.engine.extractor.events), "F2 关着 / 不耦合：3000 组随机窗口和 P4 的链逐位相同")
+
+    // 复审 H1：投票排在 P3 动作识别之后——动作识别的判断（activity / 强度上限 / 区域取舍…）和投票开关无关
+    let ctx = f2ContextIndependent(events: flakyOn.engine.extractor.events)
+    vcheck(ctx.same && ctx.oldDiffers > 0 && ctx.voted > 0,
+           "F2 投票不进 P3 动作识别（复审 H1）：\(ctx.beats) 拍随机输入、投票 \(ctx.voted) 拍，开 / 关时动作识别逐位相同"
+           + "（旧顺序「投票在 P3 前」\(ctx.oldDiffers) 拍不同）")
 
     // 设置：默认关、键名、只在融合 + 伸缩跟随频率 + 跟随画面时生效、不改 Timer 间隔
     let def = VisualSyncSettings()

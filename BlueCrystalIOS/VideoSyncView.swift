@@ -112,7 +112,7 @@ final class VideoSyncPlayer: ObservableObject {
     private var fusion = AVFusionEngine()
     private var fusionBeat: AVFusionBeat?
     /// av-fusion F2（默认关）：声音给画面节奏投票——只在上一拍融合状态 = 耦合时改交给跟随器 / 相位锁的窗口副本
-    /// （P4 前瞻之后、P3 动作识别之前）和跟随器这一拍的跳变确认拍数；不改出口、不新增发送路径
+    /// （P4 前瞻、P3 动作识别之后）和跟随器这一拍的跳变确认拍数；不改出口、不新增发送路径
     private var rhythmVote = AVRhythmVote()
     /// av-fusion（F1 复审 L2）：电平计现在算没算 6 段扩展特征（fusionFeaturesWanted 上次交给电平计的值）
     private var fusionAudioOn = false
@@ -1124,6 +1124,16 @@ final class VideoSyncPlayer: ObservableObject {
         return out
     }
 
+    /// rhythm-context P3：这一拍的动作识别（开着才调），状态行变化才刷新
+    private func refineContext(_ window: MotionWindow) -> MotionWindow {
+        // rhythm-action tune：跟随器上一拍牢牢锁着的频率（轻抚判断：锁在别的往复上就不算轻抚）
+        let lockHz = ActionContext.lockedHz(locked: rhythm.locked, weight: rhythm.weight, hz: rhythm.hz)
+        let out = actionContext.refine(window, now: CACurrentMediaTime(), followerHz: lockHz)
+        let text = actionContext.statusText()
+        if text != contextStatus { contextStatus = text }
+        return out
+    }
+
     /// rhythm-context P3：动作识别从头判断（未知 = P2 行为）
     private func resetContext() {
         actionContext.reset()
@@ -1222,7 +1232,7 @@ final class VideoSyncPlayer: ObservableObject {
         if voteStatus != nil { voteStatus = nil }
     }
 
-    /// av-fusion F2：这一拍的投票（P4 前瞻之后、P3 动作识别之前）。S2 = 上一拍融合状态是耦合（时间可用、声音在场、没在切镜考验）；
+    /// av-fusion F2：这一拍的投票（P4 前瞻、P3 动作识别之后）。S2 = 上一拍融合状态是耦合（时间可用、声音在场、没在切镜考验）；
     /// 跟随器的频率 / 锁定是上一拍的。不在 S2 时窗口原样交回
     private func refineVote(_ window: MotionWindow, player p: AVPlayer) -> MotionWindow {
         let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
@@ -1289,23 +1299,19 @@ final class VideoSyncPlayer: ObservableObject {
         } else if lookaheadBeat != nil || lookaheadStatus != nil {
             resetLookahead()
         }
-        // av-fusion F2：节奏由声音确认开着才投票（P4 之后、P3 之前；不耦合 = 原样）；关着时 input / fastJump 和以前逐位相同
-        var fastJumpHz = 0.0
-        if visualSettings.usesAVRhythmConfirm, motionSignal, let p = player {
-            input = refineVote(input, player: p)
-            fastJumpHz = rhythmVote.fastJumpHz
-        } else if rhythmVote.active || voteStatus != nil {
-            resetVote()
-        }
-        if visualSettings.usesRhythmContext, motionSignal {
-            // rhythm-action tune：跟随器上一拍牢牢锁着的频率（轻抚判断：锁在别的往复上就不算轻抚）
-            let lockHz = ActionContext.lockedHz(locked: rhythm.locked, weight: rhythm.weight, hz: rhythm.hz)
-            input = actionContext.refine(input, now: CACurrentMediaTime(), followerHz: lockHz)
-            let text = actionContext.statusText()
-            if text != contextStatus { contextStatus = text }
-        } else if contextStatus != nil {
-            resetContext()
-        }
+        // P3 动作识别（开着才走）→ av-fusion F2 投票（节奏由声音确认开着才走；不耦合 = 原样）；关着时 input / fastJumpHz 和以前逐位相同。
+        // 复审 H1：投票排在 P3 之后（顺序在 AVRhythmVote.contextThenVote 里，测试也用它）——动作识别 / 区域取舍 /
+        // 轻抚判断（activity、强度上限）只看画面，投票核对的也正是跟随器这一拍拿到的读数（区域读数改写过的也算）
+        let contextOn = visualSettings.usesRhythmContext && motionSignal
+        if !contextOn, contextStatus != nil { resetContext() }
+        let votePlayer = visualSettings.usesAVRhythmConfirm && motionSignal ? player : nil
+        if votePlayer == nil, rhythmVote.active || voteStatus != nil { resetVote() }
+        var context: ((MotionWindow) -> MotionWindow)?
+        if contextOn { context = { w in self.refineContext(w) } }
+        var vote: ((MotionWindow) -> MotionWindow)?
+        if let p = votePlayer { vote = { w in self.refineVote(w, player: p) } }
+        input = AVRhythmVote.contextThenVote(input, context: context, vote: vote)
+        let fastJumpHz = votePlayer != nil ? rhythmVote.fastJumpHz : 0
         // rhythm-action tune：认出轻抚 / 摸自己时当成「画面不在往复」（跟随器 / 相位锁不锁、已锁的按不动放开）
         let moving = activity > 0 && !(visualSettings.usesRhythmContext && actionContext.suppressesRhythm)
         if motionSignal { rhythm.step(input, dt: dt, active: moving, fastJumpHz: fastJumpHz) } else { rhythm.reset() }
