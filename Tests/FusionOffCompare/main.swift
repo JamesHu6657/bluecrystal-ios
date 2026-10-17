@@ -232,7 +232,7 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #endif
             if vis.usesRhythmContext { input = ctx.refine(input, now: now) }
 #if AV_F2_ON
-            follower.step(input, dt: dt, active: act > 0, fastJump: vote.fastJump)
+            follower.step(input, dt: dt, active: act > 0, fastJumpHz: vote.fastJumpHz)
 #else
             follower.step(input, dt: dt, active: act > 0)
 #endif

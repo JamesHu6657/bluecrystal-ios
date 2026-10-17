@@ -1290,10 +1290,10 @@ final class VideoSyncPlayer: ObservableObject {
             resetLookahead()
         }
         // av-fusion F2：节奏由声音确认开着才投票（P4 之后、P3 之前；不耦合 = 原样）；关着时 input / fastJump 和以前逐位相同
-        var fastJump = false
+        var fastJumpHz = 0.0
         if visualSettings.usesAVRhythmConfirm, motionSignal, let p = player {
             input = refineVote(input, player: p)
-            fastJump = rhythmVote.fastJump
+            fastJumpHz = rhythmVote.fastJumpHz
         } else if rhythmVote.active || voteStatus != nil {
             resetVote()
         }
@@ -1308,7 +1308,7 @@ final class VideoSyncPlayer: ObservableObject {
         }
         // rhythm-action tune：认出轻抚 / 摸自己时当成「画面不在往复」（跟随器 / 相位锁不锁、已锁的按不动放开）
         let moving = activity > 0 && !(visualSettings.usesRhythmContext && actionContext.suppressesRhythm)
-        if motionSignal { rhythm.step(input, dt: dt, active: moving, fastJump: fastJump) } else { rhythm.reset() }
+        if motionSignal { rhythm.step(input, dt: dt, active: moving, fastJumpHz: fastJumpHz) } else { rhythm.reset() }
         if visualSettings.rhythmPulse {
             // P2：相位锁跟在频率跟随器后面（跟随器没锁 / 镜头切换 / 不动 2 拍 → 相位锁立刻放开）
             if motionSignal {

@@ -1233,7 +1233,7 @@ C ≥ 0.6 持续 2 秒进入，C < 0.4 持续 1.5 秒退出；seek / 换视频 /
 ```
 VideoSyncPlayer.rhythmLevel（完整拍）
   window → P4 LookaheadCoordinator.refine → F2 AVRhythmVote.refine（usesAVRhythmConfirm 才走）→ P3 ActionContext.refine
-         → RhythmFollower.step(…, fastJump: vote.fastJump) / RhythmPhaseLock.step                          # 出口规则不变
+         → RhythmFollower.step(…, fastJumpHz: vote.fastJumpHz) / RhythmPhaseLock.step                      # 出口规则不变
 motionTick：updateFusion（F1，不变）→ … → updateAudioAnchor（usesAVRhythmConfirm 时 coupled = 这一拍 state == .coupled）
 输出仍只经 tick() → SyncOutputStage.limit → BLEManager.sendTick；pulseSubTick 不变；STOP / 看门狗 / 断连不变
 ```
@@ -1246,8 +1246,9 @@ motionTick：updateFusion（F1，不变）→ … → updateAudioAnchor（usesAV
   2. **八度消歧**：两边正好差 2 倍 / 一半（八度两边各 15%）、而且声音是**干净的单一脉冲串**（声音节奏和上一拍 F1 的 f_a = 撞击间隔中位数差 ≤ 15%）→
      画面频率乘 2 / 除 2（按画面自己的读数换八度，不直接用声音的频率；幅度按频率反比换算；按错八度拟合的相位作废，相位锁等下一个读数；
      姿态和块运动同一个八度时一起换）；
-  3. **跳频确认**：跟随器锁着、画面读数偏离跟随频率 15% 以上、声音同方向也偏了 15% 以上、而且和画面读数差 ≤ 30% → `fastJump`，
-     `RhythmFollower` 这一拍的跳变确认从 2 拍（≥ 0.6 秒 − 半拍）缩成 1 拍（≥ 1 拍 − 半拍）；跳不跳、跳到哪仍由跟随器自己的规则（平均偏离 ≥ 30%、读数彼此一致）决定。
+  3. **跳频确认**：跟随器锁着、画面读数偏离跟随频率 15% 以上、声音同方向也偏了 15% 以上、而且和画面读数差 ≤ 30% → `fastJump`、`fastJumpHz` = 这个画面读数，
+     `RhythmFollower` 这一拍**真正用的候选读数**和 `fastJumpHz` 同方向、差 ≤ 30% 时，跳变确认从 2 拍（≥ 0.6 秒 − 半拍）缩成 1 拍（≥ 1 拍 − 半拍）
+     （复审 M2：跟随器挑了姿态读数时声音没核对过它，不缩；以前是一个布尔，反方向的姿态读数也会 1 拍就跳）；跳不跳、跳到哪仍由跟随器自己的规则（平均偏离 ≥ 30%、读数彼此一致）决定。
 - **声音节奏**（`AVRhythmVote.audioRhythm`）：融合起音里的撞击（`isImpact`）按**幅度**加权（strength 是 6 段上升 dB 之和，换成每段平均上升的幅度倍数）做成脉冲串，
   归一化自相关在 0.4~4 Hz 找局部峰，取「最短且 ≥ 最高峰 85%」的周期——**只用来消歧，不发起**。
   **窗口对齐**：声音的 4 秒窗口和画面 `followEstimate` 的 4 秒窗口按播放器时钟对齐（画面窗口终点 = 最后一个相位拟合的时刻，没有时 = 现在；换成视频时间后往前 4 秒 × 倍速），
@@ -1257,7 +1258,7 @@ motionTick：updateFusion（F1，不变）→ … → updateAudioAnchor（usesAV
   两响一样强时声音和画面本来就差一倍，F1 的 A_f = 0、进不了耦合——S2 只能在声音和画面**同频**时建立，所以八度消歧实际只纠正「已经耦合以后画面一时读错八度」
   （15 fps 上 2 Hz = 7.5 格，`halvedLag` 时灵时不灵）。画面从头到尾都读错八度时进不了 S2，不纠正（宁可不纠正，也不让声音发起）；
   持续误报时相位锁拿不到读数会在约 1 秒后放开 → C 降、约 1.5 秒后退出耦合 → 退回 S1，最多桥接约 3 秒。
-- `RhythmFollower.step(_:dt:active:fastJump:)`：`fastJump` 默认 false，表达式和以前逐位相同（`Self.jumpConfirmSeconds - 0.5 * beat - 1e-9`）。
+- `RhythmFollower.step(_:dt:active:fastJumpHz:)`：`fastJumpHz` 默认 0（= 不缩），表达式和以前逐位相同（`Self.jumpConfirmSeconds - 0.5 * beat - 1e-9`）。
 - `AudioPhaseAnchor.step(…, coupled: Bool? = nil)`：nil = 不看耦合（和以前逐位相同）；false = 这一拍不算「对上」（按条件不满足保持 2 秒后回 0），
   状态行「撞击声校正：声画不耦合（像配乐 / 人声）…」。**和研究页的出入**：研究页写「融合开着（usesAVFusion）就加耦合条件」，但同一页又要求
   「融合开、F2 关 = F1 = f706431 逐位相同」，两条矛盾；这里按后一条，耦合条件跟 `usesAVRhythmConfirm` 走（F2 要求融合开着，所以仍是「只在融合开着时」）。

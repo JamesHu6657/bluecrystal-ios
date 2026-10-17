@@ -4178,7 +4178,7 @@ struct RhythmFollower {
     static let jumpRatio: Double = 0.3
     static let jumpConfirmSeconds: TimeInterval = 0.6
     static let jumpConfirmBeats = 2
-    /// av-fusion F2：声音耦合着、而且同方向跳了时（AVRhythmVote.fastJump）跳变确认缩成 1 拍（累计 ≥ 1 拍 − 半拍）
+    /// av-fusion F2：声音耦合着、而且同方向跳了时（AVRhythmVote.fastJumpHz）跳变确认缩成 1 拍（累计 ≥ 1 拍 − 半拍）
     static let fastJumpConfirmBeats = 1
     /// 待确认读数彼此要一致（最大 / 最小 ≤ 这个倍数）才跳；不一致时从最新这一拍重新数（r2 复审 L2）
     static let jumpAgreeSpread: Double = 1.45
@@ -4260,9 +4260,10 @@ struct RhythmFollower {
     /// 每拍一次。没有画面信号时调用方应 reset（不保持）。
     /// active：画面自己的强度确实在动（RhythmOutput.activity > 0）；false 时不锁定，锁定中连续 2 拍（有帧）false 才解锁、weight 快速归零；
     /// frames == 0 的窗口不算 false（没有信息，按一拍没候选保持）。
-    /// fastJump（av-fusion F2，默认 false = 原样）：这一拍的跳变确认只要 1 拍
+    /// fastJumpHz（av-fusion F2，默认 0 = 原样）：声音确认过的跳变目标（AVRhythmVote.fastJumpHz）；这一拍真正用的候选读数
+    /// 和它同方向、差 ≤ jumpRatio 时，跳变确认只要 1 拍（F2 复审 M2：姿态 / 区域读数没被声音核对过，不跟着缩短）
     @discardableResult
-    mutating func step(_ w: MotionWindow, dt: TimeInterval, active: Bool = true, fastJump: Bool = false) -> RhythmFollower {
+    mutating func step(_ w: MotionWindow, dt: TimeInterval, active: Bool = true, fastJumpHz: Double = 0) -> RhythmFollower {
         let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
         let gate = locked ? Self.releaseConfidence : Self.lockConfidence
         // r3 复审 L1：这一拍一帧都没分析到（上一帧还在算被丢、解码卡顿）= 没有信息，不当成「画面不动」，按一拍没候选保持
@@ -4291,7 +4292,7 @@ struct RhythmFollower {
                 hz = c.hz
                 clearPending()
             } else {
-                track(c.hz, step: step, fast: fastJump)
+                track(c.hz, step: step, fastHz: fastJumpHz)
             }
         } else if locked {
             inactiveTicks = 0
@@ -4319,7 +4320,7 @@ struct RhythmFollower {
     /// - 满 jumpConfirmBeats 拍、累计时间 ≥ jumpConfirmSeconds − 半拍（每拍最多按 beatSeconds 算），
     ///   待确认读数彼此一致（最大 / 最小 ≤ jumpAgreeSpread），且它们的对数平均偏离当前频率 30% 以上，才直接跳到对数平均；
     ///   平均只偏 15~30%（比如 ±20% 的逐拍抖动）不跳，照常平滑；读数彼此不一致时从最新这一拍重新数（不跳到谁也没读到的中间值）
-    private mutating func track(_ reading: Double, step: TimeInterval, fast: Bool) {
+    private mutating func track(_ reading: Double, step: TimeInterval, fastHz: Double) {
         let d = log(reading / hz)
         if abs(d) <= log(1 + Self.jumpRatio) {
             let a = 1 - exp(-step / Self.smoothSeconds)
@@ -4344,6 +4345,9 @@ struct RhythmFollower {
         pendingLogMax = max(pendingLogMax, lr)
         let beat = min(step, Self.beatSeconds)
         pendingRun += beat
+        // av-fusion F2（复审 M2）：只有这一拍真正用的读数和声音确认过的目标同方向、差 ≤ jumpRatio 才缩成 1 拍
+        let fast = fastHz.isFinite && fastHz > 0 && (fastHz > hz) == (reading > hz)
+            && abs(log(reading / fastHz)) <= log(1 + Self.jumpRatio)
         let beatsNeeded = fast ? Self.fastJumpConfirmBeats : Self.jumpConfirmBeats
         let secondsNeeded = fast ? Self.beatSeconds : Self.jumpConfirmSeconds
         guard pendingBeats >= beatsNeeded,
@@ -9212,8 +9216,10 @@ extension AVDebugColumns {
 ///    两响强弱不同时按幅度加权的自相关落在整周期，和撞击间隔中位数（F1 的 f_a）差一个八度 → 不算干净、不管；
 ///    两响一样强时声音和画面本来就差一倍、F1 的 A_f = 0 进不了耦合（S2 只能在声音和画面同频时建立）；
 /// 3. 跳频确认：跟随器锁着、画面读数偏离跟随频率 15% 以上、声音同方向也偏了 15% 以上、而且和画面读数差 ≤ 30% → fastJump，
-///    跟随器这一拍的跳变确认从 2 拍缩到 1 拍（RhythmFollower.step(fastJump:)）。声音这边看同一个对齐窗口里最后 4 下撞击的
-///    间隔中位数（4 秒自相关要攒够新节奏才换峰，比画面晚；跳了多少仍要 ≥ 30% 才跳，由跟随器自己判断）。
+///    fastJumpHz = 这个画面读数（声音核对过的目标）。跟随器只在它这一拍真正用的候选读数和目标同方向、差 ≤ 30% 时
+///    才把跳变确认从 2 拍缩到 1 拍（RhythmFollower.step(fastJumpHz:)；复审 M2：跟随器挑了姿态读数时声音没核对过，不缩）。
+///    声音这边看同一个对齐窗口里最后 4 下撞击的间隔中位数（4 秒自相关要攒够新节奏才换峰，比画面晚；跳了多少仍要 ≥ 30% 才跳，
+///    由跟随器自己判断）。
 /// 声音的 4 秒窗口和画面 followEstimate 的 4 秒窗口按播放器时钟对齐：画面窗口的终点 = 最后一个相位拟合的时刻（没有时 = 现在），
 /// 换成视频时间后往前 4 秒 × 倍速。enabled == false / 不在 S2 / 条件不满足时窗口原样交回（== 而且位模式相同）、fastJump = false
 struct AVRhythmVote {
@@ -9239,6 +9245,8 @@ struct AVRhythmVote {
 
     private(set) var action = Action.none
     private(set) var fastJump = false
+    /// fastJump 时声音核对过的跳变目标（画面这一拍的读数，Hz；没有 0）→ RhythmFollower.step(fastJumpHz:)
+    private(set) var fastJumpHz: Double = 0
     /// 这一拍声音节奏（host 时间上的 Hz，已乘倍速；没有 0）/ 自相关峰 / 最近几下撞击间隔的频率（跳频方向用）
     private(set) var audioHz: Double = 0
     private(set) var recentHz: Double = 0
@@ -9334,6 +9342,7 @@ struct AVRhythmVote {
         active = true
         action = .none
         fastJump = false
+        fastJumpHz = 0
         audioHz = 0
         audioConfidence = 0
         recentHz = 0
@@ -9377,6 +9386,7 @@ struct AVRhythmVote {
             let da = log(recentHz / followerHz)
             fastJump = abs(dv) > tol && abs(da) > tol && (dv > 0) == (da > 0)
                 && abs(log(recentHz / hv)) <= log(1 + Self.jumpSpread)
+            if fastJump { fastJumpHz = hv }
         }
         return out
     }

@@ -7516,7 +7516,7 @@ struct AVF2Run {
                                     impactHz: last?.fa ?? 0, clock: clock, followerHz: follower.hz,
                                     followerLocked: follower.locked)
             let act = active(now)
-            follower.step(input, dt: dt, active: act, fastJump: vote.fastJump)
+            follower.step(input, dt: dt, active: act, fastJumpHz: vote.fastJumpHz)
             lock.step(input, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source,
                       now: now, dt: dt, active: act)
             let b = engine.beat(clock: clock, lock: lock, activity: act ? 0.5 : 0, cut: raw.cutCount > 0, audioReady: true,
@@ -7651,7 +7651,7 @@ func f2OffChainSame(events: [AudioOnsetEvent]) -> Bool {
                                     followerHz: fb.hz, followerLocked: fb.locked)
             if input != w || vote.fastJump || vote.action != .none { same = false }
             fa.step(w, dt: dt, active: act)
-            fb.step(input, dt: dt, active: act, fastJump: vote.fastJump)
+            fb.step(input, dt: dt, active: act, fastJumpHz: vote.fastJumpHz)
             la.step(w, followerHz: fa.hz, followerLocked: fa.locked, followerSource: fa.source, now: now, dt: dt, active: act)
             lb.step(input, followerHz: fb.hz, followerLocked: fb.locked, followerSource: fb.source, now: now, dt: dt, active: act)
             var onsets: [Double] = []
@@ -7764,6 +7764,52 @@ func avFusionF2Checks() {
     vcheck(jOn != nil && jOff != nil && (jOff ?? 0) - (jOn ?? 99) >= 0.3 - 1e-9 && coupledBefore && sameBefore
            && jumpOn.beats.contains { $0.fastJump },
            "F2 跳频 1 → 1.6 Hz：耦合时 \(f2(jOn)) 秒确认，不投票 \(f2(jOff)) 秒（早 \(f2((jOff ?? 0) - (jOn ?? 0))) 秒 ≥ 0.3）")
+
+    // 复审 M2：声音核对的是块运动读数（1.6 Hz），跟随器这一拍却挑了反方向的姿态读数（0.6 Hz，置信更高、采样率看得清）→
+    // fastJumpHz 不缩短确认，逐位等于不给；跟随器挑的就是块运动读数时 1 拍就跳
+    func poseWindow(_ t: Double, flow: Double, pose: Double?) -> MotionWindow {
+        var w = f2Window(t, hz: flow)
+        if let p = pose {
+            w.poseFrames = 3
+            w.posePresentFrames = 3
+            w.poseScore = 0.5
+            w.poseRhythmHz = p
+            w.poseRhythmConfidence = 0.8
+            w.poseRhythmPart = 1
+            w.poseRhythmRate = 9
+        }
+        return w
+    }
+    var withTarget = RhythmFollower()
+    var plain = RhythmFollower()
+    var flowOnly = RhythmFollower()
+    var pt = 0.0
+    for _ in 0..<10 {
+        pt += 0.3
+        let w = poseWindow(pt, flow: 1, pose: 1)
+        withTarget.step(w, dt: 0.3)
+        plain.step(w, dt: 0.3)
+        flowOnly.step(w, dt: 0.3)
+    }
+    var poseSame = withTarget.locked && abs(withTarget.hz - 1) < 1e-9
+    var poseHz: [Double] = []
+    var flowHz: [Double] = []
+    for _ in 0..<3 {
+        pt += 0.3
+        let w = poseWindow(pt, flow: 1.6, pose: 0.6)
+        withTarget.step(w, dt: 0.3, fastJumpHz: 1.6)
+        plain.step(w, dt: 0.3)
+        flowOnly.step(poseWindow(pt, flow: 1.6, pose: nil), dt: 0.3, fastJumpHz: 1.6)
+        if withTarget.hz.bitPattern != plain.hz.bitPattern || withTarget.locked != plain.locked
+            || withTarget.weight.bitPattern != plain.weight.bitPattern || withTarget.source != plain.source {
+            poseSame = false
+        }
+        poseHz.append(withTarget.hz)
+        flowHz.append(flowOnly.hz)
+    }
+    vcheck(poseSame && withTarget.source == .pose && abs(poseHz[0] - 1) < 0.05 && abs(flowHz[0] - 1.6) < 1e-9,
+           "F2 跳频确认只认声音核对过的读数（复审 M2）：跟随器挑了反方向的姿态读数时不缩（第 1 拍仍 \(f2(poseHz[0])) Hz，"
+           + "和不给目标逐位相同）；挑的是块运动读数时 1 拍跳到 \(f2(flowHz[0])) Hz")
 
     // 5. 撞击声校正 + 同频节拍音轨（2 Hz 咔哒跨 12 秒切镜不断 = 配乐）：F2 开着（要耦合）时考验后不再「已对齐」，
     //    关着时（= P3）照旧对齐
