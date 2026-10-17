@@ -9616,7 +9616,15 @@ struct AVVibrationAudio: Equatable {
 
     var active: Bool { mix > 0 || level != nil || evidenceAt > -.infinity }
 
-    mutating func reset() { self = AVVibrationAudio() }
+    /// 复审 R2 L3：缓冲 / seek / 开关等重置不清「最近 10 秒有跨切镜 / 静止证据」的记忆（融合没重置时 S2 可能马上回来）
+    mutating func reset() {
+        let evidence = evidenceAt
+        self = AVVibrationAudio()
+        evidenceAt = evidence
+    }
+
+    /// 换视频 / F3b 关掉时全清
+    mutating func resetAll() { self = AVVibrationAudio() }
 
     /// 声音目标（不含混合）：nil = 撞击不够（< 3 下）或者没时间
     static func audioLevel(video: Int, floor: Int, events: [AudioOnsetEvent], clock: MediaClockSnapshot,
@@ -9708,8 +9716,8 @@ extension AVDebugColumns {
 //
 // 开关 bcVisualSyncAVFallback（默认关；usesAVFallback = 融合生效 + 开关）。原则不变：画面为主。
 // 画面暂时不可用（motionSignal 断：发热暂停、没视频轨、取帧停了、近场 / 切镜让画面没有新鲜样本）≥ 0.6 秒、声音有信号、
-// 而且这一次断开时「最近 10 秒内耦合过，或最近 10 秒的融合判断 P_music < 0.3」→ 声音占比 1.5 秒爬满（值 = 占比 × 声音 + (1 − 占比) × 画面，≤ max(画面, 声音)）；
-// 门不满足 → 占比不涨（维持现状：通常是 0）。画面回来 → 1.5 秒交回，每拍降 ≤ 12。声音也没了 → 声音那份当 0、没信号（不加最低强度）。
+// 而且这一次断开时「最近 10 秒内耦合过」（复审 H1：不用研究页的「或 P_music < 0.3」）→ 声音占比 1.5 秒爬满（值 = 占比 × 声音 + (1 − 占比) × 画面，≤ max(画面, 声音)）；
+// 门不满足 / 声音没了 / 替补超过 30 秒 → 占比淡回 0。画面回来 → 1.5 秒交回，每拍降 ≤ 12。声音也没了 → 声音那份当 0、没信号（不加最低强度）。
 // 占比 0 且交回完成时原样返回 handover.blend 的结果（逐位不变）。暂停 / seek / 缓冲 / 关联动走原路径（reset，不经过 F4）。
 // 结果仍然只经 tick() → SyncOutputStage → BLEManager.sendTick 发出。
 
@@ -9843,10 +9851,11 @@ extension AVDebugColumns {
 // MARK: - av-fusion F5：音画偏移估计 + 手动偏移
 //
 // 开关 bcVisualSyncAVOffsetMs（−300~300 毫秒，默认 0）、bcVisualSyncAVAutoOffset（默认关）。场景分类（SoundAnalysis）这一期不做（见文档）。
-// 模型（研究页 §4.2 第 5 条）：S2 里撞击时刻（视频时间 t）上的画面相位均值 μ 和画面频率 f（视频时间 Hz）满足 μ = φ0 + 2π·f·τ，
+// 模型（研究页 §4.2 第 5 条）：S2 里每个撞击时刻（视频时间 t）上的画面相位 μ 和画面频率 f（视频时间 Hz）满足 μ = φ0 + 2π·f·τ，
 // τ = 片子本身的音画偏移（正 = 声音晚）。φ0 是动作本身「哪个相位出声」，和频率无关；所以只有频率变化够大时才能把 τ 和 φ0 分开。
-// 估计：按频率分格（0.05 Hz）保留最近 120 秒的样本（每格圆均值 + 权重），在 τ ∈ [−0.3, 0.3] 秒上按 1 毫秒网格找
-// |Σ w·e^{i(μ − 2π f τ)}| 最大的 τ（自动处理相位绕圈）；要 ≥ 2 格、频率跨度 ≥ 0.4 Hz、总样本 ≥ 8、拟合集中度 ≥ 0.8 才给出 τ，否则 nil。
+// 估计（复审 M4 / R2 M2 之后）：每个新撞击一个样本（互相独立）；按频率分格（0.05 Hz）保留最近 120 秒，每格 ≥ 5 个、格内相位一致（≥ 0.7）才算一个点；
+// ≥ 3 个点、频率跨度 ≥ 0.4 Hz 时在 τ ∈ [−0.3, 0.3] 秒上先 5 毫秒粗找、再 1 毫秒细找 |Σ w·e^{i(μ − 2π f τ)}| 最大的 τ；
+// 拟合集中度 ≥ 0.85（3 个点时 ≥ 0.9）才更新，每次最多挪 20 毫秒（第一次从手动值起）；证据过期 / 不够时清掉。
 // 测量用不带偏移的时钟（不形成反馈）。结果只用来挪读声音时的视频时间（MediaClockSnapshot.shifted），不碰出口。
 
 struct AVOffsetEstimator: Equatable {
@@ -9858,7 +9867,7 @@ struct AVOffsetEstimator: Equatable {
     /// 复审 M4：拟合集中度门槛（3 格时只剩 1 个自由度，门槛更高）
     static let minFit = 0.85
     static let minFitThreeBins = 0.9
-    /// 复审 M4：格内样本相位要一致（合成长度 / 集中度之和 ≥ 0.6）才算一个点——随机相位的噪声在格内就互相抵消、被丢掉
+    /// 复审 M4：格内样本相位要一致（合成长度 / 集中度之和 ≥ 0.7）才算一个点——随机相位的噪声在格内就互相抵消、被丢掉
     static let minBinConsistency = 0.7
     static let minR = 0.5
     static let maxOffset = 0.3
@@ -9880,8 +9889,17 @@ struct AVOffsetEstimator: Equatable {
     private(set) var fit: Double = 0
     private(set) var spanHz: Double = 0
     private(set) var phi0: Double = .nan
+    /// 复审 R2 M2：第一次估出来时从这个值（手动偏移）起步，也按每次 20 毫秒挪
+    var seed: Double = 0
 
     mutating func reset() { self = AVOffsetEstimator() }
+
+    /// 复审 R2 M2：每拍调一次——过期的格清掉、必要时重新拟合（S2 结束后旧估计不会一直用下去）
+    mutating func expire(now: Double) {
+        guard now.isFinite, bins.values.contains(where: { now - $0.lastAt > Self.keepSeconds }) else { return }
+        bins = bins.filter { now - $0.value.lastAt <= Self.keepSeconds }
+        refit()
+    }
 
     var sampleCount: Int { bins.values.reduce(0) { $0 + $1.count } }
 
@@ -9903,7 +9921,7 @@ struct AVOffsetEstimator: Equatable {
         return (atan2(sy, sx), r)
     }
 
-    /// 加一个样本：f 视频时间 Hz，μ 弧度，r 集中度（< 0.5 不收），now host 时间。调用方只在有新撞击时加（样本不重复）
+    /// 加一个样本：f 视频时间 Hz，μ 弧度，r 权重（< 0.5 不收；单个撞击给 1），now host 时间。调用方每个新撞击加一次（样本互相独立）
     mutating func add(hz f: Double, mu: Double, r: Double, now: Double) {
         guard f.isFinite, f > 0, mu.isFinite, r.isFinite, r >= Self.minR, now.isFinite else { return }
         let key = Int((f / Self.binHz).rounded())
@@ -9982,11 +10000,8 @@ struct AVOffsetEstimator: Equatable {
             return
         }
         let target = min(Self.maxOffset, max(-Self.maxOffset, best.tau))
-        if let prev = estimate {
-            estimate = prev + min(Self.maxStepPerUpdate, max(-Self.maxStepPerUpdate, target - prev))
-        } else {
-            estimate = target
-        }
+        let from = estimate ?? (seed.isFinite ? min(Self.maxOffset, max(-Self.maxOffset, seed)) : 0)
+        estimate = from + min(Self.maxStepPerUpdate, max(-Self.maxStepPerUpdate, target - from))
         phi0 = best.phi
     }
 }

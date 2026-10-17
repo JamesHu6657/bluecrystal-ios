@@ -236,7 +236,7 @@ final class VideoSyncPlayer: ObservableObject {
         if v.usesAVRhythmConfirm != previousVote { resetVote() }
         // F3：重音 / 震动跟声音一变就从头来（关掉 = g = 1、震动回画面值）
         if v.usesAVAccent != previousAccent { accent.reset() }
-        if v.usesAVVibrationAudio != previousVibration { vibrationAudio.reset() }
+        if v.usesAVVibrationAudio != previousVibration { vibrationAudio.resetAll() }
         // F4：互为回落一变就从头来（关掉 = 原路径）
         if v.usesAVFallback != previousFallback { resetFallback() }
         // F5：自动估计一变就从头估
@@ -265,6 +265,8 @@ final class VideoSyncPlayer: ObservableObject {
             outputStage.seed(lastActive.values)
             motionShaper.reset()
             resetRhythm()
+            // av-fusion F4（复审 R2 M1）：换来源时回落从头来（声音模式不走 motionTick，状态会一直留着）
+            resetFallback()
             motionFlow.reset()
             // 正在输出时才交接；没在播 / 联动关着时下一次开播本来就从 0 起
             if isPlaying, settings.enabled { handover.begin(v.source) } else { handover.cancel() }
@@ -518,6 +520,7 @@ final class VideoSyncPlayer: ObservableObject {
         m.setTimingEnabled(debugRecording)
         bandBacklog.clear()
         resetFusion()
+        vibrationAudio.resetAll()
         resetFallback()
         resetOffsetEstimator()
         resetAVDebug()
@@ -1264,6 +1267,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// av-fusion F1：融合从头来（开关 / 换视频 / seek / 画面侧重置），状态行消失。backlog 不清（那是撞击声校正的输入）
     private func resetFusion() {
         fusion.reset()
+        // F5：seek 后撞击时间会往回走，样本从新的位置重新收（估计本身不清）
+        lastOffsetImpact = -.infinity
         fusionBeat = nil
         if fusionStatus != nil { fusionStatus = nil }
         resetVote()
@@ -1298,14 +1303,18 @@ final class VideoSyncPlayer: ObservableObject {
     private func updateOffsetEstimator(_ p: AVPlayer, beat b: AVFusionBeat) {
         guard visualSettings.usesAVAutoOffset else { return }
         let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
+        offsetEstimator.expire(now: clock.host)
+        offsetEstimator.seed = visualSettings.manualAVOffset
         if AVRhythmVote.isS2(b), clock.isValid, phaseLock.locked {
             let end = clock.item(forHost: clock.host)
+            // 复审 R2 M2：每个新撞击一个样本（那一下的画面相位），不再用重叠的 4 秒窗口均值
             let hits = AVRhythmVote.impacts(fusion.extractor.events, start: end - AVCouplingEstimator.windowSeconds * clock.rate,
-                                            end: end).map { $0.time }
-            if let newest = hits.last, newest != lastOffsetImpact,
-               let m = AVOffsetEstimator.meanPhase(itemTimes: hits, clock: clock, lock: phaseLock) {
-                lastOffsetImpact = newest
-                offsetEstimator.add(hz: phaseLock.hz / clock.rate, mu: m.mu, r: m.r, now: clock.host)
+                                            end: end).map { $0.time }.filter { $0 > lastOffsetImpact }
+            for t in hits {
+                lastOffsetImpact = t
+                if let ph = phaseLock.phase(at: clock.host(forItem: t)), ph.isFinite {
+                    offsetEstimator.add(hz: phaseLock.hz / clock.rate, mu: atan2(sin(ph), cos(ph)), r: 1, now: clock.host)
+                }
             }
         }
         let text: String
@@ -1386,7 +1395,10 @@ final class VideoSyncPlayer: ObservableObject {
         // 复审 L1：丢锁之前的撞击也能凑出一致的频率，所以还要最近一个半周期里真有撞击（声音还在跟着这个节奏响）
         if hz > 0, phaseLock.hz > 0 || flywheel.snapshot != nil {
             let period = 1 / max(0.1, flywheel.snapshot?.hz ?? phaseLock.hz)
-            let recent = AVRhythmVote.impacts(fusion.extractor.events, start: end - 1.5 * period * clock.rate, end: end)
+            // 复审 R2 L2：「最近有没有撞击」按已经解码出来的声音看（声音晚时不往未来挪）
+            let nowClock = avClock(p, instant: true)
+            let nowEnd = nowClock.item(forHost: nowClock.host)
+            let recent = AVRhythmVote.impacts(fusion.extractor.events, start: nowEnd - 1.5 * period * clock.rate, end: nowEnd)
             if recent.isEmpty { hz = 0 }
         }
         return flywheel.step(lock: phaseLock, s2: AVRhythmVote.isS2(fusionBeat), audioHz: hz, now: clock.host) ?? phaseLock
@@ -1407,7 +1419,7 @@ final class VideoSyncPlayer: ObservableObject {
     private func vibrationLevels(_ levels: [Int], player p: AVPlayer, hasSignal: Bool, activity: Double,
                                  dt: Double) -> [Int] {
         guard visualSettings.usesAVVibrationAudio, fusionFeaturesWanted, levels.count > 1 else {
-            if vibrationAudio.active { vibrationAudio.reset() }
+            if vibrationAudio.active { vibrationAudio.resetAll() }
             return levels
         }
         let floorPercent = SyncOutputStage.floorPercent(settings: settings, hasSignal: hasSignal)

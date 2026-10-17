@@ -8623,6 +8623,23 @@ func avFusionF5Checks() {
         drift.add(hz: f, mu: wrap(1.0 + 2 * Double.pi * f * -0.12), r: 0.9, now: 50 + Double(k))
         if let e = drift.estimate { maxJump = max(maxJump, abs(e - prevE)); prevE = e }
     }
+    // 复审 R2 M2：第一次估出来也从手动值起步、每次 ≤ 20 毫秒；S2 结束后过期（expire 每拍调）
+    var firstStep = AVOffsetEstimator()
+    firstStep.seed = -0.05
+    var firstValue: Double?
+    for k in 0..<60 {
+        let f = [0.8, 1.2, 1.6][k % 3]
+        firstStep.add(hz: f, mu: wrap(0.5 + 2 * Double.pi * f * 0.25), r: 1, now: Double(k))
+        if firstValue == nil, let e = firstStep.estimate { firstValue = e }
+    }
+    let converged = firstStep.estimate ?? 9
+    var stale5 = firstStep
+    stale5.expire(now: 59 + 60)
+    let keptAt119 = stale5.estimate != nil
+    stale5.expire(now: 59 + 200)
+    vcheck(firstValue.map { abs($0 + 0.03) < 1e-9 } == true && abs(converged - 0.25) < 0.015 && keptAt119 && stale5.estimate == nil
+           && stale5.bins.isEmpty,
+           "F5（复审 R2 M2）：第一次估计从手动值 −50 起步只挪 20 毫秒，之后收敛到 +250（\(String(format: "%.0f", converged * 1000))）；没新样本 120 秒后过期")
     vcheck(abs(before - 0.12) < 0.012 && maxJump <= AVOffsetEstimator.maxStepPerUpdate + 1e-12,
            "F5：估计值每次更新最多挪 20 毫秒（最大一步 \(String(format: "%.1f", maxJump * 1000)) 毫秒）")
     // 120 秒前的样本过期：只剩一个频率时估计消失

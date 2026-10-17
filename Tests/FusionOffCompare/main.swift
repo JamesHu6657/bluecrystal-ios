@@ -193,6 +193,7 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
     var accentShadow = AVAccent()
     var vibShadow = AVVibrationAudio()
     var f3shadow = 0
+    var f3bShadow = 0
 #endif
 #if AV_F4_ON
     // F4：互为回落 / 相位飞轮的接线走一遍；画面一直有新鲜样本、不在 S2 → 一拍都不该改
@@ -292,7 +293,8 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             let sv = vibShadow.step(video: videoVib, floor: 10, events: fusion.engine.extractor.events,
                                     clock: MediaClockSnapshot(host: now, item: now, rate: 1), beat: shadowBeat, activity: act,
                                     channelsBoth: true, depth: 0.15, now: now, dt: dt)
-            if sg != 1 || sv != videoVib { f3shadow += 1 }
+            if sg != 1 { f3shadow += 1 }
+            if sv != videoVib { f3bShadow += 1 }
             driver.accentGain = pulse ? g : 1
 #else
             let levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
@@ -352,6 +354,7 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #if AV_F3_ON
     FileHandle.standardError.write("f3 \(name): touched beats \(f3touched) (forced S1 → 0)\n".data(using: .utf8)!)
     FileHandle.standardError.write("f3 positive control \(name): \(f3shadow)\n".data(using: .utf8)!)
+    FileHandle.standardError.write("f3b positive control \(name): \(f3bShadow)\n".data(using: .utf8)!)
 #endif
 #if AV_F2_ON
     FileHandle.standardError.write("f2 \(name): voted beats \(voted) (switch off / forced S1 → 0)\n".data(using: .utf8)!)

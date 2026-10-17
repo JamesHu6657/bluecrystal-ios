@@ -46,7 +46,7 @@ for v in head fusion f2 f2s1 f3s1 f4s1; do
   fi
 done
 # 复审 M5 正对照：同样的输入下，真实 S2 / 画面断开时 F3 / F4 必须真能改东西（不然上面的「逐字节相同」证明不了什么）
-for tag in f3 f4; do
+for tag in f3 f3b f4; do
   n=$(grep -h "^$tag positive control" "$TMP"/f3s1.err "$TMP"/f4s1.err | awk '{s += $NF} END {print s + 0}')
   if [ "$n" -gt 0 ]; then
     echo "FusionOffCompare: $tag positive control changed $n beats (as expected)"
