@@ -70,6 +70,8 @@ jobs:
             BlueCrystalIOS/VisualSync.swift \
             Tests/VisualSyncChecks/main.swift \
             -o "$RUNNER_TEMP/visual-sync-checks" 2>&1 | tee -a tests.log
+          # 检查程序顶层很大，8 MB 默认栈不够（Debug 构建），把栈加到 64 MB
+          ulimit -s 65520 || true
           "$RUNNER_TEMP/visual-sync-checks" 2>&1 | tee -a tests.log
 
       # 只编译（BLEManager / 各 View 只有这里能验证），不打包、不上传

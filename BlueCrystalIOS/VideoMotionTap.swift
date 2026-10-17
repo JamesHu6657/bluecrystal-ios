@@ -4,6 +4,7 @@ import CoreVideo
 import QuartzCore
 import ImageIO
 import Vision
+import UIKit
 import os
 
 /// 一个视频的画面运动计：motion 队列上的分析结果写进来，主线程每 0.3 秒取走一次（照 AudioLevelMeter）。
@@ -678,5 +679,438 @@ final class VideoMotionTap {
         poseContinuous = true
         poseNext = poseNext.isFinite ? max(poseNext + PoseWorker.interval, time + PoseWorker.interval * 0.5)
                                      : time + PoseWorker.interval
+    }
+}
+
+/// rhythm-lookahead P4（默认关）：另开一路 AVAssetReader 解码同一个本地视频文件，做两件事（各自有开关）：
+/// - 前瞻：从播放头起往后最多读 LookaheadTimeline.horizon 秒，跑同一套 LumaDownscaler + MotionAnalyzer（块运动主体 / 节奏 / 相位拟合，
+///   不跑 Vision），按视频时间写进 LookaheadTimeline；主线程每个完整拍取一份快照交给 LookaheadCoordinator。
+///   往回 seek / 往前跳 / 解码跟不上时从播放头重读；10 秒内重读 4 次以上算「跟不上」，停 5 秒（这期间只用实时）。
+/// - 预扫描：前瞻不缺帧时，从头到尾按 15 Hz 分析一遍，攒 MotionPrescan，扫完回调主线程（MotionNormalizer.seed 只在还没学过时用）。
+///   播放中每 20 ms 最多解码 1 帧（每秒约 50 帧，30 fps 片源不到 2 倍速），暂停时每步最多 10 帧；
+///   可随时取消（关开关 / 换视频 / 离开画面联动）；结果用不上时（已经有结果 / 播放已经开始学）播放器也会把这一路关掉。
+/// 全部在一个 .utility 串行队列上按小步做（每步 ≤ 约 12 ms 后让出），不阻塞主线程和实时分析队列；
+/// 发热 .serious 起两路都停（LookaheadThermalPolicy），App 进后台也停，回来后从播放头 / 预扫描停下的地方接着读。
+/// 读不了这个文件（创建 / 读取失败 3 次）就放弃，主线程退回只用实时。这里不碰 BLE、不决定输出
+final class LookaheadReader {
+    struct Snapshot {
+        var timeline: LookaheadTimeline
+        /// 两路都停着的原因（发热 / 后台 / 没有画面轨）；正常时 nil
+        var blocked: String?
+        /// 前瞻这一路不能用的原因（解码跟不上 / 读不了这个文件）；正常时 nil
+        var lookNote: String?
+        /// 前瞻能不能用（没有停着、前瞻这一路也没出问题）
+        var lookUsable: Bool { blocked == nil && lookNote == nil }
+        /// 预扫描进度 0~1（没开 / 还不知道时长时 nil）
+        var prescanProgress: Double?
+        var prescanFailed: Bool
+    }
+
+    static let frameInterval: Double = 1.0 / 15
+    static let pumpBusy: Double = 0.02
+    static let pumpIdle: Double = 0.1
+    static let pumpBlocked: Double = 1
+    static let sliceSeconds: CFTimeInterval = 0.012
+    static let lookFramesPerSlice = 24
+    static let prescanFramesPlaying = 1
+    static let prescanFramesPaused = 10
+    static let maxFailures = 3
+    static let thrashRestarts = 4
+    static let thrashWindow: CFTimeInterval = 10
+    static let thrashBackoff: CFTimeInterval = 5
+
+    private let asset: AVAsset
+    private let queue = DispatchQueue(label: "com.bluecrystal.motion.lookahead", qos: .utility)
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    /// 主线程回调（扫完）。只在主线程读写
+    private var onPrescanDone: ((MotionPrescan.Summary) -> Void)?
+    // 下面跨线程，lock 保护
+    private var cancelled = false
+    private var wantLookahead = false
+    private var wantPrescan = false
+    private var phaseFit = false
+    private var playhead: Double = .nan
+    private var playing = false
+    private var duration: Double = .nan
+    private var background = false
+    private var shared = LookaheadTimeline()
+    private var sharedBlocked: String?
+    private var sharedLookNote: String?
+    private var sharedProgress: Double?
+    private var sharedPrescanFailed = false
+    // 下面只在 queue 上用
+    private var track: AVAssetTrack?
+    private var trackLoaded = false
+    private var lookReader: AVAssetReader?
+    private var lookOutput: AVAssetReaderTrackOutput?
+    private var lookEnded = false
+    private var lookAnalyzer = MotionAnalyzer()
+    private var lookScaler = LumaDownscaler()
+    private var lookFrame = LumaFrame()
+    private var lookLast: Double = -.infinity
+    private var timeline = LookaheadTimeline()
+    private var lookFailures = 0
+    private var restarts: [CFTimeInterval] = []
+    private var backoffUntil: CFTimeInterval = 0
+    private var preReader: AVAssetReader?
+    private var preOutput: AVAssetReaderTrackOutput?
+    private var preAnalyzer = MotionAnalyzer()
+    private var preScaler = LumaDownscaler()
+    private var preFrame = LumaFrame()
+    private var preLast: Double = -.infinity
+    private var prescan = MotionPrescan()
+    private var preResumeAt: Double = 0
+    private var prescanFinished = false
+    private var preFailures = 0
+    private var preFailedAt: Double = -.infinity
+    private var pumpScheduled = false
+    private var observers: [NSObjectProtocol] = []
+
+    init(asset: AVAsset, onPrescanDone: @escaping (MotionPrescan.Summary) -> Void) {
+        self.asset = asset
+        self.onPrescanDone = onPrescanDone
+        lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lock.initialize(to: os_unfair_lock())
+        restarts.reserveCapacity(8)
+    }
+
+    deinit {
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+        lock.deinitialize(count: 1)
+        lock.deallocate()
+    }
+
+    /// 主线程：开始（读视频轨，之后按开关做事）
+    func start() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil,
+                                            queue: .main) { [weak self] _ in self?.setBackground(true) })
+        observers.append(center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil,
+                                            queue: .main) { [weak self] _ in self?.setBackground(false) })
+        setBackground(UIApplication.shared.applicationState == .background)
+        asset.loadTracks(withMediaType: .video) { [weak self] tracks, _ in
+            guard let self = self else { return }
+            self.queue.async {
+                self.track = tracks?.first
+                self.trackLoaded = true
+                self.schedulePump(after: 0)
+            }
+        }
+    }
+
+    /// 主线程：拆掉。之后不再回调；读帧在队列上下一步时取消
+    func cancel() {
+        onPrescanDone = nil
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+        observers.removeAll()
+        os_unfair_lock_lock(lock)
+        cancelled = true
+        os_unfair_lock_unlock(lock)
+        queue.async { [self] in self.teardown() }
+    }
+
+    /// 主线程：开关（前瞻 / 预扫描 / 相位拟合）。下一步起生效
+    func configure(lookahead: Bool, prescan: Bool, phaseFit: Bool) {
+        os_unfair_lock_lock(lock)
+        wantLookahead = lookahead
+        wantPrescan = prescan
+        self.phaseFit = phaseFit
+        os_unfair_lock_unlock(lock)
+        queue.async { [weak self] in self?.schedulePump(after: 0) }
+    }
+
+    /// 主线程：每个完整拍 / seek 后报一下播放头（视频秒）、在不在播、时长
+    func notePlayhead(_ seconds: Double, playing: Bool, duration: Double) {
+        os_unfair_lock_lock(lock)
+        playhead = seconds
+        self.playing = playing
+        if duration.isFinite, duration > 0 { self.duration = duration }
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 主线程：这一拍用的快照（值拷贝；时间轴最多 200 帧）
+    func snapshot() -> Snapshot {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        return Snapshot(timeline: shared, blocked: sharedBlocked, lookNote: sharedLookNote, prescanProgress: sharedProgress,
+                        prescanFailed: sharedPrescanFailed)
+    }
+
+    private func setBackground(_ on: Bool) {
+        os_unfair_lock_lock(lock)
+        background = on
+        os_unfair_lock_unlock(lock)
+        queue.async { [weak self] in self?.schedulePump(after: 0) }
+    }
+
+    // MARK: queue
+
+    private func schedulePump(after delay: Double) {
+        guard !pumpScheduled else { return }
+        pumpScheduled = true
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { return }
+            self.pumpScheduled = false
+            if let next = self.pump() { self.schedulePump(after: next) }
+        }
+    }
+
+    private func publish(blocked: String?, look: String?) {
+        let progress: Double?
+        os_unfair_lock_lock(lock)
+        let total = duration
+        if wantPrescan {
+            progress = prescanFinished ? 1 : (total.isFinite && total > 0 ? min(1, max(0, prescan.scanned / total)) : nil)
+        } else {
+            progress = nil
+        }
+        // 时间轴没变就不换快照（换了以后读帧这边下一次追加要整份拷贝）
+        if shared.records.count != timeline.records.count || shared.head != timeline.head
+            || shared.first != timeline.first || shared.segment != timeline.segment
+            || shared.origin.bitPattern != timeline.origin.bitPattern {
+            shared = timeline
+        }
+        sharedBlocked = blocked
+        sharedLookNote = look
+        sharedProgress = progress
+        sharedPrescanFailed = preFailures >= Self.maxFailures
+        os_unfair_lock_unlock(lock)
+    }
+
+    private func teardown() {
+        lookReader?.cancelReading()
+        lookReader = nil
+        lookOutput = nil
+        preReader?.cancelReading()
+        preReader = nil
+        preOutput = nil
+        timeline = LookaheadTimeline()
+    }
+
+    /// 停掉两路读帧（发热 / 后台）：前瞻清空（回来后从播放头重读），预扫描记下停在哪（回来后接着扫）
+    private func suspend() {
+        lookReader?.cancelReading()
+        lookReader = nil
+        lookOutput = nil
+        lookEnded = false
+        if !timeline.isEmpty || timeline.origin.isFinite { timeline = LookaheadTimeline() }
+        if preReader != nil {
+            preReader?.cancelReading()
+            preReader = nil
+            preOutput = nil
+            preResumeAt = max(preResumeAt, prescan.scanned)
+        }
+    }
+
+    /// 一小步；返回下一步多久后做（nil = 不再做）
+    private func pump() -> Double? {
+        os_unfair_lock_lock(lock)
+        let stop = cancelled
+        let look = wantLookahead
+        let pre = wantPrescan
+        let fit = phaseFit
+        let v = playhead
+        let isPlaying = playing
+        let bg = background
+        os_unfair_lock_unlock(lock)
+        if stop {
+            teardown()
+            return nil
+        }
+        guard trackLoaded else { return nil }
+        guard track != nil else {
+            publish(blocked: "这个视频没有画面轨", look: nil)
+            return nil
+        }
+        let thermal = ProcessInfo.processInfo.thermalState
+        if let why = LookaheadThermalPolicy.note(thermal) {
+            suspend()
+            publish(blocked: why, look: nil)
+            return Self.pumpBlocked
+        }
+        if bg {
+            suspend()
+            publish(blocked: "App 在后台，已暂停提前读视频", look: nil)
+            return Self.pumpBlocked
+        }
+        let sliceEnd = CACurrentMediaTime() + Self.sliceSeconds
+        var note: String?
+        var busy = false
+        // 1. 前瞻（优先）
+        if look, lookFailures < Self.maxFailures {
+            let now = CACurrentMediaTime()
+            if now < backoffUntil {
+                note = "解码跟不上播放，暂停一会儿"
+            } else if v.isFinite {
+                if lookReader == nil || timeline.needsRestart(playhead: v) {
+                    if lookReader != nil || timeline.origin.isFinite { restarts.append(now) }
+                    restarts.removeAll { now - $0 > Self.thrashWindow }
+                    if restarts.count >= Self.thrashRestarts {
+                        restarts.removeAll()
+                        backoffUntil = now + Self.thrashBackoff
+                        lookReader?.cancelReading()
+                        lookReader = nil
+                        lookOutput = nil
+                        timeline = LookaheadTimeline()
+                        note = "解码跟不上播放，暂停一会儿"
+                    } else {
+                        restartLookahead(at: max(0, v), phaseFit: fit)
+                    }
+                }
+                lookAnalyzer.phaseFitEnabled = fit
+                timeline.prune(playhead: v)
+                var n = 0
+                while lookReader != nil, !lookEnded, timeline.wantsMore(playhead: v), n < Self.lookFramesPerSlice,
+                      CACurrentMediaTime() < sliceEnd {
+                    pullLookahead()
+                    n += 1
+                }
+                if lookReader != nil, !lookEnded, timeline.wantsMore(playhead: v) { busy = true }
+                if lookFailures >= Self.maxFailures { note = "读不了这个视频文件" }
+            }
+        } else if !look, lookReader != nil || !timeline.isEmpty {
+            lookReader?.cancelReading()
+            lookReader = nil
+            lookOutput = nil
+            lookEnded = false
+            timeline = LookaheadTimeline()
+        } else if look {
+            note = "读不了这个视频文件"
+        }
+        // 2. 预扫描（前瞻不缺帧时）
+        if pre, !prescanFinished, preFailures < Self.maxFailures, !busy {
+            if preReader == nil { startPrescan() }
+            let budget = isPlaying ? Self.prescanFramesPlaying : Self.prescanFramesPaused
+            var n = 0
+            while preReader != nil, n < budget, CACurrentMediaTime() < sliceEnd {
+                pullPrescan()
+                n += 1
+            }
+            if !prescanFinished, preFailures < Self.maxFailures { busy = true }
+        } else if !pre, preReader != nil || prescan.windows > 0 || prescanFinished {
+            preReader?.cancelReading()
+            preReader = nil
+            preOutput = nil
+            prescan = MotionPrescan()
+            preResumeAt = 0
+            prescanFinished = false
+            preFailures = 0
+            preFailedAt = -.infinity
+        }
+        publish(blocked: nil, look: note)
+        // 自审 M：只剩预扫描且已经扫完 / 放弃时没事可做，1 秒醒一次就够（不每 0.1 秒空转）
+        let lookIdle = !look || lookFailures >= Self.maxFailures
+        let preIdle = !pre || prescanFinished || preFailures >= Self.maxFailures
+        if lookIdle && preIdle { return Self.pumpBlocked }
+        return busy ? Self.pumpBusy : Self.pumpIdle
+    }
+
+    private func makeReader(from start: Double) -> (reader: AVAssetReader, output: AVAssetReaderTrackOutput)? {
+        guard let track = track, let reader = try? AVAssetReader(asset: asset) else { return nil }
+        let settings: [String: Any] = [kCVPixelBufferPixelFormatTypeKey as String:
+                                        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        output.alwaysCopiesSampleData = false
+        guard reader.canAdd(output) else { return nil }
+        reader.add(output)
+        if start > 0.001 {
+            reader.timeRange = CMTimeRange(start: CMTime(seconds: start, preferredTimescale: 600), duration: .positiveInfinity)
+        }
+        guard reader.startReading() else { return nil }
+        return (reader, output)
+    }
+
+    private func restartLookahead(at v: Double, phaseFit fit: Bool) {
+        lookReader?.cancelReading()
+        lookReader = nil
+        lookOutput = nil
+        lookEnded = false
+        timeline.restart(at: v)
+        lookAnalyzer = MotionAnalyzer()
+        lookAnalyzer.phaseFitEnabled = fit
+        lookLast = -.infinity
+        guard let made = makeReader(from: v) else {
+            lookFailures += 1
+            return
+        }
+        lookReader = made.reader
+        lookOutput = made.output
+    }
+
+    private func startPrescan() {
+        preAnalyzer = MotionAnalyzer()
+        preLast = -.infinity
+        guard let made = makeReader(from: preResumeAt) else {
+            preFailures += 1
+            return
+        }
+        preReader = made.reader
+        preOutput = made.output
+    }
+
+    /// 解码下一帧；按 15 Hz 挑帧降采样。返回 (视频时间, 降采样好了没有)；读完 / 出错返回 nil
+    private func decode(_ output: AVAssetReaderTrackOutput, last: Double, scaler: inout LumaDownscaler,
+                        into frame: inout LumaFrame) -> (time: Double, ok: Bool)? {
+        guard let sample = output.copyNextSampleBuffer() else { return nil }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample).seconds
+        guard pts.isFinite else { return (last, false) }
+        guard pts >= last + Self.frameInterval - 0.004 || pts < last - 1 else { return (pts, false) }
+        guard let buffer = CMSampleBufferGetImageBuffer(sample),
+              CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { return (pts, false) }
+        defer { _ = CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        let format = CVPixelBufferGetPixelFormatType(buffer)
+        let isYUV = format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        guard isYUV, CVPixelBufferIsPlanar(buffer), CVPixelBufferGetPlaneCount(buffer) >= 1,
+              let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return (pts, false) }
+        let width = CVPixelBufferGetWidthOfPlane(buffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(buffer, 0)
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        guard width > 0, height > 0, rowBytes >= width else { return (pts, false) }
+        let luma = UnsafeRawBufferPointer(start: UnsafeRawPointer(base), count: rowBytes * height)
+        return (pts, scaler.downscale(luma, width: width, height: height, bytesPerRow: rowBytes, into: &frame))
+    }
+
+    private func pullLookahead() {
+        guard let output = lookOutput, let reader = lookReader else { return }
+        guard let d = decode(output, last: lookLast, scaler: &lookScaler, into: &lookFrame) else {
+            if reader.status == .failed {
+                lookFailures += 1
+                lookReader = nil
+                lookOutput = nil
+            } else {
+                lookEnded = true
+            }
+            return
+        }
+        guard d.ok else { return }
+        // 自审 M：失败次数只数「连着」的（进后台那一刻读失败之类偶发的不累计到放弃）
+        lookFailures = 0
+        lookLast = d.time
+        if let s = lookAnalyzer.analyze(lookFrame, time: d.time) { timeline.append(s) }
+    }
+
+    private func pullPrescan() {
+        guard let output = preOutput, let reader = preReader else { return }
+        guard let d = decode(output, last: preLast, scaler: &preScaler, into: &preFrame) else {
+            preReader = nil
+            preOutput = nil
+            if reader.status == .completed {
+                prescan.finish()
+                prescanFinished = true
+                let summary = prescan.summary
+                DispatchQueue.main.async { [weak self] in self?.onPrescanDone?(summary) }
+            } else {
+                preFailures += 1
+                preResumeAt = max(preResumeAt, prescan.scanned)
+                preFailedAt = prescan.scanned
+            }
+            return
+        }
+        guard d.ok else { return }
+        // 读过上次出错的地方 1 秒以后才清失败次数（同一处反复出错照样 3 次放弃，不会无限重试）
+        if d.time > preFailedAt + 1 { preFailures = 0 }
+        preLast = d.time
+        if let s = preAnalyzer.analyze(preFrame, time: d.time) { prescan.add(s) }
     }
 }

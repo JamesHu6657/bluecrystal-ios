@@ -36,6 +36,9 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-context P3：动作识别 / 撞击声相位校正的状态行（开着时才有）
     @Published private(set) var contextStatus: String?
     @Published private(set) var anchorStatus: String?
+    /// rhythm-lookahead P4：前瞻 / 预扫描的状态行（开着时才有）
+    @Published private(set) var lookaheadStatus: String?
+    @Published private(set) var prescanStatus: String?
     @Published private var scrubber = PlaybackScrubber()
 
     var displaySeconds: Double { scrubber.position ?? currentSeconds }
@@ -105,6 +108,21 @@ final class VideoSyncPlayer: ObservableObject {
     var debugRecording = false
     private var onsetDetector = AudioOnsetDetector()
     private var audioAnchor = AudioPhaseAnchor()
+    /// rhythm-lookahead P4（默认关）：前瞻 / 预扫描另开一路解码（LookaheadReader，只在设置生效时建；关着时不建、不解码）。
+    /// 前瞻只改交给频率跟随器 / 相位锁的那份窗口副本，外加脉动指令相位的有界提前量（LookaheadCoordinator）；
+    /// 预扫描只给 MotionNormalizer 一个起点（还没学过时才用）。都不新增发送路径，输出仍只经 tick() → outputStage → sendTick
+    private var lookaheadReader: LookaheadReader?
+    private var lookaheadGen = 0
+    private var lookahead = LookaheadCoordinator()
+    /// 这一拍前瞻用的快照（给之后的提前量用；这一拍没用前瞻时 nil）
+    private var lookaheadBeat: (timeline: LookaheadTimeline, clock: RhythmLookahead.Clock, latency: TimeInterval)?
+    private var prescanSummary: MotionPrescan.Summary?
+    private var prescanTried = false
+    private var prescanSeeded = false
+    /// 上一次交给读帧那边的预扫描开关（复审 M1：结果用不上了就把这一路停掉）
+    private var readerPrescan = false
+    /// 预扫描进度在暂停时也要刷新（Timer 只在扫的时候跑，1 秒一次，只读快照、不发帧）
+    private var prescanPoll: Timer?
     /// Timer 间隔：平时 0.3 秒（和以前逐位相同）；相位脉动打开时 0.1 秒，每 3 次里 1 次走完整拍
     private var tickInterval: TimeInterval = AudioReactiveShaper.interval
     /// 播放中切换来源的交接（algo-opt-1）：声音→画面 4 秒内用声音补画面热身的空档（只淡出），
@@ -160,10 +178,15 @@ final class VideoSyncPlayer: ObservableObject {
         let previousPulse = visualSettings.rhythmPulse
         let previousContext = visualSettings.usesRhythmContext
         let previousAnchor = visualSettings.usesAudioAnchor
+        let previousLookahead = visualSettings.usesLookahead
+        let previousPrescan = visualSettings.usesPrescan
         visualSettings = v
         // P3：动作识别 / 撞击声校正开关一变就从头确认（关掉 = 回到 P2 行为）
         if v.usesRhythmContext != previousContext { resetContext() }
         if v.usesAudioAnchor != previousAnchor { resetAnchor() }
+        // P4：前瞻一变就从头核对；预扫描关掉就作废这个视频已扫的结果（再打开重扫）
+        if v.usesLookahead != previousLookahead { resetLookahead() }
+        if v.usesPrescan != previousPrescan, !v.usesPrescan { clearPrescan() }
         applyRhythmFlags()
         // 打开 / 关掉频率跟随：从头确认节奏（打开后 weight 1 秒内交接，关掉时伸缩回到按动作强度，降不限速）
         if v.rhythmFollow != previousRhythm { resetRhythm() }
@@ -184,6 +207,7 @@ final class VideoSyncPlayer: ObservableObject {
             // 正在输出时才交接；没在播 / 联动关着时下一次开播本来就从 0 起
             if isPlaying, settings.enabled { handover.begin(v.source) } else { handover.cancel() }
         }
+        updateLookaheadReader()
         needsResync = true
     }
 
@@ -322,6 +346,7 @@ final class VideoSyncPlayer: ObservableObject {
         audioFlow.reset()
         // 画面侧同样不和跳转前的画面做差
         resetMotionSide()
+        notePlayheadToReader(playing: false)
         needsResync = true
         // 暂停中跳转也记下落点（同 seek()）：之后不论哪个播放键开播，都等播放头真正前进
         if landed.isFinite { progressWatch.awaitSeekProgress(from: landed, now: Self.now()) }
@@ -382,6 +407,8 @@ final class VideoSyncPlayer: ObservableObject {
         // 画面侧：旧视频的取帧拆掉，重新学这个视频的运动范围
         uninstallMotion()
         motionNormalizer.resetAdaptation()
+        lookahead.resetVideo()
+        clearPrescan()
         outputStage.reset()
         handover.cancel()
         // 新播放器从暂停开始；旧视频的停止锁存和 seek 回声不带过来
@@ -460,7 +487,14 @@ final class VideoSyncPlayer: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self, weak p] d in
                 guard let self = self, let p = p, p === self.player else { return }
-                if d.seconds.isFinite, d.seconds > 0 { self.durationSeconds = d.seconds }
+                if d.seconds.isFinite, d.seconds > 0 {
+                    self.durationSeconds = d.seconds
+                    // 复审 M3：读帧那边只从 notePlayhead 知道时长；装读帧时时长多半还没读出来，暂停着时进度一直出不来
+                    if self.lookaheadReader != nil {
+                        self.notePlayheadToReader(playing: self.isPlaying)
+                        self.refreshPrescanStatus()
+                    }
+                }
             }
             .store(in: &playerCancellables)
         item.publisher(for: \.status)
@@ -512,6 +546,7 @@ final class VideoSyncPlayer: ObservableObject {
         // 正在联动时切到画面：立刻开始拉帧
         applyRhythmFlags()
         motionTap?.setActive(timer != nil)
+        updateLookaheadReader()
     }
 
     /// rhythm-context P3：分析那边的两个开关（相位拟合只在相位脉动用得上时算；动作识别开着才跑手 / 脸 / 周期区域），
@@ -519,6 +554,133 @@ final class VideoSyncPlayer: ObservableObject {
     private func applyRhythmFlags() {
         motionTap?.setRhythmFlags(phaseFit: visualSettings.usesPulseTiming, context: visualSettings.usesRhythmContext)
         meter?.setBandsEnabled(visualSettings.usesAudioAnchor)
+        configureReader()
+    }
+
+    /// rhythm-lookahead P4（复审 M1）：预扫描的结果还用得上——开关生效、这个视频还没有结果、MotionNormalizer 还一拍都没学过。
+    /// 学过以后 seed 一定不用（只在 warmElapsed == 0 时生效），再扫就是白费一路解码；已经有结果时（切来源再切回来）也不重扫
+    private var prescanWanted: Bool {
+        visualSettings.usesPrescan && prescanSummary == nil && motionNormalizer.warmElapsed == 0
+    }
+
+    /// 读帧那边的开关（没建读帧时什么都不做）
+    private func configureReader() {
+        guard let r = lookaheadReader else { return }
+        let pre = prescanWanted
+        readerPrescan = pre
+        r.configure(lookahead: visualSettings.usesLookahead, prescan: pre, phaseFit: visualSettings.usesPulseTiming)
+    }
+
+    /// rhythm-lookahead P4：前瞻生效或预扫描还用得上、而且画面取帧装着时才建另一路解码；否则拆掉（关着时一帧都不多解）
+    private func updateLookaheadReader() {
+        guard visualSettings.usesLookahead || prescanWanted, motionTap != nil, let item = player?.currentItem else {
+            cancelLookaheadReader()
+            refreshPrescanStatus()
+            return
+        }
+        if lookaheadReader == nil {
+            lookaheadGen += 1
+            let gen = lookaheadGen
+            let reader = LookaheadReader(asset: item.asset) { [weak self] summary in
+                guard let self = self, gen == self.lookaheadGen else { return }
+                self.prescanSummary = summary
+                self.refreshPrescanStatus()
+                // M1：有结果了，预扫描那一路停掉（只剩预扫描时整个读帧拆掉）。放到下一轮主线程做：别在读帧自己的回调里拆它
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, gen == self.lookaheadGen else { return }
+                    self.updateLookaheadReader()
+                }
+            }
+            lookaheadReader = reader
+            reader.start()
+        }
+        configureReader()
+        notePlayheadToReader(playing: isPlaying)
+        refreshPrescanStatus()
+    }
+
+    private func cancelLookaheadReader() {
+        if let r = lookaheadReader {
+            lookaheadGen += 1
+            r.cancel()
+            lookaheadReader = nil
+        }
+        readerPrescan = false
+        resetLookahead()
+        stopPrescanPoll()
+        if prescanStatus != nil { prescanStatus = nil }
+    }
+
+    /// 报播放头给读帧那边（完整拍 / seek 落地 / 跳转 / 建读帧时）
+    private func notePlayheadToReader(playing: Bool) {
+        guard let r = lookaheadReader, let p = player else { return }
+        r.notePlayhead(p.currentTime().seconds, playing: playing, duration: durationSeconds)
+    }
+
+    /// 这个视频的预扫描结果作废（换视频 / 关掉预扫描）
+    private func clearPrescan() {
+        prescanSummary = nil
+        prescanTried = false
+        prescanSeeded = false
+        stopPrescanPoll()
+        if prescanStatus != nil { prescanStatus = nil }
+    }
+
+    private func stopPrescanPoll() {
+        prescanPoll?.invalidate()
+        prescanPoll = nil
+    }
+
+    /// 预扫描状态行；还在扫时开一个 1 秒的刷新 Timer（只读快照）
+    private func refreshPrescanStatus() {
+        // 有结果 / 已经停扫时读帧可能已经拆了（只开预扫描时）：状态行不靠读帧，只要画面取帧装着就显示
+        guard visualSettings.usesPrescan, motionTap != nil else {
+            stopPrescanPoll()
+            if prescanStatus != nil { prescanStatus = nil }
+            return
+        }
+        var running = false
+        let text: String
+        if let s = prescanSummary {
+            if !s.isValid {
+                text = "预扫描：扫完了，可用的画面太少，按实时学"
+            } else if !prescanTried {
+                text = "预扫描：扫完了，开始播放时按整段视频的动作范围起步"
+            } else if prescanSeeded {
+                text = "预扫描：已按整段视频的动作范围起步"
+            } else {
+                text = "预扫描：扫完时已经开始播放，这次按实时学"
+            }
+        } else if motionNormalizer.warmElapsed > 0 {
+            // M1：播放已经开始学了（扫到一半开播，或开播后才打开开关），这次的结果用不上，预扫描那一路已停 / 不开
+            text = "预扫描：已经开始播放，这次按实时学（不再扫描，换视频后重新扫）"
+        } else if let r = lookaheadReader, readerPrescan {
+            let snap = r.snapshot()
+            if snap.prescanFailed {
+                text = "预扫描：读不了这个视频文件，按实时学"
+            } else if let why = snap.blocked {
+                text = "预扫描：\(why)"
+                running = true
+            } else if let pr = snap.prescanProgress {
+                text = String(format: "预扫描：已扫 %d%%（关掉开关可随时停）", Int((pr * 100).rounded(.down)))
+                running = true
+            } else {
+                text = "预扫描：准备中…"
+                running = true
+            }
+        } else {
+            stopPrescanPoll()
+            if prescanStatus != nil { prescanStatus = nil }
+            return
+        }
+        if text != prescanStatus { prescanStatus = text }
+        if running, prescanPoll == nil {
+            let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.refreshPrescanStatus() }
+            RunLoop.main.add(t, forMode: .common)
+            prescanPoll = t
+        } else if !running {
+            stopPrescanPoll()
+        }
     }
 
     /// 拆掉取帧（停定时器、item.remove(output)），智晚到的回调按代次作废
@@ -526,6 +688,7 @@ final class VideoSyncPlayer: ObservableObject {
         motionGen += 1
         motionTap?.uninstall()
         motionTap = nil
+        cancelLookaheadReader()
         motionMeter = nil
         motionStatus = .none
         motionLevel = 0
@@ -654,6 +817,7 @@ final class VideoSyncPlayer: ObservableObject {
                 }
                 self.meter?.reset()
                 self.motionMeter?.reset()
+                self.notePlayheadToReader(playing: false)
                 self.needsResync = true
                 self.progressWatch.awaitSeekProgress(from: landed, now: Self.now())
                 // 这次 seek 的 timeJumped 若晚于本回调到达，按回声忽略
@@ -760,6 +924,8 @@ final class VideoSyncPlayer: ObservableObject {
             ble?.sendStop()
             lastActive = .zero
         }
+        // P4（复审 L2）：停播 / 暂停后读帧那边按「没在播」排预扫描（停止帧先发，这里只是报个状态；没建读帧时什么都不做）
+        notePlayheadToReader(playing: false)
     }
 
     /// 每 0.3 秒：取走音频窗口 → 灵敏度 / 噪声门 / 平滑 / 上限 → 变化时才发帧（约 3.3 Hz，低于节流能力）。
@@ -826,6 +992,7 @@ final class VideoSyncPlayer: ObservableObject {
         }
         guard t.isFinite else { return }
         currentSeconds = t
+        lookaheadReader?.notePlayhead(t, playing: p.timeControlStatus == .playing, duration: durationSeconds)
 
         let now = Self.now()
         let dt = lastTickAt.map { now - $0 } ?? AudioReactiveShaper.interval
@@ -869,6 +1036,26 @@ final class VideoSyncPlayer: ObservableObject {
         if rhythmStatus != nil { rhythmStatus = nil }
         resetContext()
         resetPulse()
+        resetLookahead()
+    }
+
+    /// rhythm-lookahead P4：方向 / 提前量从头来（核对历史保留；读帧那边重读时 RhythmLookahead 自己清，换视频全清）
+    private func resetLookahead() {
+        lookahead.reset()
+        lookaheadBeat = nil
+        if lookaheadStatus != nil { lookaheadStatus = nil }
+    }
+
+    /// rhythm-lookahead P4：这一拍的前瞻（读帧那边停着 / 出问题 = 原样，等同 P4 关着）
+    private func refineLookahead(_ window: MotionWindow, reader: LookaheadReader, player p: AVPlayer) -> MotionWindow {
+        let snap = reader.snapshot()
+        let clock = RhythmLookahead.Clock(hostNow: CACurrentMediaTime(), itemNow: p.currentTime().seconds, rate: Double(p.rate))
+        let latency = visualSettings.pulseLatencyMs / 1000
+        let out = lookahead.refine(window, enabled: snap.lookUsable, timeline: snap.timeline, clock: clock, latency: latency)
+        lookaheadBeat = snap.lookUsable ? (snap.timeline, clock, latency) : nil
+        let text = lookahead.statusText(reader: snap.blocked ?? snap.lookNote)
+        if text != lookaheadStatus { lookaheadStatus = text }
+        return out
     }
 
     /// rhythm-context P3：动作识别从头判断（未知 = P2 行为）
@@ -951,10 +1138,16 @@ final class VideoSyncPlayer: ObservableObject {
         }
         // P3：动作识别开着时，跟随器 / 相位锁吃按动作改写过的窗口副本（未知 = 原窗口）；关着时就是原窗口（= P2）
         var input = window
+        // P4：前瞻开着才换成没有检测延迟的读数（核对没通过 / 读不到 / 停着 = 原样）；关着时 input 就是原窗口
+        if visualSettings.usesLookahead, motionSignal, let reader = lookaheadReader, let p = player {
+            input = refineLookahead(window, reader: reader, player: p)
+        } else if lookaheadBeat != nil || lookaheadStatus != nil {
+            resetLookahead()
+        }
         if visualSettings.usesRhythmContext, motionSignal {
             // rhythm-action tune：跟随器上一拍牢牢锁着的频率（轻抚判断：锁在别的往复上就不算轻抚）
             let lockHz = ActionContext.lockedHz(locked: rhythm.locked, weight: rhythm.weight, hz: rhythm.hz)
-            input = actionContext.refine(window, now: CACurrentMediaTime(), followerHz: lockHz)
+            input = actionContext.refine(input, now: CACurrentMediaTime(), followerHz: lockHz)
             let text = actionContext.statusText()
             if text != contextStatus { contextStatus = text }
         } else if contextStatus != nil {
@@ -990,6 +1183,12 @@ final class VideoSyncPlayer: ObservableObject {
     private func motionTick(_ p: AVPlayer, ble: BLEManager, t: Double, now: TimeInterval, dt: TimeInterval) {
         let window = motionMeter?.drain() ?? .empty
         motionFlow.note(window, now: now)
+        // P4 预扫描：扫完了、这个视频还没学过时用全片分位数当参考值起点（只试一次；关着时不走）
+        if visualSettings.usesPrescan, !prescanTried, let s = prescanSummary {
+            prescanTried = true
+            prescanSeeded = motionNormalizer.seed(s)
+            refreshPrescanStatus()
+        }
         // rhythm-action tune（动作识别开着才生效；关着时这几行和以前逐位相同）：慢 / 轻动作按绝对刻度压低、
         // 姿态不能比画面本身的运动高太多；认出轻抚 / 摸自己时强度最多到 ActionContext.caressCeiling（上一拍的判断，只降不升）
         let tuned = visualSettings.usesRhythmContext
@@ -999,6 +1198,8 @@ final class VideoSyncPlayer: ObservableObject {
         var target = motionNormalizer.step(window, gainDb: visualSettings.motionGainDb,
                                            auto: visualSettings.autoMotion, dt: dt)
         if tuned, let ceiling = actionContext.intensityCeiling { target = min(target, ceiling) }
+        // P4 预扫描（复审 M1）：这一拍开始学了，预扫描的结果这次用不上，停掉那一路解码（前瞻开着时照常读；关着时不走）
+        if readerPrescan, !prescanWanted { updateLookaheadReader() }
         let shaped = motionShaper.step(target: target, dt: dt)
         motionLevel = shaped.level
         let poseAssist = motionNormalizer.poseWeight >= 0.2
@@ -1042,8 +1243,16 @@ final class VideoSyncPlayer: ObservableObject {
             let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
                                              rateLevel: rateLevel, weight: rhythm.weight, activity: rhythmActivity)
             if visualSettings.rhythmPulse {
+                // P4：上一拍加的前瞻提前量先撤掉（没加过时原样），撞击声校正照旧按自己的值算。
+                // 防御性：updateAudioAnchor 现在每拍都整个改写 phaseOffset，撤不撤结果一样（见 LookaheadCoordinator.removeLead）
+                pulse.phaseOffset = lookahead.removeLead(from: pulse.phaseOffset)
                 // P3：撞击声校正（开着才有）只调脉动相位，有界、对不上就回 0
                 updateAudioAnchor(p, dt: dt)
+                // P4：这一拍用了前瞻才加提前量（±60°，每秒最多变 90°，总偏移 ±90°；相位锁不用时立刻 0）
+                if let b = lookaheadBeat, visualSettings.usesLookahead {
+                    pulse.phaseOffset = lookahead.applyLead(to: pulse.phaseOffset, enabled: true, timeline: b.timeline,
+                                                            clock: b.clock, latency: b.latency, lock: phaseLock, dt: dt)
+                }
                 // P2：锁上相位才在 P1 档位上叠加脉动（往里时加强）；没锁 / 没标定 / 太快 / 太弱 = P1 原样
                 vals = pulse.beat(levels: levels, lock: phaseLock, visual: visualSettings, settings: settings,
                                   hasSignal: hasSignal, value: value, activity: rhythmActivity,
@@ -1333,6 +1542,9 @@ struct VideoSyncView: View {
     // rhythm-context P3：动作识别（手 / 头 / 髋 + 周期区域）/ 撞击声相位校正（实验，默认都关）
     @AppStorage(VisualSyncSettings.Keys.rhythmContext) private var rhythmContext = VisualSyncSettings.defaultRhythmContext
     @AppStorage(VisualSyncSettings.Keys.rhythmAudioAnchor) private var rhythmAudioAnchor = VisualSyncSettings.defaultRhythmAudioAnchor
+    // rhythm-lookahead P4：前瞻（提前读后面的画面）/ 预扫描整段视频（实验，默认都关）
+    @AppStorage(VisualSyncSettings.Keys.rhythmLookahead) private var rhythmLookahead = VisualSyncSettings.defaultRhythmLookahead
+    @AppStorage(VisualSyncSettings.Keys.prescan) private var prescan = VisualSyncSettings.defaultPrescan
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -1353,7 +1565,8 @@ struct VideoSyncView: View {
         VisualSyncSettings(source: visualSource, motionGainDb: motionGainDb, autoMotion: autoMotion,
                            rhythmFollow: rhythmFollow, rateTable: rateTable, rhythmPulse: rhythmPulse,
                            pulseDepth: pulseDepth, pulseLatencyMs: pulseLatencyMs, pulseInvert: pulseInvert,
-                           rhythmContext: rhythmContext, rhythmAudioAnchor: rhythmAudioAnchor)
+                           rhythmContext: rhythmContext, rhythmAudioAnchor: rhythmAudioAnchor,
+                           rhythmLookahead: rhythmLookahead, prescan: prescan)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -1788,6 +2001,18 @@ struct VideoSyncView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if rhythmFollow, rhythmLookahead, let look = vm.lookaheadStatus {
+                    Text(look)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if autoMotion, prescan, let scan = vm.prescanStatus {
+                    Text(scan)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
                          valueText: "\(Int(vm.level.rounded()))")
@@ -1835,6 +2060,7 @@ struct VideoSyncView: View {
                     }
                 }
                 .tint(Velvet.gold)
+                if autoMotion { prescanControls }
                 rhythmControls
                 debugLogControls
             }
@@ -1967,8 +2193,45 @@ struct VideoSyncView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             contextControls
+            lookaheadControls
             pulseControls
         }
+    }
+
+    /// rhythm-lookahead P4：预扫描（实验，默认关；只在自动适应画面打开时显示）
+    @ViewBuilder private var prescanControls: some View {
+        Toggle(isOn: $prescan) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("预扫描整段视频（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("选好视频后在后台先把整段画面看一遍，开播时直接按这个视频的动作范围起步（开头 3 秒照旧慢慢升）。"
+                     + "另开一路解码、更耗电；关掉开关随时停，手机发热 / 切到后台时自动暂停")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+        .accessibilityValue(prescan ? "开" : "关")
+    }
+
+    /// rhythm-lookahead P4：前瞻（实验，默认关；只在频率跟随打开时显示）
+    @ViewBuilder private var lookaheadControls: some View {
+        Toggle(isOn: $rhythmLookahead) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("前瞻（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("另开一路解码提前读后面 3 秒的画面：频率和相位不用等检测延迟，脉动时机按画面实际会走的相位修正（最多 ±60°）。"
+                     + "要先标定；和实时画面核对不上、手机发热、切到后台时自动只用实时。更耗电")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+        .accessibilityValue(rhythmLookahead ? "开" : "关")
     }
 
     /// rhythm-context P3：动作识别（实验，默认关；只在频率跟随打开时显示）

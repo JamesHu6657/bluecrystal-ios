@@ -5920,6 +5920,1032 @@ func atPartialMovingCheck() {
 }
 atPartialMovingCheck()
 
+// MARK: - rhythm-lookahead P4：前瞻（另开一路解码提前读后面的画面，默认关）
+
+/// P4 合成画面：有纹理的静止背景 + 一块带纹理的主体按 ox = sign · amp(t) · sin Φ(t) 水平往复（向右为正，位移相位真值 = Φ − 90°）
+struct P4Scene {
+    var phase: (Double) -> Double
+    var amp: (Double) -> Double = { _ in 4 }
+    var sign: Double = 1
+
+    func frame(_ t: Double) -> LumaFrame {
+        let ox = sign * amp(t) * sin(phase(t))
+        var px = [UInt8](repeating: 0, count: 64 * 36)
+        for y in 0..<36 {
+            for x in 0..<64 {
+                let qx = Double(x) + 0.5
+                let qy = Double(y) + 0.5
+                let v: Double
+                if qx >= 22 + ox, qx < 40 + ox, qy >= 10, qy < 26 {
+                    v = vs3Value(qx - ox + 100, qy + 100, salt: 2)
+                } else {
+                    v = vs3Value(qx + 200, qy + 200, salt: 1)
+                }
+                px[y * 64 + x] = UInt8(min(255, max(0, v.rounded())))
+            }
+        }
+        return LumaFrame(width: 64, height: 36, pixels: px)
+    }
+}
+
+/// 频率阶跃 f0 → f1（at 秒处，相位连续）
+func p4StepPhase(_ f0: Double, _ f1: Double, at s: Double) -> (Double) -> Double {
+    { t in t < s ? 2 * Double.pi * f0 * t : 2 * Double.pi * (f0 * s + f1 * (t - s)) }
+}
+
+struct P4Run {
+    var times: [Double] = []
+    var p2Hz: [Double] = []
+    var p4Hz: [Double] = []
+    var p2Locked: [Bool] = []
+    var p4Locked: [Bool] = []
+    var p2Err: [Double?] = []
+    var p4Err: [Double?] = []
+    var states: [RhythmLookahead.State] = []
+    var leads: [Double] = []
+    var sameWindows = true
+    var phaseSubstituted = 0
+    var p2LockWeightAfterStop: [Double] = []
+    var p4LockWeightAfterStop: [Double] = []
+    var p4FollowerLockedAfterStop: [Bool] = []
+    var p2FollowerLockedAfterStop: [Bool] = []
+    var la = RhythmLookahead()
+}
+
+/// 实时（P2）和前瞻（P4）两条链吃同一段画面：实时分析器 15 Hz、每 5 帧一个完整拍；前瞻分析器提前读到「现在 + horizon」。
+/// look：前瞻那边看到的画面（默认同一个）；offset：播放器报的视频时间比真实的多多少（模拟时间轴对不上）；
+/// active：画面在不在动（RhythmOutput.motionActivity > 0）；latency：延迟补偿（秒）
+func p4Run(_ scene: P4Scene, look: P4Scene? = nil, seconds: Double = 24, latency: Double = 0.2, horizon: Double = 3,
+           offset: Double = 0, active: (Double) -> Bool = { _ in true }, truthPhase: ((Double) -> Double)? = nil,
+           stopAt: Double? = nil) -> P4Run {
+    var rt = MotionAnalyzer()
+    rt.phaseFitEnabled = true
+    var la = MotionAnalyzer()
+    la.phaseFitEnabled = true
+    var acc = MotionWindowAccumulator()
+    var timeline = LookaheadTimeline()
+    timeline.restart(at: 0)
+    let lookScene = look ?? scene
+    var f2 = RhythmFollower()
+    var f4 = RhythmFollower()
+    var l2 = RhythmPhaseLock()
+    var l4 = RhythmPhaseLock()
+    var r = P4Run()
+    let frames = Int(seconds * 15)
+    var kb = 0
+    let truth = truthPhase ?? { scene.phase($0) - Double.pi / 2 }
+    for k in 0..<frames {
+        let t = Double(k) * vsDt
+        if let s = rt.analyze(scene.frame(t), time: t) { acc.add(s) }
+        guard k % 5 == 4 else { continue }
+        let now = t + 0.01
+        while kb < frames, Double(kb) * vsDt <= now + horizon {
+            let tb = Double(kb) * vsDt
+            if let s = la.analyze(lookScene.frame(tb), time: tb) { timeline.append(s) }
+            kb += 1
+        }
+        timeline.prune(playhead: now)
+        let w = acc.drain()
+        let act = active(now)
+        let clock = RhythmLookahead.Clock(hostNow: now, itemNow: now + offset, rate: 1)
+        let input = r.la.refine(w, timeline: timeline, clock: clock, latency: latency)
+        if input == w { } else { r.sameWindows = false }
+        if r.la.phaseEngaged { r.phaseSubstituted += 1 }
+        f2.step(w, dt: 5.0 / 15, active: act)
+        f4.step(input, dt: 5.0 / 15, active: act)
+        l2.step(w, followerHz: f2.hz, followerLocked: f2.locked, followerSource: f2.source, now: now, dt: 5.0 / 15, active: act)
+        l4.step(input, followerHz: f4.hz, followerLocked: f4.locked, followerSource: f4.source, now: now, dt: 5.0 / 15, active: act)
+        let lead = r.la.stepLead(timeline: timeline, clock: clock, latency: latency, lockOmega: l4.omega,
+                                 lockWeight: l4.weight, dt: 5.0 / 15)
+        r.times.append(now)
+        r.p2Hz.append(f2.hz)
+        r.p4Hz.append(f4.hz)
+        r.p2Locked.append(l2.locked)
+        r.p4Locked.append(l4.locked)
+        r.p2Err.append(l2.phase(at: now + latency).map { p2Err($0, truth(now + latency)) })
+        r.p4Err.append(l4.phase(at: now + latency).map { p2Err($0 + lead, truth(now + latency)) })
+        r.states.append(r.la.state)
+        r.leads.append(lead)
+        if let s = stopAt, now >= s {
+            r.p2LockWeightAfterStop.append(l2.weight)
+            r.p4LockWeightAfterStop.append(l4.weight)
+            r.p2FollowerLockedAfterStop.append(f2.locked)
+            r.p4FollowerLockedAfterStop.append(f4.locked)
+        }
+    }
+    return r
+}
+
+func p4Deg(_ x: Double) -> String { String(format: "%.0f", x * 180 / Double.pi) }
+
+/// 手搭一帧前瞻样本（视频时间 t，位移相位 phase、频率 hz）
+func p4Sample(_ t: Double, hz: Double, phase: Double, quality: Double = 0.9, cut: Bool = false, held: Bool = false,
+              followHz: Double? = nil, epoch: Int = 0) -> MotionSample {
+    var s = MotionSample(time: t, energy: 5, coverage: 0.2, isCut: cut, isHeld: held)
+    s.subject = SubjectReading(valid: true, score: 0.5, speed: 2, hz: hz, rhythm: 0.8, amplitude: 3,
+                               followHz: followHz ?? hz, followRhythm: 0.8, followAmplitude: 3,
+                               phase: StrokeRhythm.PhaseFit(time: t, phase: StrokeRhythm.wrapPhase(phase), hz: hz,
+                                                            quality: quality, linearity: 0.95, amplitude: 3, epoch: epoch,
+                                                            axisX: 1, axisY: 0))
+    return s
+}
+
+/// 解析前瞻：0~to 秒，15 Hz，相位 = 2π·hz·t + φ0
+func p4Analytic(hz: Double, to end: Double, phase0: Double = 0.3, from start: Double = 0) -> LookaheadTimeline {
+    var tl = LookaheadTimeline()
+    tl.restart(at: start)
+    var k = 0
+    while Double(k) * vsDt + start <= end {
+        let t = start + Double(k) * vsDt
+        tl.append(p4Sample(t, hz: hz, phase: 2 * Double.pi * hz * t + phase0))
+        k += 1
+    }
+    return tl
+}
+
+do {
+    // 时间轴：追加 / 时间不前进丢掉 / 切镜和断档换段 / 保持期不带读数 / 播放头前 5 秒以前丢掉 / 容量
+    var tl = LookaheadTimeline()
+    tl.restart(at: 0)
+    for k in 0..<30 { tl.append(p4Sample(Double(k) * vsDt, hz: 1, phase: 0)) }
+    tl.append(p4Sample(1.0, hz: 1, phase: 0))  // 倒退：丢掉
+    let n30 = tl.records.count
+    let seg0 = tl.segment
+    tl.append(p4Sample(2.0, hz: 1, phase: 0, cut: true))
+    tl.append(p4Sample(2.0 + vsDt, hz: 1, phase: 0, held: true))
+    tl.append(p4Sample(3.0, hz: 1, phase: 0))  // 断档 > 0.5 秒
+    let cutRec = tl.records[30]
+    let heldRec = tl.records[31]
+    vcheck(n30 == 30 && cutRec.segment == seg0 + 1 && heldRec.segment == seg0 + 1 && tl.records[32].segment == seg0 + 2
+           && cutRec.followHz == 0 && !cutRec.phase.isValid && heldRec.followHz == 0 && !heldRec.phase.isValid
+           && tl.segment(at: 1.0) == seg0 && tl.segment(at: 2.05) == seg0 + 1 && tl.segment(at: 2.6) == nil
+           && tl.causal(at: 0.99)?.time == 14 * vsDt && tl.reach(from: 0.5) == 29 * vsDt,
+           "P4 前瞻时间轴：倒退的帧丢掉；切镜 / 断档换段；切镜和保持期的帧不带频率 / 相位；按段查到能读多远")
+    var big = LookaheadTimeline()
+    big.restart(at: 0)
+    for k in 0..<500 { big.append(p4Sample(Double(k) * vsDt, hz: 1, phase: 0)) }
+    let capOK = big.records.count == LookaheadTimeline.capacity && big.records.last?.time == 499 * vsDt
+    big.prune(playhead: 30)
+    vcheck(capOK && big.first >= 25 - 1e-9 && big.first < 25 + vsDt && big.head == 499 * vsDt,
+           "P4 前瞻时间轴：最多 \(LookaheadTimeline.capacity) 帧（丢最旧的）；播放头之前 5 秒以前的丢掉")
+    var re = big
+    re.restart(at: 40)
+    vcheck(re.isEmpty && re.segment == big.segment + 1 && re.origin == 40 && re.reach(from: 40) == nil
+           && re.centeredPhase(at: 40) == nil && re.centeredFollow(at: 40) == nil,
+           "P4 前瞻时间轴：重新开读清空、换段，没读到时什么都查不到")
+}
+
+do {
+    // 居中相位：1 Hz / 2 Hz 解析读数，现在这一刻的相位对得上；读到的不够远（< 四分之一窗口）不给；代次不同不混；居中频率往后看 2 秒
+    var worst = 0.0
+    for hz in [0.5, 1.0, 2.0, 2.4] {
+        let tl = p4Analytic(hz: hz, to: 20)
+        for v in stride(from: 8.0, through: 15, by: 0.37) {
+            guard let c = tl.centeredPhase(at: v) else { worst = .infinity; continue }
+            worst = max(worst, p2Err(c.phase, 2 * Double.pi * hz * v + 0.3))
+            if !(abs(c.hz - hz) < 1e-9 && c.coherence > 0.99 && c.centering > 0.9 && c.quality > 0.85) { worst = .infinity }
+        }
+    }
+    let short = p4Analytic(hz: 1, to: 10.2)
+    let atEdge = short.centeredPhase(at: 10.0)
+    let okFar = short.centeredPhase(at: 9.6)
+    var mixed = LookaheadTimeline()
+    mixed.restart(at: 0)
+    for k in 0..<300 {
+        let t = Double(k) * vsDt
+        let flipped = t >= 10.5
+        mixed.append(p4Sample(t, hz: 1, phase: 2 * Double.pi * t + 0.3 + (flipped ? Double.pi : 0), epoch: flipped ? 1 : 0))
+    }
+    let m = mixed.centeredPhase(at: 10)
+    let tl = p4Analytic(hz: 1, to: 20)
+    let follow = tl.centeredFollow(at: 8)
+    vcheck(worst <= 1e-6 && atEdge == nil && okFar != nil && m != nil && m.map { p2Err($0.phase, 2 * Double.pi * 10 + 0.3 + ($0.epoch == 1 ? Double.pi : 0)) <= 1e-6 } == true
+           && follow.map { abs($0.lead - 2) < vsDt && $0.hz == 1 } == true,
+           "P4 居中相位：0.5~2.4 Hz 现在这一刻的相位逐点对上；读到的不够远时不给；主轴代次不同的不混在一起；居中频率往后看 2 秒")
+
+    // 居中频率：段开头不满 4 秒时没有频率 = 还没攒够（nil，不代入）；满了没有 = 真没节奏（0）
+    var warm = LookaheadTimeline()
+    warm.restart(at: 0)
+    for k in 0..<150 { warm.append(p4Sample(Double(k) * vsDt, hz: 1, phase: 0, followHz: 0)) }
+    vcheck(warm.centeredFollow(at: 0.5) == nil && warm.centeredFollow(at: 3).map { $0.hz == 0 } == true,
+           "P4 居中频率：段开头还没攒满一个节奏窗口时不给（实时照用），攒满了还没有才算「没有节奏」")
+}
+
+do {
+    // 关着 / 没读到 / 没核对过：窗口原样（逐位相同），提前量 0；相位偏移 = 撞击声校正本身（逐位相同）
+    var la = RhythmLookahead()
+    let empty = LookaheadTimeline()
+    var same = true
+    var anchorSame = true
+    for i in 0..<3000 {
+        var w = plWindow(time: Double(i) * 0.3, hz: 0.5 + vsRandom() * 2, noise: vsRandom(), frames: Int(vsRandom() * 6),
+                         valid: vsRandom() < 0.8, cut: vsRandom() < 0.05)
+        w.subjectFollowHz = vsRandom() < 0.2 ? 0 : 0.4 + vsRandom() * 3
+        w.subjectFollowRhythm = vsRandom()
+        w.heldCount = vsRandom() < 0.05 ? 1 : 0
+        let clock = RhythmLookahead.Clock(hostNow: Double(i) * 0.3, itemNow: vsRandom() < 0.05 ? .nan : Double(i) * 0.3,
+                                          rate: vsRandom() < 0.05 ? 0 : 1)
+        let out = la.refine(w, timeline: empty, clock: clock, latency: 0.2)
+        let lead = la.stepLead(timeline: empty, clock: clock, latency: 0.2, lockOmega: 2 * Double.pi, lockWeight: vsRandom(), dt: 0.3)
+        same = same && out == w && lead == 0 && !la.phaseEngaged && !la.frequencyEngaged
+        let a = (vsRandom() - 0.5) * 7
+        anchorSame = anchorSame && RhythmLookahead.phaseOffset(anchor: a, lead: 0).bitPattern == a.bitPattern
+    }
+    vcheck(same && anchorSame && la.state == .waiting && RhythmLookahead().lead == 0,
+           "P4 关着 / 没读到：3000 个随机窗口原样交回、提前量 0，相位偏移和撞击声校正逐位相同")
+
+    // 读到了但还没核对上：原样
+    let tl = p4Analytic(hz: 1, to: 20)
+    var fresh = RhythmLookahead()
+    let w = plWindow(time: 10, hz: 1)
+    let out = fresh.refine(w, timeline: tl, clock: .init(hostNow: 10, itemNow: 10, rate: 1), latency: 0.2)
+    vcheck(out == w && fresh.state == .checking, "P4 还没核对上（实时窗口没有跟随频率）：窗口原样")
+}
+
+do {
+    // 端到端（稳态 1 Hz）：两条时间轴一致 → 核对通过、方向同向、频率和相位都代入；指令相位误差不比实时差
+    let scene = P4Scene(phase: { 2 * Double.pi * $0 })
+    let r = p4Run(scene)
+    let late = r.times.indices.filter { r.times[$0] >= 12 }
+    let p2 = late.compactMap { r.p2Err[$0] }
+    let p4 = late.compactMap { r.p4Err[$0] }
+    let p2Mean = p2.reduce(0, +) / Double(max(1, p2.count))
+    let p4Mean = p4.reduce(0, +) / Double(max(1, p4.count))
+    let engaged = late.filter { r.states[$0] == .engaged }.count
+    vcheck(r.la.verified && r.la.flip == false && engaged >= late.count - 2 && p4.count == late.count
+           && (p4.max() ?? 9) <= 0.4 && p4Mean <= p2Mean + 0.05 && late.allSatisfy { abs(r.leads[$0]) <= 0.15 },
+           "P4 端到端 1 Hz：核对通过、同向，\(engaged)/\(late.count) 拍频率和相位都按前瞻；指令相位误差平均 \(p4Deg(p4Mean))°"
+           + "（实时 \(p4Deg(p2Mean))°）、最大 \(p4Deg(p4.max() ?? 9))°，稳态提前量 ≈ 0")
+}
+
+do {
+    // 端到端（频率阶跃 1 → 1.6 Hz）：前瞻比实时更早跟上新频率、更早重新对上相位
+    let scene = P4Scene(phase: p4StepPhase(1, 1.6, at: 12))
+    let r = p4Run(scene, seconds: 24)
+    func reached(_ hz: [Double]) -> Double {
+        for i in r.times.indices where r.times[i] >= 9 {
+            if (i..<r.times.count).allSatisfy({ abs(hz[$0] - 1.6) <= 0.16 }) { return r.times[i] }
+        }
+        return 99
+    }
+    func settled(_ err: [Double?]) -> Double {
+        for i in r.times.indices where r.times[i] >= 11 {
+            let rest = (i..<r.times.count).filter { r.times[$0] <= r.times[i] + 2 }
+            if rest.allSatisfy({ (err[$0] ?? 9) <= 0.6 }) { return r.times[i] }
+        }
+        return 99
+    }
+    let p2Reach = reached(r.p2Hz)
+    let p4Reach = reached(r.p4Hz)
+    let p2Settle = settled(r.p2Err)
+    let p4Settle = settled(r.p4Err)
+    vcheck(p4Reach <= p2Reach - 0.9 && p4Reach <= 13.5 && p4Settle <= p2Settle - 0.6 && p4Settle <= 14.5
+           && r.leads.allSatisfy { abs($0) <= RhythmLookahead.maxLead + 1e-9 },
+           "P4 端到端 1→1.6 Hz（12 秒处）：频率跟上 \(String(format: "%.1f", p4Reach)) 秒（实时 \(String(format: "%.1f", p2Reach))），"
+           + "相位重新对上 \(String(format: "%.1f", p4Settle)) 秒（实时 \(String(format: "%.1f", p2Settle))）；提前量全程 ≤ 60°")
+}
+
+do {
+    // 动作停了：前瞻还看得到旧节奏，但「画面不动」照样 2 拍内放开（和实时同一规则、同一时刻）；动作开始前不因前瞻提前锁
+    let scene = P4Scene(phase: { 2 * Double.pi * $0 }, amp: { $0 < 16 ? 4 : 0 })
+    let r = p4Run(scene, seconds: 20, active: { $0 < 16.05 }, stopAt: 16.05)
+    let p4Released = r.p4FollowerLockedAfterStop.dropFirst(2).allSatisfy { !$0 }
+        && r.p4LockWeightAfterStop.dropFirst(1).allSatisfy { $0 == 0 }
+    vcheck(p4Released && r.p4FollowerLockedAfterStop == r.p2FollowerLockedAfterStop
+           && r.p4LockWeightAfterStop.dropFirst(1).elementsEqual(r.p2LockWeightAfterStop.dropFirst(1)),
+           "P4 动作停了：前瞻里还有旧节奏，频率跟随 / 相位锁照样和实时同一拍放开（相位锁 weight 归 0）")
+    let start = P4Scene(phase: { 2 * Double.pi * $0 }, amp: { $0 < 8 ? 0 : 4 })
+    let s = p4Run(start, seconds: 16, active: { $0 >= 8.3 })
+    let early = s.times.indices.filter { s.times[$0] < 8.3 }.contains { s.p4Locked[$0] || s.p4Hz[$0] > 0 }
+    let later = s.times.indices.filter { s.times[$0] >= 12 }.allSatisfy { s.p4Locked[$0] }
+    vcheck(!early && later, "P4 动作开始前（画面不动）：前瞻已经看到后面的节奏也不提前锁；开始动以后照常锁上")
+}
+
+do {
+    // 两条时间轴对不上：① 前瞻看到的是别的画面（1.4 Hz vs 1 Hz）→ 判「对不上」、窗口一直原样（频率跟随 / 相位锁和实时逐位相同）；
+    // ② 播放器时间偏 0.25 秒（1 Hz 下相位差 90°）→ 频率核对通过，但方向一直认不出，相位不代入
+    let real = P4Scene(phase: { 2 * Double.pi * $0 })
+    let other = P4Scene(phase: { 2 * Double.pi * 1.4 * $0 })
+    let mis = p4Run(real, look: other, seconds: 20)
+    let late = mis.times.indices.filter { mis.times[$0] >= 10 }
+    vcheck(mis.sameWindows && late.allSatisfy { mis.states[$0] == .mismatch || mis.states[$0] == .checking }
+           && late.contains { mis.states[$0] == .mismatch } && mis.p4Hz == mis.p2Hz && mis.p4Locked == mis.p2Locked
+           && mis.leads.allSatisfy { $0 == 0 },
+           "P4 前瞻是别的画面（1.4 vs 1 Hz）：判对不上，窗口全程原样，频率跟随 / 相位锁和只用实时逐位相同")
+    let shifted = p4Run(real, seconds: 20, offset: 0.25)
+    vcheck(shifted.phaseSubstituted == 0 && shifted.la.flip == nil && shifted.la.verified
+           && shifted.times.indices.filter { shifted.times[$0] >= 10 && shifted.times[$0] <= 19 }.allSatisfy { shifted.states[$0] == .frequencyOnly },
+           "P4 时间轴偏 0.25 秒（相位差 90°）：频率照常按前瞻，方向认不出、相位一直按实时")
+}
+
+do {
+    // 前瞻的主轴和实时反向（看到的画面镜像）：认出「反向」，代入的相位按实时的约定折回来，误差照样小
+    let real = P4Scene(phase: { 2 * Double.pi * $0 })
+    let mirrored = P4Scene(phase: { 2 * Double.pi * $0 }, sign: -1)
+    let r = p4Run(real, look: mirrored, seconds: 20)
+    let late = r.times.indices.filter { r.times[$0] >= 12 && r.times[$0] <= 19 }
+    let err = late.compactMap { r.p4Err[$0] }
+    vcheck(r.la.flip == true && late.allSatisfy { r.states[$0] == .engaged } && err.count == late.count && (err.max() ?? 9) <= 0.4,
+           "P4 前瞻主轴反向：认成反向，折回实时约定后指令相位误差 ≤ \(p4Deg(err.max() ?? 9))°")
+}
+
+do {
+    // 切镜：那一拍窗口原样、方向作废；保持期原样
+    let tl = p4Analytic(hz: 1, to: 13)
+    var la = RhythmLookahead()
+    for i in 0..<20 {
+        let t = 3 + Double(i) * 0.3
+        var w = plWindow(time: t - 0.05, hz: 1)
+        w.subjectFollowHz = 1
+        w.subjectFollowRhythm = 0.8
+        w.subjectFollowAmplitude = 3
+        _ = la.refine(w, timeline: tl, clock: .init(hostNow: t, itemNow: t, rate: 1), latency: 0.2)
+    }
+    let engagedBefore = la.state == .engaged && la.flip == false
+    var cutW = plWindow(time: 9, hz: 1, cut: true)
+    cutW.subjectFollowHz = 1
+    let cutOut = la.refine(cutW, timeline: tl, clock: .init(hostNow: 9.05, itemNow: 9.05, rate: 1), latency: 0.2)
+    let flipAfterCut = la.flip
+    var held = plWindow(time: 9.3, hz: 1)
+    held.heldCount = 1
+    held.subjectFollowHz = 1
+    let heldOut = la.refine(held, timeline: tl, clock: .init(hostNow: 9.35, itemNow: 9.35, rate: 1), latency: 0.2)
+    // 复审 M2：切镜 / 保持期那两拍不核对，核对历史（同一路时间轴）保留；切镜后第一拍实时还没有节奏、前瞻同一时刻有把握有节奏
+    // → 记一次不一致，最近一次不一致就不代入（窗口原样）；下一次对上才再用
+    let verifiedAfterHeld = la.verified
+    let noRhythm = plWindow(time: 9.6, hz: 1)  // subjectFollowHz 0
+    let noRhythmOut = la.refine(noRhythm, timeline: tl, clock: .init(hostNow: 9.65, itemNow: 9.65, rate: 1), latency: 0.2)
+    let afterNoRhythm = (la.verified, la.disagreements, la.state)
+    var back = plWindow(time: 9.9, hz: 1)
+    back.subjectFollowHz = 1
+    back.subjectFollowRhythm = 0.8
+    back.subjectFollowAmplitude = 3
+    _ = la.refine(back, timeline: tl, clock: .init(hostNow: 9.95, itemNow: 9.95, rate: 1), latency: 0.2)
+    // 方向在切镜时作废、还没重新确认：对上以后先只代入频率
+    vcheck(engagedBefore && cutOut == cutW && flipAfterCut == nil && heldOut == held && verifiedAfterHeld
+           && noRhythmOut == noRhythm && !afterNoRhythm.0 && afterNoRhythm.1 == 1 && afterNoRhythm.2 == .checking
+           && la.verified && la.state == .frequencyOnly,
+           "P4 切镜那一拍原样、方向作废（核对历史保留）；保持期原样；切镜后实时没节奏而前瞻有把握有节奏 = 不一致，"
+           + "那一拍原样，下一次对上才再代入")
+
+    // 倍速 2×：视频时间上的频率乘倍速后交给跟随器（实时看到的快慢）；相位读数时间戳是现在
+    let tl2 = p4Analytic(hz: 1, to: 17, from: 4)
+    var fast = RhythmLookahead()
+    var out = MotionWindow()
+    for i in 0..<20 {
+        let t = 3 + Double(i) * 0.3
+        let v = 3 + Double(i) * 0.6
+        var w = MotionWindow()
+        w.frames = 5
+        w.subjectFrames = 5
+        w.subjectScore = 0.5
+        w.subjectFollowHz = 2
+        w.subjectFollowRhythm = 0.8
+        w.subjectFollowAmplitude = 3
+        let ph = 2 * Double.pi * 1 * (v - 0.1) + 0.3
+        w.subjectPhase = StrokeRhythm.PhaseFit(time: t - 0.05, phase: StrokeRhythm.wrapPhase(ph), hz: 2, quality: 0.9,
+                                               linearity: 0.95, amplitude: 3, epoch: 0)
+        out = fast.refine(w, timeline: tl2, clock: .init(hostNow: t, itemNow: v, rate: 2), latency: 0.2)
+    }
+    vcheck(fast.state == .engaged && abs(out.subjectFollowHz - 2) < 1e-9 && abs(out.subjectPhase.hz - 2) < 1e-9
+           && out.subjectPhase.time == 3 + 19 * 0.3
+           && p2Err(out.subjectPhase.phase, 2 * Double.pi * (3 + 19 * 0.6) + 0.3) <= 1e-6,
+           "P4 倍速 2×：频率按实时看到的快慢（×2）交给跟随器，相位读数时间戳是现在、相位对上")
+}
+
+/// P4 核对用的一拍：实时窗口跟随频率 follow（0 = 实时没有节奏），t 时刻（host = 视频时间，1×）
+func p4CheckBeat(_ la: inout RhythmLookahead, _ t: Double, follow: Double, timeline: LookaheadTimeline) -> (MotionWindow, MotionWindow) {
+    var w = plWindow(time: t - 0.05, hz: 1)
+    w.subjectFollowHz = follow
+    w.subjectFollowRhythm = follow > 0 ? 0.8 : 0
+    w.subjectFollowAmplitude = follow > 0 ? 3 : 0
+    let out = la.refine(w, timeline: timeline, clock: .init(hostNow: t, itemNow: t, rate: 1), latency: 0.2)
+    return (w, out)
+}
+
+do {
+    // 复审 M2：核对只看最近 8 次（一致 ≥ 3、不一致 ≤ 2、最近一次不是不一致）。
+    // ① 对上过以后：最近一次不一致立刻不代入；不一致和一致交替时，最近 8 次里攒到 3 次不一致，即使这一拍对上也不代入
+    //   （旧规则按累计一致次数，8 次里 4 次不一致都还算通过）
+    let tl = p4Analytic(hz: 1, to: 13)
+    var la = RhythmLookahead()
+    var t = 3.0
+    for _ in 0..<10 {
+        _ = p4CheckBeat(&la, t, follow: 1, timeline: tl)
+        t += 0.3
+    }
+    let verifiedFirst = la.verified && la.agreements == RhythmLookahead.historyLength && la.disagreements == 0
+    var pattern: [Bool] = []
+    var lastAgree: (MotionWindow, MotionWindow)?
+    for k in 0..<6 {
+        // 偶数拍 1.5 Hz（差 50% > 15%，不一致），奇数拍 1 Hz（一致）
+        let beat = p4CheckBeat(&la, t, follow: k % 2 == 0 ? 1.5 : 1, timeline: tl)
+        if k % 2 == 1 { lastAgree = beat }
+        pattern.append(la.verified)
+        t += 0.3
+    }
+    vcheck(verifiedFirst && pattern == [false, true, false, true, false, false]
+           && la.disagreements == 3 && la.agreements == 5 && !la.mismatched && la.state == .checking
+           && lastAgree.map { $0.0 == $0.1 } == true,
+           "P4 核对只看最近 8 次：最近一次不一致立刻不用；8 次里第 3 次不一致后即使这一拍对上也不代入（窗口原样）"
+           + "（核对通过序列 \(pattern)）")
+
+    // ② 实时没有节奏、前瞻同一时刻置信度 ≥ 0.4 有节奏：算不一致；前瞻自己也没把握（0.2）时不算
+    var noLive = RhythmLookahead()
+    t = 3.0
+    for _ in 0..<10 {
+        _ = p4CheckBeat(&noLive, t, follow: 1, timeline: tl)
+        t += 0.3
+    }
+    let (nw, nout) = p4CheckBeat(&noLive, t, follow: 0, timeline: tl)
+    var tlLow = LookaheadTimeline()
+    tlLow.restart(at: 0)
+    var k = 0
+    while Double(k) * vsDt <= 13 {
+        let tk = Double(k) * vsDt
+        var s = p4Sample(tk, hz: 1, phase: 2 * Double.pi * tk + 0.3)
+        s.subject.followRhythm = 0.2
+        tlLow.append(s)
+        k += 1
+    }
+    var unsure = RhythmLookahead()
+    t = 3.0
+    for _ in 0..<10 {
+        _ = p4CheckBeat(&unsure, t, follow: 1, timeline: tlLow)
+        t += 0.3
+    }
+    _ = p4CheckBeat(&unsure, t, follow: 0, timeline: tlLow)
+    // 节奏在这一拍真的停了：前瞻在实时相位那一刻（6.05 秒，更早一帧）还有节奏、到「现在」（6.1 秒）已经没了 → 两边一起停，不算不一致
+    var tlStop = LookaheadTimeline()
+    tlStop.restart(at: 0)
+    k = 0
+    while Double(k) * vsDt <= 13 {
+        let tk = Double(k) * vsDt
+        tlStop.append(p4Sample(tk, hz: 1, phase: 2 * Double.pi * tk + 0.3, followHz: tk <= 6.02 ? 1 : 0))
+        k += 1
+    }
+    var stopper = RhythmLookahead()
+    t = 3.0
+    for _ in 0..<10 {
+        _ = p4CheckBeat(&stopper, t, follow: 1, timeline: tlStop)
+        t += 0.3
+    }
+    let stopperVerified = stopper.verified
+    _ = p4CheckBeat(&stopper, 6.1, follow: 0, timeline: tlStop)
+    vcheck(!noLive.verified && noLive.disagreements == 1 && nout == nw && noLive.state == .checking
+           && unsure.verified && unsure.disagreements == 0
+           && stopperVerified && stopper.verified && stopper.disagreements == 0,
+           "P4 实时没节奏、前瞻有把握有节奏 = 不一致（窗口原样）；前瞻自己也没把握、或节奏这一拍两边一起停时不算")
+
+    // ③ 同一路时间轴的 reset()（seek / 暂停 / 缓冲）不清核对历史；读帧那边重读（origin 变了）清掉，要重新攒 3 次一致
+    var re = RhythmLookahead()
+    t = 3.0
+    for _ in 0..<10 {
+        _ = p4CheckBeat(&re, t, follow: 1, timeline: tl)
+        t += 0.3
+    }
+    re.reset()
+    let keptAfterReset = re.verified && re.agreements == RhythmLookahead.historyLength
+    var tl2 = tl
+    tl2.restart(at: 6)
+    k = 0
+    while 6 + Double(k) * vsDt <= 13 {
+        let tk = 6 + Double(k) * vsDt
+        tl2.append(p4Sample(tk, hz: 1, phase: 2 * Double.pi * tk + 0.3))
+        k += 1
+    }
+    var afterRestart: [(Bool, Int)] = []
+    var firstOut: (MotionWindow, MotionWindow)?
+    t = 8.0
+    for i in 0..<3 {
+        let beat = p4CheckBeat(&re, t, follow: 1, timeline: tl2)
+        if i == 0 { firstOut = beat }
+        afterRestart.append((re.verified, re.agreements))
+        t += 0.3
+    }
+    vcheck(keptAfterReset && afterRestart.map { $0.0 } == [false, false, true] && afterRestart.map { $0.1 } == [1, 2, 3]
+           && re.disagreements == 0 && firstOut.map { $0.0 == $0.1 } == true,
+           "P4 reset()（同一路时间轴）保留核对历史；读帧那边重读后历史清掉，重新对上 3 次才代入")
+}
+
+/// 0~13 秒、15 Hz 的前瞻：相位 = 2π·t + 0.3；followHz(t) / followRhythm 可设；gap：这段时间不写（断档 > 0.5 秒 = 新段）
+func p4Timeline(followHz: (Double) -> Double = { _ in 1 }, followRhythm: Double = 0.8,
+                gap: ClosedRange<Double>? = nil) -> LookaheadTimeline {
+    var tl = LookaheadTimeline()
+    tl.restart(at: 0)
+    var k = 0
+    while Double(k) * vsDt <= 13 {
+        let tk = Double(k) * vsDt
+        k += 1
+        if let g = gap, g.contains(tk) { continue }
+        var s = p4Sample(tk, hz: 1, phase: 2 * Double.pi * tk + 0.3, followHz: followHz(tk))
+        s.subject.followRhythm = followRhythm
+        tl.append(s)
+    }
+    return tl
+}
+
+do {
+    // 复审 R3-M1 ①：核对通过以后，实时有把握有节奏（1 Hz、置信度 0.8），前瞻在同一时刻和「现在」都没有节奏（同一段、已攒满一个窗口）
+    // = 不一致：那一拍就不算通过、窗口原样（修之前核对一直停在「通过」，前瞻拿居中的 0 Hz 顶掉实时的 1 Hz）。
+    // 前瞻那段刚开头（断档后不满一个窗口）时没有节奏只是还没攒够，不算
+    let gone = p4Timeline(followHz: { $0 <= 6.02 ? 1 : 0 })
+    var la = RhythmLookahead()
+    for i in 0..<10 { _ = p4CheckBeat(&la, 3 + Double(i) * 0.3, follow: 1, timeline: gone) }
+    let verifiedBefore = la.verified && la.disagreements == 0
+    let (w1, out1) = p4CheckBeat(&la, 7.0, follow: 1, timeline: gone)
+    let afterFirst = (la.verified, la.disagreements, la.state)
+    let (w2, out2) = p4CheckBeat(&la, 7.3, follow: 1, timeline: gone)
+    let young = p4Timeline(followHz: { $0 <= 6.02 ? 1 : 0 }, gap: 6.03...6.6)
+    var y = RhythmLookahead()
+    for i in 0..<10 { _ = p4CheckBeat(&y, 3 + Double(i) * 0.3, follow: 1, timeline: young) }
+    _ = p4CheckBeat(&y, 7.0, follow: 1, timeline: young)
+    vcheck(verifiedBefore && out1 == w1 && !afterFirst.0 && afterFirst.1 == 1 && afterFirst.2 == .checking
+           && out2 == w2 && !la.verified && la.disagreements == 2
+           && y.verified && y.disagreements == 0,
+           "P4 实时有把握有节奏、前瞻（攒满一个窗口的同一段）没有节奏 = 不一致：不再代入、窗口原样；前瞻段开头还没攒够时不算")
+
+    // 复审 R3-M1 ②：核对太旧——核对通过后实时一直没节奏、前瞻也没把握（置信度 0.2，两边都不记核对）：
+    // 最近一次核对后 3 秒内照旧代入，超过 3 秒就不算通过、窗口原样；重新记到一次一致后恢复
+    let low = p4Timeline(followRhythm: 0.2)
+    var st = RhythmLookahead()
+    for i in 0..<10 { _ = p4CheckBeat(&st, 3 + Double(i) * 0.3, follow: 1, timeline: low) }
+    let lastCheck = 3 + 9 * 0.3
+    var fresh: [Bool] = []
+    for t in [lastCheck + 1.3, lastCheck + 2.3] {
+        let (w, out) = p4CheckBeat(&st, t, follow: 0, timeline: low)
+        fresh.append(st.verified && out != w && out.subjectFollowHz == 1)
+    }
+    var stale: [Bool] = []
+    for t in [lastCheck + 3.3, lastCheck + 4.3] {
+        let (w, out) = p4CheckBeat(&st, t, follow: 0, timeline: low)
+        stale.append(!st.verified && out == w && st.state == .checking && st.disagreements == 0 && !st.mismatched)
+    }
+    _ = p4CheckBeat(&st, lastCheck + 4.6, follow: 1, timeline: low)
+    vcheck(fresh == [true, true] && stale == [true, true] && st.verified,
+           "P4 核对超过 \(Int(RhythmLookahead.verifyStaleSeconds)) 秒没更新就不算通过（窗口原样）；3 秒内照旧，重新对上一次就恢复")
+}
+
+do {
+    // 提前量：相位锁的频率比画面快 10%（1.1 vs 1.0 Hz）、延迟 0.4 秒 → 收敛到 2π × (1.0 − 1.1) × 0.4 ≈ −14°；
+    // 每拍最多变 90°/秒 × 0.3 秒；差得多时夹在 ±60°；相位锁不用时立刻 0；不代入相位时按速率回 0
+    let tl = p4Analytic(hz: 1, to: 16, from: 3)
+    var la = RhythmLookahead()
+    var w = plWindow(time: 9.95, hz: 1)
+    w.subjectFollowHz = 1
+    w.subjectFollowRhythm = 0.8
+    w.subjectFollowAmplitude = 3
+    var leads: [Double] = []
+    for i in 0..<20 {
+        let t = 5 + Double(i) * 0.3
+        w = plWindow(time: t - 0.05, hz: 1)
+        w.subjectFollowHz = 1
+        w.subjectFollowRhythm = 0.8
+        w.subjectFollowAmplitude = 3
+        let clock = RhythmLookahead.Clock(hostNow: t, itemNow: t, rate: 1)
+        _ = la.refine(w, timeline: tl, clock: clock, latency: 0.4)
+        leads.append(la.stepLead(timeline: tl, clock: clock, latency: 0.4, lockOmega: 2 * Double.pi * 1.1, lockWeight: 1, dt: 0.3))
+    }
+    let expected = StrokeRhythm.wrapPhase(-2 * Double.pi * 0.1 * 0.4)
+    var maxStep = 0.0
+    for i in 1..<leads.count { maxStep = max(maxStep, abs(leads[i] - leads[i - 1])) }
+    var capped = la
+    var capLeads: [Double] = []
+    for i in 0..<10 {
+        let t = 11 + Double(i) * 0.3
+        capLeads.append(capped.stepLead(timeline: tl, clock: .init(hostNow: t, itemNow: t, rate: 1), latency: 0.6,
+                                        lockOmega: 2 * Double.pi * 1.5, lockWeight: 1, dt: 0.3))
+    }
+    var dropped = la
+    let zero = dropped.stepLead(timeline: tl, clock: .init(hostNow: 12, itemNow: 12, rate: 1), latency: 0.4,
+                                lockOmega: 2 * Double.pi * 1.1, lockWeight: 0, dt: 0.3)
+    // 不代入相位（切镜那一拍）时按速率回 0：每拍最多回 90°/秒 × 0.3 秒 = 27°。
+    // 草稿原来要求 −14° 的提前量切镜后「变小但不为 0」，可一拍就能回 27° > 14°，按速率回 0 本来就该一拍到 0（断言写错了）；
+    // 改成两种情况都钉死：−14° 一拍到 0；夹在 −60° 的那个一拍只回 27°（剩 −33°），再一拍剩 −6°，第三拍到 0
+    let step = RhythmLookahead.leadRatePerSecond * 0.3
+    var decay = la
+    let cutW = plWindow(time: 12, hz: 1, cut: true)
+    _ = decay.refine(cutW, timeline: tl, clock: .init(hostNow: 12.05, itemNow: 12.05, rate: 1), latency: 0.4)
+    let afterCut = decay.stepLead(timeline: tl, clock: .init(hostNow: 12.05, itemNow: 12.05, rate: 1), latency: 0.4,
+                                  lockOmega: 2 * Double.pi * 1.1, lockWeight: 1, dt: 0.3)
+    var bigDecay = capped
+    var bigLeads: [Double] = []
+    for i in 0..<3 {
+        let t = 14.05 + Double(i) * 0.3
+        _ = bigDecay.refine(plWindow(time: t - 0.05, hz: 1, cut: true), timeline: tl,
+                            clock: .init(hostNow: t, itemNow: t, rate: 1), latency: 0.6)
+        bigLeads.append(bigDecay.stepLead(timeline: tl, clock: .init(hostNow: t, itemNow: t, rate: 1), latency: 0.6,
+                                          lockOmega: 2 * Double.pi * 1.5, lockWeight: 1, dt: 0.3))
+    }
+    let bigStart = capLeads.last ?? 0
+    let bigOK = bigLeads.count == 3 && abs(bigLeads[0] - (bigStart + step)) < 1e-9
+        && abs(bigLeads[1] - min(0, bigStart + 2 * step)) < 1e-9 && bigLeads[2] == 0
+    vcheck(abs((leads.last ?? 9) - expected) <= 1e-6 && maxStep <= step + 1e-9
+           && capLeads.allSatisfy { abs($0) <= RhythmLookahead.maxLead + 1e-9 } && abs(abs(capLeads.last ?? 0) - RhythmLookahead.maxLead) < 1e-9
+           && bigStart < 0 && zero == 0 && afterCut == 0 && !decay.phaseEngaged && bigOK,
+           "P4 提前量：锁快 10% 时收敛到 \(p4Deg(leads.last ?? 9))°（应 \(p4Deg(expected))°），每拍最多变 \(p4Deg(maxStep))°；"
+           + "差太多夹在 ±60°；相位锁不用时立刻 0；不代入相位时按速率回 0（−14° 一拍到 0；−60° → \(bigLeads.map { p4Deg($0) + "°" }.joined(separator: " → "))）")
+}
+
+/// P4 + 0.1 秒子拍脉动整段（照 VideoSyncPlayer.motionTick 的顺序）。lookahead == false：一行 P4 代码都不走（main 的链）；
+/// coordinator：经 LookaheadCoordinator（enabled = lookahead）。readPast：视频比模拟多出来的秒数（前瞻读得到模拟结束之后的画面）
+struct P4PulseRun {
+    var times: [Double] = []
+    var outs: [[Int]] = []
+    var offsets: [UInt64] = []
+    var fullTimes: [Double] = []
+    var lockErr: [Double?] = []
+    var subs = 0
+    var state = RhythmLookahead.State.off
+    var lead: Double = 0
+}
+
+func p4PulseRun(_ scene: P4Scene, seconds: Double = 20, lookahead: Bool, coordinator: Bool = true,
+                readPast: Double = 3, value: Double = 70, cap: Int = 70) -> P4PulseRun {
+    var rtA = MotionAnalyzer()
+    rtA.phaseFitEnabled = true
+    var laA = MotionAnalyzer()
+    laA.phaseFitEnabled = true
+    var acc = MotionWindowAccumulator()
+    var tl = LookaheadTimeline()
+    tl.restart(at: 0)
+    var coord = LookaheadCoordinator()
+    var follower = RhythmFollower()
+    var lock = RhythmPhaseLock()
+    var driver = RhythmPulseDriver()
+    var stage = SyncOutputStage()
+    let st = AudioSyncSettings(enabled: true, maxPercent: Double(cap), channels: .both, minPercent: 10)
+    let vis = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: "20:0.6, 60:1.8, 99:2.8", rhythmPulse: true,
+                                 rhythmLookahead: lookahead)
+    var r = P4PulseRun()
+    let frames = Int(seconds * 15)
+    let readable = Int((seconds + readPast) * 15)
+    var kb = 0
+    var lastFull = 0.0
+    var tick = 0.0
+    let latency = vis.pulseLatencyMs / 1000
+    for k in 0..<frames {
+        let t = Double(k) * vsDt
+        if let s = rtA.analyze(scene.frame(t), time: t) { acc.add(s) }
+        while tick + 0.1 <= t {
+            tick += 0.1
+            let now = tick
+            if driver.takesFullBeat(at: now) {
+                if lookahead {
+                    while kb < readable, Double(kb) * vsDt <= now + LookaheadTimeline.horizon {
+                        let tb = Double(kb) * vsDt
+                        if let s = laA.analyze(scene.frame(tb), time: tb) { tl.append(s) }
+                        kb += 1
+                    }
+                    tl.prune(playhead: now)
+                }
+                let dt = now - lastFull
+                lastFull = now
+                let w = acc.drain()
+                let clock = RhythmLookahead.Clock(hostNow: now, itemNow: now, rate: 1)
+                let input = coordinator ? coord.refine(w, enabled: vis.usesLookahead, timeline: tl, clock: clock, latency: latency) : w
+                follower.step(input, dt: dt, active: true)
+                lock.step(input, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source,
+                          now: now, dt: dt, active: true)
+                if coordinator {
+                    // 撞击声校正关着：updateAudioAnchor 不动偏移；前后各一步和播放器一样
+                    driver.phaseOffset = coord.removeLead(from: driver.phaseOffset)
+                    driver.phaseOffset = coord.applyLead(to: driver.phaseOffset, enabled: vis.usesLookahead, timeline: tl,
+                                                         clock: clock, latency: latency, lock: lock, dt: dt)
+                }
+                let rate = follower.weight > 0 && follower.hz > 0 ? vis.rateMap.level(forHz: follower.hz) : nil
+                let levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate,
+                                                 weight: follower.weight, activity: 1)
+                r.outs.append(driver.beat(levels: levels, lock: lock, visual: vis, settings: st, hasSignal: true, value: value,
+                                          activity: 1, followerWeight: follower.weight, now: now, stage: &stage))
+                r.times.append(now)
+                r.offsets.append(driver.phaseOffset.bitPattern)
+                r.fullTimes.append(now)
+                r.lockErr.append(lock.phase(at: now + latency).map {
+                    p2Err($0 + driver.phaseOffset, scene.phase(now + latency) - Double.pi / 2) })
+            } else if let o = driver.subBeat(lock: lock, settings: st, now: now, stage: &stage) {
+                r.outs.append(o)
+                r.times.append(now)
+                r.offsets.append(driver.phaseOffset.bitPattern)
+                r.subs += 1
+            }
+        }
+    }
+    r.state = coord.lookahead.state
+    r.lead = coord.lead
+    return r
+}
+
+/// 出口不变量：上限 / 单步 ≤ 20 / 任意两刻升幅 ≤ 20 × 间隔 / 0.3 + 1 / 通道 3、4 恒 0
+func p4Envelope(_ r: P4PulseRun, cap: Int) -> Bool {
+    var ok = true
+    var prev = [0, 0, 0, 0]
+    for (i, o) in r.outs.enumerated() {
+        ok = ok && o[2] == 0 && o[3] == 0 && o[0] <= cap && o[1] <= cap && o[0] - prev[0] <= 20 && o[1] - prev[1] <= 20
+        prev = o
+        for j in (i + 1)..<r.outs.count where r.times[j] - r.times[i] <= 2 {
+            for ch in 0..<2 where Double(r.outs[j][ch] - o[ch]) > 20 * (r.times[j] - r.times[i]) / 0.3 + 1 + 1e-9 { ok = false }
+        }
+    }
+    return ok
+}
+
+do {
+    // 前瞻 + 0.1 秒子拍脉动整段：输出照旧过同一个出口——上限、单步 ≤ 20、任意两刻升幅 ≤ 20 × 间隔 / 0.3 + 1、通道 3 / 4 恒 0；
+    // 指令相位（含提前量）峰值落在画面 −45° 附近；频率跳变那几秒相位比只用实时的对得更快。
+    //
+    // 和草稿相比改了两处断言（算法没动，草稿里这条失败的原因都在断言本身）：
+    // ① 峰数：统计窗口是 15~20 秒、1.4 Hz，一共只有 5 × 1.4 = 7 个往复，草稿要求 ≥ 8 个峰不可能做到；改成 ≥ 7（每个往复一个峰）。
+    //    只用实时的同一段也是 7 个峰。
+    // ② 结束时 state == .engaged：草稿里前瞻只能读到 20 秒（kb < 300），和模拟同时结束，最后 2 秒前瞻没有「后面的画面」，
+    //    按设计就该退回 .waiting（读到的不够远 = 只用实时）。真实视频在这一刻之后还有画面，所以让前瞻多读 3 秒；
+    //    「视频真的到头了 → 退回只用实时、提前量回 0」另外单独钉住。
+    let scene = P4Scene(phase: p4StepPhase(1, 1.4, at: 12))
+    let on = p4PulseRun(scene, lookahead: true)
+    let base = p4PulseRun(scene, lookahead: false, coordinator: false)
+    func peaks(_ r: P4PulseRun) -> (n: Int, err: Double) {
+        let late = r.times.indices.filter { r.times[$0] >= 15 }
+        var n = 0
+        var err = 0.0
+        for k in late.dropFirst().dropLast() where r.outs[k][0] > r.outs[k - 1][0] && r.outs[k][0] >= r.outs[k + 1][0] {
+            err = max(err, p2Err(scene.phase(r.times[k] + 0.2) - Double.pi / 2, RhythmPulse.peakPhase))
+            n += 1
+        }
+        return (n, err)
+    }
+    let pk = peaks(on)
+    let pkBase = peaks(base)
+    // 12~16 秒（跳变之后）：指令相位误差（相位锁 + 偏移 vs 画面真值；锁没在用时记 180°）
+    func worst(_ r: P4PulseRun) -> Double {
+        r.fullTimes.indices.filter { r.fullTimes[$0] >= 12 && r.fullTimes[$0] <= 16 }.map { r.lockErr[$0] ?? Double.pi }.max() ?? 9
+    }
+    let worstOn = worst(on)
+    let worstBase = worst(base)
+    vcheck(p4Envelope(on, cap: 70) && on.subs > 50 && pk.n >= 7 && pk.err <= 2 * Double.pi * 0.15 && on.state == .engaged
+           && pkBase.n == pk.n && worstOn <= Double.pi / 4 && worstOn < worstBase,
+           "P4 + 子拍脉动整段（1→1.4 Hz）：上限 70 / 单步 ≤ 20 / 升幅包络 / 通道 3、4 恒 0 全程守住；"
+           + "\(pk.n) 个峰在画面 −45° ± \(p4Deg(pk.err))°（只用实时 \(pkBase.n) 个 ± \(p4Deg(pkBase.err))°，0.1 秒一档的量化）；"
+           + "跳变后 4 秒指令相位最大误差 \(p4Deg(worstOn))°（只用实时 \(p4Deg(worstBase))°）")
+
+    // 视频到头：前瞻读不到后面，最后一段退回只用实时（.waiting）、提前量回 0，出口不变量照旧
+    let end = p4PulseRun(scene, lookahead: true, readPast: 0)
+    vcheck(p4Envelope(end, cap: 70) && end.state == .waiting && end.lead == 0,
+           "P4 视频到头：后面没画面可读时退回只用实时，提前量回 0")
+}
+
+do {
+    // 开关关着 = main：同一段画面（1→1.4 Hz 跳变、上限 55、子拍脉动），经 LookaheadCoordinator（enabled = false）
+    // 和完全不走 P4 代码的链逐位相同（每一拍的输出、脉动相位偏移的位模式）。
+    // 「开着但没标定」也一样（usesLookahead 要求已标定）
+    let scene = P4Scene(phase: p4StepPhase(1, 1.4, at: 9), amp: { $0 < 17 ? 4 : 0 })
+    let base = p4PulseRun(scene, seconds: 20, lookahead: false, coordinator: false, value: 60, cap: 55)
+    let off = p4PulseRun(scene, seconds: 20, lookahead: false, coordinator: true, value: 60, cap: 55)
+    let uncal = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true, rhythmLookahead: true)
+    vcheck(base.outs == off.outs && base.times == off.times && base.offsets == off.offsets && base.subs == off.subs
+           && off.offsets.allSatisfy { $0 == 0.0.bitPattern } && off.state == .off && !uncal.usesLookahead,
+           "P4 关着：整段 \(off.outs.count) 拍（含 \(off.subs) 个子拍）输出和脉动相位偏移与不走 P4 的链逐位相同；没标定时也不生效")
+
+    // LookaheadCoordinator 关着：3000 个随机窗口 / 偏移原样（含 NaN、切镜、空窗口），状态一直是 .off
+    var c = LookaheadCoordinator()
+    let tl = p4Analytic(hz: 1, to: 20)
+    var same = true
+    let lock = plLocked()
+    for i in 0..<3000 {
+        var w = plWindow(time: Double(i) * 0.3, hz: 0.5 + vsRandom() * 2, noise: vsRandom(), frames: Int(vsRandom() * 6),
+                         valid: vsRandom() < 0.8, cut: vsRandom() < 0.05)
+        w.subjectFollowHz = vsRandom() < 0.2 ? 0 : 0.4 + vsRandom() * 3
+        let clock = RhythmLookahead.Clock(hostNow: 3 + Double(i) * 0.003, itemNow: 3 + Double(i) * 0.003, rate: 1)
+        let out = c.refine(w, enabled: false, timeline: tl, clock: clock, latency: 0.2)
+        let a = vsRandom() < 0.05 ? Double.nan : (vsRandom() - 0.5) * 3
+        let removed = c.removeLead(from: a)
+        let applied = c.applyLead(to: removed, enabled: false, timeline: tl, clock: clock, latency: 0.2, lock: lock, dt: 0.3)
+        same = same && out == w && removed.bitPattern == a.bitPattern && applied.bitPattern == a.bitPattern
+            && c.lookahead.state == .off && c.lead == 0
+    }
+    vcheck(same, "P4 接线关着：3000 个随机窗口 / 相位偏移原样交回（位模式相同），前瞻状态一直是关")
+}
+
+do {
+    // 接线：提前量加上 → 下一拍撞击声校正之前撤掉（得回原来的撞击声部分）；中间偏移被别处改过（reset）就不撤；
+    // 总偏移夹在 ±90°（撞击声校正自己最宽也是 ±90°）
+    let tl = p4Analytic(hz: 1, to: 16, from: 3)
+    var c = LookaheadCoordinator()
+    var lock = plLocked(hz: 1.1)
+    for i in 0..<20 {
+        let t = 5 + Double(i) * 0.3
+        var w = plWindow(time: t - 0.05, hz: 1)
+        w.subjectFollowHz = 1
+        w.subjectFollowRhythm = 0.8
+        _ = c.refine(w, enabled: true, timeline: tl, clock: .init(hostNow: t, itemNow: t, rate: 1), latency: 0.4)
+    }
+    let clock = RhythmLookahead.Clock(hostNow: 10.7, itemNow: 10.7, rate: 1)
+    var total = 0.25
+    for _ in 0..<6 {
+        _ = c.removeLead(from: total)
+        total = c.applyLead(to: 0.25, enabled: true, timeline: tl, clock: clock, latency: 0.4, lock: lock, dt: 0.3)
+    }
+    let restored = c.removeLead(from: total)
+    _ = c.applyLead(to: 0.25, enabled: true, timeline: tl, clock: clock, latency: 0.4, lock: lock, dt: 0.3)
+    let untouched = c.removeLead(from: 0)
+    lock.reset()
+    let big = RhythmLookahead.phaseOffset(anchor: AudioPhaseAnchor.unknownLimit, lead: RhythmLookahead.maxLead)
+    let bigNeg = RhythmLookahead.phaseOffset(anchor: -AudioPhaseAnchor.unknownLimit, lead: -RhythmLookahead.maxLead)
+    let small = RhythmLookahead.phaseOffset(anchor: 0.3, lead: -0.2)
+    vcheck(c.lead != 0 && total != 0.25 && restored == 0.25 && untouched == 0
+           && big == RhythmLookahead.maxTotalOffset && bigNeg == -RhythmLookahead.maxTotalOffset && abs(small - 0.1) < 1e-12
+           && RhythmLookahead.phaseOffset(anchor: 0.3, lead: .nan) == 0.3,
+           "P4 接线：提前量（\(p4Deg(c.lead))°）下一拍先撤掉再算撞击声校正；偏移被别处清过就不撤；总偏移夹在 ±90°")
+}
+
+do {
+    // 设置：默认关、键名、读回；只有跟随画面 + 伸缩跟随频率 + 前瞻都开才生效；不影响 Timer 间隔
+    let d = VisualSyncSettings()
+    let suite = "p4-settings-\(UInt64(vsRandom() * 1e12))"
+    let defaults = UserDefaults(suiteName: suite)!
+    defaults.set(true, forKey: VisualSyncSettings.Keys.rhythmLookahead)
+    defaults.set(1, forKey: VisualSyncSettings.Keys.source)
+    defaults.set(true, forKey: VisualSyncSettings.Keys.rhythmFollow)
+    defaults.set(true, forKey: VisualSyncSettings.Keys.prescan)
+    let loaded = VisualSyncSettings.load(from: defaults)
+    defaults.removePersistentDomain(forName: suite)
+    // 草稿这里没写标定表也断言 p1.usesLookahead：按「没标定 / 没有可信信号时退回 P4 关着的行为」，没标定时必须不生效，
+    // 所以生效的几组都带上标定表，另加一组没标定的
+    let table = "20:0.6, 60:1.8, 99:2.8"
+    let noFollow = VisualSyncSettings(source: .motion, rhythmFollow: false, rateTable: table, rhythmLookahead: true)
+    let audio = VisualSyncSettings(source: .audio, rhythmFollow: true, rateTable: table, rhythmLookahead: true)
+    let p1 = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: table, rhythmLookahead: true)
+    let uncal = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmLookahead: true)
+    let p2 = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: table, rhythmPulse: true, rhythmLookahead: true)
+    let p2off = VisualSyncSettings(source: .motion, rhythmFollow: true, rateTable: table, rhythmPulse: true)
+    let pre = VisualSyncSettings(source: .motion, prescan: true)
+    let preFixed = VisualSyncSettings(source: .motion, autoMotion: false, prescan: true)
+    let preAudio = VisualSyncSettings(source: .audio, prescan: true)
+    let loadedCal = VisualSyncSettings(source: loaded.source, rhythmFollow: loaded.rhythmFollow, rateTable: table,
+                                       rhythmLookahead: loaded.rhythmLookahead)
+    vcheck(!d.rhythmLookahead && !d.usesLookahead && !d.prescan && !d.usesPrescan && !d.usesExtraDecode
+           && VisualSyncSettings.Keys.rhythmLookahead == "bcVisualSyncRhythmLookahead"
+           && VisualSyncSettings.Keys.prescan == "bcVisualSyncPrescan"
+           && loaded.rhythmLookahead && !loaded.usesLookahead && loadedCal.usesLookahead && loaded.prescan
+           && !noFollow.usesLookahead && !audio.usesLookahead && !uncal.usesLookahead && !uncal.usesExtraDecode
+           && p1.usesLookahead && p1.usesExtraDecode && p1.tickInterval == AudioReactiveShaper.interval
+           && p2.tickInterval == p2off.tickInterval && p2.usesPulseTiming == p2off.usesPulseTiming
+           && pre.usesPrescan && pre.usesExtraDecode && !pre.usesLookahead && !preFixed.usesPrescan && !preAudio.usesPrescan
+           && VisualSyncSettings.load(from: UserDefaults(suiteName: suite + "-empty")!) == d,
+           "P4 设置：默认都关、键名 bcVisualSyncRhythmLookahead / bcVisualSyncPrescan、读回；前瞻要跟随画面 + 频率跟随 + 已标定，"
+           + "预扫描要跟随画面 + 自动适应；Timer 间隔不变")
+}
+
+do {
+    // 状态行
+    var la = RhythmLookahead()
+    let reader = la.statusText(reader: "手机发热，已暂停")
+    let waiting = la.statusText(reader: nil)
+    let tl = p4Analytic(hz: 1, to: 13)
+    for i in 0..<20 {
+        let t = 3 + Double(i) * 0.3
+        var w = plWindow(time: t - 0.05, hz: 1)
+        w.subjectFollowHz = 1
+        w.subjectFollowRhythm = 0.8
+        w.subjectFollowAmplitude = 3
+        _ = la.refine(w, timeline: tl, clock: .init(hostNow: t, itemNow: t, rate: 1), latency: 0.2)
+    }
+    let engaged = la.statusText(reader: nil)
+    vcheck(reader == "前瞻：手机发热，已暂停，只用实时画面" && waiting == "前瞻：正在提前读后面的画面…"
+           && engaged.hasPrefix("前瞻：已读到后面 ") && engaged.contains("频率和相位都按将来的画面"),
+           "P4 状态行：读帧那边有问题时说明只用实时；在读 / 已用上时说明读到多远（\(engaged)）")
+}
+
+do {
+    // 读帧那边：什么时候从播放头重新开读、什么时候还要往后读
+    var tl = LookaheadTimeline()
+    let fresh = tl.needsRestart(playhead: 5)
+    tl.restart(at: 5)
+    let emptyNear = !tl.needsRestart(playhead: 5.5) && tl.wantsMore(playhead: 5)
+    for k in 0..<60 { tl.append(p4Sample(5 + Double(k) * vsDt, hz: 1, phase: 0)) }   // 读到 ≈ 8.93
+    let ahead = !tl.wantsMore(playhead: 5.5) && tl.wantsMore(playhead: 6.5)
+    let back = tl.needsRestart(playhead: 4.7) && !tl.needsRestart(playhead: 4.8)
+    let jump = tl.needsRestart(playhead: 10) && !tl.needsRestart(playhead: 9.9)
+    vcheck(fresh && emptyNear && ahead && back && jump && !tl.needsRestart(playhead: .nan) && !tl.wantsMore(playhead: .nan),
+           "P4 读帧：没开读 / 往回 seek > 0.25 秒 / 播放头跑到读到的最远处 1 秒以后 → 从播放头重读；领先 3 秒就先不读")
+
+    // 复审 M1：从 0 开读、一路读到 63 秒、按播放头 60 秒修剪（只留 55 秒以后）：往回 seek 到 10 秒在开读处之后、
+    // 却早于还留着的最早一帧，必须重读（原来只和开读处比，要等播放头走回 55 秒才有前瞻）；往回 3 秒（57 秒）还在留着的范围里，不重读
+    var pruned = LookaheadTimeline()
+    pruned.restart(at: 0)
+    var k = 0
+    while Double(k) * vsDt <= 63 {
+        pruned.append(p4Sample(Double(k) * vsDt, hz: 1, phase: 0))
+        k += 1
+    }
+    pruned.prune(playhead: 60)
+    let prunedFirst = pruned.first
+    let backFar = pruned.needsRestart(playhead: 10)
+    let backNear = !pruned.needsRestart(playhead: 57)
+    let stillNear = !pruned.needsRestart(playhead: 60) && !pruned.wantsMore(playhead: 60) && pruned.wantsMore(playhead: 61)
+    // 播完重播：30 秒的视频读到文件尾（30 秒）、播放头停在 30 秒（只留 25 秒以后），再从 0 播：
+    // 不重读的话 wantsMore(0) 是 false、0 秒附近也查不到，整段重播都没有前瞻 → 必须重读；重读后从 0 接着往后读
+    var ended = LookaheadTimeline()
+    ended.restart(at: 0)
+    k = 0
+    while Double(k) * vsDt <= 30 {
+        ended.append(p4Sample(Double(k) * vsDt, hz: 1, phase: 0))
+        k += 1
+    }
+    ended.prune(playhead: 30)
+    let endedStuck = !ended.wantsMore(playhead: 0) && ended.reach(from: 0) == nil
+    let replay = ended.needsRestart(playhead: 0)
+    var replayed = ended
+    replayed.restart(at: 0)
+    let replayOK = !replayed.needsRestart(playhead: 0) && replayed.wantsMore(playhead: 0) && replayed.origin == 0
+    // 短视频（全程都还留着）：重播从 0 读得到，不用重读
+    var short = LookaheadTimeline()
+    short.restart(at: 0)
+    for j in 0..<60 { short.append(p4Sample(Double(j) * vsDt, hz: 1, phase: 0)) }
+    short.prune(playhead: 3.9)
+    let shortKept = !short.needsRestart(playhead: 0) && short.reach(from: 0) != nil
+    vcheck(prunedFirst >= 55 - 1e-9 && prunedFirst <= 55 + vsDt + 1e-9 && backFar && backNear && stillNear
+           && endedStuck && replay && replayOK && shortKept,
+           "P4 读帧（复审 M1）：往回 seek 到还留着的最早一帧之前（开读 0 秒、留 55 秒以后、seek 到 10 秒）要重读，往回 3 秒不重读；"
+           + "播完从 0 重播要重读、重读后接着往后读；全程都还留着的短视频重播不用重读")
+}
+
+do {
+    // 发热：另开一路解码只在 .nominal / .fair 跑，.serious 起停（且这一路不跑 Vision）
+    vcheck(LookaheadThermalPolicy.allowsExtraDecode(.nominal) && LookaheadThermalPolicy.allowsExtraDecode(.fair)
+           && !LookaheadThermalPolicy.allowsExtraDecode(.serious) && !LookaheadThermalPolicy.allowsExtraDecode(.critical)
+           && LookaheadThermalPolicy.note(.nominal) == nil && LookaheadThermalPolicy.note(.serious) != nil,
+           "P4 发热：前瞻 / 预扫描只在 .nominal / .fair 跑，.serious / .critical 停掉")
+}
+
+do {
+    // 预扫描：整段 P4Scene（前 10 秒安静、后 20 秒往复）按 15 Hz 分析 → 0.3 秒窗口 → 10 / 90 分位；
+    // 和同一段画面让 MotionNormalizer 实时学 30 秒得到的参考值同一量级；窗口数不够时不给
+    let scene = P4Scene(phase: { 2 * Double.pi * 1.2 * $0 }, amp: { $0 < 10 ? 0.5 : 4 })
+    var an = MotionAnalyzer()
+    var pre = MotionPrescan()
+    var acc = MotionWindowAccumulator()
+    var live = MotionNormalizer()
+    for k in 0..<(30 * 15) {
+        let t = Double(k) * vsDt
+        if let s = an.analyze(scene.frame(t), time: t) {
+            pre.add(s)
+            acc.add(s)
+        }
+        if k % 5 == 4 { _ = live.step(acc.drain(), gainDb: 0, auto: true, dt: 0.3) }
+    }
+    pre.finish()
+    let sum = pre.summary
+    var short = MotionPrescan()
+    var an2 = MotionAnalyzer()
+    for k in 0..<(5 * 15) {
+        let t = Double(k) * vsDt
+        if let s = an2.analyze(scene.frame(t + 12), time: t) { short.add(s) }
+    }
+    short.finish()
+    vcheck(sum.isValid && sum.scoreWindows >= 90 && sum.scoreLow <= sum.scoreHigh && sum.scoreHigh > 0.05
+           && abs(pre.scanned - 29 * 1.0 - 14 * vsDt) < 0.2 && pre.windows >= 95 && pre.windows <= 101
+           && !short.summary.isValid && short.summary.refHigh.isNaN,
+           "P4 预扫描：30 秒视频 \(pre.windows) 个窗口，主体分数 10 / 90 分位 "
+           + String(format: "%.2f / %.2f（实时学 30 秒后 %.2f / %.2f）", sum.scoreLow, sum.scoreHigh, live.scoreLow, live.scoreHigh)
+           + "；不满 \(MotionPrescan.minWindows) 个窗口不给")
+
+    // 初始化：只在换视频后还没学过时生效（之后照常实时学）；学过一拍 / 摘要不可信时不动；
+    // 夹在实时学习能到的范围里；输出照样在 0~100
+    var seeded = MotionNormalizer()
+    let used = seeded.seed(sum)
+    var learned = MotionNormalizer()
+    _ = learned.step(plWindow(time: 0, hz: 1), gainDb: 0, auto: true, dt: 0.3)
+    let before = learned
+    let late = learned.seed(sum)
+    var bad = MotionNormalizer()
+    let badUsed = bad.seed(MotionPrescan.Summary())
+    var weird = MotionPrescan.Summary()
+    weird.energyWindows = 100
+    weird.refLow = 9
+    weird.refHigh = -3
+    weird.scoreWindows = 100
+    weird.scoreLow = 2
+    weird.scoreHigh = -1
+    var clamped = MotionNormalizer()
+    _ = clamped.seed(weird)
+    var outOK = true
+    var probe = seeded
+    for i in 0..<300 {
+        var w = plWindow(time: Double(i) * 0.3, hz: 1)
+        w.subjectScore = vsRandom()
+        w.meanEnergy = vsRandom() * 30
+        w.peakEnergy = w.meanEnergy * 1.5
+        let v = probe.step(w, gainDb: (vsRandom() - 0.5) * 18, auto: true, dt: 0.3)
+        outOK = outOK && v >= 0 && v <= 100
+    }
+    vcheck(used && abs(seeded.scoreHigh - MotionStats.clamp01(sum.scoreHigh)) < 1e-12 && seeded.confidence == 0
+           && !late && learned.scoreHigh == before.scoreHigh && learned.refHigh == before.refHigh
+           && !badUsed && bad.refHigh == MotionNormalizer.initialHigh && bad.scoreHigh == MotionNormalizer.subjectInitialHigh
+           && clamped.refHigh == MotionNormalizer.minHigh && clamped.refLow <= clamped.refHigh && clamped.refLow >= 0
+           && clamped.scoreHigh == 0 && clamped.scoreLow == 0 && outOK,
+           "P4 预扫描初始化：只在还没学过时用（热身照旧从 0 起）；学过 / 不可信时不动；坏值夹回实时能到的范围；输出仍在 0~100")
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)

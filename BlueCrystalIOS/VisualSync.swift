@@ -3332,6 +3332,28 @@ struct MotionNormalizer {
         idleRun = 0
     }
 
+    /// rhythm-lookahead P4（预扫描，默认关）：换视频后还一拍都没学过（warmElapsed == 0）时，用全片分位数当参考值的起点，
+    /// 之后照常实时学（同样的快升慢降）。只改起点、不跳过热身（开头 3 秒照旧按 confidence 从 0 升）；
+    /// 夹在实时学习本来能到的范围里（refHigh ≥ minHigh、主体参考 0~1）。已经学过 / 摘要不可信时不动，返回 false。
+    /// 注意起点不保证比不初始化时低：scoreHigh 起点低时主体放大一开始就到 subjectMaxStretch（1.25 倍）、refHigh 起点可低到 minHigh，
+    /// 热身过后开头一段可能比不初始化时同一时刻更强（不超过实时学习本来会学到的范围；上限 / 升幅由出口照旧管）
+    @discardableResult
+    mutating func seed(_ s: MotionPrescan.Summary) -> Bool {
+        guard warmElapsed == 0, s.isValid else { return false }
+        var used = false
+        if s.energyWindows >= MotionPrescan.minWindows, s.refHigh.isFinite, s.refLow.isFinite {
+            refHigh = max(Self.minHigh, s.refHigh)
+            refLow = min(max(0, s.refLow), refHigh)
+            used = true
+        }
+        if s.scoreWindows >= MotionPrescan.minWindows, s.scoreHigh.isFinite, s.scoreLow.isFinite {
+            scoreHigh = MotionStats.clamp01(s.scoreHigh)
+            scoreLow = min(MotionStats.clamp01(s.scoreLow), scoreHigh)
+            used = true
+        }
+        return used
+    }
+
     mutating func step(_ w: MotionWindow, gainDb: Double, auto: Bool, dt: TimeInterval) -> Double {
         let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
         guard w.frames > 0 else {
@@ -3620,6 +3642,10 @@ struct VisualSyncSettings: Equatable {
         /// rhythm-context P3：动作识别（手 / 头 / 髋 + 周期区域，默认关）/ 撞击声相位校正（默认关）
         static let rhythmContext = "bcVisualSyncRhythmContext"
         static let rhythmAudioAnchor = "bcVisualSyncRhythmAudioAnchor"
+        /// rhythm-lookahead P4：前瞻（另开一路解码提前读后面的画面，默认关）
+        static let rhythmLookahead = "bcVisualSyncRhythmLookahead"
+        /// rhythm-lookahead P4：预扫描整段视频（全片分位初始化画面的自动适应参考值，默认关）
+        static let prescan = "bcVisualSyncPrescan"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -3649,6 +3675,10 @@ struct VisualSyncSettings: Equatable {
     static let defaultRhythmContext = false
     /// rhythm-context P3：默认关。关着时音频实时线程不算频带能量、不做撞击检测，指令相位偏移恒 0
     static let defaultRhythmAudioAnchor = false
+    /// rhythm-lookahead P4：默认关。关着时不建 LookaheadReader（不另外解码）、窗口和相位偏移都不改，和 P3 逐位相同
+    static let defaultRhythmLookahead = false
+    /// rhythm-lookahead P4：默认关。关着时不另外解码、MotionNormalizer 不被初始化，和 P3 逐位相同
+    static let defaultPrescan = false
 
     var source: VisualSyncSource
     var motionGainDb: Double
@@ -3661,13 +3691,16 @@ struct VisualSyncSettings: Equatable {
     var pulseInvert: Bool
     var rhythmContext: Bool
     var rhythmAudioAnchor: Bool
+    var rhythmLookahead: Bool
+    var prescan: Bool
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
          autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
          rateTable: String = defaultRateTable, rhythmPulse: Bool = defaultRhythmPulse,
          pulseDepth: Double = defaultPulseDepth, pulseLatencyMs: Double = defaultPulseLatencyMs,
          pulseInvert: Bool = defaultPulseInvert, rhythmContext: Bool = defaultRhythmContext,
-         rhythmAudioAnchor: Bool = defaultRhythmAudioAnchor) {
+         rhythmAudioAnchor: Bool = defaultRhythmAudioAnchor, rhythmLookahead: Bool = defaultRhythmLookahead,
+         prescan: Bool = defaultPrescan) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
@@ -3685,6 +3718,8 @@ struct VisualSyncSettings: Equatable {
         self.pulseInvert = pulseInvert
         self.rhythmContext = rhythmContext
         self.rhythmAudioAnchor = rhythmAudioAnchor
+        self.rhythmLookahead = rhythmLookahead
+        self.prescan = prescan
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -3705,7 +3740,9 @@ struct VisualSyncSettings: Equatable {
             pulseLatencyMs: defaults.object(forKey: Keys.pulseLatencyMs) as? Double ?? defaultPulseLatencyMs,
             pulseInvert: defaults.object(forKey: Keys.pulseInvert) as? Bool ?? defaultPulseInvert,
             rhythmContext: defaults.object(forKey: Keys.rhythmContext) as? Bool ?? defaultRhythmContext,
-            rhythmAudioAnchor: defaults.object(forKey: Keys.rhythmAudioAnchor) as? Bool ?? defaultRhythmAudioAnchor)
+            rhythmAudioAnchor: defaults.object(forKey: Keys.rhythmAudioAnchor) as? Bool ?? defaultRhythmAudioAnchor,
+            rhythmLookahead: defaults.object(forKey: Keys.rhythmLookahead) as? Bool ?? defaultRhythmLookahead,
+            prescan: defaults.object(forKey: Keys.prescan) as? Bool ?? defaultPrescan)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
@@ -3723,6 +3760,14 @@ struct VisualSyncSettings: Equatable {
     var usesRhythmContext: Bool { source == .motion && rhythmFollow && rhythmContext }
     /// rhythm-context P3：撞击声相位校正真正生效（要相位脉动在跑；只改指令相位，不改档位）
     var usesAudioAnchor: Bool { usesPulseTiming && rhythmAudioAnchor }
+    /// rhythm-lookahead P4：前瞻真正生效（跟随画面 + 伸缩跟随频率 + 前瞻 + 已标定）。频率只要 P1 开着就能用；
+    /// 相位读数 / 提前量只在相位脉动也开着时才有地方用。没标定（档位 → 快慢只是估计值）时不用，退回 P4 关着的行为。
+    /// 不影响 tickInterval
+    var usesLookahead: Bool { source == .motion && rhythmFollow && rhythmLookahead && calibratedRateMap != nil }
+    /// rhythm-lookahead P4：预扫描真正生效（跟随画面 + 自动适应画面 + 预扫描）。参考值只在自动适应时才用得上
+    var usesPrescan: Bool { source == .motion && autoMotion && prescan }
+    /// 要不要另开一路解码（前瞻或预扫描任一生效）
+    var usesExtraDecode: Bool { usesLookahead || usesPrescan }
 }
 
 /// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
@@ -6888,4 +6933,834 @@ struct AudioPhaseAnchor {
         }
         return "撞击声校正：没听到和画面一致的撞击声，只按画面相位"
     }
+}
+
+// MARK: - rhythm-lookahead P4：前瞻（另开一路解码提前读后面的画面，默认关）
+//
+// 视频是本地文件：VideoMotionTap.swift 的 LookaheadReader 用 AVAssetReader 从播放头附近往后读（最多领先 3 秒），
+// 跑同一套 LumaDownscaler + MotionAnalyzer（块运动主体 / 节奏 / 相位拟合，不跑 Vision），按视频时间存成 LookaheadTimeline。
+// 主线程每个完整拍：
+// 1. 核对（RhythmLookahead.refine）：同一个视频时刻，前瞻的因果读数和实时窗口的读数比——频率差 ≤ 15% 算一致，
+//    实时没有节奏而前瞻有把握有节奏、实时有把握有节奏而前瞻（攒满一个窗口的同一段里）没有节奏，都算不一致；
+//    只看最近 8 次：一致 ≥ 3、不一致 ≤ 2、最近一次不是不一致、最近一次核对在 3 秒内才「核对通过」，
+//    读帧那边重读（时间轴 origin 变了）时核对历史清掉；相位按 0° / 180° 折叠（两路主轴正方向可能取得不一样），
+//    折叠后差 ≤ 45° 才认方向，连续 2 次一致才定 / 改方向；差在 45°~135° 的不认（时间轴对不上 / 不是同一个运动）；
+// 2. 代入：核对通过后，交给 RhythmFollower / RhythmPhaseLock 的窗口副本里块运动主体的
+//    - 跟随频率 = 「现在 + 延迟补偿 × 倍速」那一刻的居中读数（followEstimate 是因果的最近 4 秒，居中 = 往后看 2 秒那一帧的读数），
+//    - 相位读数 = 现在这一刻的居中相位（相位拟合窗口中点落在现在附近的那些读数按拟合质量加权求圆平均，非因果平滑），
+//      按核对出来的方向折到实时的约定上，时间戳记成现在；
+//    P1 / P2 / P3 的锁定、门、滞回、上限都不变（锁不锁、用几成照旧由它们决定），只是读数没有检测延迟；
+// 3. 提前量（RhythmLookahead.stepLead）：P2 的指令相位 = 相位锁(现在 + 延迟)，按「现在的频率」外推；
+//    前瞻直接看到这段时间里画面实际走了多少相位，差值（有界 ±60°、每秒最多变 90°）加到脉动的指令相位偏移上。
+// 默认关；没读到够远 / 核对没通过 / 对不上 / 切镜 / 保持期 / 倍速读不出 / 发热 / 解码跟不上 / 读不了这个文件时
+// 窗口原样交回、提前量 0（= P4 关着时的行为，也就是 main 的 P1 / P2 / P3）。不改强度那条路，不改出口，不新增发送路径。
+
+/// 前瞻分析的一帧（视频时间轴）
+struct LookaheadRecord: Equatable {
+    /// 视频时间（秒；和 AVPlayer.currentTime() 同一条轴）
+    var time: Double
+    /// 连续段：切镜 / 重新开读 / 断档 +1。不同段的读数不混用
+    var segment: Int
+    /// 块运动主体的 followEstimate（视频时间上的 Hz）；切镜 / 保持期 / 没有主体读数时 0
+    var followHz: Double = 0
+    var followRhythm: Double = 0
+    var followAmplitude: Double = 0
+    /// 这一帧的相位拟合（time = 视频时间，hz = 视频时间上的频率）；没有时无效
+    var phase = StrokeRhythm.PhaseFit()
+}
+
+/// 居中（非因果）的相位读数
+struct LookaheadPhase: Equatable {
+    /// 视频时刻 time 的位移相位（前瞻分析器自己的主轴约定）
+    var time: Double = 0
+    var phase: Double = 0
+    /// 视频时间上的频率
+    var hz: Double = 0
+    /// 加权平均拟合 R² × 一致性
+    var quality: Double = 0
+    var linearity: Double = 0
+    var amplitude: Double = 0
+    /// 各读数外推到 time 后的一致性（圆平均的合成长度 0~1）
+    var coherence: Double = 0
+    /// 用上的读数里离窗口中点最近的那个有多居中（0~1，1 = 拟合窗口正好以 time 为中点）
+    var centering: Double = 0
+    var count = 0
+    var epoch = 0
+    var segment = 0
+    var axisX: Double = 0
+    var axisY: Double = 0
+}
+
+/// 前瞻时间轴（读帧队列追加，主线程按视频时间查询；纯数据，VisualSyncChecks 直接喂）
+struct LookaheadTimeline: Equatable {
+    static let capacity = 200
+    /// 播放头之前留这么久（核对用实时窗口里最旧的读数也够得着）
+    static let keepBehind: Double = 5
+    /// 相邻两帧隔这么久就算断档（新段）
+    static let maxGap: Double = 0.5
+    /// 查询时刻离最近一帧最多这么远
+    static let nearest: Double = 0.2
+    /// 居中相位：至少几个读数、一致性、居中程度
+    static let phaseMinCount = 3
+    static let phaseMinCoherence: Double = 0.7
+    static let phaseMinCentering: Double = 0.5
+    /// 居中频率：followEstimate 的窗口是因果的 StrokeRhythm.window 秒，居中要往后看一半
+    static let followLead: Double = StrokeRhythm.window / 2
+    /// 居中频率最少要往后看这么多才算（不然和实时一样是因果的，不用代入）
+    static let followMinLead: Double = 0.5
+
+    private(set) var records: [LookaheadRecord] = []
+    private(set) var segment = 0
+    /// 这一路从哪个视频时间开始读（restart 设；读帧那边判断要不要重读）
+    private(set) var origin: Double = .nan
+
+    init() {
+        records.reserveCapacity(Self.capacity)
+    }
+
+    var head: Double { records.last?.time ?? -.infinity }
+    var first: Double { records.first?.time ?? .infinity }
+    var isEmpty: Bool { records.isEmpty }
+
+    /// 重新开读（seek / 跳读 / 发热后恢复）：清空、新段
+    mutating func restart(at v: Double) {
+        records.removeAll(keepingCapacity: true)
+        segment += 1
+        origin = v
+    }
+
+    /// 读帧队列：一帧分析结果（s.time 是视频时间）。时间不前进的丢掉
+    mutating func append(_ s: MotionSample) {
+        guard s.time.isFinite else { return }
+        if let last = records.last {
+            guard s.time > last.time else { return }
+            if s.time - last.time > Self.maxGap { segment += 1 }
+        }
+        if s.isCut { segment += 1 }
+        var r = LookaheadRecord(time: s.time, segment: segment)
+        if s.subject.valid, !s.isCut, !s.isHeld {
+            let f = s.subject
+            if f.followHz.isFinite, f.followHz > 0 {
+                r.followHz = f.followHz
+                r.followRhythm = f.followRhythm.isFinite ? min(1, max(0, f.followRhythm)) : 0
+                r.followAmplitude = f.followAmplitude.isFinite ? max(0, f.followAmplitude) : 0
+            }
+            if f.phase.isValid { r.phase = f.phase }
+        }
+        if records.count >= Self.capacity { records.removeFirst(records.count - Self.capacity + 1) }
+        records.append(r)
+    }
+
+    /// 播放头之前 keepBehind 秒以前的丢掉
+    mutating func prune(playhead v: Double) {
+        guard v.isFinite else { return }
+        let limit = v - Self.keepBehind
+        var k = 0
+        while k < records.count, records[k].time < limit { k += 1 }
+        if k > 0 { records.removeFirst(k) }
+    }
+
+    /// time ≤ v 的最后一帧
+    func index(atOrBefore v: Double) -> Int? {
+        guard v.isFinite, let f = records.first, f.time <= v else { return nil }
+        var lo = 0
+        var hi = records.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if records[mid].time <= v { lo = mid } else { hi = mid - 1 }
+        }
+        return lo
+    }
+
+    /// v 落在哪一段：v 之前 nearest 秒内有一帧（就是那一帧的段）；之后紧跟着的那帧必须同段或 v 贴着它
+    func segment(at v: Double) -> Int? {
+        guard let i = index(atOrBefore: v), v - records[i].time <= Self.nearest else { return nil }
+        return records[i].segment
+    }
+
+    /// 从 v 起同一段一直读到了哪个视频时间（没有 = nil）
+    func reach(from v: Double) -> Double? {
+        guard let i = index(atOrBefore: v), v - records[i].time <= Self.nearest else { return nil }
+        let seg = records[i].segment
+        var j = i
+        while j + 1 < records.count, records[j + 1].segment == seg { j += 1 }
+        return records[j].time
+    }
+
+    /// 因果读数：v 时刻（之前 nearest 秒内）的最后一帧（核对用：和实时窗口同一个视频时刻的同一种读数比）
+    func causal(at v: Double) -> LookaheadRecord? {
+        guard let i = index(atOrBefore: v), v - records[i].time <= Self.nearest else { return nil }
+        return records[i]
+    }
+
+    /// v 时刻（之前 nearest 秒内）那一帧所在的段已经连续读了多久（秒，视频时间；没有 = nil）
+    func segmentAge(at v: Double) -> Double? {
+        guard let i = index(atOrBefore: v), v - records[i].time <= Self.nearest else { return nil }
+        var s = i
+        while s > 0, records[s - 1].segment == records[i].segment { s -= 1 }
+        return records[i].time - records[s].time
+    }
+
+    /// 居中的跟随频率：v 那一刻 = 同段里 v + followLead 那一帧的读数（读到的不够远时用同段最远的一帧，但至少往后看 followMinLead）。
+    /// 那一帧没有频率时：段开头攒满一个窗口才算「没有节奏」（返回 hz 0），没攒满 nil。
+    /// 返回 (hz（视频时间）, 置信度, 幅度, 往后看了多少秒)
+    func centeredFollow(at v: Double) -> (hz: Double, rhythm: Double, amplitude: Double, lead: Double)? {
+        guard let i = index(atOrBefore: v), v - records[i].time <= Self.nearest else { return nil }
+        let seg = records[i].segment
+        let target = v + Self.followLead
+        var j = i
+        while j + 1 < records.count, records[j + 1].segment == seg, records[j + 1].time <= target { j += 1 }
+        let r = records[j]
+        let lead = r.time - v
+        guard lead >= Self.followMinLead else { return nil }
+        // 这一帧还没有频率：段开头不满一个 StrokeRhythm 窗口时是「还没攒够」（不代入，实时照用），满了才是「真没有节奏」
+        if !(r.followHz > 0) {
+            var s = i
+            while s > 0, records[s - 1].segment == seg { s -= 1 }
+            guard r.time - records[s].time >= StrokeRhythm.window else { return nil }
+        }
+        return (r.followHz, r.followRhythm, r.followAmplitude, lead)
+    }
+
+    /// 居中的相位：同段、拟合窗口（因果的 2 个周期，夹在 1~3 秒）盖住 v 的那些读数，按「窗口中点离 v 多近 × 拟合 R²」加权，
+    /// 各自外推回 v 再求圆平均。只用权重最大那个读数的主轴代次（代次不同可能差 180°，混在一起会互相抵消）。
+    /// 读数不够 / 不一致 / 读到的还不够远（最居中的那个窗口中点离 v 超过四分之一个窗口）时 nil
+    func centeredPhase(at v: Double) -> LookaheadPhase? {
+        guard let i = index(atOrBefore: v), v - records[i].time <= Self.nearest else { return nil }
+        let seg = records[i].segment
+        let maxSpan = StrokeRhythm.phaseWindowRange.upperBound
+        func weight(_ r: LookaheadRecord) -> (w: Double, c: Double)? {
+            let p = r.phase
+            guard p.isValid, r.time >= v, p.quality.isFinite, p.quality > 0 else { return nil }
+            let span = min(StrokeRhythm.phaseWindowRange.upperBound,
+                           max(StrokeRhythm.phaseWindowRange.lowerBound, StrokeRhythm.phaseWindowPeriods / p.hz))
+            guard r.time - v <= span else { return nil }
+            let c = 1 - abs((r.time - v) - span / 2) / (span / 2)
+            guard c > 0 else { return nil }
+            return (c * min(1, p.quality), c)
+        }
+        var best: (w: Double, k: Int)?
+        var k = i
+        while k < records.count, records[k].segment == seg, records[k].time - v <= maxSpan {
+            if let wc = weight(records[k]), wc.w > (best?.w ?? 0) { best = (wc.w, k) }
+            k += 1
+        }
+        guard let b = best else { return nil }
+        let epoch = records[b.k].phase.epoch
+        var sw = 0.0, sc = 0.0, ss = 0.0, shz = 0.0, sq = 0.0, sl = 0.0, sa = 0.0
+        var count = 0
+        var centering = 0.0
+        k = i
+        while k < records.count, records[k].segment == seg, records[k].time - v <= maxSpan {
+            let r = records[k]
+            k += 1
+            guard r.phase.epoch == epoch, let wc = weight(r) else { continue }
+            let p = r.phase
+            let predicted = p.phase - 2 * Double.pi * p.hz * (r.time - v)
+            guard predicted.isFinite else { continue }
+            sw += wc.w
+            sc += wc.w * cos(predicted)
+            ss += wc.w * sin(predicted)
+            shz += wc.w * p.hz
+            sq += wc.w * min(1, p.quality)
+            sl += wc.w * (p.linearity.isFinite ? p.linearity : 0)
+            sa += wc.w * (p.amplitude.isFinite ? p.amplitude : 0)
+            count += 1
+            centering = max(centering, wc.c)
+        }
+        guard count >= Self.phaseMinCount, sw > 0 else { return nil }
+        let coherence = sqrt(sc * sc + ss * ss) / sw
+        guard coherence.isFinite, coherence >= Self.phaseMinCoherence, centering >= Self.phaseMinCentering else { return nil }
+        let a = records[b.k].phase
+        return LookaheadPhase(time: v, phase: StrokeRhythm.wrapPhase(atan2(ss, sc)), hz: shz / sw,
+                              quality: sq / sw * coherence, linearity: sl / sw, amplitude: sa / sw,
+                              coherence: coherence, centering: centering, count: count, epoch: epoch, segment: seg,
+                              axisX: a.axisX, axisY: a.axisY)
+    }
+
+    /// 视频时间 v0 → v1 之间画面实际走了多少相位（弧度；同段、同代次的两个居中相位，按平均频率解开整圈）
+    func phaseAdvance(from v0: Double, to v1: Double) -> Double? {
+        guard v1 >= v0, let a = centeredPhase(at: v0), let b = centeredPhase(at: v1),
+              a.segment == b.segment, a.epoch == b.epoch else { return nil }
+        let hz = (a.hz + b.hz) / 2
+        let expected = 2 * Double.pi * hz * (v1 - v0)
+        let dev = StrokeRhythm.wrapPhase(b.phase - a.phase - expected)
+        let adv = expected + dev
+        return adv.isFinite ? adv : nil
+    }
+}
+
+/// 前瞻的主线程状态（rhythm-lookahead P4，每个完整拍一次；纯状态，VisualSyncChecks 覆盖）：
+/// 核对两条时间轴是不是同一个画面 → 把交给频率跟随器 / 相位锁的窗口副本换成没有检测延迟的读数 → 算脉动的提前量
+struct RhythmLookahead {
+    static let agreeRatio: Double = 0.15
+    /// 频率核对只看最近 historyLength 次（复审 M2：不按开播以来的累计次数，前面对上过不代表现在还对得上）
+    static let historyLength = 8
+    /// 「核对通过」：最近 8 次里一致 ≥ 3 次、不一致 ≤ 2 次，且最近一次不是不一致
+    static let verifyAgreements = 3
+    static let verifyMaxDisagreements = 2
+    static let mismatchDisagreements = 5
+    /// 实时没有跟随频率、前瞻同一时刻却有置信度 ≥ 这个的频率：算一次不一致（= RhythmFollower 锁定的门）
+    static let confidentRhythm: Double = RhythmFollower.lockConfidence
+    /// 相位折叠后差 ≤ 45° 算同向 / 反向
+    static let flipTolerance: Double = Double.pi / 4
+    static let flipConfirm = 2
+    /// 最近 6 次相位核对里 ≥ 4 次对不上（45°~135°）：方向作废，不代入相位
+    static let phaseHistoryLength = 6
+    static let phaseMisses = 4
+    /// 方向核对多久没更新就作废（换了镜头 / 实时那边一直没有相位读数）
+    static let flipStaleSeconds: Double = 3
+    /// 频率核对多久没记过就作废（复审 R3-M1：最近一次核对太旧 = 现在没人在核对，不能再凭老结果代入）。
+    /// 和方向作废同一个时长：约 10 个完整拍，够跨过切镜 / 保持期那几拍
+    static let verifyStaleSeconds: Double = flipStaleSeconds
+    /// 提前量上限 / 每秒最多变多少
+    static let maxLead: Double = Double.pi / 3
+    static let leadRatePerSecond: Double = Double.pi / 2
+    /// 实时窗口里没有相位读数时，按「现在 − 这么久」当实时频率读数的时刻（窗口最后一帧大约这么旧）
+    static let windowAge: Double = 0.1
+
+    enum State: Equatable {
+        /// 关着（播放器不调用）
+        case off
+        /// 前瞻还没读到够远 / 这一拍不能用（切镜、保持期、倍速读不出）
+        case waiting
+        /// 读到了，正在和实时画面核对
+        case checking
+        /// 和实时画面对不上：只用实时
+        case mismatch
+        /// 只代入了频率（相位方向还没核对上 / 读数不够）
+        case frequencyOnly
+        /// 频率和相位都按前瞻
+        case engaged
+    }
+
+    /// 播放器这一拍的时钟：host 时间 hostNow 时播放头在 itemNow（视频秒），倍速 rate
+    struct Clock: Equatable {
+        var hostNow: Double
+        var itemNow: Double
+        var rate: Double
+
+        var isValid: Bool { hostNow.isFinite && itemNow.isFinite && rate.isFinite && rate > 0.01 }
+        /// host 时刻 → 视频时刻
+        func video(_ host: Double) -> Double { itemNow + (host - hostNow) * rate }
+    }
+
+    private(set) var state = State.off
+    /// 最近 historyLength 次频率核对（true = 一致），新的在低位
+    private var history: UInt32 = 0
+    private var historyCount = 0
+    /// 最近一次记下频率核对的 host 时间 / 最近一次 refine 的 host 时间（复审 R3-M1：核对太旧就不算通过）
+    private var lastCheckAt = -Double.infinity
+    private var hostNow = -Double.infinity
+    /// 上一次核对用的时间轴是从哪开读的（LookaheadTimeline.origin 的位模式）：变了 = 读帧那边重读过（seek / 发热或后台恢复 /
+    /// 跟不上后重来），核对历史作废（复审 M2）
+    private var timelineOrigin: UInt64?
+    /// 相位核对：最近几次（true = 对不上）
+    private var phaseHistory: UInt32 = 0
+    private var phaseHistoryCount = 0
+    /// 前瞻主轴相对实时主轴：false = 同向、true = 反向、nil = 还不知道
+    private(set) var flip: Bool?
+    private var flipEpoch = 0
+    private var flipSegment = 0
+    private var flipAt = -Double.infinity
+    private var flipCand: Bool?
+    private var flipCandCount = 0
+    private var flipCandEpoch = 0
+    private var flipCandSegment = 0
+    /// 脉动指令相位的提前量（弧度，加到 RhythmPulseDriver.phaseOffset 上）
+    private(set) var lead: Double = 0
+    private(set) var leadTarget: Double = 0
+    private(set) var frequencyEngaged = false
+    private(set) var phaseEngaged = false
+    /// 读到了播放头之后多远（秒，视频时间；状态行用）
+    private(set) var ahead: Double = 0
+
+    /// 核对通过（只看最近 historyLength 次）：一致 ≥ 3、不一致 ≤ 2，且最近一次不是不一致；
+    /// 最近一次核对离最近一次 refine 不超过 verifyStaleSeconds（复审 R3-M1：老结果不续命）
+    var verified: Bool {
+        historyCount > 0 && history & 1 == 1
+            && agreements >= Self.verifyAgreements && disagreements <= Self.verifyMaxDisagreements
+            && hostNow - lastCheckAt <= Self.verifyStaleSeconds
+    }
+
+    var mismatched: Bool {
+        historyCount >= Self.mismatchDisagreements && disagreements >= Self.mismatchDisagreements
+    }
+
+    /// 最近 historyLength 次核对里一致 / 不一致的次数
+    var agreements: Int { historyCount - disagreements }
+
+    var disagreements: Int {
+        var n = 0
+        for b in 0..<min(historyCount, Self.historyLength) where history & (1 << UInt32(b)) == 0 { n += 1 }
+        return n
+    }
+
+    private var phaseMissCount: Int {
+        var n = 0
+        for b in 0..<min(phaseHistoryCount, Self.phaseHistoryLength) where phaseHistory & (1 << UInt32(b)) != 0 { n += 1 }
+        return n
+    }
+
+    /// seek / 切镜 / 关开关 / 缓冲：方向、提前量从头来；核对历史保留（同一路连续读的时间轴，两条时间轴的对应关系不变）。
+    /// 读帧那边重新开读时（时间轴 origin 变了）refine 会把核对历史清掉
+    mutating func reset() {
+        flip = nil
+        flipCand = nil
+        flipCandCount = 0
+        flipAt = -.infinity
+        phaseHistory = 0
+        phaseHistoryCount = 0
+        lead = 0
+        leadTarget = 0
+        frequencyEngaged = false
+        phaseEngaged = false
+        ahead = 0
+        state = .off
+    }
+
+    /// 换视频 / 拆取帧：全清
+    mutating func resetVideo() {
+        self = RhythmLookahead()
+    }
+
+    private mutating func noteAgreement(_ agree: Bool, at now: Double) {
+        history = ((history << 1) | (agree ? 1 : 0)) & ((1 << UInt32(Self.historyLength)) - 1)
+        historyCount = min(Self.historyLength, historyCount + 1)
+        lastCheckAt = now
+    }
+
+    /// 读帧那边重读了：频率核对历史清掉，要重新对上才用（方向另由 epoch / segment 管）
+    private mutating func clearHistory() {
+        history = 0
+        historyCount = 0
+        lastCheckAt = -.infinity
+    }
+
+    private mutating func notePhaseMiss(_ miss: Bool) {
+        phaseHistory = ((phaseHistory << 1) | (miss ? 1 : 0)) & ((1 << UInt32(Self.phaseHistoryLength)) - 1)
+        phaseHistoryCount = min(Self.phaseHistoryLength, phaseHistoryCount + 1)
+    }
+
+    /// 前瞻这一帧有把握有节奏（频率 > 0、置信度 ≥ confidentRhythm）
+    static func confident(_ r: LookaheadRecord) -> Bool {
+        r.followHz.isFinite && r.followHz > 0 && r.followRhythm.isFinite && r.followRhythm >= confidentRhythm
+    }
+
+    static func agree(_ a: Double, _ b: Double) -> Bool {
+        guard a.isFinite, b.isFinite, a > 0, b > 0 else { return false }
+        return abs(log(a / b)) <= log(1 + agreeRatio)
+    }
+
+    /// 每个完整拍一次：核对 + 代入。w：实时窗口（P3 动作识别之前的原窗口）；latency：延迟补偿（秒，host 时间）。
+    /// 返回交给频率跟随器 / 相位锁（以及之后 P3 动作识别）的窗口；不能用时原样返回
+    mutating func refine(_ w: MotionWindow, timeline: LookaheadTimeline, clock: Clock, latency: TimeInterval) -> MotionWindow {
+        frequencyEngaged = false
+        phaseEngaged = false
+        // 读帧那边重新开读过（origin 变了）：之前的核对是另一路读出来的，作废（复审 M2）
+        let origin = timeline.origin.bitPattern
+        if let seen = timelineOrigin, seen != origin { clearHistory() }
+        timelineOrigin = origin
+        if clock.hostNow.isFinite { hostNow = clock.hostNow }
+        guard clock.isValid else {
+            state = .waiting
+            return w
+        }
+        let vNow = clock.itemNow
+        let reach = timeline.reach(from: vNow)
+        ahead = reach.map { max(0, $0 - vNow) } ?? 0
+        if w.cutCount > 0 {
+            // 切镜：两路的主轴都重取，方向从头核对；这一拍原样（跟随器 / 相位锁自己会放开）
+            flip = nil
+            flipCand = nil
+            flipCandCount = 0
+            state = .waiting
+            return w
+        }
+        check(w, timeline: timeline, clock: clock)
+        guard reach != nil else {
+            state = .waiting
+            return w
+        }
+        if mismatched {
+            state = .mismatch
+            return w
+        }
+        guard verified else {
+            state = .checking
+            return w
+        }
+        // 保持期（切镜后头两帧）/ 没有主体读数：原样
+        guard w.subjectFrames > 0, w.heldCount == 0, w.frames > 0 else {
+            state = .waiting
+            return w
+        }
+        var out = w
+        let lat = latency.isFinite ? max(0, latency) : 0
+        let vf = vNow + lat * clock.rate
+        if let seg = timeline.segment(at: vNow), timeline.segment(at: vf) == seg,
+           let f = timeline.centeredFollow(at: vf), f.hz.isFinite {
+            out.subjectFollowHz = f.hz > 0 ? f.hz * clock.rate : 0
+            out.subjectFollowRhythm = f.hz > 0 ? f.rhythm : 0
+            out.subjectFollowAmplitude = f.hz > 0 ? f.amplitude : 0
+            frequencyEngaged = true
+        }
+        if let fl = flip, clock.hostNow - flipAt <= Self.flipStaleSeconds, phaseMissCount < Self.phaseMisses,
+           let c = timeline.centeredPhase(at: vNow), c.epoch == flipEpoch, c.segment == flipSegment {
+            var fit = StrokeRhythm.PhaseFit()
+            fit.time = clock.hostNow
+            fit.phase = StrokeRhythm.wrapPhase(c.phase + (fl ? Double.pi : 0))
+            fit.hz = c.hz * clock.rate
+            fit.quality = c.quality
+            fit.linearity = c.linearity
+            fit.amplitude = c.amplitude
+            if w.subjectPhase.isValid {
+                fit.epoch = w.subjectPhase.epoch
+                fit.axisX = w.subjectPhase.axisX
+                fit.axisY = w.subjectPhase.axisY
+            } else {
+                fit.epoch = c.epoch
+                fit.axisX = fl ? -c.axisX : c.axisX
+                fit.axisY = fl ? -c.axisY : c.axisY
+            }
+            if fit.isValid {
+                out.subjectPhase = fit
+                phaseEngaged = true
+            }
+        }
+        state = phaseEngaged ? .engaged : (frequencyEngaged ? .frequencyOnly : .waiting)
+        return out
+    }
+
+    /// 核对：实时窗口最后的读数 ↔ 同一个视频时刻前瞻的因果读数
+    private mutating func check(_ w: MotionWindow, timeline: LookaheadTimeline, clock: Clock) {
+        guard w.subjectFrames > 0, w.heldCount == 0, w.subjectFollowHz.isFinite else { return }
+        let tRt = w.subjectPhase.isValid ? w.subjectPhase.time : clock.hostNow - Self.windowAge
+        let vRt = clock.video(tRt)
+        guard let rec = timeline.causal(at: vRt) else { return }
+        guard rec.followHz > 0 else {
+            // 复审 R3-M1：反过来——实时有把握有节奏，前瞻在那一刻和「现在」都没有节奏、同一段、而且这段已经攒满一个
+            // StrokeRhythm 窗口（不是段开头还没攒够）= 不一致。不记的话核对一直停在以前的「通过」，前瞻会拿「没节奏」顶掉实时的节奏。
+            // 节奏在这一拍才开始时前瞻「现在」那帧已经有频率，不误记
+            if w.subjectFollowHz > 0, w.subjectFollowRhythm.isFinite, w.subjectFollowRhythm >= Self.confidentRhythm,
+               let age = timeline.segmentAge(at: vRt), age >= StrokeRhythm.window,
+               let cur = timeline.causal(at: clock.itemNow), cur.segment == rec.segment, !(cur.followHz > 0) {
+                noteAgreement(false, at: clock.hostNow)
+            }
+            return
+        }
+        guard w.subjectFollowHz > 0 else {
+            // 复审 M2：实时这一刻没有节奏，前瞻（同样是因果读数）却有把握有节奏 = 不一致。
+            // 窗口的跟随频率是最后一帧的、相位时间可能是更早一帧的：前瞻在那一刻和「现在」（不早于实时最后一帧）都有把握、
+            // 同一段才算，节奏真的在这一拍停了时两边一起停，不误记。前瞻自己也没把握时不算（两边都在攒 / 都快没了）。
+            // 小幅 seek 没重读时实时刚清空、前瞻还连着，这几拍也会记成不一致，只会让前瞻晚一点用上（安全方向）
+            if Self.confident(rec), let cur = timeline.causal(at: clock.itemNow), cur.segment == rec.segment,
+               Self.confident(cur) {
+                noteAgreement(false, at: clock.hostNow)
+            }
+            return
+        }
+        noteAgreement(Self.agree(rec.followHz * clock.rate, w.subjectFollowHz), at: clock.hostNow)
+        // 相位：两边都有拟合、频率对得上才比；按 0° / 180° 折叠
+        let rp = w.subjectPhase
+        guard rp.isValid, rec.phase.isValid, Self.agree(rec.phase.hz * clock.rate, rp.hz) else { return }
+        let predicted = rec.phase.phase + 2 * Double.pi * rec.phase.hz * (vRt - rec.time)
+        let d = abs(StrokeRhythm.wrapPhase(rp.phase - predicted))
+        let obs: Bool?
+        if d <= Self.flipTolerance {
+            obs = false
+        } else if d >= Double.pi - Self.flipTolerance {
+            obs = true
+        } else {
+            obs = nil
+        }
+        notePhaseMiss(obs == nil)
+        guard let o = obs else {
+            flipCandCount = 0
+            flipCand = nil
+            return
+        }
+        let epoch = rec.phase.epoch
+        let seg = rec.segment
+        if flipCand == o, flipCandEpoch == epoch, flipCandSegment == seg {
+            flipCandCount += 1
+        } else {
+            flipCand = o
+            flipCandCount = 1
+            flipCandEpoch = epoch
+            flipCandSegment = seg
+        }
+        if flip == o, flipEpoch == epoch, flipSegment == seg {
+            flipAt = clock.hostNow
+        } else if flipCandCount >= Self.flipConfirm {
+            flip = o
+            flipEpoch = epoch
+            flipSegment = seg
+            flipAt = clock.hostNow
+        }
+    }
+
+    /// 每个完整拍一次（refine 之后、相位锁 step 之后）：前瞻里「现在 → 现在 + 延迟」画面实际走的相位，减去相位锁按现在的频率外推的，
+    /// 有界 ±60°，每秒最多变 90°；没代入相位 / 相位锁没在用 / 延迟 0 时回 0（相位锁不用时立刻 0）
+    mutating func stepLead(timeline: LookaheadTimeline, clock: Clock, latency: TimeInterval, lockOmega: Double,
+                           lockWeight: Double, dt: TimeInterval) -> Double {
+        guard lockWeight > 0, lockWeight.isFinite else {
+            lead = 0
+            leadTarget = 0
+            return 0
+        }
+        var target = 0.0
+        let lat = latency.isFinite ? max(0, latency) : 0
+        if phaseEngaged, clock.isValid, lat > 0, lockOmega.isFinite, lockOmega > 0,
+           let adv = timeline.phaseAdvance(from: clock.itemNow, to: clock.itemNow + lat * clock.rate) {
+            let dev = StrokeRhythm.wrapPhase(adv - lockOmega * lat)
+            target = min(Self.maxLead, max(-Self.maxLead, dev))
+        }
+        leadTarget = target
+        let step = (dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval) * Self.leadRatePerSecond
+        if lead < target {
+            lead = min(target, lead + step)
+        } else if lead > target {
+            lead = max(target, lead - step)
+        }
+        if !lead.isFinite { lead = 0 }
+        return lead
+    }
+
+    /// 两者相加后的总偏移上限：撞击声校正自己最宽就是 ±90°（AudioPhaseAnchor.unknownLimit），前瞻不把总偏移推到更宽
+    static let maxTotalOffset: Double = AudioPhaseAnchor.unknownLimit
+
+    /// 脉动相位偏移 = 撞击声校正 + 前瞻提前量（总和夹在 ±90°）；提前量 0 时就是撞击声校正本身（逐位相同，不夹）
+    static func phaseOffset(anchor: Double, lead: Double) -> Double {
+        guard lead != 0 else { return anchor }
+        let sum = anchor + lead
+        guard sum.isFinite else { return anchor.isFinite ? anchor : 0 }
+        return min(maxTotalOffset, max(-maxTotalOffset, sum))
+    }
+
+    /// 界面上的一行。reader：读帧那边的情况（nil = 正常在读）
+    func statusText(reader: String?) -> String {
+        if let r = reader { return "前瞻：\(r)，只用实时画面" }
+        let a = String(format: "%.1f", ahead)
+        switch state {
+        case .off, .waiting:
+            return ahead > 0.05 ? "前瞻：已读到后面 \(a) 秒，等够长的画面再用" : "前瞻：正在提前读后面的画面…"
+        case .checking:
+            return "前瞻：已读到后面 \(a) 秒，正在和实时画面核对"
+        case .mismatch:
+            return "前瞻：和实时画面对不上，只用实时画面"
+        case .frequencyOnly:
+            return "前瞻：已读到后面 \(a) 秒，频率按将来的画面；相位还在核对方向，按实时"
+        case .engaged:
+            let deg = Int((lead * 180 / Double.pi).rounded())
+            return "前瞻：已读到后面 \(a) 秒，频率和相位都按将来的画面" + (deg != 0 ? String(format: "（提前修正 %+d°）", deg) : "")
+        }
+    }
+}
+
+extension LookaheadTimeline {
+    /// 读帧那边（rhythm-lookahead P4）：前瞻最多领先播放头这么久（视频秒）。
+    /// 至少要盖住 居中频率往后看的 2 秒 + 延迟补偿（≤ 0.6 秒）
+    static let horizon: Double = 3
+    /// 播放头比还留着的最早一帧（没有帧时是开读处）早这么多（往回 seek / 播完重播）就从播放头重新开读
+    static let restartBehind: Double = 0.25
+    /// 播放头比读到的最远处还靠后这么多（往前 seek / 解码跟不上）就从播放头重新开读
+    static let restartAhead: Double = 1
+
+    /// 播放头 v 不在这一路能接着读的范围里：要从 v 重新开读（还没开读过也算）。
+    /// 往回比的是还留着的最早一帧（复审 M1）：prune 只留播放头前 5 秒，往回 seek 到开读处之后、最早一帧之前
+    /// （含播完后从 0 重播：读帧那边已读到文件尾）也要重读，不然这段一直没有前瞻
+    func needsRestart(playhead v: Double) -> Bool {
+        guard v.isFinite else { return false }
+        guard origin.isFinite else { return true }
+        let low = records.first.map { max(origin, $0.time) } ?? origin
+        if v < low - Self.restartBehind { return true }
+        let reached = records.isEmpty ? origin : max(origin, head)
+        return v > reached + Self.restartAhead
+    }
+
+    /// 还要不要往后读（读到的还没到 v + horizon）
+    func wantsMore(playhead v: Double) -> Bool {
+        guard v.isFinite else { return false }
+        let reached = records.isEmpty ? (origin.isFinite ? origin : -.infinity) : head
+        return reached < v + Self.horizon
+    }
+}
+
+/// rhythm-lookahead P4：另开一路解码（前瞻 / 预扫描）的发热规则。
+/// 只在 .nominal / .fair 跑；.serious 起整个停掉（画面分析本身那时也降频，P3 的手 / 脸 Vision 只在 .nominal）。
+/// 这一路不跑任何 Vision 请求
+enum LookaheadThermalPolicy {
+    static func allowsExtraDecode(_ state: ProcessInfo.ThermalState) -> Bool {
+        switch state {
+        case .nominal, .fair: return true
+        case .serious, .critical: return false
+        @unknown default: return false
+        }
+    }
+
+    /// 停掉时的说明（状态行用）；能跑时 nil
+    static func note(_ state: ProcessInfo.ThermalState) -> String? {
+        allowsExtraDecode(state) ? nil : "手机发热，已暂停提前读视频"
+    }
+}
+
+/// rhythm-lookahead P4：预扫描（选视频后在后台把整段视频按 15 Hz 分析一遍，默认关）。
+/// 按 0.3 秒视频时间攒成和实时同样的窗口，记下 MotionNormalizer 会拿来学参考值的那些量（同样的门：
+/// 过了噪声门、没有切镜 / 保持期、近场 < 0.5），最后给 10 / 90 分位。纯数据，VisualSyncChecks 直接喂。
+/// 只用来给 MotionNormalizer.seed 当起点；播放时以实时分析为准
+struct MotionPrescan {
+    /// 和实时一样每 0.3 秒一个窗口
+    static let windowSeconds: Double = AudioReactiveShaper.interval
+    /// 至少这么多个可学的窗口（约 9 秒）才给分位数
+    static let minWindows = 30
+    /// 最多记这么多个窗口（约 2 小时；更长的视频只看前 2 小时）
+    static let maxWindows = 24_000
+    static let lowQuantile: Double = 0.1
+    static let highQuantile: Double = 0.9
+
+    struct Summary: Equatable {
+        var refLow: Double = .nan
+        var refHigh: Double = .nan
+        var scoreLow: Double = .nan
+        var scoreHigh: Double = .nan
+        var energyWindows = 0
+        var scoreWindows = 0
+        /// 扫到了哪个视频时间（秒）
+        var scanned: Double = 0
+
+        var isValid: Bool { energyWindows >= MotionPrescan.minWindows || scoreWindows >= MotionPrescan.minWindows }
+    }
+
+    private var accumulator = MotionWindowAccumulator()
+    private var windowStart: Double = .nan
+    private(set) var windows = 0
+    private(set) var energy: [Float] = []
+    private(set) var score: [Float] = []
+    private(set) var scanned: Double = 0
+
+    /// 一帧分析结果（s.time 是视频时间）。时间倒退的（重读 / 坏时间戳）丢掉
+    mutating func add(_ s: MotionSample) {
+        guard s.time.isFinite, s.time >= scanned || windowStart.isNaN else { return }
+        if windowStart.isNaN { windowStart = s.time }
+        while s.time >= windowStart + Self.windowSeconds {
+            closeWindow()
+            windowStart += Self.windowSeconds
+            if s.time >= windowStart + 10 * Self.windowSeconds { windowStart = s.time }
+        }
+        accumulator.add(s)
+        scanned = max(scanned, s.time)
+    }
+
+    /// 扫完：最后半截窗口也算
+    mutating func finish() {
+        closeWindow()
+    }
+
+    private mutating func closeWindow() {
+        let w = accumulator.drain()
+        guard w.frames > 0, windows < Self.maxWindows else { return }
+        windows += 1
+        let near = w.nearField.isFinite ? min(1, max(0, w.nearField)) : 0
+        guard w.settled, near < MotionNormalizer.nearFieldLearnLimit else { return }
+        let e = w.representative
+        if e.isFinite, e >= MotionNormalizer.absoluteGate {
+            let l = log(1 + e)
+            if l.isFinite { energy.append(Float(l)) }
+        }
+        if w.subjectFrames > 0 {
+            var sc = MotionStats.clamp01(w.subjectScore)
+            if near > 0 { sc -= near * max(0, sc - MotionNormalizer.subjectNearFloor) }
+            score.append(Float(MotionStats.clamp01(sc)))
+        }
+    }
+
+    static func quantile(_ sorted: [Float], _ q: Double) -> Double {
+        guard !sorted.isEmpty else { return .nan }
+        let k = min(sorted.count - 1, max(0, Int((q * Double(sorted.count - 1)).rounded())))
+        return Double(sorted[k])
+    }
+
+    var summary: Summary {
+        var s = Summary()
+        s.scanned = scanned
+        s.energyWindows = energy.count
+        s.scoreWindows = score.count
+        if energy.count >= Self.minWindows {
+            let e = energy.sorted()
+            s.refLow = Self.quantile(e, Self.lowQuantile)
+            s.refHigh = Self.quantile(e, Self.highQuantile)
+        }
+        if score.count >= Self.minWindows {
+            let c = score.sorted()
+            s.scoreLow = Self.quantile(c, Self.lowQuantile)
+            s.scoreHigh = Self.quantile(c, Self.highQuantile)
+        }
+        return s
+    }
+}
+
+/// rhythm-lookahead P4 的播放器接线（纯状态；VideoSyncPlayer 和 VisualSyncChecks 用同一份）：
+/// enabled == false 时每个函数都把输入原样交回（窗口 ==、相位偏移逐位相同），状态清掉，
+/// 所以开关关着 / 没标定 / 读帧那边停了时整条链就是 P4 之前的行为
+struct LookaheadCoordinator {
+    private(set) var lookahead = RhythmLookahead()
+    /// 上一拍加过提前量：当时的撞击声部分和加完的总值（下一拍先撤掉再算撞击声校正）
+    private var appliedAnchor: Double = 0
+    private var appliedTotal: Double = 0
+    private var hasApplied = false
+
+    var lead: Double { lookahead.lead }
+
+    mutating func reset() {
+        lookahead.reset()
+        hasApplied = false
+    }
+
+    mutating func resetVideo() {
+        lookahead.resetVideo()
+        hasApplied = false
+    }
+
+    /// 每个完整拍、交给频率跟随器 / 相位锁（以及 P3 动作识别）之前
+    mutating func refine(_ w: MotionWindow, enabled: Bool, timeline: LookaheadTimeline,
+                         clock: RhythmLookahead.Clock, latency: TimeInterval) -> MotionWindow {
+        guard enabled else {
+            if lookahead.state != .off || hasApplied { reset() }
+            return w
+        }
+        return lookahead.refine(w, timeline: timeline, clock: clock, latency: latency)
+    }
+
+    /// 撞击声校正算之前：把上一拍加上去的提前量撤掉（没加过 / 偏移已经被别处改过时原样返回）。
+    /// 防御性的：现在播放器里 updateAudioAnchor 每个完整拍都会整个改写 phaseOffset（关着 / 读不出倍速时写 0，开着写校正值），
+    /// 撤不撤结果一样；留着是为了以后撞击声校正改成在原偏移上累加时，提前量也不会一拍拍叠上去
+    mutating func removeLead(from offset: Double) -> Double {
+        guard hasApplied else { return offset }
+        hasApplied = false
+        return offset.bitPattern == appliedTotal.bitPattern ? appliedAnchor : offset
+    }
+
+    /// 撞击声校正算完、相位锁 step 之后：加上这一拍的提前量（总和有界）；没开时原样返回
+    mutating func applyLead(to anchor: Double, enabled: Bool, timeline: LookaheadTimeline,
+                            clock: RhythmLookahead.Clock, latency: TimeInterval, lock: RhythmPhaseLock,
+                            dt: TimeInterval) -> Double {
+        guard enabled else {
+            hasApplied = false
+            return anchor
+        }
+        let lead = lookahead.stepLead(timeline: timeline, clock: clock, latency: latency, lockOmega: lock.omega,
+                                      lockWeight: lock.weight, dt: dt)
+        let total = RhythmLookahead.phaseOffset(anchor: anchor, lead: lead)
+        if lead != 0 {
+            appliedAnchor = anchor
+            appliedTotal = total
+            hasApplied = true
+        } else {
+            hasApplied = false
+        }
+        return total
+    }
+
+    func statusText(reader: String?) -> String { lookahead.statusText(reader: reader) }
 }
