@@ -1335,6 +1335,26 @@ F3b 四道门逐一不满足 → 逐位等于画面值；跨切镜证据后 10 �
 `Tests/FusionOffCompare/run.sh` 多编一份 `-D AV_FUSION_ON -D AV_F2_ON -D AV_F3_ON`（重音 / F3b 接线全走、耦合强制不成立 = S1），输出和 f706431 逐字节相同。
 真机验证见 `docs/rhythm-calibration.md` 第 13 节。
 
+### av-fusion F4：互为回落 + 相位飞轮（开关 `bcVisualSyncAVFallback`，默认关）
+
+研究页 F4 一步。画面暂时不可用（`motionSignal` 断：发热暂停、取帧停了、没视频轨、近场 / 切镜保持期让画面没有新鲜样本）时，声音临时替补；画面回来交回。
+`usesAVFallback` = 融合生效 + 开关，不影响 Timer 间隔。
+
+- `HandoverRamp`：把 `SourceHandover` 的爬坡 `min(1, max(0, elapsed / seconds))` 抽成纯函数，`SourceHandover` 改调它，算式逐位不变（测试 5000 组随机含 NaN 逐位相同）。
+- `AVFallbackBlend.step(blended:motionSignal:audio:audioSignal:now:dt:)`：接在 `handover.blend` 之后。画面连续不可用 ≥ 0.6 秒那一刻判一次门——
+  声音有信号，而且「最近 10 秒内耦合过」或「最近 10 秒的融合判断有声音且 P_music < 0.3」；门满足 → 声音占比 1.5 秒线性爬满，
+  值 = 占比 × 声音 + (1 − 占比) × 画面（≤ max(画面, 声音)）；门不满足 → 占比不涨（维持现状，通常是 0）。门在这一次断开里只判一次，不中途掉。
+  声音也没了 → 声音那份当 0、没信号（不加最低强度）。画面回来 → 占比 1.5 秒降到 0，同时值每拍最多降 12；占比 0 且降速不再托着时原样返回 `blended`（逐位等于原路径）。
+  融合因画面分析停下而停时，门的记忆不清（发热暂停正是这时）；暂停 / seek / 缓冲 / 关联动 / 换视频 / 换来源 → `resetFallback()`，当拍走原路径。
+- `AVPhaseFlywheel.step(lock:s2:audioHz:now:)`：S2 里相位锁丢了（locked → false），而最近几下撞击的频率（× 倍速）和丢之前的锁频率差 ≤ 15% 时，
+  相位脉动（完整拍和子拍）继续用丢之前那一拍的相位锁（按它的频率外推相位）最多 1.5 秒，然后照常放开。只是外推，不用撞击时刻改相位；频率对不上 / 没撞击 / 不在 S2 → 立刻用实时锁。
+- 状态行「画面暂不可用，暂按声音」（只在替补时出现）；调试列 3 列 `av_fallback_share` / `av_video_gone_s` / `av_flywheel`。
+- 结果仍只经 `tick()` → `SyncOutputStage` → `BLEManager.sendTick`；STOP / 看门狗 / 断连照旧。
+
+测试（`avFusionF4Checks`）：设置；爬坡纯函数逐位相同；断开 0.6 秒前照原路径、之后 1.5 秒爬到声音且有上界；门（像配乐没耦合不补、P_music 低补、没声音不算、只判一次、过期不补）；
+画面和声音都没了 → 0 且没信号；画面回来每拍降 ≤ 12、交回后逐位原样；reset 后当拍原路径；5000 组随机经出口的上限 / 升幅 / 通道、画面一直在时逐位原样；
+飞轮维持 1.5 秒后放开、各种不维持的情况；调试列。`FusionOffCompare` 多编 `-D AV_F4_ON`（接线全走、画面一直在、不在 S2），和 f706431 逐字节相同。
+
 ## 11. 风险与待定
 
 1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。rhythm-follow P1 也按速度档设计，P0 标定（`docs/rhythm-calibration.md` 第 1 步）先确认。

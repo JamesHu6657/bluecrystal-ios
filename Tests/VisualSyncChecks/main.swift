@@ -8278,7 +8278,187 @@ func avFusionF3Checks() {
 }
 
 
+
+/// av-fusion F4 的检查（互为回落 + 相位飞轮）
+func avFusionF4Checks() {
+    var seed: UInt64 = 0xF4F4
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    func beat(_ state: AVFusionBeat.State, pMusic: Double = 0) -> AVFusionBeat {
+        var b = AVFusionBeat()
+        b.state = state
+        b.pMusic = pMusic
+        return b
+    }
+
+    // 设置
+    let def = VisualSyncSettings()
+    let on = VisualSyncSettings(source: .motion, avFusion: true, avFallback: true)
+    var offF = on
+    offF.avFallback = false
+    vcheck(!def.avFallback && !def.usesAVFallback && VisualSyncSettings.Keys.avFallback == "bcVisualSyncAVFallback"
+           && on.usesAVFallback && !VisualSyncSettings(source: .audio, avFusion: true, avFallback: true).usesAVFallback
+           && !VisualSyncSettings(source: .motion, avFusion: false, avFallback: true).usesAVFallback
+           && on.tickInterval == offF.tickInterval,
+           "F4 设置：默认关、键名、要融合 + 跟随画面，不改 Timer 间隔")
+
+    // 爬坡抽成纯函数：和原式逐位相同
+    var rampSame = true
+    for _ in 0..<5000 {
+        let e = rnd() < 0.05 ? Double.nan : rnd() * 4 - 1
+        let sec = 0.5 + rnd() * 3
+        let a = HandoverRamp.share(elapsed: e, seconds: sec)
+        let b = min(1, max(0, e / sec))
+        if a.bitPattern != b.bitPattern { rampSame = false }
+    }
+    vcheck(rampSame, "F4：HandoverRamp.share 和 SourceHandover 原来的爬坡式逐位相同（5000 组随机，含 NaN）")
+
+    // 画面断开 → 0.6 秒后 1.5 秒爬到声音；值 ≤ max(画面, 声音)
+    func run(gate: AVFusionBeat?, audio: Double = 80, audioSignal: Bool = true, goneBeats: Int = 12,
+             backBeats: Int = 0, video: Double = 10) -> (values: [Double], signals: [Bool], fb: AVFallbackBlend) {
+        var f = AVFallbackBlend()
+        var vals: [Double] = []
+        var sigs: [Bool] = []
+        var now = 0.0
+        for _ in 0..<10 {   // 画面正常 3 秒
+            now += 0.3
+            f.note(beat: gate, now: now)
+            let o = f.step(blended: (video, true), motionSignal: true, audio: audio, audioSignal: audioSignal, now: now, dt: 0.3)
+            vals.append(o.value)
+            sigs.append(o.hasSignal)
+        }
+        for _ in 0..<goneBeats {
+            now += 0.3
+            let o = f.step(blended: (0, false), motionSignal: false, audio: audio, audioSignal: audioSignal, now: now, dt: 0.3)
+            vals.append(o.value)
+            sigs.append(o.hasSignal)
+        }
+        for _ in 0..<backBeats {
+            now += 0.3
+            let o = f.step(blended: (video, true), motionSignal: true, audio: audio, audioSignal: audioSignal, now: now, dt: 0.3)
+            vals.append(o.value)
+            sigs.append(o.hasSignal)
+        }
+        return (vals, sigs, f)
+    }
+    let coupled = run(gate: beat(.coupled, pMusic: 0.9))
+    let gone = Array(coupled.values[10...])
+    // 断开第 1 拍 0.3 秒、第 2 拍 0.6 秒（到 0.6 秒那拍起爬，每拍 +0.2）
+    let expect: [Double] = [0, 16, 32, 48, 64, 80, 80, 80, 80, 80, 80, 80]
+    let rampOK = zip(gone, expect).allSatisfy { abs($0.0 - $0.1) < 1e-9 } && coupled.values.prefix(10).allSatisfy { $0 == 10 }
+    let bounded = coupled.values.allSatisfy { $0 <= 80 + 1e-9 }
+    vcheck(rampOK && bounded && coupled.signals[10] == false && coupled.signals[11] && coupled.fb.substituting,
+           "F4 画面断开：0.6 秒前照原路径（0、没信号），之后 1.5 秒线性爬到声音 80，≤ max(画面, 声音)：\(gone.map { String(Int($0)) }.joined(separator: "→"))")
+    // 门：最近 10 秒耦合过或 P_music < 0.3 才补；像配乐又没耦合 → 维持现状（0、没信号）
+    let music = run(gate: beat(.uncoupled, pMusic: 0.8))
+    let lowMusic = run(gate: beat(.uncoupled, pMusic: 0.1))
+    let noAudioBeat = run(gate: beat(.noAudio, pMusic: 0))
+    vcheck(music.values[10...].allSatisfy { $0 == 0 } && music.signals[10...].allSatisfy { !$0 } && !music.fb.active
+           && lowMusic.values.last == 80 && noAudioBeat.values[10...].allSatisfy { $0 == 0 },
+           "F4 门：像配乐且没耦合过 → 不补（0、不加最低强度）；P_music < 0.3 → 补；融合报没声音不算")
+    // 门只在断开 0.6 秒那一刻判一次：之后过了 10 秒照样补（不中途掉）；门过期之后新断开不补
+    let longGone = run(gate: beat(.coupled), goneBeats: 60)
+    var stale = AVFallbackBlend()
+    stale.note(beat: beat(.coupled), now: 0)
+    var staleVals: [Double] = []
+    for k in 1...20 {
+        let o = stale.step(blended: (0, false), motionSignal: false, audio: 80, audioSignal: true, now: 10 + Double(k) * 0.3, dt: 0.3)
+        staleVals.append(o.value)
+    }
+    vcheck(longGone.values.last == 80 && staleVals.allSatisfy { $0 == 0 },
+           "F4 门：断开那一刻判，一次断开里不中途掉；门（10 秒）过期后再断开不补")
+    // 声音也没了：0、没信号
+    let silent = run(gate: beat(.coupled), audioSignal: false)
+    vcheck(silent.values[10...].allSatisfy { $0 == 0 } && silent.signals[10...].allSatisfy { !$0 },
+           "F4：画面、声音都没了 → 0、没信号（不加最低强度）")
+    // 画面回来：每拍降 ≤ 12、交回后逐位等于原路径
+    let back = run(gate: beat(.coupled), backBeats: 14)
+    let tail = Array(back.values[22...])
+    let drops = zip([back.values[21]] + tail, tail).allSatisfy { $0.0 - $0.1 <= 12 + 1e-9 }
+    vcheck(drops && tail.last == 10 && !back.fb.active && back.signals[22...].allSatisfy { $0 },
+           "F4 画面回来：每拍降 ≤ 12、交回后逐位等于原路径：\(tail.map { String(Int($0.rounded())) }.joined(separator: "→"))")
+    // 中途 reset（暂停 / seek / 缓冲 / 关联动）：下一拍原样
+    var mid = run(gate: beat(.coupled)).fb
+    mid.reset()
+    let afterReset = mid.step(blended: (0, false), motionSignal: false, audio: 80, audioSignal: true, now: 100, dt: 0.3)
+    vcheck(afterReset.value == 0 && !afterReset.hasSignal && !mid.active,
+           "F4：暂停 / seek / 缓冲 / 关联动 reset 后当拍走原路径（0）")
+
+    // 5000 组随机：经出口 ≤ 上限、升幅 ≤ 20、归零保持、通道 2 / 3 = 0；值 ≤ max(画面, 声音)；画面一直在时逐位原样
+    var f = AVFallbackBlend()
+    var stage = SyncOutputStage()
+    var prev = [0, 0, 0, 0]
+    var ok = true
+    var bad = ""
+    var alwaysVideo = AVFallbackBlend()
+    var identical = true
+    var now = 0.0
+    for i in 0..<5000 {
+        if i % 300 == 0 { f.reset(); stage.reset(); prev = [0, 0, 0, 0] }
+        now += 0.1 + rnd() * 0.3
+        if rnd() < 0.2 { f.note(beat: beat(rnd() < 0.5 ? .coupled : .uncoupled, pMusic: rnd()), now: now) }
+        let ms = rnd() < 0.6
+        let m = rnd() < 0.03 ? Double.nan : rnd() * 120 - 10
+        let a = rnd() < 0.03 ? Double.nan : rnd() * 120 - 10
+        let asig = rnd() < 0.8
+        let blendedIn = (value: ms ? m : 0, hasSignal: ms)
+        let prevF = f.lastValue
+        let o = f.step(blended: blendedIn, motionSignal: ms, audio: a, audioSignal: asig, now: now, dt: 0.3)
+        let mm = ms && m.isFinite ? min(100, max(0, m)) : 0
+        let aa = asig && a.isFinite ? min(100, max(0, a)) : 0
+        if !(o.value.isFinite || o.value.isNaN && blendedIn.value.isNaN) { ok = false; bad = "值 \(o.value)" }
+        // F4 起作用时：≤ max(画面, 声音)，交回降速托着时 ≤ 上一拍
+        if f.active, o.value > max(mm, aa, prevF ?? 0) + 1e-9 { ok = false; bad = "上界 \(o.value)" }
+        if f.active, let p = prevF, o.value > max(mm, aa) + 1e-9, o.value > p - 12 + 1e-9 { ok = false; bad = "托住 \(o.value)" }
+        let st = AudioSyncSettings(maxPercent: 10 + rnd() * 90, channels: .both, minPercent: rnd() * 40)
+        let out = stage.step(levels: RhythmOutput.target(value: o.value, settings: st, hasSignal: o.hasSignal, rateLevel: nil,
+                                                         weight: 0), settings: st)
+        let cap = SyncOutputStage.hardCap(st)
+        if out[2] != 0 || out[3] != 0 { ok = false; bad = "通道" }
+        for ch in 0..<2 {
+            if out[ch] < 0 || out[ch] > cap { ok = false; bad = "上限" }
+            if out[ch] - prev[ch] > SyncOutputStage.maxRisePerTick { ok = false; bad = "升幅" }
+        }
+        prev = out
+        let v = alwaysVideo.step(blended: (m, true), motionSignal: true, audio: a, audioSignal: asig, now: now, dt: 0.3)
+        if v.value.bitPattern != m.bitPattern || !v.hasSignal { identical = false }
+    }
+    vcheck(ok && identical,
+           "F4：5000 组随机（画面断续、NaN、声音有无、门开关）经出口 ≤ 上限、升幅 ≤ 20、通道 2 / 3 = 0；画面一直在时逐位原样 \(bad)")
+
+    // 相位飞轮：S2 里锁丢了、撞击频率一致 → 维持 ≤ 1.5 秒；不在 S2 / 频率不一致 / 超时 → 放开
+    let locked = plLocked(hz: 1, until: 13)
+    var lost = locked
+    lost.step(plWindow(time: 13, hz: 1, cut: true), followerHz: 1, followerLocked: true, followerSource: .flow,
+              now: 13.1, dt: 0.3, active: true)
+    func fly(s2: Bool, audioHz: Double) -> [Bool] {
+        var w = AVPhaseFlywheel()
+        _ = w.step(lock: locked, s2: s2, audioHz: audioHz, now: 13)
+        var held: [Bool] = []
+        for k in 1...8 { held.append(w.step(lock: lost, s2: false, audioHz: audioHz, now: 13 + Double(k) * 0.3) != nil) }
+        return held
+    }
+    let held = fly(s2: true, audioHz: 1.05)
+    let notS2 = fly(s2: false, audioHz: 1)
+    let wrongHz = fly(s2: true, audioHz: 1.4)
+    let noAudio = fly(s2: true, audioHz: 0)
+    var w = AVPhaseFlywheel()
+    let liveLocked = w.step(lock: locked, s2: true, audioHz: 1, now: 13) == nil
+    let snapPhase = w.step(lock: lost, s2: false, audioHz: 1, now: 13.3)?.phase(at: 13.3)
+    vcheck(locked.locked && !lost.locked && held.prefix(5).allSatisfy { $0 } && held.suffix(2).allSatisfy { !$0 }
+           && notS2.allSatisfy { !$0 } && wrongHz.allSatisfy { !$0 } && noAudio.allSatisfy { !$0 } && liveLocked
+           && snapPhase != nil && snapPhase == locked.phase(at: 13.3),
+           "F4 相位飞轮：S2 里锁丢了、撞击 1.05 Hz 跟得上 → 用丢之前的锁 1.5 秒（\(held.filter { $0 }.count) 拍）后放开；不在 S2 / 频率差 > 15% / 没撞击 → 不维持；锁着时用实时锁")
+
+    let f4Count = AVDebugColumns.f4Header.split(separator: ",", omittingEmptySubsequences: false).count
+    vcheck(f4Count == 3 && AVDebugColumns.f4Fields(fallback: back.fb, flywheel: w).count == 3
+           && AVDebugColumns.f4Empty.allSatisfy { $0.isEmpty }, "F4 调试列 3 列")
+}
+
 avFusionF3Checks()
+avFusionF4Checks()
 
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")

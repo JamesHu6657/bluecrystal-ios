@@ -190,6 +190,12 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
     var vibA = AVVibrationAudio()
     var f3touched = 0
 #endif
+#if AV_F4_ON
+    // F4：互为回落 / 相位飞轮的接线走一遍；画面一直有新鲜样本、不在 S2 → 一拍都不该改
+    var fallback = AVFallbackBlend()
+    var flywheel = AVPhaseFlywheel()
+    var f4touched = 0
+#endif
     var tick = 0.0
     var lastFull = 0.0
     var out = ""
@@ -234,6 +240,11 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             let shaped = shaper.step(target: target, dt: dt)
             let value = norm.confidence * shaped.smoothed
             let act = RhythmOutput.motionActivity(level: shaped.level, smoothed: shaped.smoothed, confidence: norm.confidence, motionSignal: true)
+#if AV_F4_ON
+            fallback.note(beat: fusion.last, now: now)
+            let fb = fallback.step(blended: (value, true), motionSignal: true, audio: 80, audioSignal: true, now: now, dt: dt)
+            if fb.value.bitPattern != value.bitPattern || !fb.hasSignal { f4touched += 1 }
+#endif
             let clock = RhythmLookahead.Clock(hostNow: now, itemNow: now, rate: 1)
             var input = coord.refine(w, enabled: vis.usesLookahead, timeline: tl, clock: clock, latency: latency)
             if vis.usesRhythmContext { input = ctx.refine(input, now: now) }
@@ -296,6 +307,9 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
                     driver.phaseOffset = coord.applyLead(to: driver.phaseOffset, enabled: true, timeline: tl, clock: clock,
                                                          latency: latency, lock: lock, dt: dt)
                 }
+#if AV_F4_ON
+                if flywheel.step(lock: lock, s2: false, audioHz: lock.hz, now: now) != nil { f4touched += 1 }
+#endif
                 o = driver.beat(levels: levels, lock: lock, visual: vis, settings: st, hasSignal: true, value: value, activity: act,
                                 followerWeight: follower.weight, now: now, stage: &stage)
             } else {
@@ -311,6 +325,9 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #if AV_FUSION_ON
     // 融合的结果只写 stderr（不进逐字节对照的 stdout）
     FileHandle.standardError.write("fusion \(name): rows \(fusion.rows) coupled beats \(fusion.coupledBeats)\n".data(using: .utf8)!)
+#endif
+#if AV_F4_ON
+    FileHandle.standardError.write("f4 \(name): touched beats \(f4touched) (video always fresh, not S2 → 0)\n".data(using: .utf8)!)
 #endif
 #if AV_F3_ON
     FileHandle.standardError.write("f3 \(name): touched beats \(f3touched) (forced S1 → 0)\n".data(using: .utf8)!)

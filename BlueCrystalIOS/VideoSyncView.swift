@@ -117,6 +117,10 @@ final class VideoSyncPlayer: ObservableObject {
     /// av-fusion F3：声音重音 / F3b 震动跟声音（开关关着时不走、一直是初值）
     private var accent = AVAccent()
     private var vibrationAudio = AVVibrationAudio()
+    /// av-fusion F4：互为回落 / 相位飞轮（开关关着时不走、一直是初值）
+    private var avFallback = AVFallbackBlend()
+    private var flywheel = AVPhaseFlywheel()
+    @Published private(set) var fallbackStatus: String?
     /// av-fusion（F1 复审 L2）：电平计现在算没算 6 段扩展特征（fusionFeaturesWanted 上次交给电平计的值）
     private var fusionAudioOn = false
     private var bandBacklog = AudioBandBacklog()
@@ -189,6 +193,7 @@ final class VideoSyncPlayer: ObservableObject {
             resetRhythm()
             outputStage.reset()
             handover.cancel()
+            resetFallback()
             intensity = 0
             // 全零帧在运行中会换成完整停止帧对、运行继续（OutputGate），设备没在输出时不发
             ble?.sendTick(levels: ActiveChannels.zero.values)
@@ -212,6 +217,7 @@ final class VideoSyncPlayer: ObservableObject {
         let previousVote = visualSettings.usesAVRhythmConfirm
         let previousAccent = visualSettings.usesAVAccent
         let previousVibration = visualSettings.usesAVVibrationAudio
+        let previousFallback = visualSettings.usesAVFallback
         // F1 复审 L2：上一次交给电平计的「融合要不要声音特征 / 频带」
         let previousFusionAudio = fusionAudioOn
         visualSettings = v
@@ -222,6 +228,8 @@ final class VideoSyncPlayer: ObservableObject {
         // F3：重音 / 震动跟声音一变就从头来（关掉 = g = 1、震动回画面值）
         if v.usesAVAccent != previousAccent { accent.reset() }
         if v.usesAVVibrationAudio != previousVibration { vibrationAudio.reset() }
+        // F4：互为回落一变就从头来（关掉 = 原路径）
+        if v.usesAVFallback != previousFallback { resetFallback() }
         // P3：动作识别 / 撞击声校正开关一变就从头确认（关掉 = 回到 P2 行为）
         if v.usesRhythmContext != previousContext { resetContext() }
         if v.usesAudioAnchor != previousAnchor { resetAnchor() }
@@ -456,6 +464,7 @@ final class VideoSyncPlayer: ObservableObject {
         clearPrescan()
         outputStage.reset()
         handover.cancel()
+        resetFallback()
         // 新播放器从暂停开始；旧视频的停止锁存和 seek 回声不带过来
         externalPlay = ExternalPlayGate()
         ownSeekEcho.clear()
@@ -498,6 +507,7 @@ final class VideoSyncPlayer: ObservableObject {
         m.setTimingEnabled(debugRecording)
         bandBacklog.clear()
         resetFusion()
+        resetFallback()
         resetAVDebug()
         AudioLevelTap.install(on: item, asset: asset, meter: m) { [weak self, weak item] status in
             guard let self = self, let item = item,
@@ -778,6 +788,7 @@ final class VideoSyncPlayer: ObservableObject {
         motionFlow.reset()
         outputStage.reset()
         handover.cancel()
+        resetFallback()
         resetFusion()
     }
 
@@ -948,6 +959,7 @@ final class VideoSyncPlayer: ObservableObject {
         resetRhythm()
         outputStage.reset()
         handover.cancel()
+        resetFallback()
     }
 
     var canPlay: Bool {
@@ -1053,6 +1065,7 @@ final class VideoSyncPlayer: ObservableObject {
             resetRhythm()
             outputStage.reset()
             handover.cancel()
+            resetFallback()
             level = 0
             motionLevel = 0
             intensity = 0
@@ -1235,6 +1248,45 @@ final class VideoSyncPlayer: ObservableObject {
         resetVote()
         accent.reset()
         vibrationAudio.reset()
+        // F4 不在这里清：画面分析停了（发热暂停）时融合也停，回落要用断开前记下的门
+        if flywheel.snapshot != nil { flywheel.reset() }
+    }
+
+    /// av-fusion F4：互为回落 / 飞轮从头来（暂停 / seek / 缓冲 / 关联动 / 换视频都走这里 → 下一拍走原路径）
+    private func resetFallback() {
+        avFallback.reset()
+        flywheel.reset()
+        if fallbackStatus != nil { fallbackStatus = nil }
+    }
+
+    /// av-fusion F4：画面暂时不可用时按声音补（开关关着 = 原样返回）
+    private func fallbackBlend(_ blended: (value: Double, hasSignal: Bool), motionSignal: Bool, audioSignal: Bool,
+                               now: Double, dt: Double) -> (value: Double, hasSignal: Bool) {
+        guard visualSettings.usesAVFallback else {
+            if avFallback.active || fallbackStatus != nil { resetFallback() }
+            return blended
+        }
+        avFallback.note(beat: fusionBeat, now: now)
+        let out = avFallback.step(blended: blended, motionSignal: motionSignal, audio: shaper.smoothed,
+                                  audioSignal: audioSignal, now: now, dt: dt)
+        let text: String? = avFallback.substituting ? "画面暂不可用，暂按声音" : nil
+        if text != fallbackStatus { fallbackStatus = text }
+        return out
+    }
+
+    /// av-fusion F4 相位飞轮：脉动这一拍用的相位锁（开关关着 / 没在维持 = 实时相位锁）
+    private func pulseLock(_ p: AVPlayer) -> RhythmPhaseLock {
+        guard visualSettings.usesAVFallback, fusionFeaturesWanted else {
+            if flywheel.snapshot != nil { flywheel.reset() }
+            return phaseLock
+        }
+        let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
+        let end = clock.item(forHost: clock.host)
+        let hz = clock.isValid && end.isFinite
+            ? AVRhythmVote.recentHz(fusion.extractor.events, start: end - AVRhythmVote.windowSeconds * clock.rate, end: end)
+                * clock.rate
+            : 0
+        return flywheel.step(lock: phaseLock, s2: AVRhythmVote.isS2(fusionBeat), audioHz: hz, now: clock.host) ?? phaseLock
     }
 
     /// av-fusion F3：这一拍的重音系数 g（声音重音生效 + 这一拍 S2 才可能 ≠ 1；关着时什么都不算 = 1）
@@ -1317,7 +1369,7 @@ final class VideoSyncPlayer: ObservableObject {
     private func pulseSubTick(_ p: AVPlayer, ble: BLEManager) {
         guard isPlaying, !isSeeking, settings.enabled, visualSettings.usesPulseTiming,
               p.timeControlStatus == .playing,
-              let vals = pulse.subBeat(lock: phaseLock, settings: settings, now: CACurrentMediaTime(),
+              let vals = pulse.subBeat(lock: flywheel.lock ?? phaseLock, settings: settings, now: CACurrentMediaTime(),
                                        stage: &outputStage) else { return }
         let shown = vals.max() ?? 0
         if shown != intensity { intensity = shown }
@@ -1419,8 +1471,11 @@ final class VideoSyncPlayer: ObservableObject {
                                                 playerPlaying: p.timeControlStatus == .playing, now: now)
         let blended = handover.blend(motion: shaped.smoothed, confidence: motionNormalizer.confidence,
                                      motionSignal: motionSignal, audio: shaper.smoothed, audioSignal: audioSignal, dt: dt)
-        let value = blended.value
-        let hasSignal = blended.hasSignal
+        // av-fusion F4：画面暂时不可用时按声音补（关着时就是 blended，逐位不变）
+        let fell = visualSettings.usesAVFallback || avFallback.active
+            ? fallbackBlend(blended, motionSignal: motionSignal, audioSignal: audioSignal, now: now, dt: dt) : blended
+        let value = fell.value
+        let hasSignal = fell.hasSignal
         // 节奏只认画面自己的新鲜样本和画面自己的强度（交接期间声音补的那部分没有频率，也不算「在动」）；
         // 下降跟门前的即时强度走（r2 复审 M1）：动作一停节奏马上不加伸缩，不等 0.7 秒释放平滑
         let motionActivity = RhythmOutput.motionActivity(level: shaped.level, smoothed: shaped.smoothed,
@@ -1437,6 +1492,7 @@ final class VideoSyncPlayer: ObservableObject {
             // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
             outputStage.reset()
             handover.cancel()
+            resetFallback()
             if visualSettings.rhythmFollow {
                 let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
                                                  rateLevel: rateLevel, weight: rhythm.weight, activity: rhythmActivity)
@@ -1471,10 +1527,12 @@ final class VideoSyncPlayer: ObservableObject {
                                                             clock: b.clock, latency: b.latency, lock: phaseLock, dt: dt)
                 }
                 // P2：锁上相位才在 P1 档位上叠加脉动（往里时加强）；没锁 / 没标定 / 太快 / 太弱 = P1 原样
-                vals = pulse.beat(levels: levels, lock: phaseLock, visual: visualSettings, settings: settings,
+                // av-fusion F4：S2 里相位锁刚丢、撞击还跟得上时，最多 1.5 秒用丢之前的锁（关着 = phaseLock）
+                let lockForPulse = pulseLock(p)
+                vals = pulse.beat(levels: levels, lock: lockForPulse, visual: visualSettings, settings: settings,
                                   hasSignal: hasSignal, value: value, activity: rhythmActivity,
                                   followerWeight: rhythm.weight, now: CACurrentMediaTime(), stage: &outputStage)
-                let text = pulse.statusText(lock: phaseLock, visual: visualSettings)
+                let text = pulse.statusText(lock: lockForPulse, visual: visualSettings)
                 if text != pulseStatus { pulseStatus = text }
             } else {
                 vals = outputStage.step(levels: levels, settings: settings, now: CACurrentMediaTime(), timed: false)
@@ -1497,7 +1555,9 @@ final class VideoSyncPlayer: ObservableObject {
                                 + (visualSettings.usesAVAccent
                                    ? AVDebugColumns.f3Fields(accent: accent,
                                                              vibration: visualSettings.usesAVVibrationAudio ? vibrationAudio : nil)
-                                   : AVDebugColumns.f3Empty))
+                                   : AVDebugColumns.f3Empty)
+                                + (visualSettings.usesAVFallback ? AVDebugColumns.f4Fields(fallback: avFallback, flywheel: flywheel)
+                                   : AVDebugColumns.f4Empty))
         }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
@@ -1775,6 +1835,7 @@ struct VideoSyncView: View {
     @AppStorage(VisualSyncSettings.Keys.avAccent) private var avAccent = VisualSyncSettings.defaultAVAccent
     @AppStorage(VisualSyncSettings.Keys.avAccentDepth) private var avAccentDepth = VisualSyncSettings.defaultAVAccentDepth
     @AppStorage(VisualSyncSettings.Keys.avVibrationAudio) private var avVibrationAudio = VisualSyncSettings.defaultAVVibrationAudio
+    @AppStorage(VisualSyncSettings.Keys.avFallback) private var avFallbackOn = VisualSyncSettings.defaultAVFallback
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -1798,7 +1859,7 @@ struct VideoSyncView: View {
                            rhythmContext: rhythmContext, rhythmAudioAnchor: rhythmAudioAnchor,
                            rhythmLookahead: rhythmLookahead, prescan: prescan, avFusion: avFusion,
                            avRhythmConfirm: avRhythmConfirm, avAccent: avAccent, avAccentDepth: avAccentDepth,
-                           avVibrationAudio: avVibrationAudio)
+                           avVibrationAudio: avVibrationAudio, avFallback: avFallbackOn)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -2257,6 +2318,12 @@ struct VideoSyncView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if avFusion, avFallbackOn, let fallback = vm.fallbackStatus {
+                    Text(fallback)
+                        .font(.caption2)
+                        .foregroundColor(Velvet.gold)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
                          valueText: "\(Int(vm.level.rounded()))")
@@ -2390,6 +2457,18 @@ struct VideoSyncView: View {
         }
         if avFusion {
             accentControls
+            Toggle(isOn: $avFallbackOn) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("画面不可用时按声音补（实验）")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Text("发热暂停 / 遮挡 / 没有画面超过 0.6 秒时，1.5 秒内平滑转到声音强度，画面回来再交回；最近没耦合过、又像配乐时不补")
+                        .font(.caption2)
+                        .foregroundColor(Velvet.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .tint(Velvet.gold)
         }
     }
 
@@ -3068,7 +3147,7 @@ final class MotionDebugLog {
         + "pose_rhythm_hz,pose_rhythm_conf,pose_rhythm_part,subject_follow_hz,roi_valid,roi_x0,roi_y0,roi_x1,roi_y1,roi_hz,roi_share,"
         + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
         + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1,"
-        + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header + "," + AVDebugColumns.f2Header + "," + AVDebugColumns.f3Header
+        + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header + "," + AVDebugColumns.f2Header + "," + AVDebugColumns.f3Header + "," + AVDebugColumns.f4Header
     private var rows: [String] = []
     private var start = 0
 
@@ -3083,7 +3162,7 @@ final class MotionDebugLog {
                 shapedLevel: Double, value: Double, hasSignal: Bool, kind: Int, context: String?,
                 rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
                 rateLevel: Int?, out: [Int], av: [String] = AVDebugColumns.f0Empty + AVDebugColumns.f1Empty
-                    + AVDebugColumns.f2Empty + AVDebugColumns.f3Empty) {
+                    + AVDebugColumns.f2Empty + AVDebugColumns.f3Empty + AVDebugColumns.f4Empty) {
         func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
         let r = w.roi.region
         let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")

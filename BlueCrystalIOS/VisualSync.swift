@@ -3653,6 +3653,8 @@ struct VisualSyncSettings: Equatable {
         static let avAccent = "bcVisualSyncAVAccent"
         static let avAccentDepth = "bcVisualSyncAVAccentDepth"
         static let avVibrationAudio = "bcVisualSyncAVVibrationAudio"
+        /// av-fusion F4：互为回落（画面暂时不可用时按声音补，默认关）
+        static let avFallback = "bcVisualSyncAVFallback"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -3697,6 +3699,8 @@ struct VisualSyncSettings: Equatable {
     static let defaultAVAccentDepth: Double = 15
     static let avAccentDepthRange: ClosedRange<Double> = 0...30
     static let defaultAVVibrationAudio = false
+    /// av-fusion F4：互为回落（默认关）
+    static let defaultAVFallback = false
 
     var source: VisualSyncSource
     var motionGainDb: Double
@@ -3716,6 +3720,7 @@ struct VisualSyncSettings: Equatable {
     var avAccent: Bool
     var avAccentDepth: Double
     var avVibrationAudio: Bool
+    var avFallback: Bool
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
          autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
@@ -3725,7 +3730,8 @@ struct VisualSyncSettings: Equatable {
          rhythmAudioAnchor: Bool = defaultRhythmAudioAnchor, rhythmLookahead: Bool = defaultRhythmLookahead,
          prescan: Bool = defaultPrescan, avFusion: Bool = defaultAVFusion,
          avRhythmConfirm: Bool = defaultAVRhythmConfirm, avAccent: Bool = defaultAVAccent,
-         avAccentDepth: Double = defaultAVAccentDepth, avVibrationAudio: Bool = defaultAVVibrationAudio) {
+         avAccentDepth: Double = defaultAVAccentDepth, avVibrationAudio: Bool = defaultAVVibrationAudio,
+         avFallback: Bool = defaultAVFallback) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
@@ -3752,6 +3758,7 @@ struct VisualSyncSettings: Equatable {
             ? min(Self.avAccentDepthRange.upperBound, max(Self.avAccentDepthRange.lowerBound, avAccentDepth))
             : Self.defaultAVAccentDepth
         self.avVibrationAudio = avVibrationAudio
+        self.avFallback = avFallback
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -3779,7 +3786,8 @@ struct VisualSyncSettings: Equatable {
             avRhythmConfirm: defaults.object(forKey: Keys.avRhythmConfirm) as? Bool ?? defaultAVRhythmConfirm,
             avAccent: defaults.object(forKey: Keys.avAccent) as? Bool ?? defaultAVAccent,
             avAccentDepth: defaults.object(forKey: Keys.avAccentDepth) as? Double ?? defaultAVAccentDepth,
-            avVibrationAudio: defaults.object(forKey: Keys.avVibrationAudio) as? Bool ?? defaultAVVibrationAudio)
+            avVibrationAudio: defaults.object(forKey: Keys.avVibrationAudio) as? Bool ?? defaultAVVibrationAudio,
+            avFallback: defaults.object(forKey: Keys.avFallback) as? Bool ?? defaultAVFallback)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
@@ -3814,6 +3822,8 @@ struct VisualSyncSettings: Equatable {
     var usesAVAccent: Bool { usesAVFusion && avAccent }
     /// av-fusion F3b：震动跟声音（重音的子开关）；通道「两个都用」和每拍四道门在 AVVibrationAudio 里判断
     var usesAVVibrationAudio: Bool { usesAVAccent && avVibrationAudio }
+    /// av-fusion F4：互为回落生效（融合 + 开关）。画面暂时不可用时按声音补、画面回来交回；相位飞轮另要相位脉动在跑。不影响 tickInterval
+    var usesAVFallback: Bool { usesAVFusion && avFallback }
 
     /// 复审 L6：融合的 6 段特征 / 频带用不用得上（融合生效、在联动、画面分析在跑）；播放器和测试共用
     static func fusionFeaturesWanted(usesAVFusion: Bool, running: Bool, analyzing: Bool) -> Bool {
@@ -3869,7 +3879,7 @@ struct SourceHandover {
         let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
         let fade = max(0, 1 - e / Self.fadeSeconds)
         // 画面还没有新鲜样本（刚装上取帧 / 发热暂停）就当占比 0、全用声音补；有了样本也从 0 起爬
-        let ramp = min(1, max(0, motionElapsed / Self.motionRampSeconds))
+        let ramp = HandoverRamp.share(elapsed: motionElapsed, seconds: Self.motionRampSeconds)
         if motionSignal { motionElapsed += step }
         let conf = motionSignal && c.isFinite ? min(1, max(0, c)) : 0
         let weight = ramp * conf
@@ -3888,6 +3898,21 @@ struct SourceHandover {
         guard let t = catchUpTicks else { return }
         let next = t + 1
         catchUpTicks = (limited == direct || next >= Self.maxCatchUpTicks) ? nil : next
+    }
+}
+
+/// av-fusion F4：SourceHandover 的爬坡抽出来的纯函数（min(1, max(0, elapsed / seconds))，原 SourceHandover 逐位不变），
+/// 和 AVFallbackBlend 的「按时间爬坡 / 交回」共用
+enum HandoverRamp {
+    static func share(elapsed: Double, seconds: Double) -> Double {
+        min(1, max(0, elapsed / seconds))
+    }
+
+    /// 占比按 dt / seconds 线性走一步（up = 爬、否则降），夹 [0, 1]；dt 非法当 0
+    static func step(_ share: Double, dt: Double, seconds: Double, up: Bool) -> Double {
+        let d = dt.isFinite && dt > 0 && seconds > 0 ? dt / seconds : 0
+        let base = share.isFinite ? share : 0
+        return min(1, max(0, up ? base + d : base - d))
     }
 }
 
@@ -9632,5 +9657,139 @@ extension AVDebugColumns {
 
     static var f3Empty: [String] {
         [String](repeating: "", count: f3Header.split(separator: ",", omittingEmptySubsequences: false).count)
+    }
+}
+
+// MARK: - av-fusion F4：互为回落 + 相位飞轮
+//
+// 开关 bcVisualSyncAVFallback（默认关；usesAVFallback = 融合生效 + 开关）。原则不变：画面为主。
+// 画面暂时不可用（motionSignal 断：发热暂停、没视频轨、取帧停了、近场 / 切镜让画面没有新鲜样本）≥ 0.6 秒、声音有信号、
+// 而且这一次断开时「最近 10 秒内耦合过，或最近 10 秒的融合判断 P_music < 0.3」→ 声音占比 1.5 秒爬满（值 = 占比 × 声音 + (1 − 占比) × 画面，≤ max(画面, 声音)）；
+// 门不满足 → 占比不涨（维持现状：通常是 0）。画面回来 → 1.5 秒交回，每拍降 ≤ 12。声音也没了 → 声音那份当 0、没信号（不加最低强度）。
+// 占比 0 且交回完成时原样返回 handover.blend 的结果（逐位不变）。暂停 / seek / 缓冲 / 关联动走原路径（reset，不经过 F4）。
+// 结果仍然只经 tick() → SyncOutputStage → BLEManager.sendTick 发出。
+
+struct AVFallbackBlend: Equatable {
+    static let unavailableSeconds = 0.6
+    static let rampSeconds = 1.5
+    static let gateSeconds = 10.0
+    static let musicGate = 0.3
+    static let maxDropPerBeat = 12.0
+
+    /// 声音占比 0~1
+    private(set) var share: Double = 0
+    /// 画面连续不可用的时间（秒）
+    private(set) var unavailableFor: Double = 0
+    /// 这一次画面断开时门是否满足（断开 ≥ 0.6 秒那一刻判一次，画面回来清掉）
+    private(set) var episodeAllowed: Bool?
+    /// 上一拍 F4 交出去的值（交回时每拍降 ≤ 12 的基准）；nil = F4 没在起作用
+    private(set) var lastValue: Double?
+    private var coupledAt = -Double.infinity
+    private var lowMusicAt = -Double.infinity
+
+    var active: Bool { lastValue != nil }
+    /// 状态行用：画面不可用、正在按声音补
+    var substituting: Bool { active && unavailableFor >= Self.unavailableSeconds && share > 0 }
+
+    mutating func reset() { self = AVFallbackBlend() }
+
+    /// 每个完整拍记一次融合判断（门用）：耦合 → 记时刻；有声音、P_music < 0.3 → 记时刻
+    mutating func note(beat: AVFusionBeat?, now: Double) {
+        guard let b = beat, now.isFinite else { return }
+        if b.state == .coupled { coupledAt = now }
+        if b.state != .noAudio, b.pMusic.isFinite, b.pMusic < Self.musicGate { lowMusicAt = now }
+    }
+
+    func gateOpen(now: Double) -> Bool {
+        now.isFinite && (now - coupledAt <= Self.gateSeconds || now - lowMusicAt <= Self.gateSeconds)
+    }
+
+    /// blended：handover.blend 的结果（F4 关着时就是这一拍的值）；audio：声音强度（shaper.smoothed，0~100）
+    mutating func step(blended: (value: Double, hasSignal: Bool), motionSignal: Bool, audio: Double, audioSignal: Bool,
+                       now: Double, dt: Double) -> (value: Double, hasSignal: Bool) {
+        let step = dt.isFinite && dt > 0 ? min(1, dt) : 0
+        if motionSignal {
+            unavailableFor = 0
+            episodeAllowed = nil
+            share = HandoverRamp.step(share, dt: step, seconds: Self.rampSeconds, up: false)
+        } else {
+            unavailableFor += step
+            if unavailableFor >= Self.unavailableSeconds {
+                if episodeAllowed == nil { episodeAllowed = audioSignal && gateOpen(now: now) }
+                if episodeAllowed == true, audioSignal {
+                    share = HandoverRamp.step(share, dt: step, seconds: Self.rampSeconds, up: true)
+                }
+            }
+        }
+        let videoPart = blended.value.isFinite ? min(100, max(0, blended.value)) : 0
+        let audioPart = audioSignal && audio.isFinite ? min(100, max(0, audio)) : 0
+        guard share > 0 || lastValue != nil else { return blended }
+        var v = share * audioPart + (1 - share) * videoPart
+        // 交回（画面回来、占比在降）：每拍最多降 12，不比上一拍突然低一截
+        if motionSignal, let prev = lastValue, v < prev - Self.maxDropPerBeat { v = prev - Self.maxDropPerBeat }
+        if share == 0, v <= videoPart + 1e-9 || !motionSignal {
+            // 交回完成（占比 0 且没被降速托着）：之后逐位等于原路径
+            lastValue = nil
+            return blended
+        }
+        v = v.isFinite ? min(100, max(0, v)) : 0
+        lastValue = v
+        let sig = blended.hasSignal || (share > 0 && audioSignal)
+        return (v, sig)
+    }
+}
+
+/// av-fusion F4 相位飞轮：S2（声画耦合）里画面相位锁丢了（locked → false），而最近几下撞击的频率（换算到播放器时间）
+/// 还和丢之前的锁频率一致（±15%）时，脉动继续用丢之前那一拍的相位锁（按它的频率外推相位）最多 1.5 秒，然后照常放开。
+/// 只给相位脉动用（完整拍 / 子拍）；返回 nil = 用实时的相位锁（关着 / 没在维持时逐位不变）
+struct AVPhaseFlywheel {
+    static let holdSeconds = 1.5
+
+    private(set) var snapshot: RhythmPhaseLock?
+    private(set) var holding = false
+    private var snapshotS2 = false
+    private var lostAt: Double?
+
+    mutating func reset() { self = AVPhaseFlywheel() }
+
+    var lock: RhythmPhaseLock? { holding ? snapshot : nil }
+
+    /// 每个完整拍一次。lock：实时相位锁；s2：这一拍融合是不是 S2；audioHz：撞击频率（播放器时间 Hz，0 = 没有）
+    mutating func step(lock: RhythmPhaseLock, s2: Bool, audioHz: Double, now: Double) -> RhythmPhaseLock? {
+        holding = false
+        if lock.locked {
+            snapshot = lock
+            snapshotS2 = s2
+            lostAt = nil
+            return nil
+        }
+        guard let snap = snapshot, snapshotS2, now.isFinite, snap.hz.isFinite, snap.hz > 0 else {
+            snapshot = nil
+            lostAt = nil
+            return nil
+        }
+        let since = lostAt ?? now
+        lostAt = since
+        guard now - since <= Self.holdSeconds, audioHz.isFinite, audioHz > 0,
+              abs(audioHz - snap.hz) / snap.hz <= RhythmPhaseLock.agreeRatio else {
+            snapshot = nil
+            lostAt = nil
+            return nil
+        }
+        holding = true
+        return snap
+    }
+}
+
+extension AVDebugColumns {
+    /// F4 调试列：声音占比、画面连续不可用秒数、相位飞轮在不在维持
+    static let f4Header = "av_fallback_share,av_video_gone_s,av_flywheel"
+
+    static func f4Fields(fallback: AVFallbackBlend, flywheel: AVPhaseFlywheel) -> [String] {
+        [String(format: "%.2f", fallback.share), String(format: "%.2f", fallback.unavailableFor), flywheel.holding ? "1" : "0"]
+    }
+
+    static var f4Empty: [String] {
+        [String](repeating: "", count: f4Header.split(separator: ",", omittingEmptySubsequences: false).count)
     }
 }
