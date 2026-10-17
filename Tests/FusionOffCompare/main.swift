@@ -184,6 +184,12 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
     var vote = AVRhythmVote()
     var voted = 0
 #endif
+#if AV_F3_ON
+    // F3：重音 / 震动跟声音的接线全走一遍，耦合强制不成立（S1）→ g = 1、震动 = 画面值，输出照样逐位相同
+    var accent = AVAccent()
+    var vibA = AVVibrationAudio()
+    var f3touched = 0
+#endif
     var tick = 0.0
     var lastFull = 0.0
     var out = ""
@@ -247,7 +253,20 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #endif
             if pulse { lock.step(input, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source, now: now, dt: dt, active: act > 0) }
             let rate = follower.weight > 0 && follower.hz > 0 ? vis.rateMap.level(forHz: follower.hz) : nil
+#if AV_F3_ON
+            let g = accent.step(events: fusion.engine.extractor.events, clock: MediaClockSnapshot(host: now, item: now, rate: 1),
+                                s2: false, lockHz: lock.hz, depth: 0.15)
+            let accentValue = g != 1 && !pulse ? min(100, max(0, value * g)) : value
+            var levels = RhythmOutput.target(value: accentValue, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
+            let videoVib = levels[1]
+            levels[1] = vibA.step(video: levels[1], floor: 10, events: fusion.engine.extractor.events,
+                                  clock: MediaClockSnapshot(host: now, item: now, rate: 1), beat: nil, activity: act,
+                                  channelsBoth: true, depth: 0.15, now: now, dt: dt)
+            if g != 1 || levels[1] != videoVib { f3touched += 1 }
+            driver.accentGain = pulse ? g : 1
+#else
             let levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
+#endif
 #if AV_FUSION_ON
             // F1：融合每拍先取走频带块（撞击声校正开着时经 backlog 原样交回）
             pendingBands = fusion.shareBands(pendingBands)
@@ -292,6 +311,9 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #if AV_FUSION_ON
     // 融合的结果只写 stderr（不进逐字节对照的 stdout）
     FileHandle.standardError.write("fusion \(name): rows \(fusion.rows) coupled beats \(fusion.coupledBeats)\n".data(using: .utf8)!)
+#endif
+#if AV_F3_ON
+    FileHandle.standardError.write("f3 \(name): touched beats \(f3touched) (forced S1 → 0)\n".data(using: .utf8)!)
 #endif
 #if AV_F2_ON
     FileHandle.standardError.write("f2 \(name): voted beats \(voted) (switch off / forced S1 → 0)\n".data(using: .utf8)!)

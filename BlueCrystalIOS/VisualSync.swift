@@ -3650,6 +3650,9 @@ struct VisualSyncSettings: Equatable {
         static let avFusion = "bcVisualSyncAVFusion"
         /// av-fusion F2：节奏由声音确认（实验，默认关；融合 + 伸缩跟随动作频率都开着才显示 / 生效）
         static let avRhythmConfirm = "bcVisualSyncAVRhythmConfirm"
+        static let avAccent = "bcVisualSyncAVAccent"
+        static let avAccentDepth = "bcVisualSyncAVAccentDepth"
+        static let avVibrationAudio = "bcVisualSyncAVVibrationAudio"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -3689,6 +3692,11 @@ struct VisualSyncSettings: Equatable {
     /// av-fusion F2：默认关。关着时交给跟随器 / 相位锁的窗口、跟随器的跳变确认、撞击声校正的条件都和 F1 逐位相同
     /// （融合开着也一样 = f706431，FusionOffCompare 的 AV_F2_ON 变体钉住）
     static let defaultAVRhythmConfirm = false
+    /// av-fusion F3：声音重音（默认关）、重音深度（%，0~30，默认 15）、F3b 震动跟声音（重音的子开关，默认关）
+    static let defaultAVAccent = false
+    static let defaultAVAccentDepth: Double = 15
+    static let avAccentDepthRange: ClosedRange<Double> = 0...30
+    static let defaultAVVibrationAudio = false
 
     var source: VisualSyncSource
     var motionGainDb: Double
@@ -3705,6 +3713,9 @@ struct VisualSyncSettings: Equatable {
     var prescan: Bool
     var avFusion: Bool
     var avRhythmConfirm: Bool
+    var avAccent: Bool
+    var avAccentDepth: Double
+    var avVibrationAudio: Bool
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
          autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
@@ -3713,7 +3724,8 @@ struct VisualSyncSettings: Equatable {
          pulseInvert: Bool = defaultPulseInvert, rhythmContext: Bool = defaultRhythmContext,
          rhythmAudioAnchor: Bool = defaultRhythmAudioAnchor, rhythmLookahead: Bool = defaultRhythmLookahead,
          prescan: Bool = defaultPrescan, avFusion: Bool = defaultAVFusion,
-         avRhythmConfirm: Bool = defaultAVRhythmConfirm) {
+         avRhythmConfirm: Bool = defaultAVRhythmConfirm, avAccent: Bool = defaultAVAccent,
+         avAccentDepth: Double = defaultAVAccentDepth, avVibrationAudio: Bool = defaultAVVibrationAudio) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
@@ -3735,6 +3747,11 @@ struct VisualSyncSettings: Equatable {
         self.prescan = prescan
         self.avFusion = avFusion
         self.avRhythmConfirm = avRhythmConfirm
+        self.avAccent = avAccent
+        self.avAccentDepth = avAccentDepth.isFinite
+            ? min(Self.avAccentDepthRange.upperBound, max(Self.avAccentDepthRange.lowerBound, avAccentDepth))
+            : Self.defaultAVAccentDepth
+        self.avVibrationAudio = avVibrationAudio
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -3759,7 +3776,10 @@ struct VisualSyncSettings: Equatable {
             rhythmLookahead: defaults.object(forKey: Keys.rhythmLookahead) as? Bool ?? defaultRhythmLookahead,
             prescan: defaults.object(forKey: Keys.prescan) as? Bool ?? defaultPrescan,
             avFusion: defaults.object(forKey: Keys.avFusion) as? Bool ?? defaultAVFusion,
-            avRhythmConfirm: defaults.object(forKey: Keys.avRhythmConfirm) as? Bool ?? defaultAVRhythmConfirm)
+            avRhythmConfirm: defaults.object(forKey: Keys.avRhythmConfirm) as? Bool ?? defaultAVRhythmConfirm,
+            avAccent: defaults.object(forKey: Keys.avAccent) as? Bool ?? defaultAVAccent,
+            avAccentDepth: defaults.object(forKey: Keys.avAccentDepth) as? Double ?? defaultAVAccentDepth,
+            avVibrationAudio: defaults.object(forKey: Keys.avVibrationAudio) as? Bool ?? defaultAVVibrationAudio)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
@@ -3790,6 +3810,10 @@ struct VisualSyncSettings: Equatable {
     /// av-fusion F2：节奏由声音确认真正生效（融合 + 伸缩跟随动作频率 + 开关）。声音只给画面节奏投票、不开锁；不影响 tickInterval
     /// 复审 L5：耦合要相位锁，相位脉动关着时 F1 一直报「没锁」→ 也要开相位脉动
     var usesAVRhythmConfirm: Bool { usesAVFusion && rhythmFollow && rhythmPulse && avRhythmConfirm }
+    /// av-fusion F3：声音重音生效（融合 + 开关）；只在声画耦合（S2）的拍上起作用，不影响 tickInterval
+    var usesAVAccent: Bool { usesAVFusion && avAccent }
+    /// av-fusion F3b：震动跟声音（重音的子开关）；通道「两个都用」和每拍四道门在 AVVibrationAudio 里判断
+    var usesAVVibrationAudio: Bool { usesAVAccent && avVibrationAudio }
 
     /// 复审 L6：融合的 6 段特征 / 频带用不用得上（融合生效、在联动、画面分析在跑）；播放器和测试共用
     static func fusionFeaturesWanted(usesAVFusion: Bool, running: Bool, analyzing: Bool) -> Bool {
@@ -4831,6 +4855,11 @@ enum RhythmPulse {
         return MotionStats.clamp01(Double(intensity - lo) / Double(hi - lo))
     }
 
+    /// av-fusion F3：这个设置 / 频率下的满深度（权重、强度都满时 depth 的值）：重音放大脉动深度的上界
+    static func depthCeiling(setting: Double, hz: Double) -> Double {
+        depth(setting: setting, hz: hz, weight: 1, activity: 1, intensity: 100)
+    }
+
     /// 这一拍的有效深度（峰谷差，档）
     static func depth(setting: Double, hz: Double, weight: Double, activity: Double, intensity: Int) -> Double {
         guard setting.isFinite, setting > 0, hz.isFinite, hz > 0, hz < maxHz, weight.isFinite, activity.isFinite
@@ -4906,6 +4935,8 @@ struct RhythmPulseDriver {
     static let fullBeatRegrid: TimeInterval = 0.1
     /// rhythm-context P3：撞击声相位校正（弧度，加到指令相位上；AudioPhaseAnchor 算，默认 0）
     var phaseOffset: Double = 0
+    /// av-fusion F3：重音系数（每个完整拍由播放器给；1 = 不调，逐位等于以前）
+    var accentGain: Double = 1
     private var latency: TimeInterval = 0
     private var invert = false
     private var floorLevel = 0
@@ -4973,6 +5004,10 @@ struct RhythmPulseDriver {
         state = st
         engaged = st == .active
         depth = engaged ? d : 0
+        // av-fusion F3：脉动开着时重音改调脉动深度（深度 × g，仍不超过这个设置 / 频率下的满深度）；g = 1（关着 / 不在 S2）时不碰
+        if engaged, accentGain.isFinite, accentGain > 0, accentGain != 1 {
+            depth = min(d * accentGain, RhythmPulse.depthCeiling(setting: v.pulseDepth, hz: lock.hz))
+        }
         base = levels
         latency = v.pulseLatencyMs / 1000
         invert = v.pulseInvert
@@ -9449,5 +9484,153 @@ extension AVDebugColumns {
 
     static var f2Empty: [String] {
         [String](repeating: "", count: f2Header.split(separator: ",", omittingEmptySubsequences: false).count)
+    }
+}
+
+// MARK: - av-fusion F3：声音重音（有界强度调制）+ F3b 震动跟声音（子开关）
+// 设计原则（研究页）：声音的作用都是乘在画面结果上的有界修正，从不和画面平起平坐；最坏也就是「±β 的重音放错位置」。
+// 只在 S2（AVRhythmVote.isS2：这一拍融合状态 = 耦合、相位锁还锁着）起作用；不在 S2 / 开关关着 = 1（逐位等于 F2）。
+// 开关 bcVisualSyncAVAccent / bcVisualSyncAVAccentDepth（0~30%，默认 15）/ bcVisualSyncAVVibrationAudio（F3b，默认关）。
+// 输出照旧 tick() → SyncOutputStage.limit → BLEManager.sendTick，不加发送路径。
+
+/// av-fusion F3：每个完整拍一次（主线程）。最近一下撞击（视频时间，因果：只看已经听到的）的宽带峰值相对最近 4 秒撞击的中位数 → z
+/// （幅度比的 log2；起音强度本身是上升 dB，整体响度 / 自动增益变了 z 不变）；重音系数 g = 1 + β·clamp(z, −1, 1)。
+/// 按画面节奏分到最近一下：只有这一个往复周期（1 / 相位锁频率，换成视频时间）里听到的撞击才算，没有 = 1
+struct AVAccent: Equatable {
+    static let windowSeconds = 4.0
+    static let minImpacts = 3
+
+    private(set) var gain: Double = 1
+    private(set) var z: Double = 0
+    private(set) var active = false
+
+    mutating func reset() { self = AVAccent() }
+
+    /// 撞击的宽带峰值（幅度倍数）：和 audioRhythm 同一个换算（各段平均上升 dB → 幅度）
+    static func weight(_ e: AudioOnsetEvent) -> Double {
+        pow(10, e.strength / Double(AudioFeatureFrame.bandCount) / 20)
+    }
+
+    static func median(_ xs: [Double]) -> Double {
+        guard !xs.isEmpty else { return 0 }
+        let s = xs.sorted()
+        return s.count % 2 == 1 ? s[s.count / 2] : (s[s.count / 2 - 1] + s[s.count / 2]) / 2
+    }
+
+    /// events：融合的起音（视频时间）；s2：这一拍是不是 S2；lockHz：相位锁频率（画面上的快慢）；depth：β（0~0.3）
+    mutating func step(events: [AudioOnsetEvent], clock: MediaClockSnapshot, s2: Bool, lockHz: Double,
+                       depth: Double) -> Double {
+        gain = 1
+        z = 0
+        active = false
+        guard s2, depth.isFinite, depth > 0, clock.isValid, lockHz.isFinite, lockHz > 0 else { return 1 }
+        let beta = min(VisualSyncSettings.avAccentDepthRange.upperBound / 100, depth)
+        let end = clock.item(forHost: clock.host)
+        guard end.isFinite else { return 1 }
+        let hits = AVRhythmVote.impacts(events, start: end - Self.windowSeconds * clock.rate, end: end)
+        guard hits.count >= Self.minImpacts, let last = hits.last, end - last.time <= clock.rate / lockHz else { return 1 }
+        let med = Self.median(hits.map(Self.weight))
+        let w = Self.weight(last)
+        guard med.isFinite, med > 0, w.isFinite, w > 0 else { return 1 }
+        let raw = log2(w / med)
+        guard raw.isFinite else { return 1 }
+        z = min(1, max(-1, raw))
+        gain = 1 + beta * z
+        active = true
+        return gain
+    }
+}
+
+/// av-fusion F3b：震动跟声音。伸缩照旧跟画面；只把交给出口的震动通道目标换成「画面震动值 ↔ 声音撞击强度」的有界混合。
+/// 声音那一路：带视频时间的撞击（多频带同时起音 + 起音陡 + 短促 = AudioOnsetEvent.isImpact），[t − 0.3, t] 里最响一下
+/// 相对最近 4 秒中位数的幅度比 e（持续的旋律 / 人声不是撞击，不计入；没撞击 e = 0）→ 声音目标 = 画面值 × min(1 + β, e)。
+/// 四道门全满足才生效：① 这一拍 S2；② P_music < 0.3，而且最近 10 秒没有「跨切镜节拍连续」「画面不动时仍有节奏」的证据；
+/// ③ 画面在动（activity > 0）；④ 有界：≤ 画面值 × (1 + β)，夹到 [最低强度, 99]，之后再经出口限速。
+/// 通道不是「两个都用」时不生效。任何一道门不满足就在 1.5 秒内线性淡回画面值（每拍降 ≤ 12），混合比到 0 时逐位等于画面值
+struct AVVibrationAudio: Equatable {
+    static let envelopeSeconds = 0.3
+    static let evidenceSeconds = 10.0
+    static let musicGate = 0.3
+    static let fadeSeconds = 1.5
+    static let riseSeconds = 0.6
+    static let maxDropPerBeat = 12
+
+    private(set) var mix: Double = 0
+    private(set) var gated = false
+    private(set) var level: Int?
+    private var audioTarget: Int?
+    private var evidenceAt: Double = -.infinity
+
+    var active: Bool { mix > 0 || level != nil || evidenceAt > -.infinity }
+
+    mutating func reset() { self = AVVibrationAudio() }
+
+    /// 声音目标（不含混合）：nil = 撞击不够（< 3 下）或者没时间
+    static func audioLevel(video: Int, floor: Int, events: [AudioOnsetEvent], clock: MediaClockSnapshot,
+                           depth: Double) -> Int? {
+        guard clock.isValid, depth.isFinite, depth >= 0, video > 0 else { return nil }
+        let end = clock.item(forHost: clock.host)
+        guard end.isFinite else { return nil }
+        let hits = AVRhythmVote.impacts(events, start: end - AVAccent.windowSeconds * clock.rate, end: end)
+        guard hits.count >= AVAccent.minImpacts else { return nil }
+        let med = AVAccent.median(hits.map(AVAccent.weight))
+        guard med.isFinite, med > 0 else { return nil }
+        let recent = hits.filter { $0.time > end - Self.envelopeSeconds * clock.rate }.map(AVAccent.weight)
+        let e = (recent.max() ?? 0) / med
+        guard e.isFinite else { return nil }
+        let beta = min(VisualSyncSettings.avAccentDepthRange.upperBound / 100, depth)
+        let upper = min(BCProtocol.maxManualLevel, Int((Double(video) * (1 + beta)).rounded(.down)))
+        let lower = min(max(0, floor), upper)
+        let v = (Double(video) * min(1 + beta, max(0, e))).rounded()
+        guard v.isFinite else { return nil }
+        return min(upper, max(lower, Int(v)))
+    }
+
+    /// 每个完整拍一次。video：画面算出来的震动档位（RhythmOutput.target 的 [1]）；floor：最低强度档位（有信号时）；
+    /// beat：这一拍的融合结果；activity：画面强度（只看画面）；channelsBoth：通道 = 两个都用；now：host 时间；dt：拍间隔
+    mutating func step(video: Int, floor: Int, events: [AudioOnsetEvent], clock: MediaClockSnapshot, beat: AVFusionBeat?,
+                       activity: Double, channelsBoth: Bool, depth: Double, now: Double, dt: Double) -> Int {
+        if let b = beat, b.crossCut > 0 || b.still > 0, now.isFinite { evidenceAt = now }
+        var target: Int?
+        if channelsBoth, AVRhythmVote.isS2(beat), let b = beat, b.pMusic.isFinite, b.pMusic < Self.musicGate,
+           now.isFinite, now - evidenceAt >= Self.evidenceSeconds, activity.isFinite, activity > 0 {
+            target = Self.audioLevel(video: video, floor: floor, events: events, clock: clock, depth: depth)
+        }
+        gated = target != nil
+        let step = dt.isFinite && dt > 0 ? dt : 0
+        if let t = target {
+            audioTarget = t
+            mix = min(1, mix + step / Self.riseSeconds)
+        } else {
+            mix = max(0, mix - step / Self.fadeSeconds)
+        }
+        guard mix > 0, let a = audioTarget else {
+            mix = 0
+            audioTarget = nil
+            level = nil
+            return video
+        }
+        // 淡出期间声音目标还按「上一次」的大小算（不再更新），和画面值线性混合
+        let blended = (Double(video) + (Double(a) - Double(video)) * mix).rounded()
+        var out = blended.isFinite ? Int(blended) : video
+        if !gated, let prev = level { out = max(out, min(prev - Self.maxDropPerBeat, video)) }
+        out = min(BCProtocol.maxManualLevel, max(0, out))
+        level = out
+        return out
+    }
+}
+
+extension AVDebugColumns {
+    /// F3 调试列：重音系数 g、F3b 混合比、F3b 震动档位
+    static let f3Header = "av_accent_g,av_vib_mix,av_vib_level"
+
+    static func f3Fields(accent: AVAccent?, vibration: AVVibrationAudio?) -> [String] {
+        [accent.map { String(format: "%.3f", $0.gain) } ?? "",
+         vibration.map { String(format: "%.2f", $0.mix) } ?? "",
+         vibration.flatMap { $0.level.map(String.init) } ?? ""]
+    }
+
+    static var f3Empty: [String] {
+        [String](repeating: "", count: f3Header.split(separator: ",", omittingEmptySubsequences: false).count)
     }
 }

@@ -114,6 +114,9 @@ final class VideoSyncPlayer: ObservableObject {
     /// av-fusion F2（默认关）：声音给画面节奏投票——只在上一拍融合状态 = 耦合时改交给跟随器 / 相位锁的窗口副本
     /// （P4 前瞻、P3 动作识别之后）和跟随器这一拍的跳变确认拍数；不改出口、不新增发送路径
     private var rhythmVote = AVRhythmVote()
+    /// av-fusion F3：声音重音 / F3b 震动跟声音（开关关着时不走、一直是初值）
+    private var accent = AVAccent()
+    private var vibrationAudio = AVVibrationAudio()
     /// av-fusion（F1 复审 L2）：电平计现在算没算 6 段扩展特征（fusionFeaturesWanted 上次交给电平计的值）
     private var fusionAudioOn = false
     private var bandBacklog = AudioBandBacklog()
@@ -207,6 +210,8 @@ final class VideoSyncPlayer: ObservableObject {
         let previousPrescan = visualSettings.usesPrescan
         let previousFusion = visualSettings.usesAVFusion
         let previousVote = visualSettings.usesAVRhythmConfirm
+        let previousAccent = visualSettings.usesAVAccent
+        let previousVibration = visualSettings.usesAVVibrationAudio
         // F1 复审 L2：上一次交给电平计的「融合要不要声音特征 / 频带」
         let previousFusionAudio = fusionAudioOn
         visualSettings = v
@@ -214,6 +219,9 @@ final class VideoSyncPlayer: ObservableObject {
         if v.usesAVFusion != previousFusion { resetFusion() }
         // F2：节奏确认一变就从头来（关掉 = 窗口副本原样、状态行消失）
         if v.usesAVRhythmConfirm != previousVote { resetVote() }
+        // F3：重音 / 震动跟声音一变就从头来（关掉 = g = 1、震动回画面值）
+        if v.usesAVAccent != previousAccent { accent.reset() }
+        if v.usesAVVibrationAudio != previousVibration { vibrationAudio.reset() }
         // P3：动作识别 / 撞击声校正开关一变就从头确认（关掉 = 回到 P2 行为）
         if v.usesRhythmContext != previousContext { resetContext() }
         if v.usesAudioAnchor != previousAnchor { resetAnchor() }
@@ -1225,6 +1233,36 @@ final class VideoSyncPlayer: ObservableObject {
         fusionBeat = nil
         if fusionStatus != nil { fusionStatus = nil }
         resetVote()
+        accent.reset()
+        vibrationAudio.reset()
+    }
+
+    /// av-fusion F3：这一拍的重音系数 g（声音重音生效 + 这一拍 S2 才可能 ≠ 1；关着时什么都不算 = 1）
+    private func accentGain(_ p: AVPlayer) -> Double {
+        guard visualSettings.usesAVAccent, fusionFeaturesWanted else {
+            if accent.active { accent.reset() }
+            return 1
+        }
+        let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
+        return accent.step(events: fusion.extractor.events, clock: clock, s2: AVRhythmVote.isS2(fusionBeat),
+                           lockHz: phaseLock.hz, depth: visualSettings.avAccentDepth / 100)
+    }
+
+    /// av-fusion F3b：震动通道目标换成和声音撞击的有界混合（开关关着 / 通道不是两个都用 / 门不满足且已淡回 = 原样）
+    private func vibrationLevels(_ levels: [Int], player p: AVPlayer, hasSignal: Bool, activity: Double,
+                                 dt: Double) -> [Int] {
+        guard visualSettings.usesAVVibrationAudio, fusionFeaturesWanted, levels.count > 1 else {
+            if vibrationAudio.active { vibrationAudio.reset() }
+            return levels
+        }
+        let floorPercent = SyncOutputStage.floorPercent(settings: settings, hasSignal: hasSignal)
+        let floorLevel = floorPercent.isFinite ? max(0, Int(floorPercent.rounded())) : 0
+        let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
+        var out = levels
+        out[1] = vibrationAudio.step(video: levels[1], floor: floorLevel, events: fusion.extractor.events, clock: clock,
+                                     beat: fusionBeat, activity: activity, channelsBoth: settings.channels == .both,
+                                     depth: visualSettings.avAccentDepth / 100, now: CACurrentMediaTime(), dt: dt)
+        return out
     }
 
     /// av-fusion F2：投票从头来（下一拍按当时的融合状态重新判断；不耦合 = 窗口原样）
@@ -1413,8 +1451,14 @@ final class VideoSyncPlayer: ObservableObject {
         let vals: [Int]
         if visualSettings.rhythmFollow {
             // 伸缩按动作频率（weight × 画面强度交接），震动照旧；同一个出口：上限 / 升幅 ≤ +20 / 归零保持
-            let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
-                                             rateLevel: rateLevel, weight: rhythm.weight, activity: rhythmActivity)
+            // av-fusion F3：重音（S2 才 ≠ 1）——脉动关着时乘在进 target 的强度上，开着时改调脉动深度；F3b 只改震动通道
+            let accentG = accentGain(p)
+            let accentValue = accentG != 1 && !visualSettings.rhythmPulse ? min(100, max(0, value * accentG)) : value
+            let levels = vibrationLevels(RhythmOutput.target(value: accentValue, settings: settings, hasSignal: hasSignal,
+                                                             rateLevel: rateLevel, weight: rhythm.weight,
+                                                             activity: rhythmActivity),
+                                         player: p, hasSignal: hasSignal, activity: rhythmActivity, dt: dt)
+            pulse.accentGain = visualSettings.rhythmPulse ? accentG : 1
             if visualSettings.rhythmPulse {
                 // P4：上一拍加的前瞻提前量先撤掉（没加过时原样），撞击声校正照旧按自己的值算。
                 // 防御性：updateAudioAnchor 现在每拍都整个改写 phaseOffset，撤不撤结果一样（见 LookaheadCoordinator.removeLead）
@@ -1449,7 +1493,11 @@ final class VideoSyncPlayer: ObservableObject {
                             rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
                             activity: rhythmActivity, rateLevel: rateLevel, out: vals,
                             av: avDebugFields(p) + (fusionBeat.map(AVDebugColumns.f1Fields) ?? AVDebugColumns.f1Empty)
-                                + (rhythmVote.active ? AVDebugColumns.f2Fields(rhythmVote) : AVDebugColumns.f2Empty))
+                                + (rhythmVote.active ? AVDebugColumns.f2Fields(rhythmVote) : AVDebugColumns.f2Empty)
+                                + (visualSettings.usesAVAccent
+                                   ? AVDebugColumns.f3Fields(accent: accent,
+                                                             vibration: visualSettings.usesAVVibrationAudio ? vibrationAudio : nil)
+                                   : AVDebugColumns.f3Empty))
         }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
@@ -1724,6 +1772,9 @@ struct VideoSyncView: View {
     @AppStorage(VisualSyncSettings.Keys.avFusion) private var avFusion = VisualSyncSettings.defaultAVFusion
     // av-fusion F2：节奏由声音确认（实验，默认关；融合 + 伸缩跟随动作频率都开着才显示）
     @AppStorage(VisualSyncSettings.Keys.avRhythmConfirm) private var avRhythmConfirm = VisualSyncSettings.defaultAVRhythmConfirm
+    @AppStorage(VisualSyncSettings.Keys.avAccent) private var avAccent = VisualSyncSettings.defaultAVAccent
+    @AppStorage(VisualSyncSettings.Keys.avAccentDepth) private var avAccentDepth = VisualSyncSettings.defaultAVAccentDepth
+    @AppStorage(VisualSyncSettings.Keys.avVibrationAudio) private var avVibrationAudio = VisualSyncSettings.defaultAVVibrationAudio
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -1746,7 +1797,8 @@ struct VideoSyncView: View {
                            pulseDepth: pulseDepth, pulseLatencyMs: pulseLatencyMs, pulseInvert: pulseInvert,
                            rhythmContext: rhythmContext, rhythmAudioAnchor: rhythmAudioAnchor,
                            rhythmLookahead: rhythmLookahead, prescan: prescan, avFusion: avFusion,
-                           avRhythmConfirm: avRhythmConfirm)
+                           avRhythmConfirm: avRhythmConfirm, avAccent: avAccent, avAccentDepth: avAccentDepth,
+                           avVibrationAudio: avVibrationAudio)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -2335,6 +2387,58 @@ struct VideoSyncView: View {
                 }
             }
             .tint(Velvet.gold)
+        }
+        if avFusion {
+            accentControls
+        }
+    }
+
+    private var avAccentDepthText: String { "±\(Int(avAccentDepth.rounded()))%" }
+
+    /// av-fusion F3：声音重音（实验，默认关；融合开着才显示）+ F3b 震动跟声音（子开关，通道 = 两个都用才显示）
+    @ViewBuilder private var accentControls: some View {
+        Toggle(isOn: $avAccent) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("声音重音（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("声画耦合时，撞击声比最近几下响就把这一下稍微加强、轻就稍微减弱（最多 ± 深度）；开着相位脉动时改调脉动深度。配乐 / 人声 / 没耦合时不起作用")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+        if avAccent {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("重音深度")
+                        .font(.subheadline)
+                        .foregroundColor(Velvet.text)
+                    Spacer()
+                    Text(avAccentDepthText)
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(Velvet.textSecondary)
+                }
+                Slider(value: $avAccentDepth, in: VisualSyncSettings.avAccentDepthRange, step: 5)
+                    .tint(Velvet.rose)
+                    .accessibilityLabel("重音深度")
+                    .accessibilityValue(avAccentDepthText)
+            }
+            if (AudioSyncChannels(rawValue: channelsRaw) ?? .both) == .both {
+                Toggle(isOn: $avVibrationAudio) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("震动跟声音（实验）")
+                            .font(.subheadline)
+                            .foregroundColor(Velvet.text)
+                        Text("伸缩照旧跟画面，震动按撞击声的轻重走（不超过画面强度 × (1 + 重音深度)）；只在声画耦合、不像配乐、画面在动时生效，否则 1.5 秒内淡回画面")
+                            .font(.caption2)
+                            .foregroundColor(Velvet.textMuted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .tint(Velvet.gold)
+            }
         }
     }
 
@@ -2964,7 +3068,7 @@ final class MotionDebugLog {
         + "pose_rhythm_hz,pose_rhythm_conf,pose_rhythm_part,subject_follow_hz,roi_valid,roi_x0,roi_y0,roi_x1,roi_y1,roi_hz,roi_share,"
         + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
         + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1,"
-        + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header + "," + AVDebugColumns.f2Header
+        + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header + "," + AVDebugColumns.f2Header + "," + AVDebugColumns.f3Header
     private var rows: [String] = []
     private var start = 0
 
@@ -2979,7 +3083,7 @@ final class MotionDebugLog {
                 shapedLevel: Double, value: Double, hasSignal: Bool, kind: Int, context: String?,
                 rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
                 rateLevel: Int?, out: [Int], av: [String] = AVDebugColumns.f0Empty + AVDebugColumns.f1Empty
-                    + AVDebugColumns.f2Empty) {
+                    + AVDebugColumns.f2Empty + AVDebugColumns.f3Empty) {
         func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
         let r = w.roi.region
         let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")

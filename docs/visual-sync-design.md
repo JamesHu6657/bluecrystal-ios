@@ -1307,6 +1307,34 @@ motionTick：updateFusion（F1，不变）→ … → updateAudioAnchor（usesAV
 四份输出（f706431 / 当前 / 融合 / F2）逐字节相同。`AudioLevelTap.swift` / `VideoSyncView.swift` Linux 编不了，靠 PR Checks（Xcode 16.4）编译确认，再上真机
 （`docs/rhythm-calibration.md` 第 12 节）。F2 的结果也决定 F3b 做不做。
 
+### av-fusion F3：声音重音（开关 `bcVisualSyncAVAccent`，默认关）+ F3b 震动跟声音（`bcVisualSyncAVVibrationAudio`，默认关）
+
+研究页 F3 一步。原则不变：**画面为主、声音作证**。F3 只在 S2（F1 判定耦合、相位锁跟着画面）时，用撞击声的轻重给画面强度一个有界的重音系数；
+F3b 是 F3 下面的子开关（James 10-17 决定），只换震动通道的目标。两者都不启动静止画面、不新增发送路径，结果仍走 `tick()` → `SyncOutputStage.limit` → `BLEManager.sendTick`。
+
+设置：`bcVisualSyncAVAccent`（默认关）、`bcVisualSyncAVAccentDepth`（β，默认 15%，夹 0~30，NaN → 15）、`bcVisualSyncAVVibrationAudio`（默认关）。
+`usesAVAccent` = 融合生效 + 重音开；`usesAVVibrationAudio` = 重音生效 + 子开关开。都不改 Timer 间隔。
+
+#### 类型（`VisualSync.swift`「av-fusion F3」）
+
+- `AVAccent.step(events:clock:s2:lockHz:depth:)`：最近 4 秒（视频时间，按倍速折算）的撞击（`AVRhythmVote.impacts`）≥ 3 下，而且最后一下离现在不超过一个周期（rate / lockHz），
+  z = clamp(log₂(最后一下的幅度 / 中位数), −1, 1)，g = 1 + β·z ∈ [1 − β, 1 + β]。幅度 = 10^(各段平均上升 dB / 20)，只看比值，所以整体响度变化 / 自动增益不影响 g（测试：整体 +12 dB g 不变）。
+  不在 S2 / 撞击不够 / 这个周期没撞击 / 没锁 / β = 0 → 精确的 1。
+- 作用点（`VideoSyncPlayer.motionTick`）：相位脉动关着时乘在进 `RhythmOutput.target` 的强度上（夹 0~100）；脉动开着时不改强度，改 `RhythmPulseDriver.accentGain`，
+  有效深度 = min(深度 × g, `RhythmPulse.depthCeiling`)（满深度上界不变）。g = 1 时两条路都和关着逐位相同。
+- `AVVibrationAudio.step(...)`（F3b）：四道门全满足才生效——① 这一拍 S2；② P_music < 0.3，且最近 10 秒没有「跨切镜节拍连续」「画面不动时仍有节奏」的证据（`crossCut` / `still` > 0）；
+  ③ 画面在动（activity > 0）；④ 通道 = 两个都用。声音目标 = 画面震动值 × min(1 + β, e)，e = [t − 0.3, t] 里最响一下撞击相对最近 4 秒中位数的幅度比，
+  夹到 [最低强度, min(画面值 × (1 + β), 99)]。混合比 0.6 秒爬满；门不满足时 1.5 秒线性淡回画面值、每拍降 ≤ 12；混合比 0 时逐位等于画面值。伸缩通道不动。
+- 调试列 3 列：`av_accent_g`、`av_vib_mix`、`av_vib_level`（开关关着时空）。
+
+#### 测试（`Tests/VisualSyncChecks/main.swift`「av-fusion F3」，固定种子，都在函数里）
+
+设置 / 键名 / 范围；g 的响 / 轻 / 一样 / 各种不生效情况；整体 +12 dB 不变；5000 组随机 g ∈ [1 − β, 1 + β]；脉动有效深度 ≤ 满深度；
+5000 组随机（强度、重音、上限、最低强度、通道、声音）经出口 ≤ 上限、单拍升 ≤ 20、归零保持、通道 2 / 3 = 0；按时间出口升幅；
+F3b 四道门逐一不满足 → 逐位等于画面值；跨切镜证据后 10 秒不生效；离开耦合 1.5 秒内淡回、每拍降 ≤ 12；调试列。
+`Tests/FusionOffCompare/run.sh` 多编一份 `-D AV_FUSION_ON -D AV_F2_ON -D AV_F3_ON`（重音 / F3b 接线全走、耦合强制不成立 = S1），输出和 f706431 逐字节相同。
+真机验证见 `docs/rhythm-calibration.md` 第 13 节。
+
 ## 11. 风险与待定
 
 1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。rhythm-follow P1 也按速度档设计，P0 标定（`docs/rhythm-calibration.md` 第 1 步）先确认。

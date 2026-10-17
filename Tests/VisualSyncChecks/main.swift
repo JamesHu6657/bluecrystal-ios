@@ -8063,6 +8063,223 @@ func avFusionF2Checks() {
 
 avFusionF2Checks()
 
+/// av-fusion F3 / F3b 的检查（放在函数里：顶层 main 离 8 MB 栈上限很近）
+func avFusionF3Checks() {
+    var seed: UInt64 = 0xF3F3
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    func ev(_ t: Double, _ strength: Double = 30) -> AudioOnsetEvent {
+        AudioOnsetEvent(time: t, strength: strength, risingBands: 6, steepBands: 6, shortBands: 6)
+    }
+    func s2Beat(pMusic: Double = 0, crossCut: Double = 0, still: Double = 0) -> AVFusionBeat {
+        var b = AVFusionBeat()
+        b.state = .coupled
+        b.coupled = true
+        b.fv = 0.5
+        b.pMusic = pMusic
+        b.crossCut = crossCut
+        b.still = still
+        return b
+    }
+    func clock(_ t: Double, rate: Double = 1) -> MediaClockSnapshot { MediaClockSnapshot(host: t, item: t, rate: rate) }
+    // 1 Hz 撞击，最后一下（t = 9.9）的强度可调
+    func train(last: Double, base: Double = 30, shift: Double = 0) -> [AudioOnsetEvent] {
+        var out: [AudioOnsetEvent] = []
+        for k in 0..<9 { out.append(ev(1.9 + Double(k), base + shift)) }
+        out.append(ev(9.9, last + shift))
+        return out
+    }
+
+    // 设置：默认关、键名、深度夹 0~30、生效条件
+    let def = VisualSyncSettings()
+    let on = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true, avFusion: true, avAccent: true,
+                                avVibrationAudio: true)
+    let noFusion = VisualSyncSettings(source: .motion, avFusion: false, avAccent: true, avVibrationAudio: true)
+    let audioSrc = VisualSyncSettings(source: .audio, avFusion: true, avAccent: true, avVibrationAudio: true)
+    let subOnly = VisualSyncSettings(source: .motion, avFusion: true, avAccent: false, avVibrationAudio: true)
+    var off3 = on
+    off3.avAccent = false
+    off3.avVibrationAudio = false
+    vcheck(!def.avAccent && !def.avVibrationAudio && def.avAccentDepth == 15 && !def.usesAVAccent && !def.usesAVVibrationAudio
+           && VisualSyncSettings.Keys.avAccent == "bcVisualSyncAVAccent"
+           && VisualSyncSettings.Keys.avAccentDepth == "bcVisualSyncAVAccentDepth"
+           && VisualSyncSettings.Keys.avVibrationAudio == "bcVisualSyncAVVibrationAudio"
+           && on.usesAVAccent && on.usesAVVibrationAudio && !noFusion.usesAVAccent && !audioSrc.usesAVAccent
+           && !subOnly.usesAVVibrationAudio && on.tickInterval == off3.tickInterval
+           && VisualSyncSettings(avAccentDepth: 99).avAccentDepth == 30 && VisualSyncSettings(avAccentDepth: -5).avAccentDepth == 0
+           && VisualSyncSettings(avAccentDepth: .nan).avAccentDepth == 15,
+           "F3 设置：默认关、键名、深度夹 0~30（NaN → 15）、重音要融合、F3b 要重音，不改 Timer 间隔")
+
+    // 重音系数：S2 + 最近一个周期里有撞击才 ≠ 1；响 → 1 + β，轻 → 1 − β，一样响 → 1；不在 S2 / 撞击不够 / 这个周期没撞击 → 1
+    var a = AVAccent()
+    let loud = a.step(events: train(last: 90 + 6 * 20, base: 90), clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let quiet = a.step(events: train(last: 90 - 6 * 10, base: 90), clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let same = a.step(events: train(last: 90, base: 90), clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let notS2 = a.step(events: train(last: 90 + 6 * 20, base: 90), clock: clock(10), s2: false, lockHz: 1, depth: 0.15)
+    let few = a.step(events: [ev(9.5, 90), ev(9.9, 150)], clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let stale = a.step(events: train(last: 150), clock: clock(11.5), s2: true, lockHz: 1, depth: 0.15)
+    let noLock = a.step(events: train(last: 150), clock: clock(10), s2: true, lockHz: 0, depth: 0.15)
+    let zeroDepth = a.step(events: train(last: 150), clock: clock(10), s2: true, lockHz: 1, depth: 0)
+    vcheck(abs(loud - 1.15) < 1e-12 && abs(quiet - 0.85) < 1e-12 && abs(same - 1) < 1e-12
+           && notS2 == 1 && few == 1 && stale == 1 && noLock == 1 && zeroDepth == 1,
+           "F3 重音系数：响 \(String(format: "%.3f", loud))、轻 \(String(format: "%.3f", quiet))、一样 1；不在 S2 / 撞击 < 3 / 这个周期没撞击 / 没锁 / 深度 0 → 1")
+    // 整体响度抬 12 dB（各段都 +12）：g 不变；随机输入 g ∈ [1 − β, 1 + β]
+    let lifted = a.step(events: train(last: 30 + 6 * 7, shift: 6 * 12), clock: clock(10), s2: true, lockHz: 1, depth: 0.2)
+    let plain = a.step(events: train(last: 30 + 6 * 7), clock: clock(10), s2: true, lockHz: 1, depth: 0.2)
+    var bounded = true
+    for _ in 0..<5000 {
+        var evs: [AudioOnsetEvent] = []
+        var t = 6 + rnd() * 0.5
+        while t < 10 { evs.append(ev(t, rnd() < 0.05 ? .nan : rnd() * 300 - 20)); t += 0.2 + rnd() * 0.8 }
+        let beta = rnd() < 0.05 ? Double.nan : rnd() * 0.5
+        let g = a.step(events: evs, clock: clock(10, rate: 0.5 + rnd() * 1.5), s2: rnd() < 0.8, lockHz: 0.3 + rnd() * 4,
+                       depth: beta)
+        let bb = beta.isFinite ? min(0.3, max(0, beta)) : 0
+        if !(g.isFinite && g >= 1 - bb - 1e-12 && g <= 1 + bb + 1e-12) { bounded = false }
+    }
+    vcheck(abs(lifted - plain) < 1e-9 && plain > 1 && bounded,
+           "F3 重音：整体 +12 dB 时 g 不变（\(String(format: "%.4f", plain))）；5000 组随机 g ∈ [1 − β, 1 + β]（β 夹 0~0.3）")
+
+    // 脉动深度上界：随机设置 / 频率 / 权重下 depth ≤ depthCeiling（重音放大也不超过满深度）
+    var ceilingOK = true
+    for _ in 0..<2000 {
+        let setting = rnd() * 40, hz = rnd() * 3, w = rnd(), act = rnd(), inten = Int(rnd() * 100)
+        let d = RhythmPulse.depth(setting: setting, hz: hz, weight: w, activity: act, intensity: inten)
+        if d > RhythmPulse.depthCeiling(setting: setting, hz: hz) { ceilingOK = false }
+    }
+    vcheck(ceilingOK, "F3 重音调脉动：有效深度 ≤ 这个设置 / 频率下的满深度（2000 组随机）")
+
+    // 5000 组随机（强度、z、上限、最低强度、通道）× 重音 / F3b → 出口：≤ 上限、单拍升 ≤ 20、归零保持、通道 2 / 3 = 0、NaN → 0
+    var stage = SyncOutputStage()
+    var prev = [0, 0, 0, 0]
+    let heldRun = SyncOutputStage.zeroHoldTicks + 1
+    var zeroRun = [heldRun, heldRun]
+    var ok = true
+    var bad = ""
+    var vib = AVVibrationAudio()
+    let channels = AudioSyncChannels.allCases
+    var tNow = 0.0
+    for i in 0..<5000 {
+        if i % 200 == 0 { stage.reset(); prev = [0, 0, 0, 0]; zeroRun = [heldRun, heldRun]; vib.reset() }
+        tNow += 0.3
+        let st = AudioSyncSettings(maxPercent: 5 + rnd() * 100, channels: channels[Int(rnd() * 3) % 3], minPercent: rnd() * 60)
+        let value = rnd() < 0.05 ? Double.nan : rnd() * 120 - 10
+        let sig = rnd() < 0.85
+        let beta = rnd() * 0.3
+        let g = 1 + beta * (rnd() * 2 - 1)
+        let accented = value.isFinite ? min(100, max(0, value * g)) : value
+        var levels = RhythmOutput.target(value: accented, settings: st, hasSignal: sig, rateLevel: Int(rnd() * 99),
+                                         weight: rnd())
+        let fp = SyncOutputStage.floorPercent(settings: st, hasSignal: sig)
+        var evs: [AudioOnsetEvent] = []
+        var et = tNow - 4
+        while et < tNow { evs.append(ev(et, rnd() * 200)); et += 0.2 + rnd() * 0.6 }
+        levels[1] = vib.step(video: levels[1], floor: fp.isFinite ? max(0, Int(fp.rounded())) : 0, events: evs,
+                             clock: clock(tNow), beat: rnd() < 0.7 ? s2Beat(pMusic: rnd() * 0.4) : nil,
+                             activity: rnd() < 0.8 ? rnd() : 0, channelsBoth: st.channels == .both, depth: beta,
+                             now: tNow, dt: 0.3)
+        let out = stage.step(levels: levels, settings: st)
+        let cap = SyncOutputStage.hardCap(st)
+        if out.count != 4 || out[2] != 0 || out[3] != 0 { ok = false; bad = "通道 \(out)" }
+        for ch in 0..<2 {
+            if out[ch] < 0 || out[ch] > cap { ok = false; bad = "上限 \(out) cap \(cap)" }
+            if out[ch] - prev[ch] > SyncOutputStage.maxRisePerTick { ok = false; bad = "升幅 \(prev) → \(out)" }
+            if out[ch] > 0, prev[ch] == 0, zeroRun[ch] < heldRun { ok = false; bad = "归零保持 \(zeroRun[ch]) 拍" }
+            zeroRun[ch] = out[ch] == 0 ? min(heldRun, zeroRun[ch] + 1) : 0
+        }
+        prev = out
+    }
+    vcheck(ok, "F3 / F3b：5000 组随机（强度、重音、上限、最低强度、通道、声音）经出口后 ≤ 上限、单拍升 ≤ 20、归零保持、通道 2 / 3 = 0 \(bad)")
+    // 时间折算的出口：按实际间隔升幅 ≤ 20 × Δt / 0.3 + 1
+    var timedStage = SyncOutputStage()
+    var tPrev = [0, 0, 0, 0]
+    var tt = 0.0
+    var timedOK = true
+    for _ in 0..<2000 {
+        let dt = 0.1 + rnd() * 0.3
+        tt += dt
+        let st = AudioSyncSettings(maxPercent: 30 + rnd() * 70, channels: .both, minPercent: rnd() * 30)
+        let g = 1 + 0.3 * (rnd() * 2 - 1)
+        let lv = RhythmOutput.target(value: min(100, rnd() * 100 * g), settings: st, hasSignal: true, rateLevel: nil, weight: 0)
+        let out = timedStage.step(levels: lv, settings: st, now: tt, timed: true)
+        for ch in 0..<2 where Double(out[ch] - tPrev[ch]) > 20 * dt / 0.3 + 1 { timedOK = false }
+        tPrev = out
+    }
+    vcheck(timedOK, "F3：按时间的出口升幅 ≤ 20 × Δt / 0.3 + 1（2000 组随机间隔）")
+
+    // F3b 四道门：不满足 → 逐位等于画面值
+    func vibRun(_ beat: AVFusionBeat?, activity: Double = 0.5, both: Bool = true, video: Int = 50,
+                beats: Int = 12) -> [Int] {
+        var v = AVVibrationAudio()
+        var out: [Int] = []
+        for k in 0..<beats {
+            let t = 10 + Double(k) * 0.3
+            var evs: [AudioOnsetEvent] = []
+            var e = t - 4 + 0.05
+            var n = 0
+            while e <= t { evs.append(ev(e, n % 3 == 1 ? 150 : 30)); e += 0.3; n += 1 }
+            out.append(v.step(video: video, floor: 10, events: evs, clock: clock(t), beat: beat, activity: activity,
+                              channelsBoth: both, depth: 0.15, now: t, dt: 0.3))
+        }
+        return out
+    }
+    let passes = vibRun(s2Beat())
+    var uncoupled = s2Beat()
+    uncoupled.state = .uncoupled
+    var stale2 = s2Beat()
+    stale2.fv = 0
+    let gatesOff = [vibRun(nil), vibRun(uncoupled), vibRun(stale2), vibRun(s2Beat(pMusic: 0.5)), vibRun(s2Beat(), activity: 0),
+                    vibRun(s2Beat(), both: false), vibRun(s2Beat(crossCut: 1)), vibRun(s2Beat(still: 0.2))]
+    vcheck(passes.contains { $0 != 50 } && passes.allSatisfy { $0 >= 10 && $0 <= 57 }
+           && gatesOff.allSatisfy { $0.allSatisfy { $0 == 50 } },
+           "F3b 四道门：耦合 + 不像配乐 + 画面在动 + 两个通道才跟声音（\(passes.min() ?? 0)~\(passes.max() ?? 0) ≤ 57）；"
+           + "不耦合 / 相位锁放开 / P_music 0.5 / 画面静止 / 单通道 / 跨切镜证据 / 静止仍有节奏 → 逐位等于画面值")
+    // 最近 10 秒内有过跨切镜证据：之后 10 秒内都不生效，过了才生效
+    var ve = AVVibrationAudio()
+    var evidenceHeld = true
+    var reopened = false
+    for k in 0..<50 {
+        let t = 10 + Double(k) * 0.3
+        let evs = (0..<14).map { ev(t - 4 + 0.05 + Double($0) * 0.3, $0 % 3 == 1 ? 150 : 30) }
+        let b = k == 0 ? s2Beat(crossCut: 1) : s2Beat()
+        let o = ve.step(video: 50, floor: 10, events: evs, clock: clock(t), beat: b, activity: 0.5, channelsBoth: true,
+                        depth: 0.15, now: t, dt: 0.3)
+        if t - 10 < 10 - 1e-9, o != 50 { evidenceHeld = false }
+        if t - 10 >= 10, o != 50 { reopened = true }
+    }
+    vcheck(evidenceHeld && reopened, "F3b：跨切镜证据之后 10 秒内震动 = 画面值，之后才跟声音")
+    // 离开耦合：1.5 秒内回到画面值、每拍降 ≤ 12（画面值不变）
+    var vf = AVVibrationAudio()
+    var lastOn = 0
+    for k in 0..<20 {
+        let t = 10 + Double(k) * 0.3
+        let evs = (0..<14).map { ev(t - 4 + 0.05 + Double($0) * 0.3, $0 % 3 == 1 ? 150 : 30) }
+        lastOn = vf.step(video: 50, floor: 10, events: evs, clock: clock(t), beat: s2Beat(), activity: 0.5,
+                         channelsBoth: true, depth: 0.3, now: t, dt: 0.3)
+    }
+    var fade: [Int] = [lastOn]
+    for k in 0..<8 {
+        let t = 16 + Double(k) * 0.3
+        fade.append(vf.step(video: 50, floor: 10, events: [], clock: clock(t), beat: nil, activity: 0.5, channelsBoth: true,
+                            depth: 0.3, now: t, dt: 0.3))
+    }
+    let backAt = fade.firstIndex(of: 50)
+    let drops = zip(fade, fade.dropFirst()).allSatisfy { $0.0 - $0.1 <= AVVibrationAudio.maxDropPerBeat }
+    vcheck(lastOn > 50 && (backAt ?? 99) <= 5 && fade.suffix(from: backAt ?? 0).allSatisfy { $0 == 50 } && drops && vf.mix == 0,
+           "F3b 离开耦合：\(fade.map(String.init).joined(separator: "→"))，1.5 秒内回到画面值、每拍降 ≤ 12")
+
+    // 调试列
+    let f3Count = AVDebugColumns.f3Header.split(separator: ",", omittingEmptySubsequences: false).count
+    vcheck(f3Count == 3 && AVDebugColumns.f3Fields(accent: a, vibration: vf).count == 3 && AVDebugColumns.f3Empty.count == 3
+           && AVDebugColumns.f3Empty.allSatisfy { $0.isEmpty },
+           "F3 调试列 3 列")
+}
+
+
+avFusionF3Checks()
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)
