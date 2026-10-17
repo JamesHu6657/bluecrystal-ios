@@ -40,11 +40,17 @@ final class AudioLevelMeter {
 
     /// av-fusion F1（声音特征，默认关）：6 段 10 毫秒能量 / 1 毫秒峰值帧 + 约 8 kHz 的 PCM，只在「声画融合」开着时算
     /// （关着时实时线程只多看一个布尔）。环形缓冲（锁里读写，满了丢最旧的）由实时线程写、主线程 drainFeatures 取走；
-    /// featureSplitter / pending* 只在实时线程上用，别的线程要清它们只在锁里置 featureResetPending。全部 init 时一次分配好
+    /// featureSplitter / pending* 只在实时线程上用，别的线程要清它们只在锁里置 featureResetPending。全部 init 时一次分配好。
+    /// F1 复审 L1：实时线程写环形缓冲不再等锁——回调末尾用 os_unfair_lock_trylock，主线程正拿着锁（drainFeatures 拷贝）
+    /// 就把 pending 留到下一次回调再写（pending 够放约 0.6 秒）；只有 pending 在一次回调中途满了才照旧等锁（不丢数据）。
+    /// 换代（featureEpoch：开关 / seek / prepare 清缓冲时 +1）后留着的旧 pending 一律丢掉，不会写进新位置的缓冲。
+    /// 没做成真正无锁的单生产者 / 单消费者环：iOS 16 起步、Swift 5 模式下标准库没有带内存序的原子量
+    /// （Synchronization.Atomic 要 iOS 18，swift-atomics 要加依赖 = 改工程文件），普通变量当序号在 ARM64 上是数据竞争、
+    /// 看不到写入顺序，不安全
     static let featureCapacity = 512
     static let pcmCapacity = 16384
-    static let pendingFeatureCapacity = 32
-    static let pendingPCMCapacity = 512
+    static let pendingFeatureCapacity = 64
+    static let pendingPCMCapacity = 4096
     private let features: UnsafeMutablePointer<AudioFeatureFrame>
     private var featureHead = 0
     private var featureCount = 0
@@ -58,6 +64,12 @@ final class AudioLevelMeter {
     private var featureSplitter = AudioFeatureSplitter()
     private let pendingFeatures: UnsafeMutablePointer<AudioFeatureFrame>
     private let pendingPCM: UnsafeMutablePointer<Float>
+    /// 锁里读写：特征缓冲的代次（clearFeaturesLocked 时 +1）
+    private var featureEpoch = 0
+    /// 只在实时线程上用：还没写进环形缓冲的特征帧 / PCM 个数（可以跨回调留着）和它们属于哪一代
+    private var pendingFrameCount = 0
+    private var pendingSampleCount = 0
+    private var pendingEpoch = 0
 
     init() {
         lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
@@ -133,20 +145,26 @@ final class AudioLevelMeter {
 
     /// 主线程（av-fusion F1）：取走上次以来的特征帧 / PCM（旧 → 新）和时间范围拿不到的回调数
     func drainFeatures() -> AudioFeatureDrain {
+        // F2 复审 L1：先在锁里看一眼有多少，锁外把数组容量备好（多留一次回调的余量），再进锁只拷贝——
+        // 主线程拿着锁时不分配内存，实时线程在回调开头 / 末尾等锁的时间只剩拷贝（余量不够时 append 仍会照常扩容，结果不变）
+        os_unfair_lock_lock(lock)
+        let frameHint = featureCount
+        let pcmHint = pcmCount
+        os_unfair_lock_unlock(lock)
+        var out = AudioFeatureDrain()
+        out.frames.reserveCapacity(min(Self.featureCapacity, frameHint + Self.pendingFeatureCapacity))
+        out.pcm.reserveCapacity(min(Self.pcmCapacity, pcmHint + Self.pendingPCMCapacity))
         os_unfair_lock_lock(lock)
         defer { os_unfair_lock_unlock(lock) }
-        var out = AudioFeatureDrain()
         out.pcmRate = AudioFeatureSplitter.pcmRate(forSampleRate: bandSampleRate)
         out.invalidChunks = featureInvalid
         featureInvalid = 0
         if featureCount > 0 {
-            out.frames.reserveCapacity(featureCount)
             let start = (featureHead + Self.featureCapacity - featureCount) % Self.featureCapacity
             for k in 0..<featureCount { out.frames.append(features[(start + k) % Self.featureCapacity]) }
             featureCount = 0
         }
         if pcmCount > 0 {
-            out.pcm.reserveCapacity(pcmCount)
             let start = (pcmHead + Self.pcmCapacity - pcmCount) % Self.pcmCapacity
             for k in 0..<pcmCount { out.pcm.append(pcm[(start + k) % Self.pcmCapacity]) }
             pcmCount = 0
@@ -162,6 +180,7 @@ final class AudioLevelMeter {
         pcmCount = 0
         featureInvalid = 0
         featureResetPending = true
+        featureEpoch &+= 1
     }
 
     /// 主线程（av-fusion F0）：调试记录开着时才记回调时间。关掉时丢掉没取走的记录
@@ -248,6 +267,7 @@ final class AudioLevelMeter {
         let featuresOn = featuresEnabled
         let resetFeatures = featureResetPending
         featureResetPending = false
+        let epoch = featureEpoch
         if featuresOn, !start.isFinite { featureInvalid += 1 }
         // av-fusion F0：调试记录开着才记（固定容量环形缓冲，不分配；CACurrentMediaTime 不阻塞）
         if timings.enabled { timings.record(AudioTapTiming(host: CACurrentMediaTime(), itemStart: start, frames: frames)) }
@@ -257,6 +277,12 @@ final class AudioLevelMeter {
         }
         if resetSplitter { splitter.configure(sampleRate: rate) }
         if resetFeatures { featureSplitter.configure(sampleRate: rate) }
+        if resetFeatures || epoch != pendingEpoch {
+            // 缓冲换代了：上一代没写进去的 pending 丢掉
+            pendingFrameCount = 0
+            pendingSampleCount = 0
+            pendingEpoch = epoch
+        }
         guard let f = current, frames > 0 else { return }
         if bandsOn { splitBands(list, frames: frames, format: f, start: start) }
         if featuresOn { splitFeatures(list, frames: frames, format: f, start: start) }
@@ -355,8 +381,8 @@ final class AudioLevelMeter {
         guard local.sampleRate > 0 else { return }
         local.begin(start: start, frames: n)
         let scale = f.scale
-        var pendingFrames = 0
-        var pendingSamples = 0
+        var pendingFrames = pendingFrameCount
+        var pendingSamples = pendingSampleCount
         var frame = AudioFeatureFrame()
         var sample: Float = 0
         for i in 0..<n {
@@ -377,19 +403,32 @@ final class AudioLevelMeter {
                 pendingSamples += 1
             }
             if pendingFrames == Self.pendingFeatureCapacity || pendingSamples == Self.pendingPCMCapacity {
-                pushFeatures(frames: pendingFrames, samples: pendingSamples)
+                // 一次回调中途 pending 满了（很少见：主线程连着好几次回调都拿着锁）：照旧等锁写进去，不丢
+                _ = pushFeatures(frames: pendingFrames, samples: pendingSamples, wait: true)
                 pendingFrames = 0
                 pendingSamples = 0
             }
         }
         featureSplitter = local
-        if pendingFrames > 0 || pendingSamples > 0 { pushFeatures(frames: pendingFrames, samples: pendingSamples) }
+        // 回调末尾：拿不到锁就留到下一次回调（不等）
+        if pendingFrames > 0 || pendingSamples > 0,
+           pushFeatures(frames: pendingFrames, samples: pendingSamples, wait: false) {
+            pendingFrames = 0
+            pendingSamples = 0
+        }
+        pendingFrameCount = pendingFrames
+        pendingSampleCount = pendingSamples
     }
 
-    /// 实时线程（av-fusion F1）：pending 的特征帧 / PCM 写进环形缓冲（满了丢最旧的；融合这时已经关了就不写）
-    private func pushFeatures(frames: Int, samples: Int) {
-        os_unfair_lock_lock(lock)
-        if featuresEnabled {
+    /// 实时线程（av-fusion F1）：pending 的特征帧 / PCM 写进环形缓冲（满了丢最旧的；融合这时已经关了 / 缓冲换代了就不写）。
+    /// wait == false 时只试一次锁（F1 复审 L1），拿不到返回 false、什么都没写；返回 true = pending 已处理（写了或丢了）
+    private func pushFeatures(frames: Int, samples: Int, wait: Bool) -> Bool {
+        if wait {
+            os_unfair_lock_lock(lock)
+        } else if !os_unfair_lock_trylock(lock) {
+            return false
+        }
+        if featuresEnabled, featureEpoch == pendingEpoch {
             for k in 0..<frames {
                 features[featureHead] = pendingFeatures[k]
                 featureHead = (featureHead + 1) % Self.featureCapacity
@@ -402,6 +441,7 @@ final class AudioLevelMeter {
             }
         }
         os_unfair_lock_unlock(lock)
+        return true
     }
 
     /// carry 不为 nil：接着这个声道上一次回调的分块往下分，没满的块留给下一次（不收尾）；

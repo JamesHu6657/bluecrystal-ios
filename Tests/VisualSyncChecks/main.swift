@@ -7433,6 +7433,1247 @@ enum AudioLevelMeterRingModel {
 
 avFusionF1Checks()
 
+// MARK: - av-fusion F2：节奏由声音确认（默认关）
+
+/// F2 测试里 AVF2Run 记下的一拍
+struct AVF2Beat {
+    var t: Double
+    var raw: MotionWindow
+    var input: MotionWindow
+    var followerHz: Double
+    var followerLocked: Bool
+    var followerWeight: Double
+    var lockLocked: Bool
+    var fusion: AVFusionBeat
+    var action: AVRhythmVote.Action
+    var fastJump: Bool
+    var anchorActive: Bool
+    var anchorUncoupled: Bool
+    var anchorOffset: Double
+}
+
+/// F2 的整条链（照 VideoSyncPlayer：rhythmLevel 里 P4 / P3 之后 AVRhythmVote（这里不跑 P4 / P3；看上一拍的融合状态、跟随器上一拍的结果）→
+/// RhythmFollower（fastJumpHz）/ RhythmPhaseLock → updateFusion（AVFusionEngine.beat）→ updateAudioAnchor）。
+/// 合成声音 24 kHz → 6 段 splitter + P3 三频带；倍速 1、host 时间 = 视频时间、每 0.3 秒一拍。
+/// window(k, t)：第 k 拍（t 秒）的画面窗口；coupled：nil = 用上一拍的融合状态（S2 = AVRhythmVote.isS2：耦合且相位锁锁着），否则按给的（单元测试用）；
+/// anchorGate：撞击声校正看不看耦合（= usesAVRhythmConfirm）
+struct AVF2Run {
+    var beats: [AVF2Beat] = []
+    var engine = AVFusionEngine()
+
+    init(seconds: Double, signals: [(Double, inout AVSynth) -> Double], seed: UInt64 = 7, vote voteOn: Bool,
+         active: (Double) -> Bool = { _ in true }, coupled forced: ((Double) -> Bool)? = nil, anchorGate: Bool = false,
+         window: (Int, Double) -> MotionWindow) {
+        var synth = AVSynth(seed: seed)
+        var splitter = AudioFeatureSplitter()
+        splitter.configure(sampleRate: AVSynth.rate)
+        var bands = AudioBandSplitter()
+        bands.configure(sampleRate: AVSynth.rate)
+        var follower = RhythmFollower()
+        var lock = RhythmPhaseLock()
+        var vote = AVRhythmVote()
+        var onsets = AudioOnsetDetector()
+        var anchor = AudioPhaseAnchor()
+        var drain = AudioFeatureDrain()
+        drain.pcmRate = AudioFeatureSplitter.pcmRate(forSampleRate: AVSynth.rate)
+        var bandFrames: [AudioBandFrame] = []
+        var last: AVFusionBeat?
+        var i = 0
+        var k = 0
+        let dt = 0.3
+        while Double(k + 1) * dt <= seconds + 1e-9 {
+            k += 1
+            let now = Double(k) * dt
+            let end = Int((now * AVSynth.rate).rounded())
+            while i < end {
+                let n = min(512, end - i)
+                let start = Double(i) / AVSynth.rate
+                splitter.begin(start: start, frames: n)
+                bands.begin(start: start, frames: n)
+                var f = AudioFeatureFrame()
+                var p: Float = 0
+                for j in 0..<n {
+                    let t = Double(i + j) / AVSynth.rate
+                    var x = 0.0
+                    for s in signals { x += s(t, &synth) }
+                    let flags = splitter.add(x, frame: &f, pcm: &p)
+                    if flags & AudioFeatureSplitter.frameReady != 0 { drain.frames.append(f) }
+                    if flags & AudioFeatureSplitter.pcmReady != 0 { drain.pcm.append(p) }
+                    if let b = bands.add(x, at: t) { bandFrames.append(b) }
+                }
+                i += n
+            }
+            // 复审 M4：照播放器——节奏确认开着时 motionTick 在投票前先 drainFusionAudio（投票看到的起音到「现在」）；
+            // 关着时这一拍的声音在 updateFusion（跟随器 / 相位锁之后）才取走（对跟随器没影响，融合结果也一样）
+            func feed() {
+                engine.addBands(bandFrames)
+                for b in bandFrames { onsets.add(b) }
+                engine.addFeatures(drain)
+                bandFrames.removeAll()
+                drain.frames.removeAll()
+                drain.pcm.removeAll()
+            }
+            if voteOn { feed() }
+            let raw = window(k, now)
+            let clock = MediaClockSnapshot(host: now, item: now, rate: 1)
+            let isCoupled = forced.map { $0(now) } ?? AVRhythmVote.isS2(last)
+            let input = vote.refine(raw, enabled: voteOn, coupled: isCoupled, events: engine.extractor.events,
+                                    impactHz: last?.fa ?? 0, clock: clock, followerHz: follower.hz,
+                                    followerLocked: follower.locked)
+            let act = active(now)
+            follower.step(input, dt: dt, active: act, fastJumpHz: vote.fastJumpHz)
+            lock.step(input, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source,
+                      now: now, dt: dt, active: act)
+            if !voteOn { feed() }
+            let b = engine.beat(clock: clock, lock: lock, activity: act ? 0.5 : 0, cut: raw.cutCount > 0, audioReady: true,
+                                dt: dt)
+            last = b
+            let r = onsets.rhythm()
+            let off = anchor.step(onsets: onsets.onsets(since: now - (AudioPhaseAnchor.windowSeconds + 0.5)), audioHz: r.hz,
+                                  audioConfidence: r.confidence, lock: lock, directionKnown: false, now: now, dt: dt,
+                                  coupled: anchorGate ? b.state == .coupled : nil)
+            beats.append(AVF2Beat(t: now, raw: raw, input: input, followerHz: follower.hz, followerLocked: follower.locked,
+                                  followerWeight: follower.weight, lockLocked: lock.locked, fusion: b, action: vote.action,
+                                  fastJump: vote.fastJump, anchorActive: anchor.active, anchorUncoupled: anchor.uncoupled,
+                                  anchorOffset: off))
+        }
+    }
+
+    func near(_ hz: Double, _ x: Double) -> Bool { x > 0 && abs(log(x / hz)) <= log(1.15) }
+}
+
+/// F2 手搭的画面窗口：块运动跟随频率 hz（置信 conf、单程幅度 amp）；phaseHz 不为 nil 时带一个按 phaseHz 拟合的相位
+/// （t − 0.03 秒、相位 2π·phaseHz·t + phase0）
+func f2Window(_ t: Double, hz: Double, conf: Double = 0.6, amp: Double = 6, phaseHz: Double? = nil, phase0: Double = 0,
+              cut: Bool = false) -> MotionWindow {
+    var w = MotionWindow()
+    w.frames = 5
+    w.meanEnergy = 6
+    w.peakEnergy = 8
+    if cut { w.cutCount = 1 }
+    w.subjectFrames = 5
+    w.subjectScore = 0.5
+    w.subjectHz = hz
+    w.subjectFollowHz = hz
+    w.subjectFollowRhythm = conf
+    w.subjectFollowAmplitude = amp
+    if let ph = phaseHz, !cut {
+        let tr = t - 0.03
+        w.subjectPhase = StrokeRhythm.PhaseFit(time: tr, phase: StrokeRhythm.wrapPhase(2 * Double.pi * ph * tr + phase0), hz: ph,
+                                               quality: 0.9, linearity: 0.95, amplitude: 3, epoch: 0)
+    }
+    return w
+}
+
+/// F2 跳频：画面 x = 4·cos Φ(t)（15 Hz 采样、速度差分）→ 真的 StrokeRhythm（followEstimate + 相位拟合），
+/// 咔哒落在 Φ ≡ 0（每个往复一下，和画面同相）；Φ 在 at 秒处从 f0 跳到 f1（相位连续）。
+/// audioF1（复审 M4 的反例用）：咔哒在 at 秒处跳到这个频率（nil = 和画面一样跳到 f1）
+func f2JumpRun(vote: Bool, f0: Double = 1, f1: Double = 1.6, audioF1: Double? = nil, at s: Double = 12,
+               seconds: Double = 18) -> AVF2Run {
+    func phi(_ t: Double) -> Double { t < s ? 2 * Double.pi * f0 * t : 2 * Double.pi * (f0 * s + f1 * (t - s)) }
+    let af1 = audioF1 ?? f1
+    var clicks: [Double] = []
+    var m = 1.0
+    while true {
+        let t = m <= f0 * s ? m / f0 : s + (m - f0 * s) / af1
+        if t > seconds + 1 { break }
+        clicks.append(t)
+        m += 1
+    }
+    var sr = StrokeRhythm()
+    var ks = 1
+    var prevX = 4 * cos(phi(0))
+    return AVF2Run(seconds: seconds, signals: [AVSynth.clicks(clicks), AVSynth.floor()], vote: vote) { _, now in
+        while Double(ks) / 15 <= now - 1e-9 {
+            let t = Double(ks) / 15
+            let x = 4 * cos(phi(t))
+            sr.add(time: t, x: (x - prevX) * 15, y: 0)
+            prevX = x
+            ks += 1
+        }
+        let f = sr.followEstimate
+        var w = MotionWindow()
+        w.frames = 5
+        w.meanEnergy = 6
+        w.peakEnergy = 8
+        w.subjectFrames = 5
+        w.subjectScore = 0.5
+        w.subjectHz = sr.estimate.hz
+        w.subjectFollowHz = f.hz
+        w.subjectFollowRhythm = f.confidence
+        w.subjectFollowAmplitude = f.amplitude
+        if f.hz > 0 { w.subjectPhase = sr.phaseFit(hz: f.hz) }
+        return w
+    }
+}
+
+/// F2 关着（enabled = false）/ 开着但不在 S2（coupled = false）：随机窗口逐位等于不走投票的链
+func f2OffChainSame(events: [AudioOnsetEvent]) -> Bool {
+    var lcg: UInt64 = 0xf2_0ff
+    func rnd() -> Double {
+        lcg = lcg &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(lcg >> 11) / Double(1 << 53)
+    }
+    var same = true
+    var steps = 0
+    for run in 0..<30 {
+        var fa = RhythmFollower()
+        var fb = RhythmFollower()
+        var la = RhythmPhaseLock()
+        var lb = RhythmPhaseLock()
+        var aa = AudioPhaseAnchor()
+        var ab = AudioPhaseAnchor()
+        var vote = AVRhythmVote()
+        let enabled = run % 2 == 1
+        var now = 2.0
+        for _ in 0..<100 {
+            let dt = rnd() < 0.05 ? 0.6 * rnd() : 0.3
+            now += dt
+            var w = MotionWindow()
+            w.frames = rnd() < 0.05 ? 0 : 5
+            w.cutCount = rnd() < 0.04 ? 1 : 0
+            w.heldCount = rnd() < 0.04 ? 1 : 0
+            if rnd() < 0.9 {
+                let hz = rnd() < 0.5 ? 1 + 0.1 * rnd() : (rnd() < 0.5 ? 2 + 0.2 * rnd() : 0.3 + 4 * rnd())
+                w.subjectFrames = 5
+                w.subjectScore = rnd()
+                w.subjectFollowHz = hz
+                w.subjectFollowRhythm = rnd()
+                w.subjectFollowAmplitude = 4 * rnd()
+                if rnd() < 0.8 {
+                    w.subjectPhase = StrokeRhythm.PhaseFit(time: now - 0.05 * rnd(), phase: StrokeRhythm.wrapPhase(6.3 * rnd()),
+                                                           hz: hz * (0.95 + 0.1 * rnd()), quality: rnd(), linearity: 0.5 + 0.5 * rnd(),
+                                                           amplitude: 3 * rnd(), epoch: 0)
+                }
+            }
+            if rnd() < 0.3 {
+                w.poseFrames = 3
+                w.posePresentFrames = 3
+                w.poseScore = rnd()
+                w.poseRhythmHz = 0.4 + 3 * rnd()
+                w.poseRhythmConfidence = rnd()
+                w.poseRhythmRate = 9
+            }
+            let act = rnd() < 0.9
+            let clock = MediaClockSnapshot(host: now, item: 2 + 16 * rnd(), rate: rnd() < 0.9 ? 1 : 2)
+            let input = vote.refine(w, enabled: enabled, coupled: false, events: events, impactHz: 2 * rnd(), clock: clock,
+                                    followerHz: fb.hz, followerLocked: fb.locked)
+            if input != w || vote.fastJump || vote.action != .none { same = false }
+            fa.step(w, dt: dt, active: act)
+            fb.step(input, dt: dt, active: act, fastJumpHz: vote.fastJumpHz)
+            la.step(w, followerHz: fa.hz, followerLocked: fa.locked, followerSource: fa.source, now: now, dt: dt, active: act)
+            lb.step(input, followerHz: fb.hz, followerLocked: fb.locked, followerSource: fb.source, now: now, dt: dt, active: act)
+            var onsets: [Double] = []
+            var t = now - 4
+            while t < now { t += 0.3 + 0.4 * rnd(); onsets.append(t) }
+            let ahz = 0.5 + 2 * rnd()
+            let conf = rnd()
+            let known = rnd() < 0.5
+            let oa = aa.step(onsets: onsets, audioHz: ahz, audioConfidence: conf, lock: la, directionKnown: known, now: now, dt: dt)
+            let ob = ab.step(onsets: onsets, audioHz: ahz, audioConfidence: conf, lock: lb, directionKnown: known, now: now,
+                             dt: dt, coupled: nil)
+            if oa.bitPattern != ob.bitPattern || aa.active != ab.active || ab.uncoupled { same = false }
+            if fa.hz.bitPattern != fb.hz.bitPattern || fa.weight.bitPattern != fb.weight.bitPattern || fa.locked != fb.locked
+                || fa.confidence.bitPattern != fb.confidence.bitPattern || la.weight.bitPattern != lb.weight.bitPattern
+                || la.refPhase.bitPattern != lb.refPhase.bitPattern || la.hz.bitPattern != lb.hz.bitPattern {
+                same = false
+            }
+            steps += 1
+        }
+    }
+    return same && steps == 3000
+}
+
+/// 复审 H1：P3 动作识别的判断（动作类型 / 证据 / 部位 / 区域取舍 / 方向 / 轻抚 = activity / 强度上限 / 慢动作压低）
+func f2ContextSame(_ a: ActionContext, _ b: ActionContext) -> Bool {
+    a.kind == b.kind && a.evidence == b.evidence && a.part == b.part && a.usesHand == b.usesHand && a.usesFace == b.usesFace
+        && a.usesRoi == b.usesRoi && a.usesOtherHips == b.usesOtherHips && a.selfPaced == b.selfPaced
+        && a.flowDirection == b.flowDirection && a.poseDirection == b.poseDirection && a.inwardKnown == b.inwardKnown
+        && a.quietSelf == b.quietSelf && a.suppressesRhythm == b.suppressesRhythm && a.intensityCeiling == b.intensityCeiling
+        && a.allowsGentle(followerLocked: true) == b.allowsGentle(followerLocked: true)
+        && a.allowsGentle(followerLocked: false) == b.allowsGentle(followerLocked: false) && a.directionKnown == b.directionKnown
+}
+
+/// 复审 H1：随机的 P3 输入（手 / 脸 / 髋的节奏、区域读数、整幅主体置信 0.15~0.5 跨过动作识别的 0.3 门），强制 S2、跟随器锁着。
+/// 照播放器的顺序（AVRhythmVote.contextThenVote：先 P3 再投票）投票开 / 关时 P3 的判断逐位相同；
+/// 旧顺序（投票在 P3 之前）同样的输入有拍不一样 = 这组输入确实碰得到（测试有牙）
+func f2ContextIndependent(events: [AudioOnsetEvent]) -> (same: Bool, oldDiffers: Int, voted: Int, beats: Int) {
+    var lcg: UInt64 = 0xf2_c0de
+    func rnd() -> Double {
+        lcg = lcg &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(lcg >> 11) / Double(1 << 53)
+    }
+    var same = true
+    var oldDiffers = 0
+    var voted = 0
+    var beats = 0
+    for _ in 0..<20 {
+        var on = ActionContext()
+        var off = ActionContext()
+        var old = ActionContext()
+        var voteOn = AVRhythmVote()
+        var voteOld = AVRhythmVote()
+        var t = 6.0
+        for _ in 0..<40 {
+            t += 0.3
+            func part() -> (hz: Double, conf: Double, amp: Double)? {
+                guard rnd() < 0.6 else { return nil }
+                let hz = rnd() < 0.4 ? 2 : (rnd() < 0.5 ? 1 : 0.5 + 2.5 * rnd())
+                return (hz, rnd(), 0.4 * rnd())
+            }
+            let subject = rnd() < 0.5 ? 2 * (0.97 + 0.06 * rnd()) : (rnd() < 0.5 ? 1 : 0.5 + 3 * rnd())
+            var w = p3Window(time: t, hand: part(), face: rnd() < 0.3 ? part() : nil, hips: part(), subjectHz: subject,
+                             handAt: rnd() < 0.5 ? (30, 22) : (32, 18))
+            w.subjectFollowRhythm = 0.15 + 0.35 * rnd()
+            if rnd() < 0.5 {
+                var s = SubjectReading()
+                s.valid = true
+                s.score = 0.5
+                s.followHz = rnd() < 0.5 ? 2 : 1 + rnd()
+                s.followRhythm = w.subjectFollowRhythm - 0.05 + 0.15 * rnd()
+                s.followAmplitude = 3
+                w.roiFrames = 1
+                w.roi.valid = true
+                w.roi.time = t - 0.05
+                w.roi.subject = s
+            }
+            let clock = MediaClockSnapshot(host: t, item: t, rate: 1)
+            let lockHz = rnd() < 0.5 ? 2.0 : 0
+            func vote(_ v: inout AVRhythmVote, _ x: MotionWindow) -> MotionWindow {
+                v.refine(x, enabled: true, coupled: true, events: events, impactHz: 2, clock: clock, followerHz: 2,
+                         followerLocked: true)
+            }
+            _ = AVRhythmVote.contextThenVote(w, context: { on.refine($0, now: t, followerHz: lockHz) },
+                                             vote: { vote(&voteOn, $0) })
+            _ = AVRhythmVote.contextThenVote(w, context: { off.refine($0, now: t, followerHz: lockHz) }, vote: nil)
+            _ = old.refine(vote(&voteOld, w), now: t, followerHz: lockHz)
+            if voteOn.action != .none || voteOn.fastJump { voted += 1 }
+            if !f2ContextSame(on, off) { same = false }
+            if !f2ContextSame(old, off) { oldDiffers += 1 }
+            beats += 1
+        }
+    }
+    return (same, oldDiffers, voted, beats)
+}
+
+func avFusionF2Checks() {
+    func f2(_ x: Double?) -> String { x.map { String(format: "%.2f", $0) } ?? "—" }
+    let clicks2 = AVSynth.clicks(avClickTimes(hz: 2, from: 0.3, to: 40))
+
+    // 1a.（refine 的单元测试，复审 M3：耦合是强行给的，真链路里误报从头开始时不会耦合，见 1c）
+    //     画面 2 Hz、15 fps 上半整数周期（7.5 格），halvedLag 没减半 → 块运动报 1 Hz；声音 2 Hz 咔哒、耦合（S2 从 3 秒起，单元测试直接给）
+    //     → 窗口副本改成 2 Hz，跟随器 1.5 秒内正确锁在 2 Hz；不投票时一直锁在 1 Hz
+    let misOn = AVF2Run(seconds: 9, signals: [clicks2, AVSynth.floor()], vote: true, coupled: { $0 >= 3 }) { _, t in
+        f2Window(t, hz: 1, phaseHz: 1)
+    }
+    let misOff = AVF2Run(seconds: 9, signals: [clicks2, AVSynth.floor()], vote: false, coupled: { $0 >= 3 }) { _, t in
+        f2Window(t, hz: 1, phaseHz: 1)
+    }
+    let corrected = misOn.beats.first { $0.t >= 3 && $0.followerLocked && misOn.near(2, $0.followerHz) }?.t
+    let stays = misOn.beats.filter { $0.t >= (corrected ?? 99) }.allSatisfy { $0.followerLocked && misOn.near(2, $0.followerHz) }
+    let octaveCopies = misOn.beats.filter { $0.t >= 3 }.allSatisfy {
+        $0.action == .octaveUp && abs($0.input.subjectFollowHz - 2) < 1e-12 && abs($0.input.subjectFollowAmplitude - 3) < 1e-12
+            && !$0.input.subjectPhase.isValid
+    }
+    let before = misOn.beats.filter { $0.t < 3 }.allSatisfy { $0.input == $0.raw && $0.action == .none }
+    vcheck(corrected != nil && (corrected ?? 99) - 3 <= 1.5 + 1e-9 && stays && octaveCopies && before
+           && misOff.beats.allSatisfy { !$0.followerLocked || misOff.near(1, $0.followerHz) },
+           "F2 八度消歧：画面误报 1 Hz + 声音 2 Hz（耦合）→ 副本 2 Hz，\(f2(corrected.map { $0 - 3 })) 秒锁对（≤ 1.5）；不投票一直 1 Hz")
+
+    // 1b. 端到端（真的耦合度）：画面 2 Hz，前 7 秒读数正确（耦合建立），之后每 3 拍里有 2 拍误报 1 Hz（相位拟合按错的八度，作废）。
+    //     投票：跟随器一直锁在 2 Hz；不投票：跟随器被拉到 1 Hz
+    func flaky(_ k: Int, _ t: Double) -> MotionWindow {
+        t >= 7 && k % 3 != 0 ? f2Window(t, hz: 1) : f2Window(t, hz: 2, phaseHz: 2)
+    }
+    let flakyOn = AVF2Run(seconds: 18, signals: [clicks2, AVSynth.floor()], vote: true, window: flaky)
+    let flakyOff = AVF2Run(seconds: 18, signals: [clicks2, AVSynth.floor()], vote: false, window: flaky)
+    let coupledAt = flakyOn.beats.first { $0.fusion.state == .coupled }?.t
+    let late = flakyOn.beats.filter { $0.t >= 7 }
+    let wrongOn = late.filter { !($0.followerLocked && flakyOn.near(2, $0.followerHz)) }.count
+    let wrongOff = flakyOff.beats.filter { $0.t >= 7 && !($0.followerLocked && flakyOff.near(2, $0.followerHz)) }.count
+    vcheck((coupledAt ?? 99) < 7 && wrongOn == 0 && late.allSatisfy { $0.fusion.state == .coupled }
+           && late.contains { $0.action == .octaveUp } && wrongOff >= 5,
+           "F2 八度消歧端到端：\(f2(coupledAt)) 秒进入耦合；之后 2/3 拍误报 1 Hz，投票时跟随器一直 2 Hz、一直耦合；"
+           + "不投票时 \(wrongOff) 拍不在 2 Hz")
+
+    // 1c（复审 M3）端到端、持续误报：画面 2 Hz 前 7 秒读对（耦合建立），之后一直误报 1 Hz（相位作废）。
+    //     F2 只桥接短暂翻八度：桥接有界（≤ 4 秒）后干净地回到画面的 1 Hz 一次、不来回摆，耦合退出；不投票时 1c 之后就是 1 Hz
+    func sustained(_ k: Int, _ t: Double) -> MotionWindow {
+        t >= 7 ? f2Window(t, hz: 1) : f2Window(t, hz: 2, phaseHz: 2)
+    }
+    let susOn = AVF2Run(seconds: 18, signals: [clicks2, AVSynth.floor()], vote: true, window: sustained)
+    let susLate = susOn.beats.filter { $0.t >= 7 }
+    let bridgeEnd = susLate.last { $0.followerLocked && susOn.near(2, $0.followerHz) }?.t
+    let afterBridge = susLate.filter { $0.t > (bridgeEnd ?? 7) }
+    var flips = 0
+    for j in 1..<max(1, susLate.count) where susOn.near(2, susLate[j - 1].followerHz) != susOn.near(2, susLate[j].followerHz) { flips += 1 }
+    vcheck(((bridgeEnd ?? 7) - 7) <= 4 + 1e-9 && flips <= 1
+           && !afterBridge.contains { susOn.near(2, $0.followerHz) }
+           && (susOn.beats.last.map { $0.fusion.state != .coupled } ?? false)
+           && !afterBridge.suffix(5).contains { $0.action == .octaveUp },
+           "F2 持续误报（7 秒后画面一直报 1 Hz）：桥接 \(f2(bridgeEnd.map { $0 - 7 })) 秒（≤ 4）后回到画面读数、切换 \(flips) 次（≤ 1）、耦合退出")
+
+    // 一下两响（往里重、往外轻，半个周期隔开）：撞击间隔中位数 = 2 倍、强度加权的自相关 = 整周期 → 不干净，不改八度
+    var twoClicks: [Double] = []
+    var strong: [Double] = []
+    for k in 1...30 {
+        strong.append(Double(k))
+        twoClicks.append(Double(k) + 0.5)
+    }
+    let inOut = AVF2Run(seconds: 12, signals: [AVSynth.clicks(strong, amp: 0.6), AVSynth.clicks(twoClicks, amp: 0.15), AVSynth.floor()],
+                        vote: true, coupled: { $0 >= 6 }) { _, t in f2Window(t, hz: 1, phaseHz: 1) }
+    let inOutLate = inOut.beats.filter { $0.t >= 6 }
+    vcheck(inOutLate.allSatisfy { $0.action != .octaveUp && $0.action != .octaveDown && abs($0.input.subjectFollowHz - 1) < 1e-12 }
+           && inOutLate.allSatisfy { $0.followerLocked && inOut.near(1, $0.followerHz) },
+           "F2 一下两响（强弱不同）：不改八度，跟随器留在 1 Hz（f_a \(f2(inOut.beats.last?.fusion.fa))）")
+
+    // 2. 同频配乐（120 BPM，画面 2 Hz，12 秒切镜）：考验后像配乐、不耦合 → 副本原样（逐位相同）、不投票
+    let music = AVF2Run(seconds: 22, signals: [AVSynth.music()], vote: true) { _, t in
+        abs(t - 12) < 0.15 ? f2Window(t, hz: 2, cut: true) : f2Window(t, hz: 2, phaseHz: 2)
+    }
+    var unchanged = true
+    for (j, b) in music.beats.enumerated() where j == 0 || music.beats[j - 1].fusion.state != .coupled {
+        if b.input != b.raw || b.action != .none || b.fastJump { unchanged = false }
+    }
+    let musicLate = music.beats.filter { $0.t >= 17.5 }
+    vcheck(unchanged && musicLate.allSatisfy { $0.fusion.state == .music && $0.input == $0.raw && $0.action == .none }
+           && (musicLate.last?.fusion.pMusic ?? 0) >= 0.8 - 1e-9,
+           "F2 同频配乐：P_music \(f2(musicLate.last?.fusion.pMusic))、不耦合 → 窗口副本原样、不投票")
+
+    // 3. 画面静止 + 有节奏的声音：activity = 0 → 不锁（即使给了耦合、画面有弱候选），投票不开锁
+    let still = AVF2Run(seconds: 10, signals: [clicks2, AVSynth.floor()], vote: true, active: { _ in false },
+                        coupled: { _ in true }) { _, t in f2Window(t, hz: 2, conf: 0.35, phaseHz: 2) }
+    let stillNatural = AVF2Run(seconds: 10, signals: [clicks2, AVSynth.floor()], vote: true, active: { _ in false }) { _, t in
+        f2Window(t, hz: 2, conf: 0.35, phaseHz: 2)
+    }
+    vcheck(still.beats.allSatisfy { !$0.followerLocked && $0.followerWeight == 0 && !$0.lockLocked }
+           && stillNatural.beats.allSatisfy { !$0.followerLocked && $0.fusion.state != .coupled && $0.input == $0.raw },
+           "F2 画面静止 + 有节奏的声音：不锁（activity 只看画面；给了耦合也不锁）")
+
+    // 复审 M1：画面在动、块运动候选只有 0.35（画面自己锁不上：开锁门 0.40），强制耦合、声音同频——
+    // 前 4 秒画面 0.6 先锁上，4 秒切镜（解锁）后只剩 0.35 的弱候选：投票开 / 关跟随器逐位相同，切镜后一直不锁
+    func weak(_ k: Int, _ t: Double) -> MotionWindow {
+        if abs(t - 4.2) < 0.15 { return f2Window(t, hz: 2, cut: true) }
+        return f2Window(t, hz: 2, conf: t < 4 ? 0.6 : 0.35, phaseHz: 2)
+    }
+    let weakOn = AVF2Run(seconds: 12, signals: [clicks2, AVSynth.floor()], vote: true, coupled: { _ in true }, window: weak)
+    let weakOff = AVF2Run(seconds: 12, signals: [clicks2, AVSynth.floor()], vote: false, coupled: { _ in true }, window: weak)
+    let weakSame = zip(weakOn.beats, weakOff.beats).allSatisfy {
+        $0.0.followerLocked == $0.1.followerLocked && $0.0.followerHz.bitPattern == $0.1.followerHz.bitPattern
+            && $0.0.followerWeight.bitPattern == $0.1.followerWeight.bitPattern && $0.0.lockLocked == $0.1.lockLocked
+    }
+    let weakLockedEarly = weakOn.beats.contains { $0.t < 4 && $0.followerLocked }
+    let weakAfterCut = weakOn.beats.filter { $0.t > 4.3 }.allSatisfy { !$0.followerLocked && $0.action == .none }
+    let agreedWhileLocked = weakOn.beats.contains { $0.t < 4 && $0.action == .agree }
+    var staleBeat = AVFusionBeat()
+    staleBeat.state = .coupled
+    staleBeat.fv = 0
+    var freshBeat = staleBeat
+    freshBeat.fv = 2
+    vcheck(weakSame && weakLockedEarly && weakAfterCut && agreedWhileLocked && !AVRhythmVote.isS2(staleBeat)
+           && AVRhythmVote.isS2(freshBeat) && !AVRhythmVote.isS2(nil),
+           "F2 声音不开锁（复审 M1）：画面在动、弱候选 0.35 + 强制耦合 → 投票开 / 关跟随器逐位相同、切镜后不锁；"
+           + "S2 要相位锁还锁着（耦合但 fv = 0 不算）")
+
+    // 4. 跳频 1 → 1.6 Hz（12 秒），声音同样跳：耦合时跳变确认只要 1 拍，比不投票至少早 0.3 秒
+    let jumpOn = f2JumpRun(vote: true)
+    let jumpOff = f2JumpRun(vote: false)
+    let thresh = 1.6 / 1.15
+    let jOn = jumpOn.beats.first { $0.t > 12 && $0.followerHz >= thresh }?.t
+    let jOff = jumpOff.beats.first { $0.t > 12 && $0.followerHz >= thresh }?.t
+    let coupledBefore = jumpOn.beats.filter { $0.t >= 9 && $0.t < 12 }.allSatisfy { $0.fusion.state == .coupled }
+    let sameBefore = zip(jumpOn.beats, jumpOff.beats).filter { $0.0.t < 12 }.allSatisfy {
+        $0.0.followerLocked == $0.1.followerLocked && (!$0.0.followerLocked || jumpOn.near(1, $0.0.followerHz))
+    }
+    vcheck(jOn != nil && jOff != nil && (jOff ?? 0) - (jOn ?? 99) >= 0.3 - 1e-9 && coupledBefore && sameBefore
+           && jumpOn.beats.contains { $0.fastJump },
+           "F2 跳频 1 → 1.6 Hz：耦合时 \(f2(jOn)) 秒确认，不投票 \(f2(jOff)) 秒（早 \(f2((jOff ?? 0) - (jOn ?? 0))) 秒 ≥ 0.3）")
+
+    // 复审 M4 反例 1：画面一直 1 Hz、只有声音在 12 秒跳到 1.6 Hz → 声音不发起跳频：从不 fastJump，跟随器和不投票逐位相同
+    let audioOnlyOn = f2JumpRun(vote: true, f1: 1, audioF1: 1.6)
+    let audioOnlyOff = f2JumpRun(vote: false, f1: 1, audioF1: 1.6)
+    let audioOnlySame = zip(audioOnlyOn.beats, audioOnlyOff.beats).allSatisfy {
+        $0.0.followerHz.bitPattern == $0.1.followerHz.bitPattern && $0.0.followerLocked == $0.1.followerLocked
+    }
+    vcheck(audioOnlySame && !audioOnlyOn.beats.contains { $0.fastJump }
+           && audioOnlyOn.beats.filter { $0.t > 13 }.allSatisfy { $0.followerLocked && audioOnlyOn.near(1, $0.followerHz) },
+           "F2 只有声音变速（画面一直 1 Hz、声音跳到 1.6 Hz）：不 fastJump，跟随器和不投票逐位相同、留在 1 Hz")
+    // 复审 M4 反例 2：画面 1 → 1.6 Hz、声音反方向 1 → 0.625 Hz → 从不 fastJump，跟随器和不投票逐位相同（跳变照常 2 拍确认）
+    let oppositeOn = f2JumpRun(vote: true, audioF1: 0.625)
+    let oppositeOff = f2JumpRun(vote: false, audioF1: 0.625)
+    let oppositeSame = zip(oppositeOn.beats, oppositeOff.beats).allSatisfy {
+        $0.0.followerHz.bitPattern == $0.1.followerHz.bitPattern && $0.0.followerLocked == $0.1.followerLocked
+    }
+    let oppositeJump = oppositeOn.beats.first { $0.t > 12 && $0.followerHz >= thresh }?.t
+    vcheck(oppositeSame && !oppositeOn.beats.contains { $0.fastJump } && oppositeJump != nil,
+           "F2 声音反方向跳（画面 1 → 1.6、声音 1 → 0.625 Hz）：不 fastJump，跟随器和不投票逐位相同（\(f2(oppositeJump)) 秒照常确认）")
+
+    // 复审 M2：声音核对的是块运动读数（1.6 Hz），跟随器这一拍却挑了反方向的姿态读数（0.6 Hz，置信更高、采样率看得清）→
+    // fastJumpHz 不缩短确认，逐位等于不给；跟随器挑的就是块运动读数时 1 拍就跳
+    func poseWindow(_ t: Double, flow: Double, pose: Double?) -> MotionWindow {
+        var w = f2Window(t, hz: flow)
+        if let p = pose {
+            w.poseFrames = 3
+            w.posePresentFrames = 3
+            w.poseScore = 0.5
+            w.poseRhythmHz = p
+            w.poseRhythmConfidence = 0.8
+            w.poseRhythmPart = 1
+            w.poseRhythmRate = 9
+        }
+        return w
+    }
+    var withTarget = RhythmFollower()
+    var plain = RhythmFollower()
+    var flowOnly = RhythmFollower()
+    var pt = 0.0
+    for _ in 0..<10 {
+        pt += 0.3
+        let w = poseWindow(pt, flow: 1, pose: 1)
+        withTarget.step(w, dt: 0.3)
+        plain.step(w, dt: 0.3)
+        flowOnly.step(w, dt: 0.3)
+    }
+    var poseSame = withTarget.locked && abs(withTarget.hz - 1) < 1e-9
+    var poseHz: [Double] = []
+    var flowHz: [Double] = []
+    for _ in 0..<3 {
+        pt += 0.3
+        let w = poseWindow(pt, flow: 1.6, pose: 0.6)
+        withTarget.step(w, dt: 0.3, fastJumpHz: 1.6)
+        plain.step(w, dt: 0.3)
+        flowOnly.step(poseWindow(pt, flow: 1.6, pose: nil), dt: 0.3, fastJumpHz: 1.6)
+        if withTarget.hz.bitPattern != plain.hz.bitPattern || withTarget.locked != plain.locked
+            || withTarget.weight.bitPattern != plain.weight.bitPattern || withTarget.source != plain.source {
+            poseSame = false
+        }
+        poseHz.append(withTarget.hz)
+        flowHz.append(flowOnly.hz)
+    }
+    vcheck(poseSame && withTarget.source == .pose && abs(poseHz[0] - 1) < 0.05 && abs(flowHz[0] - 1.6) < 1e-9,
+           "F2 跳频确认只认声音核对过的读数（复审 M2）：跟随器挑了反方向的姿态读数时不缩（第 1 拍仍 \(f2(poseHz[0])) Hz，"
+           + "和不给目标逐位相同）；挑的是块运动读数时 1 拍跳到 \(f2(flowHz[0])) Hz")
+
+    // 5. 撞击声校正 + 同频节拍音轨（2 Hz 咔哒跨 12 秒切镜不断 = 配乐）：F2 开着（要耦合）时考验后不再「已对齐」，
+    //    关着时（= P3）照旧对齐
+    let beatTrack = AVSynth.clicks(avClickTimes(hz: 2, from: 0.3, to: 40, offset: 0.1))
+    let anchorOff = AVF2Run(seconds: 22, signals: [beatTrack, AVSynth.floor()], vote: false, anchorGate: false) { _, t in
+        abs(t - 12) < 0.15 ? f2Window(t, hz: 2, cut: true) : f2Window(t, hz: 2, phaseHz: 2)
+    }
+    let anchorOn = AVF2Run(seconds: 22, signals: [beatTrack, AVSynth.floor()], vote: true, anchorGate: true) { _, t in
+        abs(t - 12) < 0.15 ? f2Window(t, hz: 2, cut: true) : f2Window(t, hz: 2, phaseHz: 2)
+    }
+    let offAligned = anchorOff.beats.filter { $0.t >= 17.5 && $0.anchorActive }.count
+    let onLate = anchorOn.beats.filter { $0.t >= 17.5 }
+    vcheck(offAligned > 0 && onLate.allSatisfy { !$0.anchorActive && $0.anchorUncoupled && $0.fusion.state == .music }
+           && anchorOff.beats.allSatisfy { !$0.anchorUncoupled } && anchorOn.beats.contains { $0.anchorActive },
+           "F2 撞击声校正 + 同频节拍音轨：关着 \(offAligned) 拍「已对齐」，开着（要耦合）切镜考验认出配乐后不对齐")
+
+    // 6. 开关关着 / 不在 S2：3000 组随机窗口逐位等于 P4 的链（跟随器 / 相位锁 / 撞击声校正），窗口副本原样、fastJump 恒 false
+    vcheck(f2OffChainSame(events: flakyOn.engine.extractor.events), "F2 关着 / 不耦合：3000 组随机窗口和 P4 的链逐位相同")
+
+    // 复审 H1：投票排在 P3 动作识别之后——动作识别的判断（activity / 强度上限 / 区域取舍…）和投票开关无关
+    let ctx = f2ContextIndependent(events: flakyOn.engine.extractor.events)
+    vcheck(ctx.same && ctx.oldDiffers > 0 && ctx.voted > 0,
+           "F2 投票不进 P3 动作识别（复审 H1）：\(ctx.beats) 拍随机输入、投票 \(ctx.voted) 拍，开 / 关时动作识别逐位相同"
+           + "（旧顺序「投票在 P3 前」\(ctx.oldDiffers) 拍不同）")
+
+    // 设置：默认关、键名、只在融合 + 伸缩跟随频率 + 跟随画面时生效、不改 Timer 间隔
+    let def = VisualSyncSettings()
+    let on = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true, avFusion: true, avRhythmConfirm: true)
+    let noFollow = VisualSyncSettings(source: .motion, rhythmFollow: false, avFusion: true, avRhythmConfirm: true)
+    let noFusion = VisualSyncSettings(source: .motion, rhythmFollow: true, avFusion: false, avRhythmConfirm: true)
+    let audio = VisualSyncSettings(source: .audio, rhythmFollow: true, avFusion: true, avRhythmConfirm: true)
+    var offF2 = on
+    offF2.avRhythmConfirm = false
+    vcheck(!def.avRhythmConfirm && !VisualSyncSettings.defaultAVRhythmConfirm && !def.usesAVRhythmConfirm
+           && VisualSyncSettings.Keys.avRhythmConfirm == "bcVisualSyncAVRhythmConfirm" && on.usesAVRhythmConfirm
+           && !noFollow.usesAVRhythmConfirm && !noFusion.usesAVRhythmConfirm && !audio.usesAVRhythmConfirm
+           && on.tickInterval == offF2.tickInterval && on.usesAudioAnchor == offF2.usesAudioAnchor && offF2.usesAVFusion,
+           "F2 设置：默认关、键名 bcVisualSyncAVRhythmConfirm、要融合 + 伸缩跟随频率 + 跟随画面，不改 Timer 间隔 / 其他判断")
+    if let defaults = UserDefaults(suiteName: "bc.visualsync.f2") {
+        defaults.removePersistentDomain(forName: "bc.visualsync.f2")
+        let none = VisualSyncSettings.load(from: defaults)
+        defaults.set(true, forKey: VisualSyncSettings.Keys.avRhythmConfirm)
+        let stored = VisualSyncSettings.load(from: defaults)
+        vcheck(!none.avRhythmConfirm && stored.avRhythmConfirm && !stored.usesAVRhythmConfirm, "F2 设置：没存过关、读回存的值")
+        defaults.removePersistentDomain(forName: "bc.visualsync.f2")
+    } else {
+        vcheck(false, "F2 设置：创建测试用 UserDefaults")
+    }
+
+    // 复审 L2–L6
+    func evs(_ hz: Double, from a: Double = 0.2, to b: Double) -> [AudioOnsetEvent] {
+        var out: [AudioOnsetEvent] = []
+        var t = a
+        while t <= b { out.append(AudioOnsetEvent(time: t, strength: 30, risingBands: 6, steepBands: 6, shortBands: 6)); t += 1 / hz }
+        return out
+    }
+    // L2：倍速 2、视频里 0.3 Hz（画面上 0.6 Hz，在跟随器范围里）→ 按倍速搜得到；倍速 1 时 0.3 Hz 不在范围、搜不到
+    let slow = evs(0.3, to: 20)
+    let at2 = AVRhythmVote.audioRhythm(slow, start: 0, end: 20, rate: 2)
+    let at1 = AVRhythmVote.audioRhythm(slow, start: 0, end: 20, rate: 1)
+    vcheck(abs(at2.hz - 0.3) / 0.3 < 0.1 && !(abs(at1.hz - 0.3) / 0.3 < 0.1),
+           "F2 L2 声音滞后搜索按倍速：2× 时找到视频 0.3 Hz（\(f2(at2.hz))），1× 时不找（\(f2(at1.hz))）")
+    // L3：画面 2.1 Hz、声音 3.9 Hz（像两倍）→ 换过去 4.2 Hz 超出跟随器范围，不换；画面 1.95 Hz 时照常换到 3.9
+    let fast = evs(3.9, to: 10)
+    let clk = MediaClockSnapshot(host: 10, item: 10, rate: 1)
+    var v3 = AVRhythmVote()
+    let o3 = v3.refine(f2Window(10, hz: 2.1, phaseHz: 2.1), enabled: true, coupled: true, events: fast, impactHz: 3.9, clock: clk,
+                       followerHz: 2.1, followerLocked: true)
+    var v3b = AVRhythmVote()
+    let o3b = v3b.refine(f2Window(10, hz: 1.95, phaseHz: 1.95), enabled: true, coupled: true, events: fast, impactHz: 3.9,
+                         clock: clk, followerHz: 1.95, followerLocked: true)
+    vcheck(v3.action != .octaveUp && abs(o3.subjectFollowHz - 2.1) < 1e-12 && v3b.action == .octaveUp
+           && abs(o3b.subjectFollowHz - 3.9) < 1e-9,
+           "F2 L3 换八度要落在跟随器范围：2.1 Hz 不换到 4.2（声音 \(f2(v3.audioHz))）、1.95 Hz 换到 3.9")
+    // L4：画面 1.6 Hz、声音最近也 1.6、跟随器还在 1 Hz → 平时 1 拍确认；P4 前瞻频率接管时不缩短
+    let jumpEv = evs(1.6, to: 10)
+    var v4 = AVRhythmVote()
+    _ = v4.refine(f2Window(10, hz: 1.6, phaseHz: 1.6), enabled: true, coupled: true, events: jumpEv, impactHz: 1.6, clock: clk,
+                  followerHz: 1, followerLocked: true)
+    var v4b = AVRhythmVote()
+    _ = v4b.refine(f2Window(10, hz: 1.6, phaseHz: 1.6), enabled: true, coupled: true, events: jumpEv, impactHz: 1.6, clock: clk,
+                   followerHz: 1, followerLocked: true, lookaheadFrequency: true)
+    vcheck(v4.fastJump && v4.fastJumpHz > 0 && !v4b.fastJump && v4b.fastJumpHz == 0,
+           "F2 L4 P4 前瞻频率接管时不缩短跳频确认（平时 fastJump \(v4.fastJump)，前瞻时 \(v4b.fastJump)）")
+    // L5：相位脉动关着 → 节奏确认不生效
+    let noPulse = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: false, avFusion: true, avRhythmConfirm: true)
+    vcheck(!noPulse.usesAVRhythmConfirm && noPulse.usesAVFusion, "F2 L5 相位脉动关着时节奏确认不生效（融合照旧）")
+    // L6：融合特征要不要算的真值表
+    var table = true
+    for m in 0..<8 {
+        let a = m & 1 != 0, r = m & 2 != 0, z = m & 4 != 0
+        if VisualSyncSettings.fusionFeaturesWanted(usesAVFusion: a, running: r, analyzing: z) != (a && r && z) { table = false }
+    }
+    vcheck(table, "F2 L6 fusionFeaturesWanted 真值表（融合 && 在联动 && 画面分析在跑）")
+
+    // 调试列 / 状态行
+    let f2Count = AVDebugColumns.f2Header.split(separator: ",", omittingEmptySubsequences: false).count
+    var someVote = AVRhythmVote()
+    _ = someVote.refine(f2Window(5, hz: 1, phaseHz: 1), enabled: true, coupled: true, events: misOn.engine.extractor.events,
+                        impactHz: 2, clock: MediaClockSnapshot(host: 5, item: 5, rate: 1), followerHz: 1, followerLocked: true)
+    let fields = AVDebugColumns.f2Fields(someVote)
+    vcheck(f2Count == 5 && fields.count == f2Count && AVDebugColumns.f2Empty.count == f2Count
+           && AVDebugColumns.f2Empty.allSatisfy { $0.isEmpty } && fields[0] == "octave_up" && fields[4] == "1"
+           && !fields.joined().contains(",") && someVote.statusText.hasPrefix("节奏确认：画面读成了一半")
+           && AVRhythmVote().statusText.hasPrefix("节奏确认：没有投票"),
+           "F2 调试列 \(f2Count) 列 / 状态行（八度改正：\(fields.joined(separator: " "))）")
+}
+
+avFusionF2Checks()
+
+/// av-fusion F3 / F3b 的检查（放在函数里：顶层 main 离 8 MB 栈上限很近）
+func avFusionF3Checks() {
+    var seed: UInt64 = 0xF3F3
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    func ev(_ t: Double, _ strength: Double = 30) -> AudioOnsetEvent {
+        AudioOnsetEvent(time: t, strength: strength, risingBands: 6, steepBands: 6, shortBands: 6)
+    }
+    func s2Beat(pMusic: Double = 0, crossCut: Double = 0, still: Double = 0) -> AVFusionBeat {
+        var b = AVFusionBeat()
+        b.state = .coupled
+        b.coupled = true
+        b.fv = 0.5
+        b.pMusic = pMusic
+        b.crossCut = crossCut
+        b.still = still
+        return b
+    }
+    func clock(_ t: Double, rate: Double = 1) -> MediaClockSnapshot { MediaClockSnapshot(host: t, item: t, rate: rate) }
+    // 1 Hz 撞击，最后一下（t = 9.9）的强度可调
+    func train(last: Double, base: Double = 30, shift: Double = 0) -> [AudioOnsetEvent] {
+        var out: [AudioOnsetEvent] = []
+        for k in 0..<9 { out.append(ev(1.9 + Double(k), base + shift)) }
+        out.append(ev(9.9, last + shift))
+        return out
+    }
+
+    // 设置：默认关、键名、深度夹 0~30、生效条件
+    let def = VisualSyncSettings()
+    let on = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true, avFusion: true, avAccent: true,
+                                avVibrationAudio: true)
+    let noFusion = VisualSyncSettings(source: .motion, avFusion: false, avAccent: true, avVibrationAudio: true)
+    var noPulse = on
+    noPulse.rhythmPulse = false
+    let audioSrc = VisualSyncSettings(source: .audio, avFusion: true, avAccent: true, avVibrationAudio: true)
+    let subOnly = VisualSyncSettings(source: .motion, avFusion: true, avAccent: false, avVibrationAudio: true)
+    var off3 = on
+    off3.avAccent = false
+    off3.avVibrationAudio = false
+    vcheck(!def.avAccent && !def.avVibrationAudio && def.avAccentDepth == 15 && !def.usesAVAccent && !def.usesAVVibrationAudio
+           && VisualSyncSettings.Keys.avAccent == "bcVisualSyncAVAccent"
+           && VisualSyncSettings.Keys.avAccentDepth == "bcVisualSyncAVAccentDepth"
+           && VisualSyncSettings.Keys.avVibrationAudio == "bcVisualSyncAVVibrationAudio"
+           && on.usesAVAccent && on.usesAVVibrationAudio && !noFusion.usesAVAccent && !audioSrc.usesAVAccent
+           && !noPulse.usesAVAccent && !noPulse.usesAVVibrationAudio
+           && !subOnly.usesAVVibrationAudio && on.tickInterval == off3.tickInterval
+           && VisualSyncSettings(avAccentDepth: 99).avAccentDepth == 30 && VisualSyncSettings(avAccentDepth: -5).avAccentDepth == 0
+           && VisualSyncSettings(avAccentDepth: .nan).avAccentDepth == 15,
+           "F3 设置：默认关、键名、深度夹 0~30（NaN → 15）、重音要融合、F3b 要重音，不改 Timer 间隔")
+
+    // 重音系数：S2 + 最近一个周期里有撞击才 ≠ 1；响 → 1 + β，轻 → 1 − β，一样响 → 1；不在 S2 / 撞击不够 / 这个周期没撞击 → 1
+    var a = AVAccent()
+    let loud = a.step(events: train(last: 90 + 6 * 20, base: 90), clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let quiet = a.step(events: train(last: 90 - 6 * 10, base: 90), clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let same = a.step(events: train(last: 90, base: 90), clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let notS2 = a.step(events: train(last: 90 + 6 * 20, base: 90), clock: clock(10), s2: false, lockHz: 1, depth: 0.15)
+    let few = a.step(events: [ev(9.5, 90), ev(9.9, 150)], clock: clock(10), s2: true, lockHz: 1, depth: 0.15)
+    let stale = a.step(events: train(last: 150), clock: clock(11.5), s2: true, lockHz: 1, depth: 0.15)
+    let noLock = a.step(events: train(last: 150), clock: clock(10), s2: true, lockHz: 0, depth: 0.15)
+    let zeroDepth = a.step(events: train(last: 150), clock: clock(10), s2: true, lockHz: 1, depth: 0)
+    vcheck(abs(loud - 1.15) < 1e-12 && abs(quiet - 0.85) < 1e-12 && abs(same - 1) < 1e-12
+           && notS2 == 1 && few == 1 && stale == 1 && noLock == 1 && zeroDepth == 1,
+           "F3 重音系数：响 \(String(format: "%.3f", loud))、轻 \(String(format: "%.3f", quiet))、一样 1；不在 S2 / 撞击 < 3 / 这个周期没撞击 / 没锁 / 深度 0 → 1")
+    // 整体响度抬 12 dB（各段都 +12）：g 不变；随机输入 g ∈ [1 − β, 1 + β]
+    let lifted = a.step(events: train(last: 30 + 6 * 7, shift: 6 * 12), clock: clock(10), s2: true, lockHz: 1, depth: 0.2)
+    let plain = a.step(events: train(last: 30 + 6 * 7), clock: clock(10), s2: true, lockHz: 1, depth: 0.2)
+    var bounded = true
+    for _ in 0..<5000 {
+        var evs: [AudioOnsetEvent] = []
+        var t = 6 + rnd() * 0.5
+        while t < 10 { evs.append(ev(t, rnd() < 0.05 ? .nan : rnd() * 300 - 20)); t += 0.2 + rnd() * 0.8 }
+        let beta = rnd() < 0.05 ? Double.nan : rnd() * 0.5
+        let g = a.step(events: evs, clock: clock(10, rate: 0.5 + rnd() * 1.5), s2: rnd() < 0.8, lockHz: 0.3 + rnd() * 4,
+                       depth: beta)
+        let bb = beta.isFinite ? min(0.3, max(0, beta)) : 0
+        if !(g.isFinite && g >= 1 - bb - 1e-12 && g <= 1 + bb + 1e-12) { bounded = false }
+    }
+    vcheck(abs(lifted - plain) < 1e-9 && plain > 1 && bounded,
+           "F3 重音：整体 +12 dB 时 g 不变（\(String(format: "%.4f", plain))）；5000 组随机 g ∈ [1 − β, 1 + β]（β 夹 0~0.3）")
+
+    // 脉动深度上界：随机设置 / 频率 / 权重下 depth ≤ depthCeiling（重音放大也不超过满深度）
+    var ceilingOK = true
+    for _ in 0..<2000 {
+        let setting = rnd() * 40, hz = rnd() * 3, w = rnd(), act = rnd(), inten = Int(rnd() * 100)
+        let d = RhythmPulse.depth(setting: setting, hz: hz, weight: w, activity: act, intensity: inten)
+        if d > RhythmPulse.depthCeiling(setting: setting, hz: hz) { ceilingOK = false }
+    }
+    vcheck(ceilingOK, "F3 重音调脉动：有效深度 ≤ 这个设置 / 频率下的满深度（2000 组随机）")
+
+    // 5000 组随机（强度、z、上限、最低强度、通道）× 重音 / F3b → 出口：≤ 上限、单拍升 ≤ 20、归零保持、通道 2 / 3 = 0、NaN → 0
+    var stage = SyncOutputStage()
+    var prev = [0, 0, 0, 0]
+    let heldRun = SyncOutputStage.zeroHoldTicks + 1
+    var zeroRun = [heldRun, heldRun]
+    var ok = true
+    var bad = ""
+    var vib = AVVibrationAudio()
+    let channels = AudioSyncChannels.allCases
+    var tNow = 0.0
+    for i in 0..<5000 {
+        if i % 200 == 0 { stage.reset(); prev = [0, 0, 0, 0]; zeroRun = [heldRun, heldRun]; vib.reset() }
+        tNow += 0.3
+        let st = AudioSyncSettings(maxPercent: 5 + rnd() * 100, channels: channels[Int(rnd() * 3) % 3], minPercent: rnd() * 60)
+        let value = rnd() < 0.05 ? Double.nan : rnd() * 120 - 10
+        let sig = rnd() < 0.85
+        let beta = rnd() * 0.3
+        let g = 1 + beta * (rnd() * 2 - 1)
+        let accented = value.isFinite ? min(100, max(0, value * g)) : value
+        var levels = RhythmOutput.target(value: accented, settings: st, hasSignal: sig, rateLevel: Int(rnd() * 99),
+                                         weight: rnd())
+        let fp = SyncOutputStage.floorPercent(settings: st, hasSignal: sig)
+        var evs: [AudioOnsetEvent] = []
+        var et = tNow - 4
+        while et < tNow { evs.append(ev(et, rnd() * 200)); et += 0.2 + rnd() * 0.6 }
+        levels[1] = vib.step(video: levels[1], floor: fp.isFinite ? max(0, Int(fp.rounded())) : 0, events: evs,
+                             clock: clock(tNow), beat: rnd() < 0.7 ? s2Beat(pMusic: rnd() * 0.4) : nil,
+                             activity: rnd() < 0.8 ? rnd() : 0, channelsBoth: st.channels == .both, depth: beta,
+                             now: tNow, dt: 0.3)
+        let out = stage.step(levels: levels, settings: st)
+        let cap = SyncOutputStage.hardCap(st)
+        if out.count != 4 || out[2] != 0 || out[3] != 0 { ok = false; bad = "通道 \(out)" }
+        for ch in 0..<2 {
+            if out[ch] < 0 || out[ch] > cap { ok = false; bad = "上限 \(out) cap \(cap)" }
+            if out[ch] - prev[ch] > SyncOutputStage.maxRisePerTick { ok = false; bad = "升幅 \(prev) → \(out)" }
+            if out[ch] > 0, prev[ch] == 0, zeroRun[ch] < heldRun { ok = false; bad = "归零保持 \(zeroRun[ch]) 拍" }
+            zeroRun[ch] = out[ch] == 0 ? min(heldRun, zeroRun[ch] + 1) : 0
+        }
+        prev = out
+    }
+    vcheck(ok, "F3 / F3b：5000 组随机（强度、重音、上限、最低强度、通道、声音）经出口后 ≤ 上限、单拍升 ≤ 20、归零保持、通道 2 / 3 = 0 \(bad)")
+    // 时间折算的出口：按实际间隔升幅 ≤ 20 × Δt / 0.3 + 1
+    var timedStage = SyncOutputStage()
+    var tPrev = [0, 0, 0, 0]
+    var tt = 0.0
+    var timedOK = true
+    for _ in 0..<2000 {
+        let dt = 0.1 + rnd() * 0.3
+        tt += dt
+        let st = AudioSyncSettings(maxPercent: 30 + rnd() * 70, channels: .both, minPercent: rnd() * 30)
+        let g = 1 + 0.3 * (rnd() * 2 - 1)
+        let lv = RhythmOutput.target(value: min(100, rnd() * 100 * g), settings: st, hasSignal: true, rateLevel: nil, weight: 0)
+        let out = timedStage.step(levels: lv, settings: st, now: tt, timed: true)
+        for ch in 0..<2 where Double(out[ch] - tPrev[ch]) > 20 * dt / 0.3 + 1 { timedOK = false }
+        tPrev = out
+    }
+    vcheck(timedOK, "F3：按时间的出口升幅 ≤ 20 × Δt / 0.3 + 1（2000 组随机间隔）")
+
+    // F3b 四道门：不满足 → 逐位等于画面值
+    func vibRun(_ beat: AVFusionBeat?, activity: Double = 0.5, both: Bool = true, video: Int = 50,
+                beats: Int = 12) -> [Int] {
+        var v = AVVibrationAudio()
+        var out: [Int] = []
+        for k in 0..<beats {
+            let t = 10 + Double(k) * 0.3
+            var evs: [AudioOnsetEvent] = []
+            var e = t - 4 + 0.05
+            var n = 0
+            while e <= t { evs.append(ev(e, n % 3 == 1 ? 150 : 30)); e += 0.3; n += 1 }
+            out.append(v.step(video: video, floor: 10, events: evs, clock: clock(t), beat: beat, activity: activity,
+                              channelsBoth: both, depth: 0.15, now: t, dt: 0.3))
+        }
+        return out
+    }
+    let passes = vibRun(s2Beat())
+    var uncoupled = s2Beat()
+    uncoupled.state = .uncoupled
+    var stale2 = s2Beat()
+    stale2.fv = 0
+    let gatesOff = [vibRun(nil), vibRun(uncoupled), vibRun(stale2), vibRun(s2Beat(pMusic: 0.5)), vibRun(s2Beat(), activity: 0),
+                    vibRun(s2Beat(), both: false), vibRun(s2Beat(crossCut: 1)), vibRun(s2Beat(still: 0.2))]
+    vcheck(passes.contains { $0 != 50 } && passes.allSatisfy { $0 >= 10 && $0 <= 57 }
+           && gatesOff.allSatisfy { $0.allSatisfy { $0 == 50 } },
+           "F3b 四道门：耦合 + 不像配乐 + 画面在动 + 两个通道才跟声音（\(passes.min() ?? 0)~\(passes.max() ?? 0) ≤ 57）；"
+           + "不耦合 / 相位锁放开 / P_music 0.5 / 画面静止 / 单通道 / 跨切镜证据 / 静止仍有节奏 → 逐位等于画面值")
+    // 最近 10 秒内有过跨切镜证据：之后 10 秒内都不生效，过了才生效
+    var ve = AVVibrationAudio()
+    var evidenceHeld = true
+    var reopened = false
+    for k in 0..<50 {
+        let t = 10 + Double(k) * 0.3
+        let evs = (0..<14).map { ev(t - 4 + 0.05 + Double($0) * 0.3, $0 % 3 == 1 ? 150 : 30) }
+        let b = k == 0 ? s2Beat(crossCut: 1) : s2Beat()
+        let o = ve.step(video: 50, floor: 10, events: evs, clock: clock(t), beat: b, activity: 0.5, channelsBoth: true,
+                        depth: 0.15, now: t, dt: 0.3)
+        if t - 10 < 10 - 1e-9, o != 50 { evidenceHeld = false }
+        if t - 10 >= 10, o != 50 { reopened = true }
+    }
+    vcheck(evidenceHeld && reopened, "F3b：跨切镜证据之后 10 秒内震动 = 画面值，之后才跟声音")
+    // 离开耦合：1.5 秒内回到画面值、每拍降 ≤ 12（画面值不变）
+    var vf = AVVibrationAudio()
+    var lastOn = 0
+    for k in 0..<20 {
+        let t = 10 + Double(k) * 0.3
+        let evs = (0..<14).map { ev(t - 4 + 0.05 + Double($0) * 0.3, $0 % 3 == 1 ? 150 : 30) }
+        lastOn = vf.step(video: 50, floor: 10, events: evs, clock: clock(t), beat: s2Beat(), activity: 0.5,
+                         channelsBoth: true, depth: 0.3, now: t, dt: 0.3)
+    }
+    var fade: [Int] = [lastOn]
+    for k in 0..<8 {
+        let t = 16 + Double(k) * 0.3
+        fade.append(vf.step(video: 50, floor: 10, events: [], clock: clock(t), beat: nil, activity: 0.5, channelsBoth: true,
+                            depth: 0.3, now: t, dt: 0.3))
+    }
+    let backAt = fade.firstIndex(of: 50)
+    let drops = zip(fade, fade.dropFirst()).allSatisfy { $0.0 - $0.1 <= AVVibrationAudio.maxDropPerBeat }
+    vcheck(lastOn > 50 && (backAt ?? 99) <= 5 && fade.suffix(from: backAt ?? 0).allSatisfy { $0 == 50 } && drops && vf.mix == 0,
+           "F3b 离开耦合：\(fade.map(String.init).joined(separator: "→"))，1.5 秒内回到画面值、每拍降 ≤ 12")
+    // 复审 H2：淡回中画面值降了 → 上界跟着压；画面停了 / 震动为 0 / 换成单通道 → 当拍回画面值；淡回每拍降 ≤ 12（含混合比到 0 之后）
+    func engaged(depth: Double = 0.3) -> AVVibrationAudio {
+        var v = AVVibrationAudio()
+        for k in 0..<20 {
+            let t = 10 + Double(k) * 0.3
+            let evs = (0..<14).map { ev(t - 4 + 0.05 + Double($0) * 0.3, $0 % 3 == 1 ? 150 : 30) }
+            _ = v.step(video: 50, floor: 10, events: evs, clock: clock(t), beat: s2Beat(), activity: 0.5, channelsBoth: true,
+                       depth: depth, now: t, dt: 0.3)
+        }
+        return v
+    }
+    var falling = engaged()
+    var fallOut: [Int] = []
+    var fallOK = true
+    for (k, video) in [40, 30, 20, 10, 10, 10, 10, 10].enumerated() {
+        let t = 16 + Double(k) * 0.3
+        let o = falling.step(video: video, floor: 10, events: [], clock: clock(t), beat: nil, activity: 0.5, channelsBoth: true,
+                             depth: 0.3, now: t, dt: 0.3)
+        if o > Int((Double(video) * 1.3).rounded(.down)) { fallOK = false }
+        fallOut.append(o)
+    }
+    var still = engaged()
+    let stillOut = still.step(video: 50, floor: 10, events: [], clock: clock(16), beat: nil, activity: 0, channelsBoth: true,
+                              depth: 0.3, now: 16, dt: 0.3)
+    var zero = engaged()
+    let zeroOut = zero.step(video: 0, floor: 10, events: [], clock: clock(16), beat: s2Beat(), activity: 0.5, channelsBoth: true,
+                            depth: 0.3, now: 16, dt: 0.3)
+    var single = engaged()
+    let singleOut = single.step(video: 50, floor: 10, events: [], clock: clock(16), beat: s2Beat(), activity: 0.5,
+                                channelsBoth: false, depth: 0.3, now: 16, dt: 0.3)
+    // 卡顿：dt = 5 秒也只当一拍
+    var stall = engaged()
+    let stallOut = stall.step(video: 50, floor: 10, events: [], clock: clock(21), beat: nil, activity: 0.5, channelsBoth: true,
+                              depth: 0.3, now: 21, dt: 5)
+    vcheck(fallOK && fallOut.last == 10 && stillOut == 50 && still.mix == 0 && zeroOut == 0 && zero.mix == 0
+           && singleOut == 50 && single.mix == 0 && stallOut > 50 && stall.mix > 0,
+           "F3b（复审 H2）：淡回时画面降了上界跟着压（\(fallOut.map(String.init).joined(separator: "→"))）；画面停 / 震动 0 / 单通道当拍回画面值；卡顿 dt 只当一拍")
+
+    // 调试列
+    let f3Count = AVDebugColumns.f3Header.split(separator: ",", omittingEmptySubsequences: false).count
+    vcheck(f3Count == 3 && AVDebugColumns.f3Fields(accent: a, vibration: vf).count == 3 && AVDebugColumns.f3Empty.count == 3
+           && AVDebugColumns.f3Empty.allSatisfy { $0.isEmpty },
+           "F3 调试列 3 列")
+}
+
+
+
+/// av-fusion F4 的检查（互为回落 + 相位飞轮）
+func avFusionF4Checks() {
+    var seed: UInt64 = 0xF4F4
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    func beat(_ state: AVFusionBeat.State, pMusic: Double = 0) -> AVFusionBeat {
+        var b = AVFusionBeat()
+        b.state = state
+        b.pMusic = pMusic
+        return b
+    }
+
+    // 设置
+    let def = VisualSyncSettings()
+    let on = VisualSyncSettings(source: .motion, avFusion: true, avFallback: true)
+    var offF = on
+    offF.avFallback = false
+    vcheck(!def.avFallback && !def.usesAVFallback && VisualSyncSettings.Keys.avFallback == "bcVisualSyncAVFallback"
+           && on.usesAVFallback && !VisualSyncSettings(source: .audio, avFusion: true, avFallback: true).usesAVFallback
+           && !VisualSyncSettings(source: .motion, avFusion: false, avFallback: true).usesAVFallback
+           && on.tickInterval == offF.tickInterval,
+           "F4 设置：默认关、键名、要融合 + 跟随画面，不改 Timer 间隔")
+
+    // 爬坡抽成纯函数：和原式逐位相同
+    var rampSame = true
+    for _ in 0..<5000 {
+        let e = rnd() < 0.05 ? Double.nan : rnd() * 4 - 1
+        let sec = 0.5 + rnd() * 3
+        let a = HandoverRamp.share(elapsed: e, seconds: sec)
+        let b = min(1, max(0, e / sec))
+        if a.bitPattern != b.bitPattern { rampSame = false }
+    }
+    vcheck(rampSame, "F4：HandoverRamp.share 和 SourceHandover 原来的爬坡式逐位相同（5000 组随机，含 NaN）")
+
+    // 画面断开 → 0.6 秒后 1.5 秒爬到声音；值 ≤ max(画面, 声音)
+    func run(gate: AVFusionBeat?, audio: Double = 80, audioSignal: Bool = true, goneBeats: Int = 12,
+             backBeats: Int = 0, video: Double = 10) -> (values: [Double], signals: [Bool], fb: AVFallbackBlend) {
+        var f = AVFallbackBlend()
+        var vals: [Double] = []
+        var sigs: [Bool] = []
+        var now = 0.0
+        for _ in 0..<10 {   // 画面正常 3 秒
+            now += 0.3
+            f.note(beat: gate, now: now)
+            let o = f.step(blended: (video, true), motionSignal: true, audio: audio, audioSignal: audioSignal, now: now, dt: 0.3)
+            vals.append(o.value)
+            sigs.append(o.hasSignal)
+        }
+        for _ in 0..<goneBeats {
+            now += 0.3
+            let o = f.step(blended: (0, false), motionSignal: false, audio: audio, audioSignal: audioSignal, now: now, dt: 0.3)
+            vals.append(o.value)
+            sigs.append(o.hasSignal)
+        }
+        for _ in 0..<backBeats {
+            now += 0.3
+            let o = f.step(blended: (video, true), motionSignal: true, audio: audio, audioSignal: audioSignal, now: now, dt: 0.3)
+            vals.append(o.value)
+            sigs.append(o.hasSignal)
+        }
+        return (vals, sigs, f)
+    }
+    let coupled = run(gate: beat(.coupled, pMusic: 0.9))
+    let gone = Array(coupled.values[10...])
+    // 断开第 1 拍 0.3 秒、第 2 拍 0.6 秒（到 0.6 秒那拍起爬，每拍 +0.2）
+    let expect: [Double] = [0, 16, 32, 48, 64, 80, 80, 80, 80, 80, 80, 80]
+    let rampOK = zip(gone, expect).allSatisfy { abs($0.0 - $0.1) < 1e-9 } && coupled.values.prefix(10).allSatisfy { $0 == 10 }
+    let bounded = coupled.values.allSatisfy { $0 <= 80 + 1e-9 }
+    vcheck(rampOK && bounded && coupled.signals[10] == false && coupled.signals[11] && coupled.fb.substituting,
+           "F4 画面断开：0.6 秒前照原路径（0、没信号），之后 1.5 秒线性爬到声音 80，≤ max(画面, 声音)：\(gone.map { String(Int($0)) }.joined(separator: "→"))")
+    // 门：最近 10 秒耦合过或 P_music < 0.3 才补；像配乐又没耦合 → 维持现状（0、没信号）
+    let music = run(gate: beat(.uncoupled, pMusic: 0.8))
+    let lowMusic = run(gate: beat(.uncoupled, pMusic: 0.1))
+    let noAudioBeat = run(gate: beat(.noAudio, pMusic: 0))
+    var voiceBeat = beat(.voice, pMusic: 0)
+    voiceBeat.pVoice = 0.9
+    let voice = run(gate: voiceBeat)
+    vcheck(music.values[10...].allSatisfy { $0 == 0 } && music.signals[10...].allSatisfy { !$0 } && !music.fb.active
+           && lowMusic.values[10...].allSatisfy { $0 == 0 } && voice.values[10...].allSatisfy { $0 == 0 }
+           && noAudioBeat.values[10...].allSatisfy { $0 == 0 },
+           "F4 门（复审 H1）：只认最近 10 秒内真的耦合过；像配乐 / P_music 低但没耦合（单镜头配乐的默认值）/ 人声 / 没声音 → 不补（0、不加最低强度）")
+    // 复审 M1：交回到一半又断开、门不满足 → 占比淡回 0（不冻住）；一次替补最多 30 秒
+    var halfBack = run(gate: beat(.coupled), backBeats: 2).fb
+    let shareMid = halfBack.share
+    var later: [Double] = []
+    for k in 1...12 {
+        _ = halfBack.step(blended: (0, false), motionSignal: false, audio: 80, audioSignal: true, now: 100 + Double(k) * 0.3, dt: 0.3)
+        later.append(halfBack.share)
+    }
+    let capped = run(gate: beat(.coupled), goneBeats: Int((AVFallbackBlend.maxSubstituteSeconds + 3) / 0.3))
+    vcheck(shareMid > 0 && shareMid < 1 && later.last == 0 && zip(later, later.dropFirst()).allSatisfy { $0.1 <= $0.0 }
+           && capped.values.last == 0 && capped.values.contains(80),
+           "F4（复审 M1）：门不满足时占比淡回 0、不冻在交回的一半；替补 30 秒后淡回原路径")
+    // 门只在断开 0.6 秒那一刻判一次：之后过了 10 秒照样补（不中途掉）；门过期之后新断开不补
+    let longGone = run(gate: beat(.coupled), goneBeats: 60)
+    var stale = AVFallbackBlend()
+    stale.note(beat: beat(.coupled), now: 0)
+    var staleVals: [Double] = []
+    for k in 1...20 {
+        let o = stale.step(blended: (0, false), motionSignal: false, audio: 80, audioSignal: true, now: 10 + Double(k) * 0.3, dt: 0.3)
+        staleVals.append(o.value)
+    }
+    vcheck(longGone.values.last == 80 && staleVals.allSatisfy { $0 == 0 },
+           "F4 门：断开那一刻判，一次断开里不中途掉；门（10 秒）过期后再断开不补")
+    // 声音也没了：0、没信号
+    let silent = run(gate: beat(.coupled), audioSignal: false)
+    vcheck(silent.values[10...].allSatisfy { $0 == 0 } && silent.signals[10...].allSatisfy { !$0 },
+           "F4：画面、声音都没了 → 0、没信号（不加最低强度）")
+    // 画面回来：每拍降 ≤ 12、交回后逐位等于原路径
+    let back = run(gate: beat(.coupled), backBeats: 14)
+    let tail = Array(back.values[22...])
+    let drops = zip([back.values[21]] + tail, tail).allSatisfy { $0.0 - $0.1 <= 12 + 1e-9 }
+    vcheck(drops && tail.last == 10 && !back.fb.active && back.signals[22...].allSatisfy { $0 },
+           "F4 画面回来：每拍降 ≤ 12、交回后逐位等于原路径：\(tail.map { String(Int($0.rounded())) }.joined(separator: "→"))")
+    // 中途 reset（暂停 / seek / 缓冲 / 关联动）：下一拍原样
+    var mid = run(gate: beat(.coupled)).fb
+    mid.reset()
+    let afterReset = mid.step(blended: (0, false), motionSignal: false, audio: 80, audioSignal: true, now: 100, dt: 0.3)
+    vcheck(afterReset.value == 0 && !afterReset.hasSignal && !mid.active,
+           "F4：暂停 / seek / 缓冲 / 关联动 reset 后当拍走原路径（0）")
+
+    // 5000 组随机：经出口 ≤ 上限、升幅 ≤ 20、归零保持、通道 2 / 3 = 0；值 ≤ max(画面, 声音)；画面一直在时逐位原样
+    var f = AVFallbackBlend()
+    var stage = SyncOutputStage()
+    var prev = [0, 0, 0, 0]
+    var ok = true
+    var bad = ""
+    var alwaysVideo = AVFallbackBlend()
+    var identical = true
+    var now = 0.0
+    for i in 0..<5000 {
+        if i % 300 == 0 { f.reset(); stage.reset(); prev = [0, 0, 0, 0] }
+        now += 0.1 + rnd() * 0.3
+        if rnd() < 0.2 { f.note(beat: beat(rnd() < 0.5 ? .coupled : .uncoupled, pMusic: rnd()), now: now) }
+        let ms = rnd() < 0.6
+        let m = rnd() < 0.03 ? Double.nan : rnd() * 120 - 10
+        let a = rnd() < 0.03 ? Double.nan : rnd() * 120 - 10
+        let asig = rnd() < 0.8
+        let blendedIn = (value: ms ? m : 0, hasSignal: ms)
+        let prevF = f.lastValue
+        let o = f.step(blended: blendedIn, motionSignal: ms, audio: a, audioSignal: asig, now: now, dt: 0.3)
+        let mm = ms && m.isFinite ? min(100, max(0, m)) : 0
+        let aa = asig && a.isFinite ? min(100, max(0, a)) : 0
+        if !(o.value.isFinite || o.value.isNaN && blendedIn.value.isNaN) { ok = false; bad = "值 \(o.value)" }
+        // F4 起作用时：≤ max(画面, 声音)，交回降速托着时 ≤ 上一拍
+        if f.active, o.value > max(mm, aa, prevF ?? 0) + 1e-9 { ok = false; bad = "上界 \(o.value)" }
+        if f.active, let p = prevF, o.value > max(mm, aa) + 1e-9, o.value > p - 12 + 1e-9 { ok = false; bad = "托住 \(o.value)" }
+        let st = AudioSyncSettings(maxPercent: 10 + rnd() * 90, channels: .both, minPercent: rnd() * 40)
+        let out = stage.step(levels: RhythmOutput.target(value: o.value, settings: st, hasSignal: o.hasSignal, rateLevel: nil,
+                                                         weight: 0), settings: st)
+        let cap = SyncOutputStage.hardCap(st)
+        if out[2] != 0 || out[3] != 0 { ok = false; bad = "通道" }
+        for ch in 0..<2 {
+            if out[ch] < 0 || out[ch] > cap { ok = false; bad = "上限" }
+            if out[ch] - prev[ch] > SyncOutputStage.maxRisePerTick { ok = false; bad = "升幅" }
+        }
+        prev = out
+        let v = alwaysVideo.step(blended: (m, true), motionSignal: true, audio: a, audioSignal: asig, now: now, dt: 0.3)
+        if v.value.bitPattern != m.bitPattern || !v.hasSignal { identical = false }
+    }
+    vcheck(ok && identical,
+           "F4：5000 组随机（画面断续、NaN、声音有无、门开关）经出口 ≤ 上限、升幅 ≤ 20、通道 2 / 3 = 0；画面一直在时逐位原样 \(bad)")
+
+    // 相位飞轮：S2 里锁丢了、撞击频率一致 → 维持 ≤ 1.5 秒；不在 S2 / 频率不一致 / 超时 → 放开
+    let locked = plLocked(hz: 1, until: 13)
+    var lost = locked
+    lost.step(plWindow(time: 13, hz: 1, cut: true), followerHz: 1, followerLocked: true, followerSource: .flow,
+              now: 13.1, dt: 0.3, active: true)
+    func fly(s2: Bool, audioHz: Double) -> [Bool] {
+        var w = AVPhaseFlywheel()
+        _ = w.step(lock: locked, s2: s2, audioHz: audioHz, now: 13)
+        var held: [Bool] = []
+        for k in 1...8 { held.append(w.step(lock: lost, s2: false, audioHz: audioHz, now: 13 + Double(k) * 0.3) != nil) }
+        return held
+    }
+    let held = fly(s2: true, audioHz: 1.05)
+    let notS2 = fly(s2: false, audioHz: 1)
+    let wrongHz = fly(s2: true, audioHz: 1.4)
+    let noAudio = fly(s2: true, audioHz: 0)
+    var w = AVPhaseFlywheel()
+    let liveLocked = w.step(lock: locked, s2: true, audioHz: 1, now: 13) == nil
+    let snapPhase = w.step(lock: lost, s2: false, audioHz: 1, now: 13.3)?.phase(at: 13.3)
+    vcheck(locked.locked && !lost.locked && held.prefix(5).allSatisfy { $0 } && held.suffix(2).allSatisfy { !$0 }
+           && notS2.allSatisfy { !$0 } && wrongHz.allSatisfy { !$0 } && noAudio.allSatisfy { !$0 } && liveLocked
+           && snapPhase != nil && snapPhase == locked.phase(at: 13.3),
+           "F4 相位飞轮：S2 里锁丢了、撞击 1.05 Hz 跟得上 → 用丢之前的锁 1.5 秒（\(held.filter { $0 }.count) 拍）后放开；不在 S2 / 频率差 > 15% / 没撞击 → 不维持；锁着时用实时锁")
+
+    let f4Count = AVDebugColumns.f4Header.split(separator: ",", omittingEmptySubsequences: false).count
+    vcheck(f4Count == 3 && AVDebugColumns.f4Fields(fallback: back.fb, flywheel: w).count == 3
+           && AVDebugColumns.f4Empty.allSatisfy { $0.isEmpty }, "F4 调试列 3 列")
+}
+
+avFusionF3Checks()
+
+/// av-fusion F5 的检查（音画偏移估计 + 手动偏移）
+func avFusionF5Checks() {
+    var seed: UInt64 = 0xF5F5
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    func wrap(_ x: Double) -> Double { atan2(sin(x), cos(x)) }
+
+    // 设置
+    let def = VisualSyncSettings()
+    let fusionOn = VisualSyncSettings(source: .motion, avFusion: true, avOffsetMs: 120)
+    let fusionOff = VisualSyncSettings(source: .motion, avFusion: false, avOffsetMs: 120, avAutoOffset: true)
+    vcheck(def.avOffsetMs == 0 && !def.avAutoOffset && !def.usesAVAutoOffset && def.manualAVOffset == 0
+           && VisualSyncSettings.Keys.avOffsetMs == "bcVisualSyncAVOffsetMs"
+           && VisualSyncSettings.Keys.avAutoOffset == "bcVisualSyncAVAutoOffset"
+           && VisualSyncSettings(avOffsetMs: 999).avOffsetMs == 300 && VisualSyncSettings(avOffsetMs: -999).avOffsetMs == -300
+           && VisualSyncSettings(avOffsetMs: .nan).avOffsetMs == 0
+           && abs(fusionOn.manualAVOffset - 0.12) < 1e-12 && fusionOff.manualAVOffset == 0 && !fusionOff.usesAVAutoOffset
+           && fusionOn.tickInterval == def.tickInterval,
+           "F5 设置：默认 0 / 关、键名、夹 ±300（NaN → 0）、融合没生效时偏移 0、不改 Timer 间隔")
+
+    // 时钟挪动：0 / NaN 原样（逐位）；正偏移 = 撞击按 t − τ 算
+    let c = MediaClockSnapshot(host: 100.123, item: 12.5, rate: 1.5)
+    let s0 = c.shifted(byItem: 0)
+    let sn = c.shifted(byItem: .nan)
+    let sp = c.shifted(byItem: 0.12)
+    vcheck(s0.host.bitPattern == c.host.bitPattern && s0.item.bitPattern == c.item.bitPattern && s0.rate.bitPattern == c.rate.bitPattern
+           && sn == c && abs(sp.host(forItem: 12.62) - c.host(forItem: 12.5)) < 1e-9,
+           "F5 时钟挪动：偏移 0 / NaN 逐位原样；+120 毫秒时 12.62 秒的撞击按 12.50 秒对画面")
+    // 复审 M5：真的撞击时刻 + 非零偏移。声音比画面晚 120 毫秒的撞击，用挪过的时钟算出的画面相位和「没偏移的片子」一样；
+    // 不挪时相位整体转 2π·f·τ
+    let lock = plLocked(hz: 1.2, until: 20)
+    let clk0 = MediaClockSnapshot(host: 20, item: 20, rate: 1)
+    let truth = [17.2, 17.9, 18.6, 19.3]
+    let late = truth.map { $0 + 0.12 }
+    let mTruth = AVOffsetEstimator.meanPhase(itemTimes: truth, clock: clk0, lock: lock)
+    let mFixed = AVOffsetEstimator.meanPhase(itemTimes: late, clock: clk0.shifted(byItem: 0.12), lock: lock)
+    let mRaw = AVOffsetEstimator.meanPhase(itemTimes: late, clock: clk0, lock: lock)
+    let rot = lock.omega * 0.12
+    let fixedOK = mTruth != nil && mFixed != nil && abs(wrap(mFixed!.mu - mTruth!.mu)) < 1e-6
+    let rawOK = mTruth != nil && mRaw != nil && abs(wrap(mRaw!.mu - mTruth!.mu - rot)) < 0.02
+    // 窗口：τ = 0 时撞击集合和不挪逐位相同；τ > 0 时窗口右端跟着挪
+    var evs: [AudioOnsetEvent] = []
+    for t in late { evs.append(AudioOnsetEvent(time: t, strength: 60, risingBands: 6, steepBands: 6, shortBands: 6)) }
+    let w0 = AVRhythmVote.impacts(evs, start: 15.9, end: 19.4).map { $0.time }
+    let c0 = clk0.shifted(byItem: 0)
+    let w0b = AVRhythmVote.impacts(evs, start: c0.item(forHost: 20) - 4.1, end: c0.item(forHost: 20) - 0.6).map { $0.time }
+    let cP = clk0.shifted(byItem: 0.12)
+    let wP = AVRhythmVote.impacts(evs, start: cP.item(forHost: 20) - 4.1, end: cP.item(forHost: 20) - 0.6).map { $0.time }
+    vcheck(fixedOK && rawOK && w0 == w0b && wP.count == w0.count + 1,
+           "F5：声音晚 120 毫秒时，按挪过的时钟算的撞击相位和没偏移时一样（不挪差 \(String(format: "%.0f", rot * 180 / .pi))°）；"
+           + "τ = 0 窗口逐位相同、τ > 0 窗口右端跟着挪")
+
+    // 合成 (f, μ)：μ = φ0 + 2π f τ + 噪声 → 分离出 τ 和 φ0
+    func estimate(tau: Double, phi0: Double, freqs: [Double], noise: Double = 0.1, n: Int = 40,
+                  random: Bool = false) -> AVOffsetEstimator {
+        var est = AVOffsetEstimator()
+        for k in 0..<n {
+            let f = freqs[k % freqs.count] + (rnd() - 0.5) * 0.02
+            let mu = random ? rnd() * 2 * Double.pi : wrap(phi0 + 2 * Double.pi * f * tau + (rnd() - 0.5) * 2 * noise)
+            est.add(hz: f, mu: mu, r: 0.8, now: Double(k))
+        }
+        return est
+    }
+    let a = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.0, 1.3, 1.6])
+    let b = estimate(tau: -0.2, phi0: 3.0, freqs: [0.7, 1.1, 1.5])
+    let z = estimate(tau: 0, phi0: -2.5, freqs: [0.9, 1.15, 1.4])
+    let aOK = a.estimate.map { abs($0 - 0.12) <= 0.012 } ?? false
+    let bOK = b.estimate.map { abs($0 + 0.2) <= 0.015 } ?? false
+    let zOK = z.estimate.map { abs($0) <= 0.015 } ?? false
+    // φ0 是格中心频率上拟合出来的，和真值差 ≤ 0.15 弧度
+    let phiOK = abs(wrap(a.phi0 - 1.0)) <= 0.15 && abs(wrap(b.phi0 - 3.0)) <= 0.2
+    vcheck(aOK && bOK && zOK && phiOK,
+           "F5 估计：+120 / −200 / 0 毫秒分别估成 \(a.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "–") / "
+           + "\(b.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "–") / \(z.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "–") 毫秒，"
+           + "φ0 分开（含绕过 ±π）")
+    // 频率跨度不够 / 样本不够 / 相位和频率没关系 → 不估
+    let narrow = estimate(tau: 0.12, phi0: 1.0, freqs: [1.0, 1.15])
+    let single = estimate(tau: 0.12, phi0: 1.0, freqs: [1.2])
+    let few = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.2, 1.6], n: 8)
+    // 复审 M4：7 + 1 个样本（一个格只有 1 个）、两格、三格纯随机相位 → 都不估
+    var sevenOne = AVOffsetEstimator()
+    for k in 0..<7 { sevenOne.add(hz: 0.8, mu: 1, r: 0.8, now: Double(k)) }
+    sevenOne.add(hz: 1.2, mu: -2, r: 0.5, now: 8)
+    let twoBins = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.6], n: 40)
+    var randomHits = 0
+    for trial in 0..<200 {
+        _ = trial
+        if estimate(tau: 0, phi0: 0, freqs: [0.8, 1.2, 1.6], n: 30, random: true).estimate != nil { randomHits += 1 }
+    }
+    let noisy = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.0, 1.2, 1.4, 1.6, 1.8], n: 80, random: true)
+    var weak = AVOffsetEstimator()
+    for k in 0..<40 { weak.add(hz: k % 2 == 0 ? 0.8 : 1.6, mu: 1, r: 0.3, now: Double(k)) }
+    vcheck(narrow.estimate == nil && single.estimate == nil && few.estimate == nil && noisy.estimate == nil
+           && weak.sampleCount == 0 && narrow.spanHz < AVOffsetEstimator.minSpanHz
+           && sevenOne.estimate == nil && twoBins.estimate == nil && randomHits == 0,
+           "F5：频率跨度 < 0.4 Hz / 只有一个频率 / 每格样本 < 5 / 7 + 1 / 只有两格 / 相位和频率没关系（200 次随机 \(randomHits) 次误估）/ 集中度 < 0.5 → 不估 τ")
+    // 复审 M4：估计值每次最多挪 20 毫秒（先学 +120，再换成 −120 的数据）
+    var drift = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.2, 1.6])
+    let before = drift.estimate ?? 9
+    var maxJump = 0.0
+    var prevE = before
+    for k in 0..<200 {
+        let f = [0.8, 1.2, 1.6][k % 3]
+        drift.add(hz: f, mu: wrap(1.0 + 2 * Double.pi * f * -0.12), r: 0.9, now: 50 + Double(k))
+        if let e = drift.estimate { maxJump = max(maxJump, abs(e - prevE)); prevE = e }
+    }
+    // 复审 R2 M2：第一次估出来也从手动值起步、每次 ≤ 20 毫秒；S2 结束后过期（expire 每拍调）
+    var firstStep = AVOffsetEstimator()
+    firstStep.seed = -0.05
+    var firstValue: Double?
+    for k in 0..<60 {
+        let f = [0.8, 1.2, 1.6][k % 3]
+        firstStep.add(hz: f, mu: wrap(0.5 + 2 * Double.pi * f * 0.25), r: 1, now: Double(k))
+        if firstValue == nil, let e = firstStep.estimate { firstValue = e }
+    }
+    let converged = firstStep.estimate ?? 9
+    var stale5 = firstStep
+    stale5.expire(now: 59 + 60)
+    let keptAt119 = stale5.estimate != nil
+    stale5.expire(now: 59 + 200)
+    vcheck(firstValue.map { abs($0 + 0.03) < 1e-9 } == true && abs(converged - 0.25) < 0.015 && keptAt119 && stale5.estimate == nil
+           && stale5.bins.isEmpty,
+           "F5（复审 R2 M2）：第一次估计从手动值 −50 起步只挪 20 毫秒，之后收敛到 +250（\(String(format: "%.0f", converged * 1000))）；没新样本 120 秒后过期")
+    vcheck(abs(before - 0.12) < 0.012 && maxJump <= AVOffsetEstimator.maxStepPerUpdate + 1e-12,
+           "F5：估计值每次更新最多挪 20 毫秒（最大一步 \(String(format: "%.1f", maxJump * 1000)) 毫秒）")
+    // 120 秒前的样本过期：只剩一个频率时估计消失
+    var aging = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.2, 1.6])
+    let hadIt = aging.estimate != nil
+    for k in 0..<10 { aging.add(hz: 1.6, mu: wrap(1.0 + 2 * Double.pi * 1.6 * 0.12), r: 0.8, now: 200 + Double(k)) }
+    vcheck(hadIt && aging.estimate == nil && aging.bins.count == 1, "F5：120 秒前的样本过期，频率只剩一格时不再估")
+    // 实际用的偏移：自动开且估出来 → 估计；自动开没估出 → 手动；自动关 → 手动；融合关 → 0；都夹 ±0.3
+    let autoOn = VisualSyncSettings(source: .motion, avFusion: true, avOffsetMs: -50, avAutoOffset: true)
+    let autoOff = VisualSyncSettings(source: .motion, avFusion: true, avOffsetMs: -50, avAutoOffset: false)
+    vcheck(abs(AVOffset.effective(settings: autoOn, estimator: a) - (a.estimate ?? 9)) < 1e-12
+           && abs(AVOffset.effective(settings: autoOn, estimator: narrow) + 0.05) < 1e-12
+           && abs(AVOffset.effective(settings: autoOff, estimator: a) + 0.05) < 1e-12
+           && AVOffset.effective(settings: fusionOff, estimator: a) == 0
+           && AVOffset.effective(settings: autoOn, estimator: nil) == -0.05,
+           "F5 实际偏移：自动估出 → 估计值；估不出 / 自动关 → 手动值；融合关 → 0")
+    // 撞击上的相位均值：没锁 / < 3 次 → nil；锁着时 μ 是各撞击相位的圆均值
+    let clk = clk0
+    let times = [18.0, 18.4, 19.1, 19.6]
+    let mp = AVOffsetEstimator.meanPhase(itemTimes: times, clock: clk, lock: lock)
+    var sx = 0.0, sy = 0.0
+    for t in times { if let ph = lock.phase(at: t) { sx += cos(ph); sy += sin(ph) } }
+    vcheck(mp != nil && abs(wrap(mp!.mu - atan2(sy, sx))) < 1e-12
+           && AVOffsetEstimator.meanPhase(itemTimes: [18, 19], clock: clk, lock: lock) == nil
+           && AVOffsetEstimator.meanPhase(itemTimes: times, clock: clk, lock: RhythmPhaseLock()) == nil,
+           "F5：撞击相位均值（锁着、≥ 3 次才有）")
+    vcheck(AVDebugColumns.f5Header.split(separator: ",").count == 4 && AVDebugColumns.f5Fields(effective: 0.12, estimator: a).count == 4
+           && AVDebugColumns.f5Fields(effective: 0, estimator: nil)[0] == "0" && AVDebugColumns.f5Empty.allSatisfy { $0.isEmpty },
+           "F5 调试列 4 列")
+}
+
+avFusionF4Checks()
+avFusionF5Checks()
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)

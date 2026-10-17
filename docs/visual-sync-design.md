@@ -1204,6 +1204,182 @@ P4 前瞻——分别和 f706431 的 `VisualSync.swift`、当前分支的 `Visua
 6 段特征 → `AVFusionEngine`，P3 频带块照 `VideoSyncPlayer` 经 `AudioBandBacklog` 先给融合再交给撞击声校正）编译（`-O`），
 三份输出（每拍输出档位、原值、浮点位模式）必须逐字节相同。CI 的 checkout 改成 `fetch-depth: 0` 才拿得到 f706431。
 
+### av-fusion F2：节奏由声音确认（开关 `bcVisualSyncAVRhythmConfirm`，默认关）+ F1 复审 L1 / L2
+
+研究页 F2 一步。原则：**画面为主、声音作证**——频率和相位永远由画面（P1~P4）决定；声音只在证明了自己和画面说的是同一件事（F1 的「耦合」：
+C ≥ 0.6 持续 2 秒进入，C < 0.4 持续 1.5 秒退出；seek / 换视频 / 开关 / 画面侧重置时立刻从头来）之后才说话，而且**只纠正、不发起**：
+`activity` 只看画面（声音永远不能让静止的画面动起来）、声音不能开节奏锁，只能在画面已经有候选时加置信度 / 选八度 / 缩短跳变确认。
+每个效果都是乘在画面结果上的有界修正；不耦合或开关关着时和现在的跟随画面逐位相同。
+
+#### 开关
+
+| 开关 | 存储键 | 显示条件 | 真正生效 | 关着时 |
+| --- | --- | --- | --- | --- |
+| 节奏由声音确认（实验） | `bcVisualSyncAVRhythmConfirm` | 「声画融合（实验）」和「伸缩跟随动作频率」都开（只在跟随画面） | `usesAVRhythmConfirm` = `usesAVFusion && rhythmFollow && avRhythmConfirm` | 不投票、窗口副本原样、跟随器 `fastJump = false`、撞击声校正 `coupled = nil`（P3 原样） |
+
+不改 `tickInterval`；不是第三种来源（`VisualSyncSource` / `resolveSource` / 来源选择不动），声音模式一行不改。
+
+#### 状态机（主线程，每个完整拍）
+
+- **S0 关**（开关关 / 不在跟随画面）= main；
+- **S1 只有画面**（不耦合 / 没声音 / 时间不可用 / 切镜考验 / 画面这一拍没有块运动候选）= 现在的跟随画面，窗口副本原样（`==` 且位模式相同）；
+- **S2 耦合**（`AVRhythmVote.isS2`：**上一拍** `AVFusionBeat.state == .coupled`，**而且那一拍画面相位锁还锁着**（`fv > 0`，复审 M1））= 画面结果 + `AVRhythmVote` 的确认 + 撞击声校正的耦合条件。
+  `state == .coupled` 本身就要求时间可用（拿不到时间范围 → 没有频带 / 特征帧 → `no_time`）、声音在场、不在切镜考验，所以没有时间就没有 S2。
+  用上一拍的状态是因为 `updateFusion` 照 F1 排在 `rhythmLevel` 之后（读这一拍更新过的相位锁），F1 的显示 / 输出不因此变；滞后 ≤ 1 拍（0.3 秒）。
+- S2 → S1 单调退回：耦合一退出，下一拍起窗口原样。
+
+#### 数据流
+
+```
+VideoSyncPlayer.rhythmLevel（完整拍）
+  window → P4 LookaheadCoordinator.refine → P3 ActionContext.refine → F2 AVRhythmVote.refine（usesAVRhythmConfirm 才走）
+         （P3 / F2 两步的顺序在 AVRhythmVote.contextThenVote 里，播放器和测试共用）
+         → RhythmFollower.step(…, fastJumpHz: vote.fastJumpHz) / RhythmPhaseLock.step                      # 出口规则不变
+motionTick：updateFusion（F1，不变）→ … → updateAudioAnchor（usesAVRhythmConfirm 时 coupled = 这一拍 state == .coupled）
+输出仍只经 tick() → SyncOutputStage.limit → BLEManager.sendTick；pulseSubTick 不变；STOP / 看门狗 / 断连不变
+```
+
+#### 类型（`VisualSync.swift`「av-fusion F2」）
+
+- **声音不开锁（复审 M1）**：C 是 τ = 1 秒的 EMA、退出还要撑 1.5 秒，相位锁放开后「耦合」会再挂约 2.3 秒；切镜考验期间耦合度挂起不清，考验完新镜头头几拍也还是「耦合」。以前这些拍里投票照样 +0.1，0.30~0.39 的画面候选就被推过 0.40 的开锁门（换八度还替新锁选频率）。现在 S2 要相位锁还锁着，加置信 / 换八度还要跟随器上一拍已经被画面锁上；测试：画面在动、弱候选 0.35、强制耦合、切镜后，投票开 / 关跟随器逐位相同、一直不锁。锁上以后 +0.1 仍可让 0.20~0.29 的读数不掉锁（研究页允许的「画面有候选时加置信」）。
+- `AVRhythmVote.refine(window, enabled:, coupled:, events:, impactHz:, clock:, followerHz:, followerLocked:)`：只在 S2、这一拍有块运动候选
+  （`subjectFrames > 0`、跟随频率在 0.4~4 Hz、置信 > 0）、没切镜 / 保持期、时钟有效时改副本：
+  1. **一致**：声音节奏和画面跟随频率差 ≤ 15%（和 F1 的 A_f 同口径）→ `subjectFollowRhythm` + 0.1（夹 0~1）；
+  2. **八度消歧**：两边正好差 2 倍 / 一半（八度两边各 15%）、而且声音是**干净的单一脉冲串**（声音节奏和上一拍 F1 的 f_a = 撞击间隔中位数差 ≤ 15%）→
+     画面频率乘 2 / 除 2（按画面自己的读数换八度，不直接用声音的频率；幅度按频率反比换算；按错八度拟合的相位作废，相位锁等下一个读数；
+     姿态和块运动同一个八度时一起换）；
+  3. **跳频确认**：跟随器锁着、画面读数偏离跟随频率 15% 以上、声音同方向也偏了 15% 以上、而且和画面读数差 ≤ 30% → `fastJump`、`fastJumpHz` = 这个画面读数，
+     `RhythmFollower` 这一拍**真正用的候选读数**和 `fastJumpHz` 同方向、差 ≤ 30% 时，跳变确认从 2 拍（≥ 0.6 秒 − 半拍）缩成 1 拍（≥ 1 拍 − 半拍）
+     （复审 M2：跟随器挑了姿态读数时声音没核对过它，不缩；以前是一个布尔，反方向的姿态读数也会 1 拍就跳）；跳不跳、跳到哪仍由跟随器自己的规则（平均偏离 ≥ 30%、读数彼此一致）决定。
+- **声音节奏**（`AVRhythmVote.audioRhythm`）：融合起音里的撞击（`isImpact`）按**幅度**加权（strength 是 6 段上升 dB 之和，换成每段平均上升的幅度倍数）做成脉冲串，
+  归一化自相关在 0.4~4 Hz 找局部峰，取「最短且 ≥ 最高峰 85%」的周期——**只用来消歧，不发起**。
+  **窗口对齐**：声音的 4 秒窗口和画面 `followEstimate` 的 4 秒窗口按播放器时钟对齐（画面窗口终点 = 最后一个相位拟合的时刻，没有时 = 现在；换成视频时间后往前 4 秒 × 倍速），
+  频率乘倍速后再和画面（host 时间上的 Hz）比。跳频方向看同一个对齐窗口里**最后 4 下撞击的间隔中位数**（`recentHz`）：
+  4 秒自相关要攒够新节奏才换峰，测试里比画面的 `followEstimate` 晚 1 拍以上，用它就永远赶不上。
+- **一下两响（往里 / 往外各一声）的风险**：两响强弱不同时按幅度加权的自相关落在整周期、撞击间隔中位数却是一半周期 → 不干净 → 不改八度（测试：12 dB 差的两响，留在 1 Hz）；
+  两响一样强时声音和画面本来就差一倍，F1 的 A_f = 0、进不了耦合——S2 只能在声音和画面**同频**时建立，所以八度消歧实际只纠正「已经耦合以后画面一时读错八度」
+  （15 fps 上 2 Hz = 7.5 格，`halvedLag` 时灵时不灵）。画面从头到尾都读错八度时进不了 S2，不纠正（宁可不纠正，也不让声音发起）；
+  持续误报时相位锁拿不到读数会在约 1 秒后放开 → C 降、约 1.5 秒后退出耦合 → 退回 S1，最多桥接约 3 秒。
+- `RhythmFollower.step(_:dt:active:fastJumpHz:)`：`fastJumpHz` 默认 0（= 不缩），表达式和以前逐位相同（`Self.jumpConfirmSeconds - 0.5 * beat - 1e-9`）。
+- `AudioPhaseAnchor.step(…, coupled: Bool? = nil)`：nil = 不看耦合（和以前逐位相同）；false = 这一拍不算「对上」（按条件不满足保持 2 秒后回 0），
+  状态行「撞击声校正：声画不耦合（像配乐 / 人声）…」。**和研究页的出入**：研究页写「融合开着（usesAVFusion）就加耦合条件」，但同一页又要求
+  「融合开、F2 关 = F1 = f706431 逐位相同」，两条矛盾；这里按后一条，耦合条件跟 `usesAVRhythmConfirm` 走（F2 要求融合开着，所以仍是「只在融合开着时」）。
+- 调试列 `AVDebugColumns.f2Header`：`av_vote,av_vote_hz,av_vote_conf,av_vote_clean,av_fast_jump`（接在 F1 列后面；开关关着时整组空）。状态行「节奏确认：…」。
+
+#### F1 复审 L1 / L2（融合关着时行为不变）
+
+- **L1（实时线程在 pushFeatures 里等 `os_unfair_lock`）**：**没做成原子量的无锁 SPSC 环**——工程是 iOS 16 起步、Swift 5 模式，标准库没有带内存序的原子量
+  （`Synchronization.Atomic` 要 iOS 18；swift-atomics 要加包依赖 = 改 `project.pbxproj`，不允许；`OSAtomic*` 已废弃），
+  用普通 Swift 变量当序号 / 下标在 ARM64（弱内存序）上是数据竞争，消费者可能先看到下标再看到数据，不安全。
+  改成**实时线程不等锁**：回调末尾 `os_unfair_lock_trylock`，主线程正拿着锁（`drainFeatures` 拷贝）就把 pending 留到下一次回调再写
+  （pending 加到 64 帧 / 4096 个 PCM ≈ 0.6 秒，init 时一次分配）；只有一次回调中途 pending 满了才照旧等锁（不丢数据）。
+  另加缓冲代次 `featureEpoch`（开关 / seek / prepare 清缓冲时 +1，锁里读写）：换代后留着的旧 pending 一律丢掉，顺带堵上了「回调中途 reset、
+  旧位置的特征写进新缓冲」的老竞态。只动特征那条路：三频带 `pushBands`（P3，融合关着时也在用）一字没改。回调开头 / 末尾那两次已有的锁（电平累加）也没动。
+- **L2（融合开着时 6 段带通一直在跑）**：`VideoSyncPlayer.fusionFeaturesWanted = usesAVFusion && Timer 在跑（在联动）&& 画面分析在跑（有画面轨、没发热暂停）`，
+  不满足时 `setFeaturesEnabled(false)`、融合自己要的频带也关（`setBandsEnabled(usesAudioAnchor || wanted)`），`updateFusion` 不做（FFT 也不跑），
+  在 `startTimer` / `stopTimer` / 画面分析状态变化 / 设置变化时更新。融合关着时 wanted 恒 false，频带开关仍是 `usesAudioAnchor`（= f706431）。
+  「撞击声校正这时才打开要 `restartBands()`」的条件改看上一次交给电平计的 `fusionAudioOn`（融合关着时恒 false，和以前一样）。
+  纯计算类型一行没改，确定性测试不受影响。
+
+#### 安全不变
+
+- 只改交给跟随器 / 相位锁的窗口副本（锁不锁、用几成仍由 P1 / P2 的门、滞回、`activity` 决定；画面不动时声音再有节奏也不锁）和跟随器这一拍的确认拍数；
+  **投票排在 P3 动作识别之后（复审 H1，和研究页「P4 之后、P3 之前」不同）**：排在 P3 之前时，+0.1 置信会跨过动作识别的 0.3 参考门、抬高区域读数的取舍门槛，换八度会改动作识别的参考频率——声音就间接改了动作类型、轻抚判断（`suppressesRhythm` → activity）、强度上限（轻抚 20）和姿态节奏的抬升。现在动作识别只看画面（测试：800 拍随机 P3 输入，投票开 / 关时动作识别逐位相同；旧顺序同样输入 239 拍不同）。剩下的唯一联系是动作识别读跟随器**上一拍**的频率（轻抚判断「锁在别的往复上不算轻抚」），那是 F2 本来就允许改的频率；锁不锁不受声音影响（见复审 M1）；
+  撞击声校正只会因为不耦合**少**对齐（偏移仍有界 ±90°、按时间回 0）。
+- 输出仍只经 `tick()` → `SyncOutputStage`（上限、每拍升幅 ≤ 20、归零保持、通道 2 / 3 为 0）→ `sendTick`；没有新的发送路径、没有新的阻塞；STOP 照旧一下就停。
+- 新值都夹在有效范围（置信 0~1、频率只乘 2 / 除 2 且仍要过跟随器的 0.4~4 Hz、非有限数不投票）；所有重置点（`resetRhythm` / `resetFusion` / 开关）都清投票。
+- `BLEManager.swift` / `SafetyLedger.swift` / `Protocol.swift` / `AIProgram.swift` / `Models.swift` / `project.pbxproj` 都没动；没有新 Swift 文件。
+
+#### 测试（`Tests/VisualSyncChecks/main.swift`「av-fusion F2」，固定种子 LCG、24 kHz，都在函数里）
+
+`AVF2Run` 照播放器的顺序（投票看上一拍融合状态 → 跟随器 / 相位锁 → `AVFusionEngine.beat` → 撞击声校正）跑整条链：
+1. 八度消歧（单元）：画面误报 1 Hz + 声音 2 Hz、S2 从 3 秒起 → 副本 2 Hz（幅度减半、相位作废），跟随器 0 秒（≤ 1.5）锁对 2 Hz；不投票一直 1 Hz。
+   端到端（真的耦合度）：前 7 秒读数正确 → 5.1 秒进入耦合；之后 3 拍里 2 拍误报 1 Hz → 投票时跟随器一直 2 Hz、一直耦合，不投票 35 拍不在 2 Hz；
+   一下两响（12 dB 强弱差）→ 不改八度、留在 1 Hz。
+2. 同频配乐（12 秒切镜）：凡是上一拍不耦合的拍，副本 `==` 原窗口、不投票；考验后 P_music 0.8。
+3. 画面静止 + 有节奏的声音：强制给耦合、画面有弱候选也不锁（跟随器 / 相位锁）；自然情况不耦合、副本原样。
+4. 跳频 1 → 1.6 Hz（真的 `StrokeRhythm` + 相位拟合，咔哒和画面同相）：耦合时 13.5 秒确认、不投票 13.8 秒（早 0.3 秒），跳之前两条链一样。
+5. 撞击声校正 + 同频节拍音轨（2 Hz 咔哒跨切镜不断）：F2 关（= P3）15 拍「已对齐」；F2 开时切镜考验认出配乐后不对齐（`uncoupled`）。
+6. 开关关着 / 开着但不耦合：3000 组随机窗口（含切镜 / 保持期 / 没帧 / 姿态 / 倍速 2）跟随器、相位锁、撞击声校正（`coupled: nil`）和 P4 的链逐位相同、副本 `==`。
+另有设置（默认关 / 键名 / 生效条件 / 不改 Timer）、读回、调试列 5 列 / 状态行。
+
+`Tests/FusionOffCompare/run.sh` 多编一份 `-D AV_FUSION_ON -D AV_F2_ON`（融合开、节奏确认关，F2 接线全走一遍：投票 → `fastJump` → 校正 `coupled`），
+四份输出（f706431 / 当前 / 融合 / F2）逐字节相同。`AudioLevelTap.swift` / `VideoSyncView.swift` Linux 编不了，靠 PR Checks（Xcode 16.4）编译确认，再上真机
+（`docs/rhythm-calibration.md` 第 12 节）。F2 的结果也决定 F3b 做不做。
+
+### av-fusion F3：声音重音（开关 `bcVisualSyncAVAccent`，默认关）+ F3b 震动跟声音（`bcVisualSyncAVVibrationAudio`，默认关）
+
+研究页 F3 一步。原则不变：**画面为主、声音作证**。F3 只在 S2（F1 判定耦合、相位锁跟着画面）时，用撞击声的轻重给画面强度一个有界的重音系数；
+F3b 是 F3 下面的子开关（James 10-17 决定），只换震动通道的目标。两者都不启动静止画面、不新增发送路径，结果仍走 `tick()` → `SyncOutputStage.limit` → `BLEManager.sendTick`。
+
+设置：`bcVisualSyncAVAccent`（默认关）、`bcVisualSyncAVAccentDepth`（β，默认 15%，夹 0~30，NaN → 15）、`bcVisualSyncAVVibrationAudio`（默认关）。
+`usesAVAccent` = 融合生效 + 伸缩跟随动作频率 + 相位脉动 + 重音开（复审 M2：S2 要相位锁，相位锁只在相位脉动开着时跑；研究页说的「脉动关着时乘在强度上」因此到不了，去掉了）；`usesAVVibrationAudio` = 重音生效 + 子开关开。都不改 Timer 间隔。
+
+#### 类型（`VisualSync.swift`「av-fusion F3」）
+
+- `AVAccent.step(events:clock:s2:lockHz:depth:)`：最近 4 秒（视频时间，按倍速折算）的撞击（`AVRhythmVote.impacts`）≥ 3 下，而且最后一下离现在不超过一个周期（rate / lockHz），
+  z = clamp(log₂(最后一下的幅度 / 中位数), −1, 1)，g = 1 + β·z ∈ [1 − β, 1 + β]。幅度 = 10^(各段平均上升 dB / 20)，只看比值，所以整体响度变化 / 自动增益不影响 g（测试：整体 +12 dB g 不变）。
+  不在 S2 / 撞击不够 / 这个周期没撞击 / 没锁 / β = 0 → 精确的 1。
+- 作用点（`VideoSyncPlayer.motionTick`）：不改强度，改 `RhythmPulseDriver.accentGain`，
+  有效深度 = min(深度 × g, `RhythmPulse.depthCeiling`)（满深度上界不变）。g = 1 时两条路都和关着逐位相同。
+- `AVVibrationAudio.step(...)`（F3b）：四道门全满足才生效——① 这一拍 S2；② P_music < 0.3，且最近 10 秒没有「跨切镜节拍连续」「画面不动时仍有节奏」的证据（`crossCut` / `still` > 0）；
+  ③ 画面在动（activity > 0）；④ 通道 = 两个都用。声音目标 = 画面震动值 × min(1 + β, e)，e = [t − 0.3, t] 里最响一下撞击相对最近 4 秒中位数的幅度比，
+  夹到 [最低强度, min(画面值 × (1 + β), 99)]。混合比 0.6 秒爬满；门不满足时 1.5 秒线性淡回画面值、每拍降 ≤ 12（混合比到 0 后也按 12 降完）；混合比 0 时逐位等于画面值。伸缩通道不动。
+  复审 H2：上界每拍按当时的画面值重算（画面降了，旧的声音目标也被压住）；画面震动为 0 / 画面不动 / 通道不是两个都用 → 当拍回画面值、状态清掉；dt 夹到 0.3 秒；
+  关联动 / 缓冲 / seek / 跟随频率开关（都走 `resetRhythm`）和通道变化时重置。
+- 调试列 3 列：`av_accent_g`、`av_vib_mix`、`av_vib_level`（开关关着时空）。
+
+#### 测试（`Tests/VisualSyncChecks/main.swift`「av-fusion F3」，固定种子，都在函数里）
+
+设置 / 键名 / 范围；g 的响 / 轻 / 一样 / 各种不生效情况；整体 +12 dB 不变；5000 组随机 g ∈ [1 − β, 1 + β]；脉动有效深度 ≤ 满深度；
+5000 组随机（强度、重音、上限、最低强度、通道、声音）经出口 ≤ 上限、单拍升 ≤ 20、归零保持、通道 2 / 3 = 0；按时间出口升幅；
+F3b 四道门逐一不满足 → 逐位等于画面值；跨切镜证据后 10 秒不生效；离开耦合 1.5 秒内淡回、每拍降 ≤ 12；调试列。
+`Tests/FusionOffCompare/run.sh` 多编一份 `-D AV_FUSION_ON -D AV_F2_ON -D AV_F3_ON`（重音 / F3b 接线全走、耦合强制不成立 = S1），输出和 f706431 逐字节相同。
+真机验证见 `docs/rhythm-calibration.md` 第 13 节。
+
+### av-fusion F4：互为回落 + 相位飞轮（开关 `bcVisualSyncAVFallback`，默认关）
+
+研究页 F4 一步。画面暂时不可用（`motionSignal` 断：发热暂停、取帧停了、没视频轨、近场 / 切镜保持期让画面没有新鲜样本）时，声音临时替补；画面回来交回。
+`usesAVFallback` = 融合生效 + 开关，不影响 Timer 间隔。
+
+- `HandoverRamp`：把 `SourceHandover` 的爬坡 `min(1, max(0, elapsed / seconds))` 抽成纯函数，`SourceHandover` 改调它，算式逐位不变（测试 5000 组随机含 NaN 逐位相同）。
+- `AVFallbackBlend.step(blended:motionSignal:audio:audioSignal:now:dt:)`：接在 `handover.blend` 之后。画面连续不可用 ≥ 0.6 秒那一刻判一次门——
+  声音有信号，而且「最近 10 秒内耦合过」（复审 H1：研究页的「或 P_music < 0.3」不用——没有切镜 / 静止证据时 P_music 最多 0.3，单镜头配乐 / 说话片子会一直开门）；门满足 → 声音占比 1.5 秒线性爬满，
+  值 = 占比 × 声音 + (1 − 占比) × 画面（≤ max(画面, 声音)）；门不满足 / 声音没了 → 占比淡回 0（复审 M1：不冻在交回到一半的值上）。门在这一次断开里只判一次；
+  一次替补最多 30 秒，之后淡回原路径（发热暂停时融合也停了，没有新证据能关门）。
+  声音也没了 → 声音那份当 0、没信号（不加最低强度）。画面回来 → 占比 1.5 秒降到 0，同时值每拍最多降 12；占比 0 且降速不再托着时原样返回 `blended`（逐位等于原路径）。
+  融合因画面分析停下而停时，门的记忆不清（发热暂停正是这时）；暂停 / seek / 缓冲 / 关联动 / 换视频 / 换来源 → `resetFallback()`，当拍走原路径。
+- `AVPhaseFlywheel.step(lock:s2:audioHz:now:)`：S2 里相位锁丢了（locked → false），而最近几下撞击的频率（× 倍速）和丢之前的锁频率差 ≤ 15% 时，
+  而且最近一个半周期里真有撞击时，相位脉动（完整拍和子拍）继续用丢之前那一拍的相位锁（按它的频率外推相位）最多 1.5 秒，然后照常放开。只是外推，不用撞击时刻改相位；频率对不上 / 没撞击 / 不在 S2 → 立刻用实时锁；
+  相位锁重置（seek 等）时飞轮一起清。画面整个断了（发热 / 遮挡）时画面强度和跟随器都清了，脉动本来就停，飞轮帮不上——它只管「画面还在、相位锁短暂丢了」。
+- 状态行「画面暂不可用，暂按声音」（只在替补时出现）；调试列 3 列 `av_fallback_share` / `av_video_gone_s` / `av_flywheel`。
+- 结果仍只经 `tick()` → `SyncOutputStage` → `BLEManager.sendTick`；STOP / 看门狗 / 断连照旧。
+
+测试（`avFusionF4Checks`）：设置；爬坡纯函数逐位相同；断开 0.6 秒前照原路径、之后 1.5 秒爬到声音且有上界；门（像配乐没耦合不补、P_music 低补、没声音不算、只判一次、过期不补）；
+画面和声音都没了 → 0 且没信号；画面回来每拍降 ≤ 12、交回后逐位原样；reset 后当拍原路径；5000 组随机经出口的上限 / 升幅 / 通道、画面一直在时逐位原样；
+飞轮维持 1.5 秒后放开、各种不维持的情况；调试列。`FusionOffCompare` 多编 `-D AV_F4_ON`（接线全走、画面一直在、不在 S2），和 f706431 逐字节相同。
+
+### av-fusion F5：音画偏移（手动 `bcVisualSyncAVOffsetMs` 默认 0 + 自动估计 `bcVisualSyncAVAutoOffset` 默认关）
+
+研究页 F5（可选）。片子本身声音和画面可能差几十到几百毫秒；F1~F4 读撞击声时都按「同一视频时间」对画面，偏了会让耦合度、重音、投票、飞轮读错。
+
+- `MediaClockSnapshot.shifted(byItem:)`：偏移 τ > 0（声音晚）时把读声音用的视频时间往后挪 τ，等价于撞击按 t − τ 对画面；τ == 0 / NaN 原样返回（逐位不变）。
+  `VideoSyncPlayer.avClock` 用在融合每拍、F2 投票、F4 飞轮；F3 重音 / F3b 只看最近一瞬间的响度，声音晚时那一下还没解码出来，所以只补「声音早」（τ < 0）那一半。
+  复审 M3：整体平移只把所有撞击相位转同一个角度，耦合度 / 投票 / 飞轮的频率基本不变；真正看绝对相位的是 P3 撞击声校正，所以撞击声校正的撞击时刻也按 t − τ 换算（τ == 0 时那一行逐位不变）。F0 调试列不改。
+- 实际偏移 `AVOffset.effective`：自动估计生效且估出来 → 估计值，否则手动值；融合没生效 → 0；夹 ±300 毫秒。
+- `AVOffsetEstimator`：S2 的拍上取最近 4 秒撞击（不带偏移的时钟，不形成反馈）处画面相位的圆均值 μ、集中度 R ≥ 0.5，和画面频率 f（视频时间 Hz）。
+  模型 μ = φ0 + 2π·f·τ；按 0.05 Hz 分格保留最近 120 秒，τ ∈ [−0.3, 0.3] 秒先 5 毫秒粗找、再 1 毫秒细找，最大化 |Σ w·e^{i(μ − 2πfτ)}|（自动处理绕圈）。
+  复审 M4：每格 ≥ 5 个样本、格内相位一致（合成长度 / 集中度之和 ≥ 0.7，随机噪声在格内就抵消掉）才算一个点，权重 = 合成长度；要 ≥ 3 个点、频率跨度 ≥ 0.4 Hz、
+  拟合集中度 ≥ 0.85（只有 3 个点时 ≥ 0.9）才给 τ（同时得到 φ0）；只在有新撞击时加样本；估计值每次最多挪 20 毫秒，拟合一时不够好时保持上一次的值，证据不够（过期 / 太集中）时清掉。
+  已知偏差：μ 用的是 4 秒窗口按当前频率外推的相位，频率正在变时有偏差。大多数片子频率变化小，估不出时就用手动值——这是已知的可辨识性限制。
+  换视频 / 自动开关变化时清空，seek 不清。
+- 界面：「音画偏移」滑杆（±300，步长 10）、「自动估计音画偏移（实验）」开关和状态行；调试列 4 列 `av_offset_ms` / `av_offset_est_ms` / `av_offset_span_hz` / `av_offset_fit`。
+- **场景分类（SoundAnalysis，`bcVisualSyncAVSceneClassifier`）这一期不做**：要改 `AudioLevelTap.swift` 加无锁 PCM 环形缓冲和独立分析队列，发热 / 延迟只能真机测；
+  规则判断（P_music / P_voice）已经够当门。等 F0~F5 真机数据回来再定。
+
+测试（`avFusionF5Checks`）：设置 / 夹范围；时钟挪动 0 / NaN 逐位原样、+120 毫秒的对应关系；偏移 0 时融合 60 拍逐位相同；合成 (f, μ) 分离 τ（+120 / −200 / 0 毫秒）和 φ0（含绕过 ±π）；
+跨度不够 / 单一频率 / 样本少 / 无关相位 / 集中度低 → 不估；120 秒过期；实际偏移的取舍；撞击相位均值；调试列。
+
 ## 11. 风险与待定
 
 1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。rhythm-follow P1 也按速度档设计，P0 标定（`docs/rhythm-calibration.md` 第 1 步）先确认。
