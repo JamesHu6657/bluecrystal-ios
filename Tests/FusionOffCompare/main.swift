@@ -69,16 +69,49 @@ struct SynthAudio {
 }
 
 #if AV_FUSION_ON
-/// 融合部件在旁边跟着跑（只用当前分支的接口；结果只进 summary，不进逐字节对照的输出）。
+/// 融合部件在旁边跟着跑（只用当前分支的接口；结果只写 stderr，不进逐字节对照的输出）。
 /// F0：观测部件（tap 回调时间缓冲 / 提前量 / 调试列格式化）
+/// F1：6 段特征 splitter → AVFusionEngine（耦合度 / 配乐 / 人声）；P3 频带块照 VideoSyncPlayer 经 AudioBandBacklog
+///     先给融合、再原样交给撞击声校正（shareBands）；撞击声校正关着时融合自己分频带（= 电平计频带照开）
 struct FusionShadow {
     let ring = AudioTapTimingRing()
     var lead = AudioTapLeadEstimator()
     var bands = AudioBandSummary()
     var rows = 0
-    init(vis: VisualSyncSettings) { ring.setEnabled(true) }
+    let anchor: Bool
+    var features = AudioFeatureSplitter()
+    var ownBands = AudioBandSplitter()
+    var drain = AudioFeatureDrain()
+    var ownPending: [AudioBandFrame] = []
+    var backlog = AudioBandBacklog()
+    var engine = AVFusionEngine()
+    var coupledBeats = 0
+    init(vis: VisualSyncSettings) {
+        ring.setEnabled(true)
+        anchor = vis.usesAudioAnchor
+        features.configure(sampleRate: SynthAudio.rate)
+        ownBands.configure(sampleRate: SynthAudio.rate)
+        drain.pcmRate = AudioFeatureSplitter.pcmRate(forSampleRate: SynthAudio.rate)
+    }
     mutating func audio(start: Double, samples: [Double]) {
         ring.record(AudioTapTiming(host: start - 0.1, itemStart: start, frames: samples.count))
+        features.begin(start: start, frames: samples.count)
+        if !anchor { ownBands.begin(start: start, frames: samples.count) }
+        var f = AudioFeatureFrame()
+        var p: Float = 0
+        for (j, x) in samples.enumerated() {
+            let flags = features.add(x, frame: &f, pcm: &p)
+            if flags & AudioFeatureSplitter.frameReady != 0 { drain.frames.append(f) }
+            if flags & AudioFeatureSplitter.pcmReady != 0 { drain.pcm.append(p) }
+            if !anchor, let b = ownBands.add(x, at: start + Double(j) / SynthAudio.rate) { ownPending.append(b) }
+        }
+    }
+    /// 照 VideoSyncPlayer.updateFusion / updateAudioAnchor：融合先取走，校正开着时存进 backlog，校正取的时候原样接上
+    mutating func shareBands(_ pending: [AudioBandFrame]) -> [AudioBandFrame] {
+        guard anchor else { return pending }
+        backlog.keep(pending)
+        engine.addBands(pending)
+        return backlog.take(adding: [])
     }
     mutating func beat(window: MotionWindow, activity: Double, lock: RhythmPhaseLock, now: Double, dt: Double) {
         let d = ring.drain()
@@ -86,6 +119,16 @@ struct FusionShadow {
         lead.add(d.timings, clock: clock)
         rows += AVDebugColumns.f0Fields(onsets: [], bands: bands, tapLead: lead.lead, tapValid: d.valid, tapInvalid: d.invalid,
                                         clock: clock).count
+        if !anchor {
+            engine.addBands(ownPending)
+            ownPending.removeAll()
+        }
+        engine.addFeatures(drain)
+        drain.frames.removeAll()
+        drain.pcm.removeAll()
+        let b = engine.beat(clock: clock, lock: lock, activity: activity, cut: window.cutCount > 0, audioReady: true, dt: dt)
+        rows += AVDebugColumns.f1Fields(b).count
+        if b.coupled { coupledBeats += 1 }
     }
 }
 #endif
@@ -173,6 +216,10 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             if pulse { lock.step(input, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source, now: now, dt: dt, active: act > 0) }
             let rate = follower.weight > 0 && follower.hz > 0 ? vis.rateMap.level(forHz: follower.hz) : nil
             let levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
+#if AV_FUSION_ON
+            // F1：融合每拍先取走频带块（撞击声校正开着时经 backlog 原样交回）
+            pendingBands = fusion.shareBands(pendingBands)
+#endif
             let o: [Int]
             if pulse {
                 driver.phaseOffset = coord.removeLead(from: driver.phaseOffset)
@@ -203,6 +250,10 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             out += "f\(o)|\(plain)|\(target.bitPattern)|\(follower.hz.bitPattern)|\(lock.weight.bitPattern)|\(driver.phaseOffset.bitPattern)|\(coord.lead.bitPattern)\n"
         }
     }
+#if AV_FUSION_ON
+    // 融合的结果只写 stderr（不进逐字节对照的 stdout）
+    FileHandle.standardError.write("fusion \(name): rows \(fusion.rows) coupled beats \(fusion.coupledBeats)\n".data(using: .utf8)!)
+#endif
     print(name, out.count)
     print(out)
 }

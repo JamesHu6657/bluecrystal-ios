@@ -38,6 +38,27 @@ final class AudioLevelMeter {
     /// av-fusion F0（观测与标定）：每次回调的 host 时间 / 视频时间范围，只在调试记录开着时写（锁里读写；关着时实时线程只多看一个布尔）
     private let timings = AudioTapTimingRing()
 
+    /// av-fusion F1（声音特征，默认关）：6 段 10 毫秒能量 / 1 毫秒峰值帧 + 约 8 kHz 的 PCM，只在「声画融合」开着时算
+    /// （关着时实时线程只多看一个布尔）。环形缓冲（锁里读写，满了丢最旧的）由实时线程写、主线程 drainFeatures 取走；
+    /// featureSplitter / pending* 只在实时线程上用，别的线程要清它们只在锁里置 featureResetPending。全部 init 时一次分配好
+    static let featureCapacity = 512
+    static let pcmCapacity = 16384
+    static let pendingFeatureCapacity = 32
+    static let pendingPCMCapacity = 512
+    private let features: UnsafeMutablePointer<AudioFeatureFrame>
+    private var featureHead = 0
+    private var featureCount = 0
+    private let pcm: UnsafeMutablePointer<Float>
+    private var pcmHead = 0
+    private var pcmCount = 0
+    private var featuresEnabled = false
+    private var featureResetPending = true
+    /// 融合开着时时间范围拿不到（NaN）的回调数，drainFeatures 清零
+    private var featureInvalid = 0
+    private var featureSplitter = AudioFeatureSplitter()
+    private let pendingFeatures: UnsafeMutablePointer<AudioFeatureFrame>
+    private let pendingPCM: UnsafeMutablePointer<Float>
+
     init() {
         lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
         lock.initialize(to: os_unfair_lock())
@@ -47,6 +68,14 @@ final class AudioLevelMeter {
         bands.initialize(repeating: AudioBandFrame(), count: Self.bandCapacity)
         pendingBands = UnsafeMutablePointer<AudioBandFrame>.allocate(capacity: Self.pendingCapacity)
         pendingBands.initialize(repeating: AudioBandFrame(), count: Self.pendingCapacity)
+        features = UnsafeMutablePointer<AudioFeatureFrame>.allocate(capacity: Self.featureCapacity)
+        features.initialize(repeating: AudioFeatureFrame(), count: Self.featureCapacity)
+        pcm = UnsafeMutablePointer<Float>.allocate(capacity: Self.pcmCapacity)
+        pcm.initialize(repeating: 0, count: Self.pcmCapacity)
+        pendingFeatures = UnsafeMutablePointer<AudioFeatureFrame>.allocate(capacity: Self.pendingFeatureCapacity)
+        pendingFeatures.initialize(repeating: AudioFeatureFrame(), count: Self.pendingFeatureCapacity)
+        pendingPCM = UnsafeMutablePointer<Float>.allocate(capacity: Self.pendingPCMCapacity)
+        pendingPCM.initialize(repeating: 0, count: Self.pendingPCMCapacity)
     }
 
     deinit {
@@ -58,6 +87,14 @@ final class AudioLevelMeter {
         bands.deallocate()
         pendingBands.deinitialize(count: Self.pendingCapacity)
         pendingBands.deallocate()
+        features.deinitialize(count: Self.featureCapacity)
+        features.deallocate()
+        pcm.deinitialize(count: Self.pcmCapacity)
+        pcm.deallocate()
+        pendingFeatures.deinitialize(count: Self.pendingFeatureCapacity)
+        pendingFeatures.deallocate()
+        pendingPCM.deinitialize(count: Self.pendingPCMCapacity)
+        pendingPCM.deallocate()
     }
 
     /// 主线程（rhythm-context P3）：「撞击声相位校正」开着时才分频带。关掉时丢掉没取走的块
@@ -70,6 +107,61 @@ final class AudioLevelMeter {
             splitterResetPending = true
         }
         os_unfair_lock_unlock(lock)
+    }
+
+    /// 主线程（av-fusion F1）：频带已经开着、撞击声校正这时才打开（之前是融合在取）——照「从关到开」那样
+    /// 丢掉没取走的块、splitter 从头来，校正拿到的块和融合关着时逐位相同。频带关着时什么都不做
+    func restartBands() {
+        os_unfair_lock_lock(lock)
+        if bandsEnabled {
+            bandHead = 0
+            bandCount = 0
+            splitterResetPending = true
+        }
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 主线程（av-fusion F1）：「声画融合」开着时才算声音特征。切换时丢掉没取走的特征、splitter 从头来
+    func setFeaturesEnabled(_ on: Bool) {
+        os_unfair_lock_lock(lock)
+        if featuresEnabled != on {
+            featuresEnabled = on
+            clearFeaturesLocked()
+        }
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 主线程（av-fusion F1）：取走上次以来的特征帧 / PCM（旧 → 新）和时间范围拿不到的回调数
+    func drainFeatures() -> AudioFeatureDrain {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        var out = AudioFeatureDrain()
+        out.pcmRate = AudioFeatureSplitter.pcmRate(forSampleRate: bandSampleRate)
+        out.invalidChunks = featureInvalid
+        featureInvalid = 0
+        if featureCount > 0 {
+            out.frames.reserveCapacity(featureCount)
+            let start = (featureHead + Self.featureCapacity - featureCount) % Self.featureCapacity
+            for k in 0..<featureCount { out.frames.append(features[(start + k) % Self.featureCapacity]) }
+            featureCount = 0
+        }
+        if pcmCount > 0 {
+            out.pcm.reserveCapacity(pcmCount)
+            let start = (pcmHead + Self.pcmCapacity - pcmCount) % Self.pcmCapacity
+            for k in 0..<pcmCount { out.pcm.append(pcm[(start + k) % Self.pcmCapacity]) }
+            pcmCount = 0
+        }
+        return out
+    }
+
+    /// 锁里调：丢掉没取走的特征，splitter 下一次回调从头来
+    private func clearFeaturesLocked() {
+        featureHead = 0
+        featureCount = 0
+        pcmHead = 0
+        pcmCount = 0
+        featureInvalid = 0
+        featureResetPending = true
     }
 
     /// 主线程（av-fusion F0）：调试记录开着时才记回调时间。关掉时丢掉没取走的记录
@@ -115,6 +207,7 @@ final class AudioLevelMeter {
         bandHead = 0
         bandCount = 0
         splitterResetPending = true
+        clearFeaturesLocked()
         timings.clear()
         os_unfair_lock_unlock(lock)
     }
@@ -130,6 +223,7 @@ final class AudioLevelMeter {
         bandHead = 0
         bandCount = 0
         splitterResetPending = true
+        clearFeaturesLocked()
         timings.clear()
         os_unfair_lock_unlock(lock)
     }
@@ -151,6 +245,10 @@ final class AudioLevelMeter {
         let resetSplitter = splitterResetPending
         splitterResetPending = false
         let rate = bandSampleRate
+        let featuresOn = featuresEnabled
+        let resetFeatures = featureResetPending
+        featureResetPending = false
+        if featuresOn, !start.isFinite { featureInvalid += 1 }
         // av-fusion F0：调试记录开着才记（固定容量环形缓冲，不分配；CACurrentMediaTime 不阻塞）
         if timings.enabled { timings.record(AudioTapTiming(host: CACurrentMediaTime(), itemStart: start, frames: frames)) }
         os_unfair_lock_unlock(lock)
@@ -158,8 +256,10 @@ final class AudioLevelMeter {
             for i in 0..<Self.maxCarryChannels { carries[i] = AudioBlockCarry() }
         }
         if resetSplitter { splitter.configure(sampleRate: rate) }
+        if resetFeatures { featureSplitter.configure(sampleRate: rate) }
         guard let f = current, frames > 0 else { return }
         if bandsOn { splitBands(list, frames: frames, format: f, start: start) }
+        if featuresOn { splitFeatures(list, frames: frames, format: f, start: start) }
         var chunkPeakToPeak = 0.0
         var chunkMeanSquare = 0.0
         var chunkFrames = 0
@@ -236,6 +336,69 @@ final class AudioLevelMeter {
                 bands[bandHead] = pendingBands[k]
                 bandHead = (bandHead + 1) % Self.bandCapacity
                 bandCount = min(Self.bandCapacity, bandCount + 1)
+            }
+        }
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 实时线程（av-fusion F1）：第一个 AudioBuffer 的第 0 声道 → 6 段特征帧 + 降采样 PCM → 环形缓冲（和 splitBands 同一个声道）
+    private func splitFeatures(_ list: UnsafeMutablePointer<AudioBufferList>, frames: Int, format f: AudioSampleFormat,
+                               start: Double) {
+        let buffers = UnsafeMutableAudioBufferListPointer(list)
+        guard buffers.count > 0 else { return }
+        let buffer = buffers[0]
+        let channels = max(1, Int(buffer.mNumberChannels))
+        guard let data = buffer.mData else { return }
+        let n = min(frames, Int(buffer.mDataByteSize) / (f.bytesPerSample * channels))
+        guard n > 0 else { return }
+        var local = featureSplitter
+        guard local.sampleRate > 0 else { return }
+        local.begin(start: start, frames: n)
+        let scale = f.scale
+        var pendingFrames = 0
+        var pendingSamples = 0
+        var frame = AudioFeatureFrame()
+        var sample: Float = 0
+        for i in 0..<n {
+            let x: Double
+            switch f {
+            case .float32: x = Double(data.assumingMemoryBound(to: Float32.self)[i * channels])
+            case .float64: x = data.assumingMemoryBound(to: Float64.self)[i * channels]
+            case .int16: x = Double(data.assumingMemoryBound(to: Int16.self)[i * channels]) * scale
+            case .int32: x = Double(data.assumingMemoryBound(to: Int32.self)[i * channels]) * scale
+            }
+            let flags = local.add(x, frame: &frame, pcm: &sample)
+            if flags & AudioFeatureSplitter.frameReady != 0 {
+                pendingFeatures[pendingFrames] = frame
+                pendingFrames += 1
+            }
+            if flags & AudioFeatureSplitter.pcmReady != 0 {
+                pendingPCM[pendingSamples] = sample
+                pendingSamples += 1
+            }
+            if pendingFrames == Self.pendingFeatureCapacity || pendingSamples == Self.pendingPCMCapacity {
+                pushFeatures(frames: pendingFrames, samples: pendingSamples)
+                pendingFrames = 0
+                pendingSamples = 0
+            }
+        }
+        featureSplitter = local
+        if pendingFrames > 0 || pendingSamples > 0 { pushFeatures(frames: pendingFrames, samples: pendingSamples) }
+    }
+
+    /// 实时线程（av-fusion F1）：pending 的特征帧 / PCM 写进环形缓冲（满了丢最旧的；融合这时已经关了就不写）
+    private func pushFeatures(frames: Int, samples: Int) {
+        os_unfair_lock_lock(lock)
+        if featuresEnabled {
+            for k in 0..<frames {
+                features[featureHead] = pendingFeatures[k]
+                featureHead = (featureHead + 1) % Self.featureCapacity
+                featureCount = min(Self.featureCapacity, featureCount + 1)
+            }
+            for k in 0..<samples {
+                pcm[pcmHead] = pendingPCM[k]
+                pcmHead = (pcmHead + 1) % Self.pcmCapacity
+                pcmCount = min(Self.pcmCapacity, pcmCount + 1)
             }
         }
         os_unfair_lock_unlock(lock)

@@ -39,6 +39,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-lookahead P4：前瞻 / 预扫描的状态行（开着时才有）
     @Published private(set) var lookaheadStatus: String?
     @Published private(set) var prescanStatus: String?
+    /// av-fusion F1：「声画：」状态行（声画融合开着才有；只显示，不改输出）
+    @Published private(set) var fusionStatus: String?
     @Published private var scrubber = PlaybackScrubber()
 
     var displaySeconds: Double { scrubber.position ?? currentSeconds }
@@ -103,6 +105,11 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-context P3（默认关）：动作识别只改交给频率跟随器 / 相位锁的那份窗口副本（强度那条路不看）；
     /// 撞击声相位校正只给脉动的相位加一个有界偏移（RhythmPulseDriver.phaseOffset）。都不新增发送路径
     private var actionContext = ActionContext()
+    /// av-fusion F1（默认关）：声音特征 + 耦合度，每个完整拍算一次，只出状态行和调试列（不改任何交给出口的值、不新增发送路径）。
+    /// bandBacklog：融合和撞击声校正都开着时，融合先取走的 P3 频带块存在这里，校正取的时候原样接上（校正的输入逐位不变）
+    private var fusion = AVFusionEngine()
+    private var fusionBeat: AVFusionBeat?
+    private var bandBacklog = AudioBandBacklog()
     /// 调试记录（默认关）：只记数字，不存画面；只读不改控制路径，关着时不做任何事
     let debugLog = MotionDebugLog()
     var debugRecording = false {
@@ -191,7 +198,10 @@ final class VideoSyncPlayer: ObservableObject {
         let previousAnchor = visualSettings.usesAudioAnchor
         let previousLookahead = visualSettings.usesLookahead
         let previousPrescan = visualSettings.usesPrescan
+        let previousFusion = visualSettings.usesAVFusion
         visualSettings = v
+        // F1：融合开关一变就从头来（关掉 = 状态行消失）
+        if v.usesAVFusion != previousFusion { resetFusion() }
         // P3：动作识别 / 撞击声校正开关一变就从头确认（关掉 = 回到 P2 行为）
         if v.usesRhythmContext != previousContext { resetContext() }
         if v.usesAudioAnchor != previousAnchor { resetAnchor() }
@@ -199,6 +209,8 @@ final class VideoSyncPlayer: ObservableObject {
         if v.usesLookahead != previousLookahead { resetLookahead() }
         if v.usesPrescan != previousPrescan, !v.usesPrescan { clearPrescan() }
         applyRhythmFlags()
+        // F1：融合开着时频带一直在分，撞击声校正这时才打开——照融合关着时「频带从关到开」那样从头分（校正输入逐位不变）
+        if v.usesAudioAnchor, !previousAnchor, previousFusion { meter?.restartBands() }
         // 打开 / 关掉频率跟随：从头确认节奏（打开后 weight 1 秒内交接，关掉时伸缩回到按动作强度，降不限速）
         if v.rhythmFollow != previousRhythm { resetRhythm() }
         // P2：打开 / 关掉相位脉动从头锁相位；Timer 间隔跟着换（只重建 Timer，不动其余状态）
@@ -333,6 +345,7 @@ final class VideoSyncPlayer: ObservableObject {
         externalPlay.clearLatch()
         ble?.userResumeOutput()
         meter?.reset()
+        bandBacklog.clear()
         shaper.reset()
         resetMotionSide()
         lastActive = .zero
@@ -353,6 +366,7 @@ final class VideoSyncPlayer: ObservableObject {
         if ownSeekEcho.consumeIfEcho(position: landed, now: Self.now()) { return }
         if landed.isFinite { currentSeconds = landed }
         meter?.reset()
+        bandBacklog.clear()
         shaper.reset()
         audioFlow.reset()
         // 画面侧同样不和跳转前的画面做差
@@ -460,8 +474,11 @@ final class VideoSyncPlayer: ObservableObject {
         let gen = meterGen
         let m = AudioLevelMeter()
         meter = m
-        m.setBandsEnabled(visualSettings.usesAudioAnchor)
+        m.setBandsEnabled(visualSettings.usesAudioAnchor || visualSettings.usesAVFusion)
+        m.setFeaturesEnabled(visualSettings.usesAVFusion)
         m.setTimingEnabled(debugRecording)
+        bandBacklog.clear()
+        resetFusion()
         resetAVDebug()
         AudioLevelTap.install(on: item, asset: asset, meter: m) { [weak self, weak item] status in
             guard let self = self, let item = item,
@@ -566,7 +583,9 @@ final class VideoSyncPlayer: ObservableObject {
     /// 撞击声频带只在校正开着时分
     private func applyRhythmFlags() {
         motionTap?.setRhythmFlags(phaseFit: visualSettings.usesPulseTiming, context: visualSettings.usesRhythmContext)
-        meter?.setBandsEnabled(visualSettings.usesAudioAnchor)
+        // av-fusion F1：融合开着也要频带（给「画面不动时仍有节奏」），扩展特征只在融合开着时算
+        meter?.setBandsEnabled(visualSettings.usesAudioAnchor || visualSettings.usesAVFusion)
+        meter?.setFeaturesEnabled(visualSettings.usesAVFusion)
         configureReader()
     }
 
@@ -723,6 +742,7 @@ final class VideoSyncPlayer: ObservableObject {
         motionFlow.reset()
         outputStage.reset()
         handover.cancel()
+        resetFusion()
     }
 
     /// 当前视频在 App 目录里的副本（换视频时删旧的，避免占空间）
@@ -776,6 +796,7 @@ final class VideoSyncPlayer: ObservableObject {
             // 用户点"播放"才显式开闸；tick 自己不会开闸
             ble?.userResumeOutput()
             meter?.reset()
+            bandBacklog.clear()
             shaper.reset()
             resetMotionSide()
             lastActive = .zero
@@ -800,6 +821,7 @@ final class VideoSyncPlayer: ObservableObject {
         currentSeconds = target
         // seek 造成采样不连续：旧位置还没取走的声音 / 画面不能算进新窗口
         meter?.reset()
+        bandBacklog.clear()
         shaper.reset()
         audioFlow.reset()
         resetMotionSide()
@@ -829,6 +851,7 @@ final class VideoSyncPlayer: ObservableObject {
                     return
                 }
                 self.meter?.reset()
+                self.bandBacklog.clear()
                 self.motionMeter?.reset()
                 self.notePlayheadToReader(playing: false)
                 self.needsResync = true
@@ -1083,6 +1106,7 @@ final class VideoSyncPlayer: ObservableObject {
         onsetDetector.reset()
         pulse.phaseOffset = 0
         _ = meter?.drainBands()
+        bandBacklog.clear()
         avLoggedItem = -Double.infinity
         if anchorStatus != nil { anchorStatus = nil }
     }
@@ -1126,7 +1150,10 @@ final class VideoSyncPlayer: ObservableObject {
             if pulse.phaseOffset != 0 || anchorStatus != nil { resetAnchor() }
             return
         }
-        let drained = m.drainBands()
+        // av-fusion F1：融合开着时这一拍新出的块也给融合；之前融合先取走的块原样接在前面（关着时 backlog 一直是空的）
+        let fresh = m.drainBands()
+        if visualSettings.usesAVFusion { fusion.addBands(fresh) }
+        let drained = bandBacklog.take(adding: fresh)
         for band in drained { onsetDetector.add(band) }
         // av-fusion F0：调试记录开着时顺便汇总这一拍的频带块（只读；撞击检测照旧吃同一份）
         if debugRecording { beatBands.add(drained) }
@@ -1147,6 +1174,32 @@ final class VideoSyncPlayer: ObservableObject {
                                              lock: phaseLock, directionKnown: known, now: now, dt: dt)
         let text = audioAnchor.statusText(lockHz: phaseLock.hz)
         if text != anchorStatus { anchorStatus = text }
+    }
+
+    /// av-fusion F1：融合从头来（开关 / 换视频 / seek / 画面侧重置），状态行消失。backlog 不清（那是撞击声校正的输入）
+    private func resetFusion() {
+        fusion.reset()
+        fusionBeat = nil
+        if fusionStatus != nil { fusionStatus = nil }
+    }
+
+    /// av-fusion F1：每个完整拍一次（跟随画面 + 融合开着才算）：取走频带块（撞击声校正也开着时存进 backlog 留给它）和特征，
+    /// 读一次播放器时钟 → 耦合度 / 配乐 / 人声的判断 → 状态行和调试列。只读相位锁和画面强度，不改任何控制状态
+    private func updateFusion(_ p: AVPlayer, window: MotionWindow, activity: Double, dt: TimeInterval) {
+        guard visualSettings.usesAVFusion, let m = meter else {
+            if fusionBeat != nil || fusionStatus != nil { resetFusion() }
+            return
+        }
+        let fresh = m.drainBands()
+        if visualSettings.usesAudioAnchor { bandBacklog.keep(fresh) }
+        fusion.addBands(fresh)
+        fusion.addFeatures(m.drainFeatures())
+        let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
+        let b = fusion.beat(clock: clock, lock: phaseLock, activity: activity, cut: window.cutCount > 0,
+                            audioReady: audioStatus == .ready, dt: dt)
+        fusionBeat = b
+        let text = b.statusText
+        if text != fusionStatus { fusionStatus = text }
     }
 
     /// rhythm-phase P2 子拍：播放器确实在播、联动开着、跟随画面 + 频率跟随 + 相位脉动都开着，且上一个完整拍在脉动，
@@ -1263,6 +1316,8 @@ final class VideoSyncPlayer: ObservableObject {
         let rateLevel = rhythmLevel(window, motionSignal: motionSignal, activity: motionActivity, dt: dt)
         // rhythm-action tune：认出轻抚时这一拍伸缩不跟节奏（activity 当 0；关着时就是 motionActivity）
         let rhythmActivity = tuned && actionContext.suppressesRhythm ? 0 : motionActivity
+        // av-fusion F1：只显示（关着时什么都不做）
+        updateFusion(p, window: window, activity: rhythmActivity, dt: dt)
         guard settings.enabled else {
             // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
             outputStage.reset()
@@ -1315,7 +1370,8 @@ final class VideoSyncPlayer: ObservableObject {
                             shapedLevel: shaped.level, value: value, hasSignal: hasSignal,
                             kind: actionContext.kind.rawValue, context: contextStatus,
                             rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
-                            activity: rhythmActivity, rateLevel: rateLevel, out: vals, av: avDebugFields(p))
+                            activity: rhythmActivity, rateLevel: rateLevel, out: vals,
+                            av: avDebugFields(p) + (fusionBeat.map(AVDebugColumns.f1Fields) ?? AVDebugColumns.f1Empty))
         }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
@@ -1586,6 +1642,8 @@ struct VideoSyncView: View {
     // rhythm-lookahead P4：前瞻（提前读后面的画面）/ 预扫描整段视频（实验，默认都关）
     @AppStorage(VisualSyncSettings.Keys.rhythmLookahead) private var rhythmLookahead = VisualSyncSettings.defaultRhythmLookahead
     @AppStorage(VisualSyncSettings.Keys.prescan) private var prescan = VisualSyncSettings.defaultPrescan
+    // av-fusion F1：声画融合（实验，默认关；只显示「声画：」状态行，不改输出）
+    @AppStorage(VisualSyncSettings.Keys.avFusion) private var avFusion = VisualSyncSettings.defaultAVFusion
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -1607,7 +1665,7 @@ struct VideoSyncView: View {
                            rhythmFollow: rhythmFollow, rateTable: rateTable, rhythmPulse: rhythmPulse,
                            pulseDepth: pulseDepth, pulseLatencyMs: pulseLatencyMs, pulseInvert: pulseInvert,
                            rhythmContext: rhythmContext, rhythmAudioAnchor: rhythmAudioAnchor,
-                           rhythmLookahead: rhythmLookahead, prescan: prescan)
+                           rhythmLookahead: rhythmLookahead, prescan: prescan, avFusion: avFusion)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -2054,6 +2112,12 @@ struct VideoSyncView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if avFusion, let fusion = vm.fusionStatus {
+                    Text(fusion)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
                 MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
                          valueText: "\(Int(vm.level.rounded()))")
@@ -2103,6 +2167,7 @@ struct VideoSyncView: View {
                 .tint(Velvet.gold)
                 if autoMotion { prescanControls }
                 rhythmControls
+                fusionControls
                 debugLogControls
             }
         } else {
@@ -2154,6 +2219,22 @@ struct VideoSyncView: View {
                 .tint(Velvet.gold)
             }
         }
+    }
+
+    /// av-fusion F1：声画融合（实验，默认关；只在跟随画面时显示）。只显示「声画：」状态行，不改输出
+    @ViewBuilder private var fusionControls: some View {
+        Toggle(isOn: $avFusion) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("声画融合（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("同时听视频的声音，判断撞击声是不是跟画面同步（还是配乐 / 人声），只显示「声画：」状态行，不改输出；判断耦合要同时开「伸缩跟随动作频率」和「相位脉动」")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
     }
 
     /// 调试记录：画面联动每一拍的数字（运动量、归一化、动作类型、节奏、输出）存成表格导出；不存画面
@@ -2782,7 +2863,7 @@ final class MotionDebugLog {
         + "pose_rhythm_hz,pose_rhythm_conf,pose_rhythm_part,subject_follow_hz,roi_valid,roi_x0,roi_y0,roi_x1,roi_y1,roi_hz,roi_share,"
         + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
         + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1,"
-        + AVDebugColumns.f0Header
+        + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header
     private var rows: [String] = []
     private var start = 0
 
@@ -2796,7 +2877,7 @@ final class MotionDebugLog {
     func append(t: Double, window w: MotionWindow, normalizer n: MotionNormalizer, target: Double,
                 shapedLevel: Double, value: Double, hasSignal: Bool, kind: Int, context: String?,
                 rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
-                rateLevel: Int?, out: [Int], av: [String] = AVDebugColumns.f0Empty) {
+                rateLevel: Int?, out: [Int], av: [String] = AVDebugColumns.f0Empty + AVDebugColumns.f1Empty) {
         func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
         let r = w.roi.region
         let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")

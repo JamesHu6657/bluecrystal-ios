@@ -3646,6 +3646,8 @@ struct VisualSyncSettings: Equatable {
         static let rhythmLookahead = "bcVisualSyncRhythmLookahead"
         /// rhythm-lookahead P4：预扫描整段视频（全片分位初始化画面的自动适应参考值，默认关）
         static let prescan = "bcVisualSyncPrescan"
+        /// av-fusion F1：声画融合（实验，默认关；F1 只显示耦合度，不改输出）
+        static let avFusion = "bcVisualSyncAVFusion"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -3679,6 +3681,9 @@ struct VisualSyncSettings: Equatable {
     static let defaultRhythmLookahead = false
     /// rhythm-lookahead P4：默认关。关着时不另外解码、MotionNormalizer 不被初始化，和 P3 逐位相同
     static let defaultPrescan = false
+    /// av-fusion F1：默认关。关着时实时线程不算 6 段频带 / 包络 / PCM，频带块开关仍是 usesAudioAnchor，和 f706431 逐位相同
+    /// （FusionOffCompare 钉住）；开着时 F1 也只显示「声画：」状态行和调试列，交给出口的值和关着时逐位相同
+    static let defaultAVFusion = false
 
     var source: VisualSyncSource
     var motionGainDb: Double
@@ -3693,6 +3698,7 @@ struct VisualSyncSettings: Equatable {
     var rhythmAudioAnchor: Bool
     var rhythmLookahead: Bool
     var prescan: Bool
+    var avFusion: Bool
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
          autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
@@ -3700,7 +3706,7 @@ struct VisualSyncSettings: Equatable {
          pulseDepth: Double = defaultPulseDepth, pulseLatencyMs: Double = defaultPulseLatencyMs,
          pulseInvert: Bool = defaultPulseInvert, rhythmContext: Bool = defaultRhythmContext,
          rhythmAudioAnchor: Bool = defaultRhythmAudioAnchor, rhythmLookahead: Bool = defaultRhythmLookahead,
-         prescan: Bool = defaultPrescan) {
+         prescan: Bool = defaultPrescan, avFusion: Bool = defaultAVFusion) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
@@ -3720,6 +3726,7 @@ struct VisualSyncSettings: Equatable {
         self.rhythmAudioAnchor = rhythmAudioAnchor
         self.rhythmLookahead = rhythmLookahead
         self.prescan = prescan
+        self.avFusion = avFusion
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -3742,7 +3749,8 @@ struct VisualSyncSettings: Equatable {
             rhythmContext: defaults.object(forKey: Keys.rhythmContext) as? Bool ?? defaultRhythmContext,
             rhythmAudioAnchor: defaults.object(forKey: Keys.rhythmAudioAnchor) as? Bool ?? defaultRhythmAudioAnchor,
             rhythmLookahead: defaults.object(forKey: Keys.rhythmLookahead) as? Bool ?? defaultRhythmLookahead,
-            prescan: defaults.object(forKey: Keys.prescan) as? Bool ?? defaultPrescan)
+            prescan: defaults.object(forKey: Keys.prescan) as? Bool ?? defaultPrescan,
+            avFusion: defaults.object(forKey: Keys.avFusion) as? Bool ?? defaultAVFusion)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
@@ -3768,6 +3776,8 @@ struct VisualSyncSettings: Equatable {
     var usesPrescan: Bool { source == .motion && autoMotion && prescan }
     /// 要不要另开一路解码（前瞻或预扫描任一生效）
     var usesExtraDecode: Bool { usesLookahead || usesPrescan }
+    /// av-fusion F1：声画融合真正生效（跟随画面 + 开关）。不是第三种来源；不影响 tickInterval
+    var usesAVFusion: Bool { source == .motion && avFusion }
 }
 
 /// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
@@ -7941,5 +7951,1219 @@ enum AVDebugColumns {
     /// 没在记录 / 这一拍没数据时的空列（列数不变）
     static var f0Empty: [String] {
         [String](repeating: "", count: f0Header.split(separator: ",", omittingEmptySubsequences: false).count)
+    }
+}
+
+// MARK: - av-fusion F1：声音特征 + 耦合度（只显示，默认关）
+// 开关 bcVisualSyncAVFusion（VisualSyncSettings.avFusion；只在跟随画面时显示 / 生效：usesAVFusion）。不是第三种来源。
+// - 实时线程（AudioLevelMeter，开着才算；关着时只多看一个布尔）：AudioFeatureSplitter——6 段二阶带通的 10 毫秒能量 +
+//   1 毫秒子块峰值、降采样到约 8 kHz 的 PCM，写固定容量的环形缓冲（init 时一次分配，回调里不分配、不加新锁）；
+// - 主线程每个完整拍（AVFusionEngine.beat）：AudioFeatureExtractor（多频带同时起音 / 起音陡度 + 衰减 → 撞击；
+//   纯 Swift FFT → 谐波度 / 频谱平坦度 / HPSS；长窗节拍网格）→ AudioSceneEvidence（P_music / P_voice）→
+//   AVCouplingEstimator（C、回差、切镜考验）→「声画：」状态行和调试列；
+// - F1 只显示：不改任何交给出口的值；P3 撞击声校正和融合共用频带块时经 AudioBandBacklog 原样接上（输入逐位不变）
+
+/// av-fusion F1：P3 的三频带块两边共用。融合每拍先从电平计取走（drainBands），撞击声校正还要用时把取走的块存在这里；
+/// 校正下次取的时候 take(adding:) 把新取的接在后面、只留最新的 capacity 个——和电平计环形缓冲（满了丢最旧的）
+/// 单独攒到那一刻的内容逐位相同。融合关着时这里一直是空的，take 原样返回新取的
+struct AudioBandBacklog {
+    /// = AudioLevelMeter.bandCapacity
+    static let capacity = 1024
+    private(set) var frames: [AudioBandFrame] = []
+
+    mutating func clear() {
+        frames.removeAll(keepingCapacity: true)
+    }
+
+    /// 融合取走的块先存着（只留最新的 capacity 个）
+    mutating func keep(_ fresh: [AudioBandFrame]) {
+        guard !fresh.isEmpty else { return }
+        frames.append(contentsOf: fresh)
+        if frames.count > Self.capacity { frames.removeFirst(frames.count - Self.capacity) }
+    }
+
+    /// 撞击声校正取块：存着的 + 新取的，只留最新的 capacity 个，取完清空
+    mutating func take(adding fresh: [AudioBandFrame]) -> [AudioBandFrame] {
+        guard !frames.isEmpty else { return fresh }
+        keep(fresh)
+        let out = frames
+        clear()
+        return out
+    }
+}
+
+/// av-fusion F1：6 段频带的一帧（10 毫秒）。time = 帧中点的视频时间；e* = 这一帧的均方能量；p* = 帧内 1 毫秒子块均方的最大值
+struct AudioFeatureFrame: Equatable {
+    static let bandCount = 6
+    var time: Double = .nan
+    var e0: Float = 0
+    var e1: Float = 0
+    var e2: Float = 0
+    var e3: Float = 0
+    var e4: Float = 0
+    var e5: Float = 0
+    var p0: Float = 0
+    var p1: Float = 0
+    var p2: Float = 0
+    var p3: Float = 0
+    var p4: Float = 0
+    var p5: Float = 0
+
+    func energy(_ b: Int) -> Double {
+        switch b {
+        case 0: return Double(e0)
+        case 1: return Double(e1)
+        case 2: return Double(e2)
+        case 3: return Double(e3)
+        case 4: return Double(e4)
+        default: return Double(e5)
+        }
+    }
+
+    func peak(_ b: Int) -> Double {
+        switch b {
+        case 0: return Double(p0)
+        case 1: return Double(p1)
+        case 2: return Double(p2)
+        case 3: return Double(p3)
+        case 4: return Double(p4)
+        default: return Double(p5)
+        }
+    }
+
+    var totalEnergy: Double { Double(e0) + Double(e1) + Double(e2) + Double(e3) + Double(e4) + Double(e5) }
+}
+
+/// av-fusion F1：RBJ 二阶带通（峰值增益 0 dB，转置直接 II 型）。几个数的状态，不分配
+struct AudioBiquad {
+    private var b0: Double = 0
+    private var b2: Double = 0
+    private var a1: Double = 0
+    private var a2: Double = 0
+    private var z1: Double = 0
+    private var z2: Double = 0
+
+    init() {}
+
+    /// 中心频率 ≥ 0.45 × 采样率（或参数不对）时不通：输出恒 0
+    init(center f: Double, q: Double, sampleRate sr: Double) {
+        guard sr.isFinite, sr > 0, f.isFinite, f > 0, f < 0.45 * sr, q.isFinite, q > 0 else { return }
+        let w = 2 * Double.pi * f / sr
+        let alpha = sin(w) / (2 * q)
+        let a0 = 1 + alpha
+        b0 = alpha / a0
+        b2 = -alpha / a0
+        a1 = -2 * cos(w) / a0
+        a2 = (1 - alpha) / a0
+    }
+
+    mutating func run(_ x: Double) -> Double {
+        let y = b0 * x + z1
+        z1 = -a1 * y + z2
+        z2 = b2 * x - a2 * y
+        // 静音后滤波状态衰减到非规格化数时直接归零（只为速度；有声音时一位不差）
+        if abs(z1) < 1e-25 { z1 = 0 }
+        if abs(z2) < 1e-25 { z2 = 0 }
+        return y
+    }
+}
+
+/// av-fusion F1：一段频带的累加状态（帧能量、1 毫秒子块、帧内子块峰值）
+struct AudioFeatureBand {
+    private var filter = AudioBiquad()
+    private var acc: Double = 0
+    private var sub: Double = 0
+    private var peak: Double = 0
+
+    init() {}
+
+    init(center: Double, sampleRate: Double) {
+        filter = AudioBiquad(center: center, q: AudioFeatureSplitter.q, sampleRate: sampleRate)
+    }
+
+    mutating func add(_ x: Double) {
+        let y = filter.run(x)
+        let s = y * y
+        acc += s
+        sub += s
+    }
+
+    mutating func closeSub(_ inv: Double) {
+        peak = max(peak, sub * inv)
+        sub = 0
+    }
+
+    mutating func closeFrame(_ inv: Double) -> (energy: Float, peak: Float) {
+        let e = acc * inv
+        let r = (Float(e.isFinite ? e : 0), Float(peak.isFinite ? peak : 0))
+        acc = 0
+        peak = 0
+        return r
+    }
+}
+
+/// av-fusion F1（实时线程上用，纯值类型、不分配、不加锁）：6 段二阶带通（100 / 300 / 800 / 1800 / 3500 / 6000 Hz，Q = 1）
+/// 每 10 毫秒出一帧（均方能量 + 1 毫秒子块峰值）；另把单声道低通（约 3.4 kHz）后按 round(采样率 / 8000) 取平均降采样成 PCM。
+/// 时间按样本计数从这一段连续声音的起点推（不按回调切块累加），所以任意切块喂进来结果都和一次喂完逐位相同；
+/// 回调之间时间对不上（seek / 丢样本）超过 maxSkew 就丢掉没满的帧、滤波从头来
+struct AudioFeatureSplitter {
+    static let frameSeconds: Double = 0.01
+    static let subSeconds: Double = 0.001
+    static let maxSkew: Double = AudioBandSplitter.maxSkew
+    static let q: Double = 1
+    /// 中心频率（Hz）。用 switch 不用数组：configure 在实时线程上跑，静态数组第一次访问会分配
+    static func center(_ b: Int) -> Double {
+        switch b {
+        case 0: return 100
+        case 1: return 300
+        case 2: return 800
+        case 3: return 1800
+        case 4: return 3500
+        default: return 6000
+        }
+    }
+    static let pcmTargetRate: Double = 8000
+    static let pcmCutHz: Double = 3400
+    /// add 的返回值：出了一帧 / 出了一个 PCM 样本
+    static let frameReady: UInt8 = 1
+    static let pcmReady: UInt8 = 2
+
+    /// 采样率 → 降采样倍数（认不出 0）
+    static func decimation(forSampleRate sr: Double) -> Int {
+        guard sr.isFinite, sr > 1000, sr < 1_000_000 else { return 0 }
+        return max(1, Int((sr / pcmTargetRate).rounded()))
+    }
+
+    /// 采样率 → PCM 的采样率（认不出 0）
+    static func pcmRate(forSampleRate sr: Double) -> Double {
+        let d = decimation(forSampleRate: sr)
+        return d > 0 ? sr / Double(d) : 0
+    }
+
+    private(set) var sampleRate: Double = 0
+    private var band0 = AudioFeatureBand()
+    private var band1 = AudioFeatureBand()
+    private var band2 = AudioFeatureBand()
+    private var band3 = AudioFeatureBand()
+    private var band4 = AudioFeatureBand()
+    private var band5 = AudioFeatureBand()
+    private var frameLength = 0
+    private var subLength = 0
+    private var decimation = 0
+    private var inFrame = 0
+    private var inSub = 0
+    private var inPCM = 0
+    private var frameStart = 0
+    private var count = 0
+    /// 这一段连续声音第一个样本的视频时间（NaN = 还没开始 / 时间拿不到，此时不出帧）
+    private var origin = Double.nan
+    private var expectedNext = Double.nan
+    private var lowpass: Double = 0
+    private var lowpassCoef: Double = 0
+    private var pcmAcc: Double = 0
+
+    /// 采样率认不出（≤ 1 kHz / 非有限）时不出帧
+    mutating func configure(sampleRate sr: Double) {
+        self = AudioFeatureSplitter()
+        let d = Self.decimation(forSampleRate: sr)
+        guard d > 0 else { return }
+        sampleRate = sr
+        frameLength = max(1, Int((sr * Self.frameSeconds).rounded()))
+        subLength = max(1, Int((sr * Self.subSeconds).rounded()))
+        decimation = d
+        lowpassCoef = 1 - exp(-2 * Double.pi * min(Self.pcmCutHz, 0.45 * sr / Double(d)) / sr)
+        band0 = AudioFeatureBand(center: Self.center(0), sampleRate: sr)
+        band1 = AudioFeatureBand(center: Self.center(1), sampleRate: sr)
+        band2 = AudioFeatureBand(center: Self.center(2), sampleRate: sr)
+        band3 = AudioFeatureBand(center: Self.center(3), sampleRate: sr)
+        band4 = AudioFeatureBand(center: Self.center(4), sampleRate: sr)
+        band5 = AudioFeatureBand(center: Self.center(5), sampleRate: sr)
+    }
+
+    private mutating func restart(origin start: Double) {
+        let sr = sampleRate
+        configure(sampleRate: sr)
+        origin = start
+    }
+
+    /// 一次回调开始：start = 第一个样本的视频时间。拿不到时间 → 这一段不出帧（滤波从头来）；
+    /// 和上一次接不上 → 丢掉没满的帧、从这里重新起算；差不到半个样本的不动，差得多（≤ maxSkew）只把时间起点挪过去
+    mutating func begin(start: Double, frames: Int) {
+        guard sampleRate > 0 else { return }
+        guard start.isFinite else {
+            restart(origin: .nan)
+            return
+        }
+        if !origin.isFinite || !expectedNext.isFinite || abs(start - expectedNext) > Self.maxSkew {
+            restart(origin: start)
+        } else if abs(start - expectedNext) > 0.5 / sampleRate {
+            origin += start - expectedNext
+        }
+        expectedNext = start + Double(max(0, frames)) / sampleRate
+    }
+
+    /// 一个样本。满 10 毫秒把一帧写进 frame、满一个降采样周期把一个 PCM 样本写进 pcm；返回 frameReady / pcmReady 的组合
+    mutating func add(_ x: Double, frame: inout AudioFeatureFrame, pcm: inout Float) -> UInt8 {
+        guard frameLength > 0, origin.isFinite else { return 0 }
+        let v = x.isFinite ? max(-4, min(4, x)) : 0
+        if inFrame == 0 { frameStart = count }
+        band0.add(v)
+        band1.add(v)
+        band2.add(v)
+        band3.add(v)
+        band4.add(v)
+        band5.add(v)
+        count += 1
+        var flags: UInt8 = 0
+        inSub += 1
+        if inSub >= subLength {
+            let inv = 1 / Double(subLength)
+            band0.closeSub(inv)
+            band1.closeSub(inv)
+            band2.closeSub(inv)
+            band3.closeSub(inv)
+            band4.closeSub(inv)
+            band5.closeSub(inv)
+            inSub = 0
+        }
+        inFrame += 1
+        if inFrame >= frameLength {
+            let inv = 1 / Double(frameLength)
+            var f = AudioFeatureFrame()
+            f.time = origin + (Double(frameStart) + 0.5 * Double(frameLength)) / sampleRate
+            (f.e0, f.p0) = band0.closeFrame(inv)
+            (f.e1, f.p1) = band1.closeFrame(inv)
+            (f.e2, f.p2) = band2.closeFrame(inv)
+            (f.e3, f.p3) = band3.closeFrame(inv)
+            (f.e4, f.p4) = band4.closeFrame(inv)
+            (f.e5, f.p5) = band5.closeFrame(inv)
+            inFrame = 0
+            if f.time.isFinite {
+                frame = f
+                flags |= Self.frameReady
+            }
+        }
+        lowpass += lowpassCoef * (v - lowpass)
+        pcmAcc += lowpass
+        inPCM += 1
+        if inPCM >= decimation {
+            let y = pcmAcc / Double(decimation)
+            pcm = Float(y.isFinite ? y : 0)
+            pcmAcc = 0
+            inPCM = 0
+            flags |= Self.pcmReady
+        }
+        return flags
+    }
+}
+
+/// av-fusion F1：主线程每拍从电平计取走的特征（旧 → 新）。invalidChunks = 融合开着时时间范围拿不到的回调数
+struct AudioFeatureDrain: Equatable {
+    var frames: [AudioFeatureFrame] = []
+    var pcm: [Float] = []
+    var pcmRate: Double = 0
+    var invalidChunks = 0
+}
+
+/// av-fusion F1：纯 Swift 基 2 复数 FFT（原地）。只依赖 Foundation：设备和 VisualSyncChecks 走同一份代码（不用 Accelerate）
+struct AudioFFT {
+    let n: Int
+    private let cosTable: [Double]
+    private let sinTable: [Double]
+    private let bitReverse: [Int]
+
+    init(size: Int) {
+        var m = 2
+        while m < size { m <<= 1 }
+        n = m
+        cosTable = (0..<(m / 2)).map { cos(2 * Double.pi * Double($0) / Double(m)) }
+        sinTable = (0..<(m / 2)).map { sin(2 * Double.pi * Double($0) / Double(m)) }
+        var bits = 0
+        while (1 << bits) < m { bits += 1 }
+        var rev = [Int](repeating: 0, count: m)
+        for i in 0..<m {
+            var r = 0
+            var x = i
+            for _ in 0..<bits {
+                r = (r << 1) | (x & 1)
+                x >>= 1
+            }
+            rev[i] = r
+        }
+        bitReverse = rev
+    }
+
+    /// 正变换 X[k] = Σ x[j]·e^(−2πi·jk/n)；inverse 时 e^(+…)（不除 n）
+    func transform(_ re: inout [Double], _ im: inout [Double], inverse: Bool = false) {
+        guard re.count == n, im.count == n else { return }
+        for i in 0..<n {
+            let j = bitReverse[i]
+            if j > i {
+                re.swapAt(i, j)
+                im.swapAt(i, j)
+            }
+        }
+        let sign: Double = inverse ? 1 : -1
+        var len = 2
+        while len <= n {
+            let half = len / 2
+            let step = n / len
+            var start = 0
+            while start < n {
+                for k in 0..<half {
+                    let wr = cosTable[k * step]
+                    let wi = sign * sinTable[k * step]
+                    let a = start + k
+                    let b = a + half
+                    let xr = re[b] * wr - im[b] * wi
+                    let xi = re[b] * wi + im[b] * wr
+                    re[b] = re[a] - xr
+                    im[b] = im[a] - xi
+                    re[a] += xr
+                    im[a] += xi
+                }
+                start += len
+            }
+            len <<= 1
+        }
+    }
+}
+
+/// av-fusion F1：降采样 PCM 的短时分析（主线程）。每 20 毫秒一帧：最近 512 个样本加 Hann 窗、补零到 1024 点 FFT——
+/// - 谐波度：功率谱反变换得自相关，除以窗自己的自相关（Boersma），70~400 Hz 的 lag 里取最高的局部峰 ρ，
+///   谐波度 = clamp((ρ − 0.35) / 0.5)（噪声 / 撞击 ≈ 0，人声 / 呻吟 / 和弦 ≈ 1）；太静（RMS < 1e-3）的帧不算；
+/// - 频谱平坦度：功率谱几何平均 / 算术平均；
+/// - HPSS 用的 32 段频谱（每段 16 个频点）
+struct AudioHarmonicAnalyzer {
+    static let window = 512
+    static let fftSize = 1024
+    static let hopSeconds: Double = 0.02
+    static let minHz: Double = 70
+    static let maxHz: Double = 400
+    static let gateRMS: Double = 1e-3
+    static let rhoLow: Double = 0.35
+    static let rhoSpan: Double = 0.5
+    static let spectrumBands = 32
+
+    struct Frame: Equatable {
+        var voiced = false
+        var harmonicity: Double = 0
+        var flatness: Double = .nan
+        var spectrum: [Double] = []
+    }
+
+    static let hann: [Double] = (0..<window).map { 0.5 - 0.5 * cos(2 * Double.pi * (Double($0) + 0.5) / Double(window)) }
+    /// Hann 窗自己的自相关（归一到 lag 0 = 1）
+    static let windowCorrelation: [Double] = {
+        var r = [Double](repeating: 0, count: window)
+        for lag in 0..<window {
+            var s = 0.0
+            for i in 0..<(window - lag) { s += hann[i] * hann[i + lag] }
+            r[lag] = s
+        }
+        let r0 = r[0]
+        return r.map { $0 / r0 }
+    }()
+
+    private(set) var rate: Double = 0
+    private var ring = [Float](repeating: 0, count: AudioHarmonicAnalyzer.window)
+    private var head = 0
+    private var filled = 0
+    private var sinceHop = 0
+    private var hop = 0
+    private let fft = AudioFFT(size: AudioHarmonicAnalyzer.fftSize)
+
+    mutating func reset() {
+        ring = [Float](repeating: 0, count: Self.window)
+        head = 0
+        filled = 0
+        sinceHop = 0
+        hop = 0
+        rate = 0
+    }
+
+    /// 喂一段 PCM（采样率变了就从头来）；返回这段里出的分析帧
+    mutating func add(_ samples: [Float], rate r: Double) -> [Frame] {
+        guard r.isFinite, r > 1000 else { return [] }
+        if r != rate {
+            reset()
+            rate = r
+            hop = max(1, Int((r * Self.hopSeconds).rounded()))
+        }
+        var out: [Frame] = []
+        for x in samples {
+            ring[head] = x.isFinite ? x : 0
+            head = (head + 1) % Self.window
+            filled = min(Self.window, filled + 1)
+            sinceHop += 1
+            if filled == Self.window, sinceHop >= hop {
+                sinceHop = 0
+                out.append(analyze())
+            }
+        }
+        return out
+    }
+
+    private func analyze() -> Frame {
+        let n = Self.fftSize
+        var re = [Double](repeating: 0, count: n)
+        var im = [Double](repeating: 0, count: n)
+        var sq = 0.0
+        for i in 0..<Self.window {
+            let x = Double(ring[(head + i) % Self.window])
+            sq += x * x
+            re[i] = x * Self.hann[i]
+        }
+        fft.transform(&re, &im)
+        var power = [Double](repeating: 0, count: n)
+        for k in 0..<n { power[k] = re[k] * re[k] + im[k] * im[k] }
+        var frame = Frame()
+        let bins = n / 2
+        let per = bins / Self.spectrumBands
+        var spectrum = [Double](repeating: 0, count: Self.spectrumBands)
+        for b in 0..<Self.spectrumBands {
+            var s = 0.0
+            for k in (b * per)..<((b + 1) * per) { s += power[k] }
+            spectrum[b] = s
+        }
+        frame.spectrum = spectrum
+        let rms = (sq / Double(Self.window)).squareRoot()
+        guard rms.isFinite, rms >= Self.gateRMS else { return frame }
+        frame.voiced = true
+        var logSum = 0.0
+        var sum = 0.0
+        for k in 1..<bins {
+            logSum += log(power[k] + 1e-20)
+            sum += power[k]
+        }
+        let mean = sum / Double(bins - 1)
+        let flat = exp(logSum / Double(bins - 1)) / (mean + 1e-20)
+        frame.flatness = flat.isFinite ? min(1, max(0, flat)) : .nan
+        // 自相关 = 功率谱的反变换（补零到 2 倍窗长 = 线性自相关）
+        var ar = power
+        var ai = [Double](repeating: 0, count: n)
+        fft.transform(&ar, &ai, inverse: true)
+        let r0 = ar[0]
+        guard r0 > 1e-20 else { return frame }
+        let minLag = max(2, Int((rate / Self.maxHz).rounded(.down)))
+        let maxLag = min(Self.window / 3, Int((rate / Self.minHz).rounded(.up)))
+        guard maxLag > minLag + 1 else { return frame }
+        func rho(_ lag: Int) -> Double { (ar[lag] / r0) / max(1e-6, Self.windowCorrelation[lag]) }
+        var best = 0.0
+        for lag in minLag...maxLag {
+            let v = rho(lag)
+            if v > best, v >= rho(lag - 1), v >= rho(lag + 1) { best = v }
+        }
+        let h = (min(1, best) - Self.rhoLow) / Self.rhoSpan
+        frame.harmonicity = h.isFinite ? min(1, max(0, h)) : 0
+        return frame
+    }
+}
+
+/// av-fusion F1：一次起音候选的判断结果（视频时间）
+struct AudioOnsetEvent: Equatable {
+    var time: Double
+    /// 各频带上升（dB）之和：节拍网格的权重
+    var strength: Double
+    /// 上升 ≥ 6 dB 的频带数
+    var risingBands: Int
+    /// 起音陡（20 毫秒内比之前升 ≥ 9 dB，而且已经到了之后 80 毫秒最高点的 3 dB 以内）的频带数
+    var steepBands: Int
+    /// 又陡、40~80 毫秒内又降了 ≥ 6 dB 的频带数
+    var shortBands: Int
+
+    /// 撞击：≥ 4 段同时又陡又短（宽带、短促）
+    var isImpact: Bool { shortBands >= AudioFeatureExtractor.impactBands }
+    /// 起音陡（≥ 2 段又陡又短）：P_voice 的「起音陡度」按这个算占比
+    var isSteep: Bool { shortBands >= AudioFeatureExtractor.steepBands }
+}
+
+/// av-fusion F1：长窗节拍网格（视频时间）：period 秒一格，anchor 是一个格点；share = 起音落在格点 ±30 毫秒内的权重占比
+struct AudioBeatGrid: Equatable {
+    var period: Double
+    var anchor: Double
+    var share: Double
+    /// clamp((share − 0.5) / 0.3)
+    var stable: Double
+    /// 有 2× 细分（踩镲）：clamp((corr(L/2) / corr(L) − 0.3) / 0.4)
+    var subdivided: Double
+
+    /// P_music 的「长窗网格稳定」= 稳定 × 细分
+    var value: Double { stable * subdivided }
+
+    /// t 离最近格点多远（秒，±period / 2）
+    func residual(_ t: Double) -> Double {
+        guard period > 0, t.isFinite else { return .infinity }
+        var x = (t - anchor) / period
+        x -= x.rounded()
+        return x * period
+    }
+
+    static let tolerance: Double = 0.03
+    static let windowSeconds: Double = 12
+    static let minSpan: Double = 6
+    static let minEvents = 8
+    static let bin: Double = 0.01
+    static let minLagBins = 30
+    static let maxLagBins = 150
+    static let harmonicShare: Double = 0.85
+
+    /// 最近 windowSeconds 秒（start ~ end）的起音按强度做成脉冲串（σ = 1.5 格的高斯），归一化自相关：
+    /// 0.3~1.5 秒里最高的局部峰 L（比它短、不低于它 85% 的局部峰优先），看 L/2 有没有细分；
+    /// 格长 = 细分 ≥ 0.5 时 L/2、否则 L，再在 ±12 毫秒里按 0.5 毫秒细调（合成长度最大），求格点和占比
+    static func estimate(_ events: [AudioOnsetEvent], start: Double, end: Double) -> AudioBeatGrid? {
+        guard start.isFinite, end.isFinite, end - start >= minSpan else { return nil }
+        let ev = events.filter { $0.time > start && $0.time <= end && $0.strength > 0 && $0.strength.isFinite }
+        guard ev.count >= minEvents else { return nil }
+        let n = Int(((end - start) / bin).rounded(.up)) + 1
+        guard n > 2 * maxLagBins else { return nil }
+        var sig = [Double](repeating: 0, count: n)
+        let sigma = 1.5
+        for e in ev {
+            let c = (e.time - start) / bin
+            let lo = max(0, Int((c - 4 * sigma).rounded(.down)))
+            let hi = min(n - 1, Int((c + 4 * sigma).rounded(.up)))
+            guard lo <= hi else { continue }
+            for k in lo...hi {
+                let d = (Double(k) - c) / sigma
+                sig[k] += e.strength * exp(-0.5 * d * d)
+            }
+        }
+        var mean = 0.0
+        for v in sig { mean += v }
+        mean /= Double(n)
+        var r0 = 0.0
+        for k in 0..<n {
+            sig[k] -= mean
+            r0 += sig[k] * sig[k]
+        }
+        guard r0 > 1e-12 else { return nil }
+        let lo = minLagBins / 2 - 1
+        let hi = maxLagBins + 1
+        var corr = [Double](repeating: 0, count: hi + 1)
+        for lag in lo...hi {
+            var s = 0.0
+            for k in 0..<(n - lag) { s += sig[k] * sig[k + lag] }
+            corr[lag] = s / r0 * Double(n) / Double(n - lag)
+        }
+        var best = 0.0
+        var bestLag = 0
+        for lag in minLagBins...maxLagBins where corr[lag] > best && corr[lag] >= corr[lag - 1] && corr[lag] >= corr[lag + 1] {
+            best = corr[lag]
+            bestLag = lag
+        }
+        guard bestLag > 0, best > 0.1 else { return nil }
+        for lag in minLagBins..<bestLag where corr[lag] >= harmonicShare * best
+            && corr[lag] >= corr[lag - 1] && corr[lag] >= corr[lag + 1] {
+            bestLag = lag
+            break
+        }
+        let half = bestLag / 2
+        let sub = max(corr[half], corr[half + (bestLag % 2)], corr[max(lo, half - 1)], corr[half + 1])
+        let ratio = sub / max(1e-9, corr[bestLag])
+        let subdivided = min(1, max(0, (ratio - 0.3) / 0.4))
+        let coarse = (subdivided >= 0.5 ? Double(bestLag) / 2 : Double(bestLag)) * bin
+        var total = 0.0
+        for e in ev { total += e.strength }
+        var bestR = -1.0
+        var period = coarse
+        var anchor = 0.0
+        var step = -24
+        while step <= 24 {
+            let g = coarse + Double(step) * 0.0005
+            step += 1
+            guard g > 0.05 else { continue }
+            var sx = 0.0
+            var sy = 0.0
+            for e in ev {
+                let a = 2 * Double.pi * (e.time - start) / g
+                sx += e.strength * cos(a)
+                sy += e.strength * sin(a)
+            }
+            let r = (sx * sx + sy * sy).squareRoot() / total
+            if r > bestR {
+                bestR = r
+                period = g
+                anchor = start + atan2(sy, sx) / (2 * Double.pi) * g
+            }
+        }
+        var grid = AudioBeatGrid(period: period, anchor: anchor, share: 0, stable: 0, subdivided: subdivided)
+        var on = 0.0
+        for e in ev where abs(grid.residual(e.time)) <= tolerance { on += e.strength }
+        grid.share = on / total
+        grid.stable = min(1, max(0, (grid.share - 0.5) / 0.3))
+        return grid
+    }
+}
+
+/// av-fusion F1：主线程的声音特征（只读电平计取走的特征帧和 PCM，不碰任何控制状态）。
+/// 起音候选：≥ 2 段的帧能量比前两帧里低的那个升了 ≥ 6 dB（离上一个候选 ≥ 80 毫秒）；8 帧（80 毫秒）后判断——
+/// 每段：陡 = 这帧和下一帧的 1 毫秒峰值比之前升 ≥ 9 dB、而且到了之后 80 毫秒最高点的 3 dB 以内（10~20 毫秒内起来）；
+/// 短 = 40~80 毫秒那 5 帧的平均比峰值降了 ≥ 6 dB。≥ 4 段又陡又短 = 撞击（宽带、短促）。
+/// PCM 那边每 20 毫秒一帧谐波度 / 平坦度 / 32 段频谱（AudioHarmonicAnalyzer），取最近 2 秒的中位数；HPSS 用最近 17 帧
+struct AudioFeatureExtractor {
+    static let jumpDb: Double = 6
+    static let minRisingBands = 2
+    static let steepRiseDb: Double = 9
+    static let nearPeakDb: Double = 3
+    static let decayDb: Double = 6
+    static let refractory: Double = 0.08
+    static let impactBands = 4
+    static let steepBands = 2
+    static let lookahead = 8
+    static let silenceDb: Double = -70
+    static let maxFrameGap: Double = 0.1
+    static let historySeconds: Double = 13
+    static let historyFrames = 16
+    static let harmonicFrames = 100
+    static let minVoicedFrames = 10
+    static let hpssFrames = 17
+    static let loudEnergy: Double = 1e-7
+
+    private var recent: [AudioFeatureFrame] = []
+    /// recent[0] 的序号（收到的第几帧）
+    private var base = 0
+    private var nextIndex = 0
+    private var pending: [Int] = []
+    private var lastCandidate = -Double.infinity
+    private(set) var events: [AudioOnsetEvent] = []
+    private(set) var lastFrameTime = Double.nan
+    private(set) var lastLoudTime = Double.nan
+    /// 这次 reset 以来第一帧的视频时间（长窗网格的起点不早于它）
+    private(set) var firstFrameTime = Double.nan
+    private var analyzer = AudioHarmonicAnalyzer()
+    private(set) var harmonic: [AudioHarmonicAnalyzer.Frame] = []
+
+    mutating func reset() {
+        self = AudioFeatureExtractor()
+    }
+
+    private static func db(_ x: Double) -> Double { 10 * log10(max(1e-14, x.isFinite ? x : 0)) }
+
+    private func frame(_ i: Int) -> AudioFeatureFrame { recent[i - base] }
+    private func energyDb(_ i: Int, _ b: Int) -> Double { Self.db(frame(i).energy(b)) }
+    private func peakDb(_ i: Int, _ b: Int) -> Double {
+        let f = frame(i)
+        return Self.db(max(f.peak(b), f.energy(b)))
+    }
+
+    /// 时间倒退 / 断档（seek）：没判断完的候选和最近几帧丢掉（已判断的起音留着，换视频 / seek 时由调用方 reset）
+    private mutating func clearFrames() {
+        recent.removeAll(keepingCapacity: true)
+        base = nextIndex
+        pending.removeAll()
+    }
+
+    mutating func add(_ f: AudioFeatureFrame) {
+        guard f.time.isFinite else { return }
+        if lastFrameTime.isFinite, f.time <= lastFrameTime || f.time - lastFrameTime > Self.maxFrameGap { clearFrames() }
+        lastFrameTime = f.time
+        if !firstFrameTime.isFinite { firstFrameTime = f.time }
+        if f.totalEnergy >= Self.loudEnergy { lastLoudTime = f.time }
+        recent.append(f)
+        if recent.count > Self.historyFrames {
+            recent.removeFirst()
+            base += 1
+        }
+        let k = nextIndex
+        nextIndex += 1
+        if k - 2 >= base, f.time - lastCandidate >= Self.refractory {
+            var rising = 0
+            for b in 0..<AudioFeatureFrame.bandCount {
+                let d = energyDb(k, b)
+                let before = max(min(energyDb(k - 1, b), energyDb(k - 2, b)), Self.silenceDb)
+                if d > Self.silenceDb, d - before >= Self.jumpDb { rising += 1 }
+            }
+            if rising >= Self.minRisingBands {
+                pending.append(k)
+                lastCandidate = f.time
+            }
+        }
+        while let c = pending.first, k >= c + Self.lookahead {
+            pending.removeFirst()
+            if c - 2 >= base { evaluate(c) }
+        }
+    }
+
+    private mutating func evaluate(_ c: Int) {
+        var strength = 0.0
+        var rising = 0
+        var steep = 0
+        var short = 0
+        for b in 0..<AudioFeatureFrame.bandCount {
+            let before = max(min(energyDb(c - 1, b), energyDb(c - 2, b)), Self.silenceDb)
+            let top = max(energyDb(c, b), energyDb(c + 1, b))
+            let rise = top - before
+            if rise > 0 { strength += rise }
+            if rise >= Self.jumpDb { rising += 1 }
+            let near = max(peakDb(c, b), peakDb(c + 1, b))
+            var later = near
+            for j in (c + 2)...(c + Self.lookahead) { later = max(later, peakDb(j, b)) }
+            guard near - before >= Self.steepRiseDb, near >= later - Self.nearPeakDb else { continue }
+            steep += 1
+            var tail = 0.0
+            for j in (c + 4)...(c + 8) { tail += energyDb(j, b) }
+            tail /= 5
+            if tail <= top - Self.decayDb { short += 1 }
+        }
+        events.append(AudioOnsetEvent(time: frame(c).time, strength: strength, risingBands: rising, steepBands: steep,
+                                      shortBands: short))
+        let keepAfter = lastFrameTime - Self.historySeconds
+        if let first = events.first, first.time < keepAfter { events.removeAll { $0.time < keepAfter } }
+    }
+
+    mutating func addPCM(_ samples: [Float], rate: Double) {
+        guard !samples.isEmpty else { return }
+        let frames = analyzer.add(samples, rate: rate)
+        guard !frames.isEmpty else { return }
+        harmonic.append(contentsOf: frames)
+        if harmonic.count > Self.harmonicFrames { harmonic.removeFirst(harmonic.count - Self.harmonicFrames) }
+    }
+
+    /// 撞击时刻（视频时间，from ≤ t ≤ to，旧 → 新）
+    func impacts(from: Double, to: Double) -> [Double] {
+        events.filter { $0.isImpact && $0.time >= from && $0.time <= to }.map { $0.time }
+    }
+
+    /// 起音陡度：这段时间里起音候选（按强度加权）有多少是陡的；没有候选 0
+    func steepness(from: Double, to: Double) -> Double {
+        var all = 0.0
+        var steep = 0.0
+        for e in events where e.time >= from && e.time <= to {
+            let w = max(1e-6, e.strength)
+            all += w
+            if e.isSteep { steep += w }
+        }
+        return all > 0 ? steep / all : 0
+    }
+
+    private static func median(_ xs: [Double]) -> Double {
+        guard !xs.isEmpty else { return .nan }
+        let s = xs.sorted()
+        let m = s.count / 2
+        return s.count % 2 == 1 ? s[m] : 0.5 * (s[m - 1] + s[m])
+    }
+
+    /// 谐波度：最近 2 秒不太静的帧的中位数（不够 10 帧 0）
+    var harmonicity: Double {
+        let v = harmonic.filter { $0.voiced }.map { $0.harmonicity }
+        return v.count >= Self.minVoicedFrames ? Self.median(v) : 0
+    }
+
+    /// 频谱平坦度：最近 2 秒不太静的帧的中位数（不够 10 帧 NaN）
+    var flatness: Double {
+        let v = harmonic.filter { $0.voiced && $0.flatness.isFinite }.map { $0.flatness }
+        return v.count >= Self.minVoicedFrames ? Self.median(v) : .nan
+    }
+
+    /// HPSS 简化版：最近 17 帧 × 32 段，中间那帧每段的时间方向中值 H、频率方向（±8 段）中值 P，
+    /// 打击成分占比 = Σ S·P² / (H² + P²) / Σ S（不够 17 帧 / 太静 NaN）
+    var percussive: Double {
+        guard harmonic.count >= Self.hpssFrames else { return .nan }
+        let frames = harmonic.suffix(Self.hpssFrames).map { $0.spectrum }
+        let bands = AudioHarmonicAnalyzer.spectrumBands
+        guard frames.allSatisfy({ $0.count == bands }) else { return .nan }
+        let center = frames[Self.hpssFrames / 2]
+        var total = 0.0
+        var perc = 0.0
+        for b in 0..<bands {
+            let h = Self.median(frames.map { $0[b] })
+            let p = Self.median(Array(center[max(0, b - 8)...min(bands - 1, b + 8)]))
+            let den = h * h + p * p
+            total += center[b]
+            if den > 0 { perc += center[b] * p * p / den }
+        }
+        return total > 1e-12 ? min(1, max(0, perc / total)) : .nan
+    }
+}
+
+/// av-fusion F1：配乐 / 人声的证据（主线程每个完整拍一次，视频时间）。
+/// P_music = max(0.4·跨切镜节拍连续 + 0.3·画面不动时仍有节奏 + 0.2·长窗网格（稳定 × 细分）+ 0.1·谐波,
+///               0.8·跨切镜连续, 0.6·画面不动仍有节奏)；P_voice = 谐波度 × (1 − 起音陡度)。
+/// - 跨切镜：切镜那一拍有稳定网格（stable ≥ 0.5）就记下来，之后 2 秒里 ≥ 2 次起音、按强度 ≥ 75% 落在原网格 ±30 毫秒 → 1，保持 10 秒；
+///   考验期间（cutTesting）耦合度挂起不更新；
+/// - 画面不动（activity = 0）时声音节奏置信 ≥ 0.4：1 秒爬满，条件没了保持 10 秒再按 1 秒降
+struct AudioSceneEvidence {
+    static let crossCutWeight: Double = 0.4
+    static let stillWeight: Double = 0.3
+    static let gridWeight: Double = 0.2
+    static let harmonicWeight: Double = 0.1
+    /// 两条最有力的证据单独成立时的下限（「强烈上升」）：跨切镜连续 ⇒ ≥ 0.8，画面不动仍有节奏 ⇒ ≥ 0.6
+    static let crossCutFloor: Double = 0.8
+    static let stillFloor: Double = 0.6
+    static let cutTestSeconds: Double = 2
+    static let cutMinOnsets = 2
+    static let cutShare: Double = 0.75
+    static let holdSeconds: Double = 10
+    static let stillConfidence: Double = 0.4
+    static let rampSeconds: Double = 1
+    static let minCutStable: Double = 0.5
+
+    private(set) var crossCut: Double = 0
+    private(set) var still: Double = 0
+    private(set) var grid: Double = 0
+    private(set) var harmonic: Double = 0
+    private(set) var steepness: Double = 0
+    private(set) var pMusic: Double = 0
+    private(set) var pVoice: Double = 0
+    /// 切镜考验：记下的网格和切镜时刻（视频时间）
+    private(set) var cutTest: (grid: AudioBeatGrid, start: Double)?
+    private var crossCutUntil = -Double.infinity
+    private var stillSeen = -Double.infinity
+
+    var cutTesting: Bool { cutTest != nil }
+
+    mutating func reset() {
+        self = AudioSceneEvidence()
+    }
+
+    mutating func step(item: Double, cut: Bool, grid g: AudioBeatGrid?, onsets: [AudioOnsetEvent], activity: Double,
+                       rhythmConfidence: Double, harmonicity: Double, steepness s: Double, audioPresent: Bool,
+                       dt: Double) {
+        let step = dt.isFinite ? min(1, max(0, dt)) : AudioReactiveShaper.interval
+        guard item.isFinite else { return }
+        if cut, cutTest == nil, let g = g, g.stable >= Self.minCutStable { cutTest = (g, item) }
+        if let test = cutTest, item >= test.start + Self.cutTestSeconds {
+            var all = 0.0
+            var on = 0.0
+            var count = 0
+            for e in onsets where e.time > test.start && e.time <= test.start + Self.cutTestSeconds {
+                let w = max(1e-6, e.strength)
+                all += w
+                count += 1
+                if abs(test.grid.residual(e.time)) <= AudioBeatGrid.tolerance { on += w }
+            }
+            if count >= Self.cutMinOnsets, all > 0, on / all >= Self.cutShare { crossCutUntil = item + Self.holdSeconds }
+            cutTest = nil
+        }
+        crossCut = item < crossCutUntil ? 1 : 0
+        if audioPresent, activity <= 0, rhythmConfidence.isFinite, rhythmConfidence >= Self.stillConfidence {
+            still = min(1, still + step / Self.rampSeconds)
+            stillSeen = item
+        } else if item - stillSeen > Self.holdSeconds || item < stillSeen {
+            still = max(0, still - step / Self.rampSeconds)
+        }
+        grid = g?.value ?? 0
+        harmonic = harmonicity.isFinite ? min(1, max(0, harmonicity)) : 0
+        steepness = s.isFinite ? min(1, max(0, s)) : 0
+        if !audioPresent {
+            grid = 0
+            harmonic = 0
+        }
+        let linear = Self.crossCutWeight * crossCut + Self.stillWeight * still + Self.gridWeight * grid
+            + Self.harmonicWeight * harmonic
+        pMusic = min(1, max(linear, Self.crossCutFloor * crossCut, Self.stillFloor * still))
+        pVoice = harmonic * (1 - steepness)
+    }
+}
+
+/// av-fusion F1：声画耦合度 C（主线程每个完整拍一次）。
+/// C_raw = A_f × A_R × A_n × (1 − P_music) × (1 − P_voice)：
+/// A_f = clamp(1 − |ln(f_a / f_v)| / ln 1.15)（f_a = 最近 4 秒撞击间隔中位数换成的频率 × 倍速，f_v = 相位锁频率）；
+/// A_R = clamp((R − 0.4) / 0.4)（R = 撞击时刻画面相位的集中度，相位锁锁着才有）；A_n = clamp((n − 2) / 3)（n = 最近 4 秒撞击次数）。
+/// C 按 τ = 1 秒 EMA；C ≥ 0.6 持续 2 秒进入「耦合」，C < 0.4 持续 1.5 秒退出；切镜考验期间挂起（不更新、不清）；seek / 换视频 / 开关时 reset
+struct AVCouplingEstimator {
+    static let agreeRatio: Double = 0.15
+    static let minR: Double = 0.4
+    static let spanR: Double = 0.4
+    static let minImpacts: Double = 2
+    static let spanImpacts: Double = 3
+    static let windowSeconds: Double = 4
+    static let tau: Double = 1
+    static let enterLevel: Double = 0.6
+    static let enterSeconds: Double = 2
+    static let exitLevel: Double = 0.4
+    static let exitSeconds: Double = 1.5
+    static let minPhaseImpacts = 3
+
+    private(set) var c: Double = 0
+    private(set) var coupled = false
+    private var above: Double?
+    private var below: Double?
+
+    mutating func reset() {
+        self = AVCouplingEstimator()
+    }
+
+    static func clamp01(_ x: Double) -> Double { x.isFinite ? min(1, max(0, x)) : 0 }
+
+    static func frequencyAgreement(audioHz fa: Double, visualHz fv: Double) -> Double {
+        guard fa.isFinite, fv.isFinite, fa > 0, fv > 0 else { return 0 }
+        return clamp01(1 - abs(log(fa / fv)) / log(1 + agreeRatio))
+    }
+
+    static func concentrationScore(_ r: Double) -> Double { clamp01((r - minR) / spanR) }
+
+    static func countScore(_ n: Int) -> Double { clamp01((Double(n) - minImpacts) / spanImpacts) }
+
+    /// 撞击间隔中位数 → 频率（视频时间上的 Hz；不够 3 次 / 间隔离谱 0）
+    static func impactHz(_ times: [Double]) -> Double {
+        guard times.count >= 3 else { return 0 }
+        var gaps: [Double] = []
+        for k in 1..<times.count {
+            let g = times[k] - times[k - 1]
+            if g.isFinite, g > 0.2, g < 3 { gaps.append(g) }
+        }
+        guard gaps.count >= 2 else { return 0 }
+        let s = gaps.sorted()
+        let m = s.count / 2
+        let med = s.count % 2 == 1 ? s[m] : 0.5 * (s[m - 1] + s[m])
+        return med > 0 ? 1 / med : 0
+    }
+
+    /// 撞击时刻（host 时间）的画面相位集中度（相位锁没锁 / 不够 3 次 NaN）
+    static func concentration(_ hostTimes: [Double], lock: RhythmPhaseLock) -> Double {
+        guard lock.locked else { return .nan }
+        var sx = 0.0
+        var sy = 0.0
+        var n = 0
+        for t in hostTimes {
+            guard let ph = lock.phase(at: t) else { continue }
+            sx += cos(ph)
+            sy += sin(ph)
+            n += 1
+        }
+        guard n >= minPhaseImpacts else { return .nan }
+        let r = (sx * sx + sy * sy).squareRoot() / Double(n)
+        return r.isFinite ? r : .nan
+    }
+
+    /// 这一拍：raw = C_raw；suspended（切镜考验）时什么都不改
+    mutating func step(raw: Double, dt: Double, suspended: Bool) {
+        guard !suspended else { return }
+        let step = dt.isFinite ? min(1, max(0, dt)) : AudioReactiveShaper.interval
+        let x = Self.clamp01(raw)
+        c += (1 - exp(-step / Self.tau)) * (x - c)
+        if !c.isFinite { c = 0 }
+        if coupled {
+            above = nil
+            if c < Self.exitLevel {
+                let held = (below ?? -step) + step
+                below = held
+                if held >= Self.exitSeconds - 1e-9 {
+                    coupled = false
+                    below = nil
+                }
+            } else {
+                below = nil
+            }
+        } else {
+            below = nil
+            if c >= Self.enterLevel {
+                let held = (above ?? -step) + step
+                above = held
+                if held >= Self.enterSeconds - 1e-9 {
+                    coupled = true
+                    above = nil
+                }
+            } else {
+                above = nil
+            }
+        }
+    }
+}
+
+/// av-fusion F1：一拍的融合结果（状态行 / 调试列用；F1 不进控制）
+struct AVFusionBeat: Equatable {
+    enum State: String {
+        case noAudio = "no_audio"
+        case noTime = "no_time"
+        case cutTest = "cut_test"
+        case coupled
+        case music
+        case voice
+        case noLock = "no_lock"
+        case uncoupled
+    }
+
+    var state: State = .noAudio
+    var c: Double = 0
+    var raw: Double = 0
+    var coupled = false
+    var af: Double = 0
+    var ar: Double = 0
+    var an: Double = 0
+    var r: Double = .nan
+    var impacts = 0
+    var fa: Double = 0
+    var fv: Double = 0
+    var pMusic: Double = 0
+    var pVoice: Double = 0
+    var crossCut: Double = 0
+    var still: Double = 0
+    var grid: Double = 0
+    var harmonicity: Double = 0
+    var steepness: Double = 0
+    var flatness: Double = .nan
+    var percussive: Double = .nan
+    var rhythmConfidence: Double = 0
+
+    static let musicLevel: Double = 0.5
+    static let voiceLevel: Double = 0.5
+
+    var statusText: String {
+        switch state {
+        case .noAudio:
+            return "声画：没声音（只看画面）"
+        case .noTime:
+            return "声画：时间不可用（拿不到这段声音的视频时间，只看画面）"
+        case .cutTest:
+            return "声画：切镜了，看节拍是否连续（耦合度先挂起）"
+        case .coupled:
+            return String(format: "声画：耦合（C %.2f，撞击 %d 下 / 4 秒，集中度 %.2f）", c, impacts, r.isFinite ? r : 0)
+        case .music:
+            return String(format: "声画：像配乐（%.2f），不耦合（C %.2f）", pMusic, c)
+        case .voice:
+            return String(format: "声画：像人声（%.2f），不耦合（C %.2f）", pVoice, c)
+        case .noLock:
+            return "声画：不耦合（画面相位还没锁上；要开「伸缩跟随频率」和「相位脉动」）"
+        case .uncoupled:
+            let reason: String
+            if an <= 0 {
+                reason = "撞击太少"
+            } else if af <= ar {
+                reason = "频率对不上"
+            } else {
+                reason = "相位散"
+            }
+            return String(format: "声画：不耦合（C %.2f，%@）", c, reason)
+        }
+    }
+}
+
+/// av-fusion F1：融合的主线程部分（每个完整拍一次；只读，不改任何交给出口的值）。
+/// 声音在场 = 音轨 tap 就绪 + 特征帧在流（最近 1 秒内有）+ 最近 1 秒有不静的帧；时间不可用 = 这一拍没有特征帧、却有时间范围拿不到的回调
+struct AVFusionEngine {
+    static let presenceSeconds: Double = 1
+    static let gridEvery: Double = 1
+
+    private(set) var extractor = AudioFeatureExtractor()
+    /// P3 的三频带块 → 撞击检测（只给「画面不动时仍有节奏」用；和撞击声校正那份互不影响）
+    private var onsetDetector = AudioOnsetDetector()
+    private(set) var scene = AudioSceneEvidence()
+    private(set) var coupling = AVCouplingEstimator()
+    private(set) var grid: AudioBeatGrid?
+    private var gridAt = -Double.infinity
+    private var framesThisBeat = 0
+    private var invalidThisBeat = 0
+    private var timeInvalid = false
+
+    mutating func reset() {
+        self = AVFusionEngine()
+    }
+
+    mutating func addBands(_ frames: [AudioBandFrame]) {
+        for f in frames { onsetDetector.add(f) }
+    }
+
+    mutating func addFeatures(_ d: AudioFeatureDrain) {
+        for f in d.frames { extractor.add(f) }
+        extractor.addPCM(d.pcm, rate: d.pcmRate)
+        framesThisBeat += d.frames.count
+        invalidThisBeat += d.invalidChunks
+    }
+
+    /// clock：这一拍读到的播放器时钟；lock：画面相位锁（P2，只读）；activity：画面在不在往复（RhythmOutput.motionActivity）；
+    /// cut：这一拍的画面窗口有切镜；audioReady：音轨 tap 就绪
+    mutating func beat(clock: MediaClockSnapshot, lock: RhythmPhaseLock, activity: Double, cut: Bool, audioReady: Bool,
+                       dt: Double) -> AVFusionBeat {
+        if framesThisBeat > 0 {
+            timeInvalid = false
+        } else if invalidThisBeat > 0 {
+            timeInvalid = true
+        }
+        framesThisBeat = 0
+        invalidThisBeat = 0
+        var out = AVFusionBeat()
+        let item = clock.item
+        guard clock.isValid else {
+            out.state = timeInvalid ? .noTime : .noAudio
+            out.c = coupling.c
+            out.coupled = coupling.coupled
+            return out
+        }
+        let rate = clock.rate
+        let ex = extractor
+        let present = audioReady && !timeInvalid && ex.lastFrameTime.isFinite
+            && ex.lastFrameTime >= item - Self.presenceSeconds * rate - 0.5
+            && ex.lastLoudTime.isFinite && ex.lastLoudTime >= ex.lastFrameTime - Self.presenceSeconds
+        if item - gridAt >= Self.gridEvery || item < gridAt {
+            gridAt = item
+            let end = ex.lastFrameTime.isFinite ? ex.lastFrameTime : item
+            let start = max(end - AudioBeatGrid.windowSeconds, ex.firstFrameTime.isFinite ? ex.firstFrameTime : end)
+            grid = AudioBeatGrid.estimate(ex.events, start: start, end: end)
+        }
+        let window = AVCouplingEstimator.windowSeconds * rate
+        let from = item - window
+        let to = item + 0.2 * rate
+        let hits = ex.impacts(from: from, to: to)
+        let rhythm = onsetDetector.rhythm()
+        let steep = ex.steepness(from: from, to: to)
+        let harmonicity = ex.harmonicity
+        scene.step(item: item, cut: cut, grid: grid, onsets: ex.events, activity: activity,
+                   rhythmConfidence: rhythm.confidence, harmonicity: harmonicity, steepness: steep, audioPresent: present, dt: dt)
+        let fa = AVCouplingEstimator.impactHz(hits) * rate
+        let fv = lock.locked && lock.hz > 0 ? lock.hz : 0
+        let r = AVCouplingEstimator.concentration(hits.map { clock.host(forItem: $0) }, lock: lock)
+        out.impacts = hits.count
+        out.fa = fa
+        out.fv = fv
+        out.r = r
+        out.af = AVCouplingEstimator.frequencyAgreement(audioHz: fa, visualHz: fv)
+        out.ar = r.isFinite ? AVCouplingEstimator.concentrationScore(r) : 0
+        out.an = AVCouplingEstimator.countScore(hits.count)
+        out.pMusic = scene.pMusic
+        out.pVoice = scene.pVoice
+        var raw = out.af * out.ar * out.an * (1 - scene.pMusic) * (1 - scene.pVoice)
+        if !present { raw = 0 }
+        out.raw = AVCouplingEstimator.clamp01(raw)
+        coupling.step(raw: out.raw, dt: dt, suspended: scene.cutTesting)
+        out.c = coupling.c
+        out.coupled = coupling.coupled
+        out.crossCut = scene.crossCut
+        out.still = scene.still
+        out.grid = scene.grid
+        out.harmonicity = harmonicity
+        out.steepness = steep
+        out.flatness = ex.flatness
+        out.percussive = ex.percussive
+        out.rhythmConfidence = rhythm.confidence
+        if timeInvalid {
+            out.state = .noTime
+        } else if !present {
+            out.state = .noAudio
+        } else if scene.cutTesting {
+            out.state = .cutTest
+        } else if coupling.coupled {
+            out.state = .coupled
+        } else if scene.pMusic >= AVFusionBeat.musicLevel {
+            out.state = .music
+        } else if scene.pVoice >= AVFusionBeat.voiceLevel {
+            out.state = .voice
+        } else if !lock.locked {
+            out.state = .noLock
+        } else {
+            out.state = .uncoupled
+        }
+        return out
+    }
+}
+
+extension AVDebugColumns {
+    /// av-fusion F1：融合开着时每拍的耦合度 / 证据（关着时整组空）
+    static let f1Header = "av_state,av_c,av_c_raw,av_coupled,av_af,av_ar,av_an,av_r,av_impacts,av_fa,av_fv,"
+        + "av_p_music,av_p_voice,av_cross_cut,av_still,av_grid,av_harmonicity,av_steepness,av_flatness,av_percussive,"
+        + "av_rhythm_conf"
+
+    static func f1Fields(_ b: AVFusionBeat) -> [String] {
+        [b.state.rawValue, field(b.c, digits: 3), field(b.raw, digits: 3), b.coupled ? "1" : "0", field(b.af, digits: 3),
+         field(b.ar, digits: 3), field(b.an, digits: 3), field(b.r, digits: 3), String(b.impacts), field(b.fa, digits: 3),
+         field(b.fv, digits: 3), field(b.pMusic, digits: 3), field(b.pVoice, digits: 3), field(b.crossCut, digits: 2),
+         field(b.still, digits: 2), field(b.grid, digits: 3), field(b.harmonicity, digits: 3), field(b.steepness, digits: 3),
+         field(b.flatness, digits: 3), field(b.percussive, digits: 3), field(b.rhythmConfidence, digits: 3)]
+    }
+
+    static var f1Empty: [String] {
+        [String](repeating: "", count: f1Header.split(separator: ",", omittingEmptySubsequences: false).count)
     }
 }
