@@ -266,7 +266,13 @@ func vsWindow(_ mean: Double, _ peak: Double? = nil) -> MotionWindow {
 
 /// 归一化 + 平滑一拍（0.3 秒），返回乘过热身置信度的 0~100
 struct VSChain {
-    var normalizer = MotionNormalizer()
+    /// gentleAllowed = false：同 VideoSyncPlayer 在没有正面依据（轻抚 / 节奏只来自摸着自己的手）时的设法。
+    /// 只在 actionTuned 时看；要测「有正面依据」的场景自己设 true
+    var normalizer: MotionNormalizer = {
+        var n = MotionNormalizer()
+        n.gentleAllowed = false
+        return n
+    }()
     var shaper = MotionShaper()
 
     mutating func step(_ w: MotionWindow, auto: Bool = true, gainDb: Double = 0) -> Double {
@@ -1366,8 +1372,12 @@ func vs3Analyze(_ scene: VS3Scene, seconds: Double = 14) -> VS3Analysis {
 }
 
 /// 窗口 → 归一化 → 平滑 → 出口（上限 cap）：后一半的平均值、全程最大值、单拍最大升幅
-func vs3Output(_ windows: [MotionWindow], cap: Double = 100, auto: Bool = true) -> (mean: Double, max: Int, rise: Int) {
+func vs3Output(_ windows: [MotionWindow], cap: Double = 100, auto: Bool = true,
+               tuned: Bool = false) -> (mean: Double, max: Int, rise: Int) {
     var chain = VSChain()
+    // tuned：归一化也按动作调优。gentleAllowed 是 VSChain 的 false（没有轻抚的正面依据，同真机）：
+    // 压低只来自 MotionNormalizer.unrhythmic（画面完全没节奏）
+    chain.normalizer.actionTuned = tuned
     var stage = SyncOutputStage()
     let settings = AudioSyncSettings(maxPercent: cap)
     var outs: [Int] = []
@@ -4658,6 +4668,1257 @@ do {
            "P3 姿态上下文：髋 / 头 / 腕位置 + 节奏（髋 \(String(format: "%.2f", bc.hips.follow.hz)) Hz）、另一个人的髋 / 头；"
            + "关着时是空的，姿态读数和关着逐位相同")
 }
+
+// MARK: - rhythm-action tune：动作识别调优（真机反馈：慢慢摸胸口 → 强；臀部对着镜头不动 → 强）
+
+/// 92681ea 的 PoseBlend 原样拷贝（常量写死）：调优关着时 PoseBlend / MotionNormalizer 必须和它逐位相同
+struct BasePoseBlend92 {
+    private(set) var weight: Double = 0
+    private(set) var heldScore: Double = 0
+    private var heldConfidence: Double = 0
+    private var heldTrust: Double = 1
+    private var presentRun: TimeInterval = 0
+    private var absentRun: TimeInterval = .infinity
+
+    mutating func reset() { self = BasePoseBlend92() }
+
+    mutating func step(_ w: MotionWindow, flow: Double, dt: TimeInterval) -> Double {
+        let flow = MotionStats.clamp01(flow)
+        if w.posePresentFrames > 0, w.poseScore.isFinite {
+            presentRun += dt
+            absentRun = 0
+            heldScore = MotionStats.clamp01(w.poseScore)
+            heldConfidence = MotionStats.clamp01(w.poseConfidence)
+            heldTrust = w.poseTrust.isFinite ? MotionStats.clamp01(w.poseTrust) : 0
+        } else {
+            if w.cutCount > 0 { absentRun = max(absentRun, 0.9) }
+            absentRun += dt
+            if absentRun > 0.9 { presentRun = 0 }
+        }
+        let trustFactor = 0.5 + (1 - 0.5) * heldTrust
+        let confFactor = (0.5 + 0.5 * MotionStats.clamp01((heldConfidence - 0.3) / 0.3)) * trustFactor
+        let target = presentRun >= 0.55 && absentRun <= 0.9 ? 0.8 * confFactor : 0
+        let rate = 0.8 / (target > weight ? 1.0 : 1.5)
+        if target > weight {
+            weight = min(target, weight + rate * dt)
+        } else {
+            weight = max(target, weight - rate * dt)
+        }
+        if !weight.isFinite { weight = 0 }
+        let blended = weight * heldScore + (1 - weight) * flow
+        return MotionStats.clamp01(max(blended, flow * (1 - 0.4 * weight)))
+    }
+}
+
+/// 92681ea 的 MotionNormalizer 原样拷贝（常量写死）
+struct BaseMotionNormalizer92 {
+    private(set) var refHigh: Double = log(4.0)
+    private(set) var refLow: Double = log(1.8)
+    private(set) var warmElapsed: TimeInterval = 0
+    private(set) var scoreHigh: Double = 0.7
+    private(set) var scoreLow: Double = 0.08
+    private(set) var pose = BasePoseBlend92()
+    private var idleRun: TimeInterval = 0
+
+    var confidence: Double { min(1, max(0, warmElapsed / 3)) }
+
+    mutating func resetAdaptation() { self = BaseMotionNormalizer92() }
+
+    mutating func step(_ w: MotionWindow, gainDb: Double, auto: Bool, dt: TimeInterval) -> Double {
+        let step = dt.isFinite ? min(1, max(0.01, dt)) : 0.3
+        guard w.frames > 0 else {
+            idleRun += step
+            if idleRun > 0.9 { pose.reset() }
+            return 0
+        }
+        idleRun = 0
+        warmElapsed = min(3, warmElapsed + step)
+        let e = w.representative
+        let near = w.nearField.isFinite ? min(1, max(0, w.nearField)) : 0
+        let gated = e.isFinite && e >= 0.5
+        let l = gated ? log(1 + e) : 0
+        if gated, w.settled, near < 0.5, l.isFinite {
+            let highTau = l > refHigh ? 2.0 : 25.0
+            refHigh += (l - refHigh) * (1 - exp(-step / highTau))
+            refHigh = max(log(3.5), refHigh)
+            let lowTau = l < refLow ? 1.5 : 20.0
+            refLow += (l - refLow) * (1 - exp(-step / lowTau))
+            if !refHigh.isFinite || !refLow.isFinite { resetAdaptation() }
+        }
+        if w.subjectFrames > 0 {
+            let flow = MotionStats.clamp01(w.subjectScore)
+            var s = pose.step(w, flow: flow, dt: step)
+            if near > 0 { s -= near * max(0, s - 0.3) }
+            s = MotionStats.clamp01(s)
+            if w.settled, near < 0.5 {
+                let highTau = s > scoreHigh ? 2.0 : 25.0
+                scoreHigh += (s - scoreHigh) * (1 - exp(-step / highTau))
+                let lowTau = s < scoreLow ? 1.5 : 20.0
+                scoreLow += (s - scoreLow) * (1 - exp(-step / lowTau))
+                if !scoreHigh.isFinite || !scoreLow.isFinite {
+                    scoreHigh = 0.7
+                    scoreLow = 0.08
+                }
+            }
+            var ratio = s
+            if auto {
+                let base = min(max(0, scoreLow), 0.08)
+                ratio = max(0, (s - base) / (1 - base))
+                let stretch = min(1.25, max(1, 0.7 / max(scoreHigh, 0.05)))
+                ratio *= stretch
+            }
+            let clampedGain = gainDb.isFinite ? min(12, max(-6, gainDb)) : 0
+            let out = ratio * pow(10, clampedGain / 20) * 100
+            return out.isFinite ? min(100, max(0, out)) : 0
+        }
+        guard gated else { return 0 }
+        let fixedRatio = min(1.15, (l - log(1.8)) / (log(13.0) - log(1.8)))
+        var ratio = fixedRatio
+        if auto {
+            let hi = refHigh
+            let lo = min(refLow, hi - 0.8)
+            let span = max(0.8, hi - lo)
+            let adaptive = min(1, (l - lo) / span)
+            ratio = 0.5 * adaptive + 0.5 * fixedRatio
+        }
+        if near > 0 {
+            let floorRatio = 0.6 * max(0, fixedRatio)
+            ratio -= near * max(0, ratio - floorRatio)
+        }
+        let clampedGain = gainDb.isFinite ? min(12, max(-6, gainDb)) : 0
+        let out = ratio * pow(10, clampedGain / 20) * 75
+        return out.isFinite ? min(100, max(0, out)) : 0
+    }
+}
+
+/// 随机窗口（含姿态 / 近场 / 切镜 / 坏值），给逐位比对用
+func atRandomWindow() -> MotionWindow {
+    var w = MotionWindow()
+    let r = vsRandom()
+    w.frames = r < 0.05 ? 0 : 1 + Int(vsRandom() * 5)
+    w.meanEnergy = vsRandom() < 0.03 ? Double.nan : vsRandom() * 12
+    w.peakEnergy = w.meanEnergy + vsRandom() * 4
+    w.cutCount = vsRandom() < 0.05 ? 1 : 0
+    w.heldCount = vsRandom() < 0.05 ? 1 : 0
+    w.nearField = vsRandom() < 0.2 ? vsRandom() : 0
+    if vsRandom() < 0.85 {
+        w.subjectFrames = max(1, w.frames)
+        w.subjectScore = vsRandom() < 0.02 ? Double.nan : vsRandom()
+    }
+    if vsRandom() < 0.6 {
+        w.poseFrames = 3
+        w.posePresentFrames = vsRandom() < 0.8 ? 3 : 0
+        w.poseScore = vsRandom()
+        w.poseConfidence = vsRandom()
+        w.poseTrust = vsRandom() < 0.5 ? 1 : vsRandom()
+    }
+    return w
+}
+
+do {
+    // 开关关着 = 92681ea：调优关着的 MotionNormalizer（含 PoseBlend）和原样拷贝逐位相同（随机窗口 / 设置 / 换视频）
+    var same = true
+    var steps = 0
+    for _ in 0..<60 {
+        var a = MotionNormalizer()
+        var b = BaseMotionNormalizer92()
+        for _ in 0..<120 {
+            if vsRandom() < 0.01 {
+                a.resetAdaptation()
+                b.resetAdaptation()
+            }
+            let w = atRandomWindow()
+            let gain = vsRandom() < 0.05 ? Double.infinity : vsRandom() * 18 - 6
+            let auto = vsRandom() < 0.8
+            let dt = vsRandom() < 0.03 ? Double.nan : 0.05 + vsRandom() * 0.6
+            let x = a.step(w, gainDb: gain, auto: auto, dt: dt)
+            let y = b.step(w, gainDb: gain, auto: auto, dt: dt)
+            same = same && (x == y || (x.isNaN && y.isNaN)) && a.confidence == b.confidence
+            steps += 1
+        }
+    }
+    let d = MotionNormalizer()
+    var p = PoseMotionTracker()
+    let an = MotionAnalyzer()
+    var est = BlockMotionEstimator()
+    est.cameraFit = true
+    p.contextEnabled = true
+    vcheck(same && !d.actionTuned && !p.actionTuned && !an.actionTuned && !an.periodicity.stabilityGuard
+           && !est.noiseGuard && !RoiFlowTracker().noiseGuard && ActionContext().intensityCeiling == nil
+           && !ActionContext().suppressesRhythm,
+           "动作调优关着 = 92681ea：MotionNormalizer / PoseBlend 和原样拷贝逐位相同（\(steps) 步随机），所有调优开关默认关")
+}
+
+do {
+    // gentle：单调、不升、≥ 0.55 不变；固定点
+    var mono = true
+    var prev = -1.0
+    for i in 0...100 {
+        let s = Double(i) / 100
+        let g = MotionNormalizer.gentle(s)
+        mono = mono && g >= prev - 1e-12 && g <= s + 1e-12
+        prev = g
+    }
+    vcheck(mono && abs(MotionNormalizer.gentle(0.2) - 0.07) < 1e-9 && abs(MotionNormalizer.gentle(0.6) - 0.6) < 1e-9
+           && MotionNormalizer.gentle(.nan) == 0 && abs(MotionNormalizer.gentle(0.4) - 0.4 * (0.35 + 0.65 * 0.2 / 0.35)) < 1e-9,
+           "动作调优：慢 / 轻动作的绝对压低单调、只降不升（0.2 → 0.07、0.4 → 0.29、≥ 0.55 不变）")
+
+    // 轻动作（主体分数一直 0.3）：以前自动适应会放大到 ≥ 24；调优后 ≈ 9（≤ 12）。强动作（0.85）开 / 关完全一样
+    func run(_ score: Double, tuned: Bool) -> [Double] {
+        var c = VSChain()
+        c.normalizer.actionTuned = tuned
+        var out: [Double] = []
+        for _ in 0..<60 {
+            var w = MotionWindow(meanEnergy: 2, peakEnergy: 2, frames: 5, cutCount: 0, heldCount: 0)
+            w.subjectFrames = 5
+            w.subjectScore = score
+            out.append(c.step(w))
+        }
+        return out
+    }
+    let lightOld = vs3Late(run(0.3, tuned: false))
+    let lightNew = vs3Late(run(0.3, tuned: true))
+    let strongOld = run(0.85, tuned: false)
+    let strongNew = run(0.85, tuned: true)
+    vcheck(lightOld >= 20 && lightNew <= 12 && strongOld == strongNew && vs3Late(strongNew) >= 80,
+           "动作调优：轻动作不再被自动适应放大（关 \(Int(lightOld)) → 开 \(Int(lightNew))），强动作开 / 关逐位相同（\(Int(vs3Late(strongNew)))）")
+}
+
+/// 臀部特写：Vision 只认到髋 / 膝 4 个点（没有躯干 / 肩宽可量），置信度 0.5
+func atPartialHips(confidence: Double = 0.5) -> PoseCandidate {
+    var p = PoseCandidate()
+    p.confidence = confidence
+    p.set(.leftHip, x: 24, y: 18, confidence: confidence)
+    p.set(.rightHip, x: 40, y: 18, confidence: confidence)
+    p.set(.leftKnee, x: 22, y: 30, confidence: confidence)
+    p.set(.rightKnee, x: 42, y: 30, confidence: confidence)
+    return p
+}
+
+/// 同 vs3PoseRun，但 tracker / 归一化按 tuned 打开动作调优
+func atPoseRun(tuned: Bool, flow: Double, seconds: Double = 14, pose: (Int, Double) -> PoseCandidate?) -> VS3PoseRun {
+    var tracker = PoseMotionTracker()
+    tracker.actionTuned = tuned
+    tracker.contextEnabled = tuned
+    var acc = MotionWindowAccumulator()
+    var chain = VSChain()
+    chain.normalizer.actionTuned = tuned
+    var r = VS3PoseRun()
+    var i = 0
+    for k in 0..<Int(seconds * 15) {
+        let t = Double(k) * vsDt
+        acc.add(MotionSample(time: t, energy: 1, coverage: 0.2, isCut: false, isHeld: false,
+                             subject: SubjectReading(valid: true, score: flow)))
+        if k % 5 == 0 || k % 5 == 2 || k % 5 == 4 {
+            let found = pose(i, t).map { [$0] } ?? []
+            let reading = tracker.update(time: t, candidates: found, camera: .identity, continuous: true, frameHeight: 36)
+            r.readings.append(reading)
+            acc.addPose(reading)
+            i += 1
+        }
+        if k % 5 == 4 {
+            let v = chain.step(acc.drain())
+            r.outs.append(v)
+            r.maxWeight = max(r.maxWeight, chain.normalizer.poseWeight)
+        }
+    }
+    return r
+}
+
+do {
+    // 尺度：部分骨架（只有髋 / 膝）以前按包围框 × 0.3 ≈ 7 像素，调优按髋宽 × 2 = 32 像素；完整的人不变
+    let partial = atPartialHips()
+    let old = PoseMotionTracker.bodyScale(partial, frameHeight: 36)
+    let tuned = PoseMotionTracker.tunedBodyScale(partial, frameHeight: 36)
+    let full = vs3Skeleton(hipX: 1.5)
+    let fullOld = PoseMotionTracker.bodyScale(full, frameHeight: 36)
+    let fullNew = PoseMotionTracker.tunedBodyScale(full, frameHeight: 36)
+    var chestOnly = PoseCandidate()
+    chestOnly.confidence = 0.6
+    chestOnly.set(.nose, x: 30, y: 4, confidence: 0.6)
+    chestOnly.set(.leftWrist, x: 28, y: 20, confidence: 0.6)
+    chestOnly.set(.rightWrist, x: 36, y: 22, confidence: 0.6)
+    chestOnly.set(.neck, x: 31, y: 9, confidence: 0.6)
+    let chest = PoseMotionTracker.tunedBodyScale(chestOnly, frameHeight: 36)
+    vcheck(abs(old - 0.3 * (400.0 + 144).squareRoot()) < 1e-9 && tuned.partial && abs(tuned.scale - 32) < 1e-9
+           && !fullNew.partial && fullNew.scale == fullOld && chest.partial && chest.scale >= 9 - 1e-9,
+           "动作调优：只认到髋 / 膝时尺度 \(String(format: "%.1f", old)) → \(String(format: "%.1f", tuned.scale)) 像素（髋宽 × 2），"
+           + "胸口特写至少 0.25 × 画面高；完整的人不变（\(String(format: "%.1f", fullNew.scale))）")
+
+    // 臀部对着镜头不动（真机 b）：Vision 关键点每次独立抖 σ = 0.6 像素，块运动分数 0。
+    // 以前：尺度太小 → 抖动读成很快 → 姿态分数高、输出 ≥ 10；调优：姿态分数 ≤ 0.12、输出 ≤ 3
+    let oldRun = atPoseRun(tuned: false, flow: 0) { i, _ in vs3Jittered(atPartialHips(), i: i, sigma: 0.6) }
+    let newRun = atPoseRun(tuned: true, flow: 0) { i, _ in vs3Jittered(atPartialHips(), i: i, sigma: 0.6) }
+    let oldScores = oldRun.readings.suffix(oldRun.readings.count / 2).filter { $0.present }.map { $0.score }
+    let oldScore = oldScores.isEmpty ? 0 : oldScores.reduce(0, +) / Double(oldScores.count)
+    let newScore = newRun.readings.map { $0.score }.max() ?? 99
+    let oldOut = vs3Late(oldRun.outs)
+    let newOut = newRun.outs.max() ?? 99
+    vcheck(oldScore >= 0.25 && oldOut >= 10 && newScore <= 0.12 && newOut <= 3,
+           "动作调优（真机 b）：臀部特写不动 + 关键点抖动：姿态分 \(String(format: "%.2f", oldScore)) → ≤ \(String(format: "%.2f", newScore))，"
+           + "输出 \(Int(oldOut)) → 最高 \(String(format: "%.1f", newOut))")
+
+    // 姿态分数再高也不能比画面本身高太多：块运动 0 + 姿态说 1.0（检测在抖）→ 调优输出 0；块运动 0.6 时姿态照常起作用
+    var on = MotionWindow(meanEnergy: 1, peakEnergy: 1, frames: 5, cutCount: 0, heldCount: 0)
+    on.subjectFrames = 5
+    on.subjectScore = 0
+    on.poseFrames = 3
+    on.posePresentFrames = 3
+    on.poseScore = 1
+    on.poseConfidence = 0.9
+    var blendOld = PoseBlend()
+    var blendNew = PoseBlend()
+    var blendBusy = PoseBlend()
+    var busy = on
+    busy.subjectScore = 0.6
+    var o = 0.0, n = 0.0, b = 0.0
+    for _ in 0..<12 {
+        o = blendOld.step(on, flow: 0, dt: 0.3)
+        n = blendNew.step(on, flow: 0, dt: 0.3, tuned: true)
+        b = blendBusy.step(busy, flow: 0.6, dt: 0.3, tuned: true)
+    }
+    vcheck(o >= 0.75 && n <= 0.1 + 1e-9 && b >= 0.9,
+           "动作调优：姿态不能比画面本身的运动高太多（块运动 0：\(String(format: "%.2f", o)) → \(String(format: "%.2f", n))；块运动 0.6 时 \(String(format: "%.2f", b))）")
+
+    // 完整的人：调优开着时姿态读数和关着逐位相同（尺度不变、死区不变）
+    var a = PoseMotionTracker()
+    var t = PoseMotionTracker()
+    t.actionTuned = true
+    var poseSame = true
+    for i in 0..<90 {
+        let time = Double(i) / 9
+        let c = [vs3Jittered(vs3Skeleton(hipX: vs3HipWave(time)), i: i, sigma: 0.15)]
+        poseSame = poseSame && a.update(time: time, candidates: c, camera: .identity, continuous: true, frameHeight: 36)
+            == t.update(time: time, candidates: c, camera: .identity, continuous: true, frameHeight: 36)
+    }
+    vcheck(poseSame, "动作调优：完整的人（躯干 / 肩宽都在）姿态读数和关着逐位相同")
+}
+
+do {
+    // 块运动噪声防护（真机 b：大片皮肤 + 光线闪烁）：上一帧平的 100，这一帧叠一个低对比的周期纹理（±6，周期 8 像素）：
+    // 每块零位移帧差方差 12.5~14.5 > 9、纹理 rms ≈ 2.1 → 以前按法向流 ≈ 0.88 像素 / 帧，48 块全「在动」；
+    // 调优：纹理 rms < 4 的块不给法向流 → 速度 0
+    let pattern: [Int] = [-6, -3, 0, 3, 6, 3, 0, -3]
+    let flat = [UInt8](repeating: 100, count: 64 * 36)
+    var flicker = flat
+    for y in 0..<36 {
+        for x in 0..<64 { flicker[y * 64 + x] = UInt8(100 + pattern[x % 8]) }
+    }
+    func run(_ guardOn: Bool) -> BlockMotionResult {
+        var e = BlockMotionEstimator()
+        e.noiseGuard = guardOn
+        return flicker.withUnsafeBufferPointer { cur in
+            flat.withUnsafeBufferPointer { prev in e.estimate(cur: cur, prev: prev, width: 64, height: 36, gap: vsDt) }
+        }
+    }
+    let old = run(false)
+    let new = run(true)
+    vcheck(old.movingBlocks >= 30 && old.speed >= 0.75 && new.movingBlocks == 0 && new.speed == 0 && !new.cameraActive,
+           "动作调优（真机 b）：大片没纹理的皮肤上的闪烁不算运动（以前 \(old.movingBlocks) 块、\(String(format: "%.2f", old.speed)) 像素 / 帧 → "
+           + "\(new.movingBlocks) 块、\(String(format: "%.2f", new.speed))）")
+
+    // 有纹理的真实运动不受影响：20% 快速往复画面（algo-opt-3 的场景）调优开 / 关的输出差 ≤ 10 且仍 ≥ 70
+    var plain = MotionAnalyzer()
+    var tuned = MotionAnalyzer()
+    tuned.actionTuned = true
+    var accA = MotionWindowAccumulator()
+    var accB = MotionWindowAccumulator()
+    var wa: [MotionWindow] = []
+    var wb: [MotionWindow] = []
+    let scene = VS3Scene(rect: vs3Mid, hz: 2, peak: 4)
+    for k in 0..<Int(14 * 15) {
+        let f = scene.frame(k)
+        if let s = plain.analyze(f, time: Double(k) * vsDt) { accA.add(s) }
+        if let s = tuned.analyze(f, time: Double(k) * vsDt) { accB.add(s) }
+        if k % 5 == 4 {
+            wa.append(accA.drain())
+            wb.append(accB.drain())
+        }
+    }
+    let outA = vs3Output(wa)
+    // 开 = 分析器噪声防护 + 归一化调优（gentle / 姿态上界 / 放大门槛）整条链都开
+    let outB = vs3Output(wb, tuned: true)
+    vcheck(tuned.actionTuned && tuned.periodicity.stabilityGuard && abs(outA.mean - outB.mean) <= 10 && outB.mean >= 70,
+           "动作调优：有纹理的 20% 快速往复照样强（关 \(Int(outA.mean)) / 整条链开 \(Int(outB.mean))）")
+}
+
+/// 一拍的窗口：主体在 1.2 Hz 往复（块运动 0.45、姿态 0.4、腕的节奏 1.2 Hz）；上下文里一只手在胸口（32, 12）。
+/// chest = true：姿态给了胸口锚点和右手腕（调优后的 PoseMotionTracker 才给）；false：92681ea 的上下文（没有这几项）
+func atChestWindow(time: Double, chest: Bool, region: Bool = false, amplitude: Double = 0.08) -> MotionWindow {
+    var w = MotionWindow(meanEnergy: 2, peakEnergy: 3, frames: 5, cutCount: 0, heldCount: 0)
+    w.subjectFrames = 5
+    w.subjectScore = 0.45
+    w.subjectHz = 1.2
+    w.subjectFollowHz = 1.2
+    w.subjectFollowRhythm = 0.7
+    w.subjectFollowAmplitude = 3
+    w.poseFrames = 3
+    w.posePresentFrames = 3
+    w.poseScore = 0.4
+    w.poseConfidence = 0.8
+    w.poseRhythmHz = 1.2
+    w.poseRhythmConfidence = 0.8
+    w.poseRhythmPart = 3
+    w.poseRhythmRate = 9
+    var c = PoseContext()
+    c.valid = true
+    c.time = time - 0.05
+    c.frameWidth = 64
+    c.frameHeight = 36
+    var rh = PartRhythm()
+    // 轻抚：手小幅地摸（默认 0.08 躯干）；amplitude ≥ 0.12 的同一个窗口就是在胸口前规则地撸（H1 反例）
+    rh.follow = StrokeRhythm.FollowEstimate(hz: 1.2, confidence: 0.8, amplitude: amplitude, sampleRate: 9)
+    c.hand = PartReading(present: true, time: c.time, x: 32, y: 12, size: 6, confidence: 0.8, rhythm: rh)
+    c.body.present = true
+    c.body.time = c.time
+    c.body.scale = 16
+    c.body.hasHip = true
+    c.body.hipX = 32
+    c.body.hipY = 20
+    c.body.hasHead = true
+    c.body.headX = 32
+    c.body.headY = 4
+    c.body.hasWrist = true
+    c.body.wristX = 33
+    c.body.wristY = 12
+    c.body.wrists = rh
+    if chest {
+        c.body.hasChest = true
+        c.body.chestX = 32
+        c.body.chestY = 9
+        c.body.hasRightWrist = true
+        c.body.rightWristX = 33
+        c.body.rightWristY = 12
+        c.body.rightWristRhythm = rh.follow
+    }
+    w.context = c
+    if region {
+        // 周期区域就在摸胸口的那只手上（真机里慢慢摸的那只手就是主要的周期区域）
+        w.roi.region = atRegion(x: 33, y: 12, time: time - 0.05)
+    }
+    return w
+}
+
+/// 分析帧（64 × 36）里以 (x, y) 为中心、半宽 halfW / 半高 halfH 像素的周期区域
+func atRegion(x: Double, y: Double, halfW: Double = 4, halfH: Double = 3, time: Double, hz: Double = 1.2) -> PeriodicityROI {
+    var g = PeriodicityROI()
+    g.valid = true
+    g.time = time
+    g.hz = hz
+    g.x0 = (x - halfW) / 64
+    g.x1 = (x + halfW) / 64
+    g.y0 = (y - halfH) / 36
+    g.y1 = (y + halfH) / 36
+    g.blocks = 1
+    g.share = 0.6
+    return g
+}
+
+struct ATRun {
+    var values: [Double] = []
+    var out: [[Int]] = []
+    var kinds: [ActionContext.Kind] = []
+    var locked: [Bool] = []
+}
+
+/// VideoSyncPlayer.motionTick 的画面 → 出口那一段（0.3 秒一拍、频率跟随开、未标定的档位表、联动开）：
+/// tuned = 动作调优；context = 跑 ActionContext.refine（动作识别开着）
+func atRun(beats: Int = 40, tuned: Bool, context: Bool, settings: AudioSyncSettings = AudioSyncSettings(maxPercent: 100),
+           window: (Double) -> MotionWindow) -> ATRun {
+    var normalizer = MotionNormalizer()
+    normalizer.actionTuned = tuned
+    var shaper = MotionShaper()
+    var ac = ActionContext()
+    var follower = RhythmFollower()
+    var stage = SyncOutputStage()
+    var r = ATRun()
+    for i in 0..<beats {
+        let now = 100 + Double(i) * 0.3
+        let w = window(now)
+        // 同 VideoSyncPlayer：gentle 只在轻抚 / 还没认出动作且没锁节奏时用（上一拍的判断）
+        normalizer.gentleAllowed = ac.allowsGentle(followerLocked: follower.locked)
+        var target = normalizer.step(w, gainDb: 0, auto: true, dt: 0.3)
+        if tuned, let ceiling = ac.intensityCeiling { target = min(target, ceiling) }
+        let shaped = shaper.step(target: target, dt: 0.3)
+        let value = normalizer.confidence * shaped.smoothed
+        let activity = RhythmOutput.motionActivity(level: shaped.level, smoothed: shaped.smoothed,
+                                                   confidence: normalizer.confidence, motionSignal: true)
+        let lockHz = ActionContext.lockedHz(locked: follower.locked, weight: follower.weight, hz: follower.hz)
+        let input = context ? ac.refine(w, now: now, followerHz: lockHz) : w
+        let suppress = tuned && ac.suppressesRhythm
+        follower.step(input, dt: 0.3, active: activity > 0 && !suppress)
+        let rate: Int? = follower.weight > 0 && follower.hz > 0 ? DeviceRateMap.uncalibrated.level(forHz: follower.hz) : nil
+        let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: true, rateLevel: rate,
+                                         weight: follower.weight, activity: suppress ? 0 : activity)
+        r.out.append(stage.step(levels: levels, settings: settings, now: now, timed: false))
+        r.values.append(value)
+        r.kinds.append(ac.kind)
+        r.locked.append(follower.locked)
+    }
+    return r
+}
+
+do {
+    // 真机 a：一只手慢慢在自己胸口摸（1.2 Hz 小幅，髋不动）。
+    // 92681ea + 动作识别：手在髋附近 → 认成撸动、跟手的 1.2 Hz，强度被自动适应放大 → 输出 ≥ 30；
+    // 调优：自己的手在自己躯干上 → 轻抚：不跟节奏（跟随器放开）、强度最多 20
+    let old = atRun(tuned: false, context: true) { atChestWindow(time: $0, chest: false) }
+    let new = atRun(tuned: true, context: true) { atChestWindow(time: $0, chest: true, region: true) }
+    let lateOld = old.out.suffix(15)
+    let lateNew = new.out.suffix(15)
+    let oldPeak = Double(lateOld.map { $0.max() ?? 0 }.reduce(0, +)) / 15
+    let oldThrust = Double(lateOld.map { $0[0] }.reduce(0, +)) / 15
+    let newMax = lateNew.map { $0.max() ?? 0 }.max() ?? 99
+    vcheck(old.kinds.last == .stroke && old.locked.last == true && oldPeak >= 30 && oldThrust >= 25,
+           "动作调优（真机 a 复现）：92681ea 把摸胸口认成撸动、锁 1.2 Hz（输出 \(Int(oldPeak))、伸缩 \(Int(oldThrust))）")
+    vcheck(new.kinds.last == .caress && new.locked.suffix(10).allSatisfy { !$0 } && newMax <= 20
+           && (new.values.suffix(15).max() ?? 99) <= 20 + 0.01,  // 平滑从前三拍的高值指数回落，尾巴上 ~0.0006 的残差；出口值已 ≤ 20
+           "动作调优（真机 a）：摸自己胸口认成轻抚，不跟节奏、输出 ≤ 20（最高 \(newMax)；kind \(String(describing: new.kinds.last))；locked \(new.locked.suffix(10))；value \(new.values.suffix(15).max() ?? -1)；kinds \(new.kinds.map { $0.rawValue })）")
+    var ac = ActionContext()
+    var t = 10.0
+    while t < 12.5 {
+        _ = ac.refine(atChestWindow(time: t, chest: true, region: true), now: t)
+        t += 0.3
+    }
+    let refined = ac.refine(atChestWindow(time: t, chest: true, region: true), now: t)
+    vcheck(ac.kind == .caress && ac.suppressesRhythm && ac.intensityCeiling == ActionContext.caressCeiling
+           && refined.subjectFollowHz == 0 && refined.poseRhythmHz == 0 && !refined.subjectPhase.isValid
+           && !ac.directionKnown && ac.statusText().contains("轻抚"),
+           "动作调优：轻抚时交给跟随器 / 相位锁的副本没有节奏候选，状态行「\(ac.statusText())」")
+
+    // 自己的手放在胯（不是胸口 / 肚子）上：不算轻抚（照常按撸动的规则走）
+    var low = ActionContext()
+    t = 10
+    while t < 12.5 {
+        var w = atChestWindow(time: t, chest: true)
+        w.context.body.rightWristX = 32
+        w.context.body.rightWristY = 21
+        w.context.hand.x = 32
+        w.context.hand.y = 21
+        w.context.body.wristX = 32
+        w.context.body.wristY = 21
+        _ = low.refine(w, now: t)
+        t += 0.3
+    }
+    // 髋在同频往复（被插入时摸自己）：不算轻抚
+    var busy = ActionContext()
+    t = 10
+    while t < 12.5 {
+        var w = atChestWindow(time: t, chest: true, region: true)
+        w.context.body.hips.follow = StrokeRhythm.FollowEstimate(hz: 1.2, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
+        _ = busy.refine(w, now: t)
+        t += 0.3
+    }
+    vcheck(low.kind == .stroke && busy.kind != .caress && busy.evidence.caress == 0 && busy.intensityCeiling == nil,
+           "动作调优：手在胯上 → 撸动（\(low.kind)）；髋在同频往复时摸自己不算轻抚（\(busy.kind)）")
+}
+
+do {
+    // 只有一只手在动（没认到身体）不算撸动：以前直接认成撸动、把手的节奏塞给跟随器
+    var ac = ActionContext()
+    var out = MotionWindow()
+    var t = 10.0
+    while t < 13 {
+        var w = p3Window(time: t, hand: (1.5, 0.8, 0.3))
+        w.context.body = PoseBodyContext()
+        out = ac.refine(w, now: t)
+        t += 0.3
+    }
+    // 说话 / 点头的人：脸在自己头上和画面同频地动，没有别人的髋 → 不是口交
+    var talk = ActionContext()
+    var talkOut = MotionWindow()
+    t = 10
+    while t < 13 {
+        talkOut = talk.refine(p3Window(time: t, face: (1.5, 0.8, 0.3), faceAt: (32, 7)), now: t)
+        t += 0.3
+    }
+    // 同一张脸在另一个人的髋旁 → 口交照认
+    var oral = ActionContext()
+    t = 10
+    while t < 13 {
+        _ = oral.refine(p3Window(time: t, face: (1.5, 0.8, 0.3), faceAt: (32, 7), otherHip: (34, 12)), now: t)
+        t += 0.3
+    }
+    vcheck(ac.kind == .unknown && out.poseRhythmHz == 0 && talk.kind == .unknown && talkOut.poseRhythmPart == 0
+           && oral.kind == .oral,
+           "动作调优：没有对象的手（没认到身体）不算撸动、说话 / 点头不算口交（\(ac.kind) / \(talk.kind)）；脸在另一个人髋旁照认（\(oral.kind)）")
+}
+
+do {
+    // 另一个人的髋在往复（认到的这个人不动）：插入，跟另一个人的髋，往里 = 朝认到的这个人
+    var ac = ActionContext()
+    var out = MotionWindow()
+    var t = 10.0
+    while t < 13 {
+        var w = p3Window(time: t, otherHip: (32, 28))
+        var rh = PartRhythm()
+        rh.follow = StrokeRhythm.FollowEstimate(hz: 1.5, confidence: 0.8, amplitude: 0.3, sampleRate: 9)
+        w.context.body.otherHips = rh
+        out = ac.refine(w, now: t)
+        t += 0.3
+    }
+    vcheck(ac.kind == .insertion && ac.usesOtherHips && out.poseRhythmPart == 1 && abs(out.poseRhythmHz - 1.5) < 1e-9
+           && ac.statusText().contains("另一个人"),
+           "动作调优：另一个人的髋在往复时认成插入并跟他（\(ac.statusText())）")
+
+    // PoseMotionTracker：认到的人不动、另一个人髋 2 Hz 往复 → bodyContext.otherHips ≈ 2 Hz；胸口 / 两腕位置给出
+    var tracker = PoseMotionTracker()
+    tracker.contextEnabled = true
+    tracker.actionTuned = true
+    for i in 0..<90 {
+        let time = Double(i) / 9
+        let c = [vs3Skeleton(), vs3Skeleton(shiftX: 20, hipX: vs3HipWave(time), confidence: 0.6)]
+        _ = tracker.update(time: time, candidates: c, camera: .identity, continuous: true, frameHeight: 36)
+    }
+    let bc = tracker.bodyContext
+    vcheck(abs(bc.otherHips.follow.hz - 2) <= 0.2 && bc.hasChest && abs(bc.chestY - 11) < 1e-9 && bc.hasLeftWrist
+           && bc.hasRightWrist && abs(bc.rightWristX - 38) < 1e-9,
+           "动作调优：另一个人的髋也攒节奏（\(String(format: "%.2f", bc.otherHips.follow.hz)) Hz），给出胸口和两只手腕的位置")
+}
+
+do {
+    // 改判确认漏一拍不重新计时：撸动、撸动、（这拍没依据）、撸动 → 第 4 拍（0.9 秒）就改判；
+    // 连续缺 3 拍（> 0.6 秒）才重新计时
+    func kinds(_ missing: Set<Int>) -> [ActionContext.Kind] {
+        var ac = ActionContext()
+        var out: [ActionContext.Kind] = []
+        for i in 0..<12 {
+            let t = 10 + Double(i) * 0.3
+            let w = missing.contains(i) ? p3Window(time: t) : p3Window(time: t, hand: (1.5, 0.8, 0.3))
+            _ = ac.refine(w, now: t)
+            out.append(ac.kind)
+        }
+        return out
+    }
+    let one = kinds([2])
+    let three = kinds([2, 3, 4])
+    vcheck(one[2] == .unknown && one[3] == .stroke && three[7] == .unknown && three[8] == .stroke,
+           "动作调优：改判确认中漏一拍不重新计时（第 \(one.firstIndex(of: .stroke) ?? -1) 拍改判），连续缺 0.9 秒才重新计时（第 \(three.firstIndex(of: .stroke) ?? -1) 拍）")
+}
+
+do {
+    // 周期区域稳定性：一块 1.2 Hz 往复 → 调优要连续两次（≥ 0.3 秒）一致才给区域；
+    // 画面到处都有同频的抖动（6 块各 0.9 倍、和种子不相邻）→ 种子只占 ≈ 17% 的功率 → 调优不给区域（以前给）
+    func run(_ guardOn: Bool, extra: Bool) -> (roi: PeriodicityROI, first: Double, everValid: Bool) {
+        var map = PeriodicityMap()
+        map.stabilityGuard = guardOn
+        var first = -1.0
+        var ever = false
+        for k in 0..<90 {
+            let t = Double(k) * vsDt
+            var rx = [Double](repeating: 0, count: PeriodicityMap.blockCount)
+            let ry = [Double](repeating: 0, count: PeriodicityMap.blockCount)
+            rx[5] = sin(2 * Double.pi * 1.2 * t)
+            if extra {
+                for (j, b) in [0, 2, 16, 18, 32, 34].enumerated() {
+                    rx[b] = 0.9 * sin(2 * Double.pi * 1.2 * t + Double(j))
+                }
+            }
+            map.add(time: t, residualX: rx, residualY: ry, gap: vsDt)
+            let r = map.update(hz: 1.2, now: t)
+            if r.valid {
+                ever = true
+                if first < 0 { first = t }
+            }
+        }
+        return (map.roi, first, ever)
+    }
+    let a = run(false, extra: false)
+    let b = run(true, extra: false)
+    let c = run(false, extra: true)
+    let d = run(true, extra: true)
+    vcheck(a.roi.valid && b.roi.valid && b.roi.blocks == 1 && abs(b.roi.x0 - 5.0 / 8) < 1e-9 && b.first >= a.first + 0.29
+           && c.roi.valid && c.roi.share < 0.35 && !d.everValid,
+           "动作调优：周期区域连续两次一致才给（晚 \(String(format: "%.2f", b.first - a.first)) 秒）；"
+           + "到处都有同频抖动、种子只占 \(String(format: "%.0f", c.roi.share * 100))% 时不给区域")
+}
+
+// MARK: - rhythm-action tune 复审修正：轻抚不压掉真往复、gentle 只压轻抚 / 没认出的动作
+
+/// 两只手：右手平放在自己肚子上（不动），左手在胯上撸（1.5 Hz）。handOnRest = 手检测落在不动的那只手上
+func atTwoHandWindow(time: Double, handOnRest: Bool, region: Bool) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: true)
+    w.subjectHz = 1.5
+    w.subjectFollowHz = 1.5
+    w.poseRhythmHz = 1.5
+    var stroke = PartRhythm()
+    stroke.follow = StrokeRhythm.FollowEstimate(hz: 1.5, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
+    w.context.body.rightWristX = 33
+    w.context.body.rightWristY = 15
+    w.context.body.rightWristRhythm = StrokeRhythm.FollowEstimate()
+    w.context.body.hasLeftWrist = true
+    w.context.body.leftWristX = 31
+    w.context.body.leftWristY = 21
+    w.context.body.leftWristRhythm = stroke.follow
+    w.context.body.wristX = 32
+    w.context.body.wristY = 18
+    w.context.body.wrists = stroke
+    if handOnRest {
+        w.context.hand.x = 33
+        w.context.hand.y = 15
+        w.context.hand.rhythm = PartRhythm()
+    } else {
+        w.context.hand.x = 31
+        w.context.hand.y = 21
+        w.context.hand.rhythm = stroke
+    }
+    if region { w.roi.region = atRegion(x: 31, y: 21, time: time - 0.05, hz: 1.5) }
+    return w
+}
+
+/// 被口交的一方（认到的这个人）一只手放在自己肚子上；另一个人的脸在他胯上 1.5 Hz 往复
+func atPassiveOralWindow(time: Double, region: Bool) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: true)
+    w.subjectHz = 1.5
+    w.subjectFollowHz = 1.5
+    w.poseRhythmHz = 1.5
+    w.context.hand = PartReading()
+    w.context.body.wrists = PartRhythm()
+    w.context.body.rightWristX = 33
+    w.context.body.rightWristY = 15
+    w.context.body.rightWristRhythm = StrokeRhythm.FollowEstimate()
+    w.context.body.wristX = 33
+    w.context.body.wristY = 15
+    var bob = PartRhythm()
+    bob.follow = StrokeRhythm.FollowEstimate(hz: 1.5, confidence: 0.8, amplitude: 0.3, sampleRate: 9)
+    w.context.face = PartReading(present: true, time: w.context.time, x: 32, y: 22, size: 6, confidence: 0.8, rhythm: bob)
+    w.context.body.hasOtherHip = true
+    w.context.body.otherHipX = 32
+    w.context.body.otherHipY = 34
+    w.context.body.otherScale = 16
+    w.context.body.hasOtherHead = true
+    w.context.body.otherHeadX = 32
+    w.context.body.otherHeadY = 22
+    if region { w.roi.region = atRegion(x: 32, y: 22, time: time - 0.05, hz: 1.5) }
+    return w
+}
+
+func atSettle(_ make: (Double) -> MotionWindow, seconds: Double = 3) -> ActionContext {
+    var ac = ActionContext()
+    var t = 10.0
+    while t < 10 + seconds {
+        _ = ac.refine(make(t), now: t)
+        t += 0.3
+    }
+    return ac
+}
+
+do {
+    // 自己撸、另一只手放在肚子上：不能认成轻抚（以前固定 0.6 的轻抚依据压过撸动 → 强度最多 20、不跟节奏）
+    var ok = true
+    var notes: [String] = []
+    for handOnRest in [false, true] {
+        for region in [true, false] {
+            let ac = atSettle { atTwoHandWindow(time: $0, handOnRest: handOnRest, region: region) }
+            ok = ok && ac.kind == .stroke && ac.evidence.caress == 0 && ac.intensityCeiling == nil && !ac.suppressesRhythm
+            notes.append("\(ac.kind)")
+        }
+    }
+    vcheck(ok, "动作调优：自己撸、另一只手放在肚子上 → 撸动，不是轻抚（手检测在撸的手 / 放着的手 × 有 / 没区域：\(notes)）")
+
+    // 被口交的一方一只手放在自己肚子上：口交，不是轻抚（区域在脸那里，离髋比离那只手近）
+    var oralOK = true
+    var oralNotes: [String] = []
+    for region in [true, false] {
+        let ac = atSettle { atPassiveOralWindow(time: $0, region: region) }
+        oralOK = oralOK && ac.kind == .oral && ac.evidence.caress == 0 && ac.intensityCeiling == nil
+        oralNotes.append("\(ac.kind)")
+    }
+    vcheck(oralOK, "动作调优：被口交的一方手放在肚子上 → 口交，不是轻抚（有 / 没区域：\(oralNotes)）")
+
+    // 轻抚中出现往复的对手（另一只手开始撸）：这一拍就放开轻抚（上限 / 不跟节奏马上撤掉），0.9 秒后认成撸动
+    var ac = atSettle { atChestWindow(time: $0, chest: true, region: true) }
+    let wasCaress = ac.kind == .caress
+    var t = 13.0
+    _ = ac.refine(atTwoHandWindow(time: t, handOnRest: false, region: true), now: t)
+    let leftAtOnce = ac.kind != .caress && ac.intensityCeiling == nil && !ac.suppressesRhythm
+    while t < 14.2 {
+        t += 0.3
+        _ = ac.refine(atTwoHandWindow(time: t, handOnRest: false, region: true), now: t)
+    }
+    vcheck(wasCaress && leftAtOnce && ac.kind == .stroke,
+           "动作调优：轻抚中另一只手开始撸 → 当拍放开轻抚、随后认成撸动（\(ac.kind)）")
+
+    // 没有周期区域：摸胸口不算轻抚（区域必须在那只手旁）；整幅画面在大幅动 / 跟随器锁在别的频率上也不算
+    let noRegion = atSettle { atChestWindow(time: $0, chest: true, region: false) }
+    let vigorous = atSettle { t in
+        var w = atChestWindow(time: t, chest: true, region: true)
+        w.subjectScore = 0.8
+        return w
+    }
+    var lockedElse = ActionContext()
+    t = 10
+    while t < 13 {
+        _ = lockedElse.refine(atChestWindow(time: t, chest: true, region: true), now: t, followerHz: 2.0)
+        t += 0.3
+    }
+    vcheck(noRegion.kind != .caress && noRegion.allowsGentle(followerLocked: true)
+           && vigorous.kind != .caress && lockedElse.kind != .caress && !lockedElse.allowsGentle(followerLocked: true),
+           "动作调优：没有区域 / 画面大幅动 / 跟随器锁在别的频率时不认轻抚（\(noRegion.kind) / \(vigorous.kind) / \(lockedElse.kind)）；"
+           + "没区域时节奏只来自那只手，慢动作照样压低")
+
+    // 没区域时（认不成轻抚）慢慢摸胸口也不会被放大：跟随器锁上那只手的 1.2 Hz，gentle 照样压（比 92681ea 低）
+    let oldNoRegion = atRun(tuned: false, context: true) { atChestWindow(time: $0, chest: false) }
+    let newNoRegion = atRun(tuned: true, context: true) { atChestWindow(time: $0, chest: true, region: false) }
+    let oldMean = vs3Late(oldNoRegion.values)
+    let newMean = vs3Late(newNoRegion.values)
+    // M1：伸缩通道（out[0]）也不能被手的 1.2 Hz 节奏推上去：selfPaced 时跟随器不锁、伸缩跟强度走
+    let oldNRThrust = Double(oldNoRegion.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    let newNRThrust = Double(newNoRegion.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    let newNRPeak = newNoRegion.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 99
+    vcheck(newMean <= oldMean - 3 && newNRThrust <= oldNRThrust - 5 && newNoRegion.locked.suffix(10).allSatisfy { !$0 }
+           && Double(newNRPeak) <= newMean + 3,
+           "动作调优：没区域时摸胸口也按轻动作压低（92681ea \(Int(oldMean)) → \(Int(newMean))），伸缩不跟手的节奏"
+           + "（\(Int(oldNRThrust)) → \(Int(newNRThrust))，最高 \(newNRPeak)）")
+}
+
+/// 慢的真插入：髋 0.8 Hz 往复（置信度 0.8、幅度 0.15 躯干），主体分数 0.32（0.8 Hz、1.5 像素 / 帧、4 像素幅度的实际分数）
+func atSlowThrustWindow(time: Double) -> MotionWindow {
+    var w = MotionWindow(meanEnergy: 2, peakEnergy: 3, frames: 5, cutCount: 0, heldCount: 0)
+    w.subjectFrames = 5
+    w.subjectScore = 0.32
+    w.subjectHz = 0.8
+    w.subjectFollowHz = 0.8
+    w.subjectFollowRhythm = 0.8
+    w.subjectFollowAmplitude = 4
+    var c = PoseContext()
+    c.valid = true
+    c.time = time - 0.05
+    c.frameWidth = 64
+    c.frameHeight = 36
+    c.body.present = true
+    c.body.time = c.time
+    c.body.scale = 16
+    c.body.hasHip = true
+    c.body.hipX = 32
+    c.body.hipY = 20
+    c.body.hips.follow = StrokeRhythm.FollowEstimate(hz: 0.8, confidence: 0.8, amplitude: 0.15, sampleRate: 9)
+    w.context = c
+    w.roi.region = atRegion(x: 32, y: 20, time: time - 0.05, hz: 0.8)
+    return w
+}
+
+do {
+    // 慢的真插入不被 gentle 压：认出插入 / 节奏锁上后，强度和 92681ea 一样（以前一直按轻动作压到约 1/3）
+    let old = atRun(tuned: false, context: true) { atSlowThrustWindow(time: $0) }
+    let new = atRun(tuned: true, context: true) { atSlowThrustWindow(time: $0) }
+    var crushed = MotionNormalizer()
+    crushed.actionTuned = true
+    crushed.gentleAllowed = true  // 对照：一直按轻动作压会是多少
+    var crushedChain = VSChain()
+    crushedChain.normalizer = crushed
+    var crushedOut: [Double] = []
+    for i in 0..<40 { crushedOut.append(crushedChain.step(atSlowThrustWindow(time: 100 + Double(i) * 0.3))) }
+    let oldMean = vs3Late(old.values)
+    let newMean = vs3Late(new.values)
+    let oldThrust = Double(old.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    let newThrust = Double(new.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    vcheck(new.kinds.last == .insertion && new.locked.last == true && newMean >= 0.95 * oldMean
+           && newThrust >= 0.9 * oldThrust && vs3Late(crushedOut) <= 0.6 * oldMean,
+           "动作调优：慢的真插入（主体 0.32）认出 / 锁上后不再按轻动作压（强度 92681ea \(Int(oldMean)) / 调优 \(Int(newMean))，"
+           + "伸缩 \(Int(oldThrust)) / \(Int(newThrust))；一直压的话只有 \(Int(vs3Late(crushedOut)))）")
+
+    // gentle 不和近场收拢叠加：近场 1 的大幅动作（主体 0.9）调优开 / 关一样；近场里本来就轻的（0.3）照样压
+    func nearRun(_ score: Double, tuned: Bool) -> Double {
+        var c = VSChain()
+        c.normalizer.actionTuned = tuned
+        var out: [Double] = []
+        for _ in 0..<60 {
+            var w = MotionWindow(meanEnergy: 2, peakEnergy: 2, frames: 5, cutCount: 0, heldCount: 0)
+            w.subjectFrames = 5
+            w.subjectScore = score
+            w.nearField = 1
+            out.append(c.step(w))
+        }
+        return vs3Late(out)
+    }
+    let vigOld = nearRun(0.9, tuned: false)
+    let vigNew = nearRun(0.9, tuned: true)
+    let lightOld = nearRun(0.3, tuned: false)
+    let lightNew = nearRun(0.3, tuned: true)
+    vcheck(abs(vigOld - vigNew) < 1e-9 && vigNew >= 20 && lightNew < lightOld,
+           "动作调优：近景大幅动作不被 gentle 再压一遍（关 \(Int(vigOld)) / 开 \(Int(vigNew))），近景轻动作照样压（\(Int(lightOld)) → \(Int(lightNew))）")
+}
+
+do {
+    // 臀部特写不动、块运动带着真实的残余噪声（压缩闪烁 / 暗场，主体分 0.12~0.2 来回）：调优整条链输出 ≤ 3
+    var seed: UInt64 = 7
+    func noise() -> Double {
+        seed = seed &* 6364136223846793005 &+ 1442695040888963407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    var tracker = PoseMotionTracker()
+    tracker.actionTuned = true
+    tracker.contextEnabled = true
+    var oldTracker = PoseMotionTracker()
+    var acc = MotionWindowAccumulator()
+    var oldAcc = MotionWindowAccumulator()
+    var chain = VSChain()
+    chain.normalizer.actionTuned = true
+    var oldChain = VSChain()
+    var outs: [Double] = []
+    var oldOuts: [Double] = []
+    var i = 0
+    for k in 0..<Int(14 * 15) {
+        let t = Double(k) * vsDt
+        let flow = 0.12 + 0.08 * noise()
+        let sample = MotionSample(time: t, energy: 1, coverage: 0.2, isCut: false, isHeld: false,
+                                  subject: SubjectReading(valid: true, score: flow))
+        acc.add(sample)
+        oldAcc.add(sample)
+        if k % 5 == 0 || k % 5 == 2 || k % 5 == 4 {
+            let p = [vs3Jittered(atPartialHips(), i: i, sigma: 0.6)]
+            acc.addPose(tracker.update(time: t, candidates: p, camera: .identity, continuous: true, frameHeight: 36))
+            oldAcc.addPose(oldTracker.update(time: t, candidates: p, camera: .identity, continuous: true, frameHeight: 36))
+            i += 1
+        }
+        if k % 5 == 4 {
+            outs.append(chain.step(acc.drain()))
+            oldOuts.append(oldChain.step(oldAcc.drain()))
+        }
+    }
+    let newMax = outs.max() ?? 99
+    let oldLate = vs3Late(oldOuts)
+    vcheck(newMax <= 3 && oldLate >= 10,
+           "动作调优（真机 b）：臀部特写不动 + 残余块运动噪声 0.12~0.2 + 关键点抖动：输出 92681ea \(Int(oldLate)) → 调优最高 \(String(format: "%.1f", newMax))")
+}
+
+// MARK: - rhythm-action tune 复审 2：在胸口前的真往复不封顶、gentle 要正面依据、没纹理的真运动、轻抚的放开
+
+/// H1 反例：同一个胸口窗口，但那只手规则、大幅（0.2 躯干）地 1.2 Hz 往复
+/// kind：handjob = 一只手在胸口前撸（POV，被撸的人不在画面里）；titjob = 两只手都在胸口；cowgirl = 一只手放胸口、髋出画
+func atReciprocationWindow(time: Double, kind: String, chest: Bool) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: chest, region: true, amplitude: 0.2)
+    if kind == "titjob", chest {
+        w.context.body.hasLeftWrist = true
+        w.context.body.leftWristX = 29
+        w.context.body.leftWristY = 13
+        w.context.body.leftWristRhythm = w.context.body.rightWristRhythm
+    }
+    if kind == "cowgirl" {
+        w.context.body.hasHip = false
+        w.context.body.hips = PartRhythm()
+    }
+    return w
+}
+
+do {
+    var ok = true
+    var notes: [String] = []
+    for kind in ["handjob", "titjob", "cowgirl"] {
+        let old = atRun(tuned: false, context: true) { atReciprocationWindow(time: $0, kind: kind, chest: false) }
+        let new = atRun(tuned: true, context: true) { atReciprocationWindow(time: $0, kind: kind, chest: true) }
+        let oldMean = vs3Late(old.values)
+        let newMean = vs3Late(new.values)
+        let newPeak = new.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 0
+        let ac = atSettle { atReciprocationWindow(time: $0, kind: kind, chest: true) }
+        let fine = !new.kinds.contains(.caress) && ac.intensityCeiling == nil && !ac.suppressesRhythm
+            && newMean >= 0.9 * oldMean && newPeak > 20 && new.locked.last == true
+        ok = ok && fine
+        notes.append("\(kind): \(ac.kind) \(Int(oldMean))→\(Int(newMean)) 峰 \(newPeak) 锁 \(new.locked.last ?? false)")
+    }
+    vcheck(ok, "动作调优（H1）：胸口前规则大幅的真往复（POV 撸动 / 乳交 / 骑乘手放胸口、髋出画）不认轻抚、不封顶 20、照常跟节奏（\(notes)）")
+}
+
+do {
+    // M2：没认到身体的特写里慢的、不规则的真插入（0.6 Hz、跟随置信度 0.35 < 锁定门 0.4，跟随器锁不上）≈ 92681ea
+    func slow(_ t: Double) -> MotionWindow {
+        var w = MotionWindow(meanEnergy: 2, peakEnergy: 3, frames: 5, cutCount: 0, heldCount: 0)
+        w.subjectFrames = 5
+        w.subjectScore = 0.32
+        w.subjectHz = 0.6
+        w.subjectFollowHz = 0.6
+        w.subjectFollowRhythm = 0.35
+        w.subjectFollowAmplitude = 2
+        return w
+    }
+    let old = atRun(tuned: false, context: true, window: slow)
+    let new = atRun(tuned: true, context: true, window: slow)
+    // 画面完全没节奏（静止特写的残余噪声 0.2）：照样压到几乎 0
+    let still = atRun(tuned: true, context: true) { t in
+        var w = slow(t)
+        w.subjectScore = 0.2
+        w.subjectFollowRhythm = 0
+        w.subjectFollowHz = 0
+        return w
+    }
+    let oldMean = vs3Late(old.values)
+    let newMean = vs3Late(new.values)
+    let stillMax = still.values.max() ?? 99
+    vcheck(newMean >= 0.95 * oldMean && oldMean >= 20 && stillMax <= 3 && !(new.locked.last ?? true),
+           "动作调优（M2）：没骨架的慢速不规则真插入不被 gentle 压（92681ea \(Int(oldMean)) / 调优 \(Int(newMean))）；"
+           + "完全没节奏的静止画面照样压（最高 \(String(format: "%.1f", stillMax))）")
+}
+
+do {
+    // M3：边缘清楚、里面很平滑的一块皮肤（圆盘，中间圆顶的明暗梯度 < 4）每帧往右移 2.5 像素：
+    // 噪声防护开着时里面的平滑块靠旁边在动的边缘块采用法向流，和关着时差不多；到处闪烁的平面照样 0
+    func disk(_ cx: Double) -> [UInt8] {
+        var f = [UInt8](repeating: 60, count: 64 * 36)
+        let r0 = 14.0
+        for y in 0..<36 {
+            for x in 0..<64 {
+                let dx = Double(x) - cx
+                let dy = Double(y) - 18
+                let r2 = dx * dx + dy * dy
+                if r2 < r0 * r0 { f[y * 64 + x] = UInt8(120 + 20 * (1 - r2 / (r0 * r0))) }
+            }
+        }
+        return f
+    }
+    let prev = disk(28)
+    let cur = disk(30.5)
+    func run(_ guardOn: Bool) -> BlockMotionResult {
+        var e = BlockMotionEstimator()
+        e.noiseGuard = guardOn
+        return cur.withUnsafeBufferPointer { c in
+            prev.withUnsafeBufferPointer { p in e.estimate(cur: c, prev: p, width: 64, height: 36, gap: vsDt) }
+        }
+    }
+    let off = run(false)
+    let on = run(true)
+    vcheck(on.movingBlocks >= off.movingBlocks - 1 && on.speed >= 0.8 * off.speed && on.movingBlocks >= 3,
+           "动作调优（M3）：平滑皮肤真的在动时噪声防护不丢运动（关 \(off.movingBlocks) 块 \(String(format: "%.2f", off.speed)) / "
+           + "开 \(on.movingBlocks) 块 \(String(format: "%.2f", on.speed))）")
+}
+
+do {
+    // L2：轻抚中手离开胸口、画面开始大幅动（主体 0.8）/ 髋开始往复：这一拍就放开轻抚
+    for variant in ["strong", "hips"] {
+        var ac = atSettle { atChestWindow(time: $0, chest: true, region: true) }
+        let was = ac.kind == .caress
+        var w = atChestWindow(time: 13, chest: false, region: true)
+        if variant == "strong" {
+            w.subjectScore = 0.8
+        } else {
+            w.context.body.hips.follow = StrokeRhythm.FollowEstimate(hz: 1.2, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
+        }
+        _ = ac.refine(w, now: 13)
+        vcheck(was && ac.kind != .caress && ac.intensityCeiling == nil && !ac.suppressesRhythm,
+               "动作调优（L2）：轻抚中手离开胸口且\(variant == "strong" ? "画面大幅动" : "髋开始往复")：当拍放开（\(ac.kind)）")
+    }
+}
+
+// MARK: - rhythm-action tune R3：轻抚依据的频率一致放宽；归给自己的手要安静
+
+/// 摸胸口的窗口，但姿态手腕（和手检测）的频率是 wristHz，块运动 / 区域 / 姿态读数是 refHz（两个估计对不上 / 一个减半）
+func atCaressHzWindow(time: Double, wristHz: Double, refHz: Double) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: true, region: true)
+    w.subjectHz = refHz
+    w.subjectFollowHz = refHz
+    w.poseRhythmHz = refHz
+    w.roi.region.hz = refHz
+    var rh = PartRhythm()
+    rh.follow = StrokeRhythm.FollowEstimate(hz: wristHz, confidence: 0.8, amplitude: 0.08, sampleRate: 9)
+    w.context.hand.rhythm = rh
+    w.context.body.wrists = rh
+    w.context.body.rightWristRhythm = rh.follow
+    return w
+}
+
+// R3 的检查都放在函数里：顶层 do 块的局部变量都算在 main 的栈帧里，main 已经接近 8 MB 栈上限
+func atCaressHzCheck() {
+    // H3：慢慢摸胸口，手腕 1.0 Hz / 画面 1.25 Hz（差 25%），手腕减半（0.6 / 1.2）、画面减半（1.25 / 0.625）：照样认轻抚、输出 ≤ 20
+    var ok = true
+    var notes: [String] = []
+    for (wristHz, refHz) in [(1.0, 1.25), (0.6, 1.2), (1.25, 0.625)] {
+        var strict = PartRhythm()
+        strict.follow = StrokeRhythm.FollowEstimate(hz: wristHz, confidence: 0.8, amplitude: 0.08, sampleRate: 9)
+        // 严的 ±15% 下这只手的依据是 0（这几组确实对不上）
+        let strictZero = ActionContext.support(strict, x: 33, y: 12, size: 8, refHz: refHz, region: nil,
+                                               frameWidth: 64, frameHeight: 36) == 0
+        let run = atRun(tuned: true, context: true) { atCaressHzWindow(time: $0, wristHz: wristHz, refHz: refHz) }
+        let ac = atSettle { atCaressHzWindow(time: $0, wristHz: wristHz, refHz: refHz) }
+        let peak = run.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 99
+        let fine = strictZero && run.kinds.last == .caress && ac.kind == .caress && ac.suppressesRhythm
+            && run.locked.suffix(10).allSatisfy { !$0 } && peak <= 20
+        ok = ok && fine
+        notes.append("\(wristHz)/\(refHz): \(ac.kind) 峰 \(peak) 锁 \(run.locked.last ?? true)")
+    }
+    vcheck(ok, "动作调优 R3（H3）：手腕 / 画面频率差 25% 或差一个八度时摸胸口照样认轻抚、不跟节奏、输出 ≤ 20（\(notes)）")
+
+    // 放宽只到 ±35% / 八度 ±15%：锁在 1.67 倍（2.0 / 1.2）仍算锁在别的频率上（不认轻抚）
+    var lockedElse = ActionContext()
+    var t = 10.0
+    while t < 13 {
+        _ = lockedElse.refine(atChestWindow(time: t, chest: true, region: true), now: t, followerHz: 2.0)
+        t += 0.3
+    }
+    vcheck(lockedElse.kind != .caress && !lockedElse.allowsGentle(followerLocked: true),
+           "动作调优 R3（H3）：放宽后跟随器锁在 1.67 倍频率上仍不认轻抚（\(lockedElse.kind)）")
+}
+atCaressHzCheck()
+
+/// 别人给被认到的人撸（1.5 Hz、手检测在胯上），被撸的人右手放在小腹上不动、离撸动的手 5 像素（0.3 个身体尺度）
+func atPartnerHandjobWindow(time: Double) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: true)
+    w.subjectHz = 1.5
+    w.subjectFollowHz = 1.5
+    w.poseRhythmHz = 1.5
+    var stroke = PartRhythm()
+    stroke.follow = StrokeRhythm.FollowEstimate(hz: 1.5, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
+    w.context.body.rightWristX = 33
+    w.context.body.rightWristY = 16
+    w.context.body.rightWristRhythm = StrokeRhythm.FollowEstimate()
+    w.context.body.wristX = 33
+    w.context.body.wristY = 16
+    w.context.body.wrists = PartRhythm()
+    w.context.hand.x = 33
+    w.context.hand.y = 21
+    w.context.hand.rhythm = stroke
+    w.roi.region = atRegion(x: 33, y: 21, time: time - 0.05, hz: 1.5)
+    return w
+}
+
+func atPartnerHandjobCheck() {
+    // H2：手检测落在别人撸动的手上、离被撸的人放着的手腕很近：不能归给自己（以前 → quietSelf：不跟节奏 + gentle 压）
+    let w0 = atPartnerHandjobWindow(time: 10)
+    let near = ActionContext.selfTouch(w0.context.body).map {
+        (($0.x - w0.context.hand.x) * ($0.x - w0.context.hand.x) + ($0.y - w0.context.hand.y) * ($0.y - w0.context.hand.y))
+            .squareRoot() <= ActionContext.selfHandReach * w0.context.body.scale
+    } ?? false
+    let ac = atSettle { atPartnerHandjobWindow(time: $0) }
+    let base = atRun(tuned: false, context: false) { atPartnerHandjobWindow(time: $0) }
+    let new = atRun(tuned: true, context: true) { atPartnerHandjobWindow(time: $0) }
+    let baseMean = vs3Late(base.values)
+    let newMean = vs3Late(new.values)
+    let baseThrust = Double(base.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    let newThrust = Double(new.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    vcheck(near && ac.kind == .stroke && ac.usesHand && !ac.suppressesRhythm && ac.intensityCeiling == nil
+           && ac.evidence.caress == 0 && !ac.allowsGentle(followerLocked: false)
+           && !new.kinds.contains(.caress) && new.locked.last == true
+           && newMean >= 0.95 * baseMean && newThrust >= 0.9 * baseThrust,
+           "动作调优 R3（H2）：别人撸、被撸的人手放小腹（离撸的手 0.3 尺度）→ 撸动（看手），不是轻抚 / 只来自自己的手；"
+           + "强度 \(Int(baseMean)) → \(Int(newMean))、伸缩 \(Int(baseThrust)) → \(Int(newThrust))（\(ac.kind)）")
+}
+atPartnerHandjobCheck()
+
+/// 骑乘、手放自己胸口、髋出画：头 / 肩 / 两腕整个上身一起 1.2 Hz 上下（幅度 0.25 躯干），右手腕贴在胸口，左手垂在身侧。
+/// 真的跑 PoseMotionTracker（调优开），每拍把它的 bodyContext 放进胸口窗口（区域就在胸口，最容易误认轻抚）
+func atRidingRun(tuned: Bool, context: Bool) -> (run: ATRun, body: PoseBodyContext) {
+    var tracker = PoseMotionTracker()
+    tracker.actionTuned = true
+    tracker.contextEnabled = true
+    let torso = 13.0  // 1.3 × 肩宽 10
+    var poseT = 99.0
+    var i = 0
+    let run = atRun(tuned: tuned, context: context) { now in
+        while poseT + 1.0 / 9 <= now - 0.05 {
+            poseT += 1.0 / 9
+            let dy = 0.25 * torso * sin(2 * Double.pi * 1.2 * poseT)
+            var p = PoseCandidate()
+            p.confidence = 0.9
+            for (j, x, y) in [(PoseJoint.nose, 32.0, 4.0), (.neck, 32, 8), (.leftShoulder, 27, 10), (.rightShoulder, 37, 10),
+                              (.rightWrist, 33, 14), (.leftWrist, 24, 19)] {
+                p.set(j, x: x, y: y + dy, confidence: 0.9)
+            }
+            _ = tracker.update(time: poseT, candidates: [vs3Jittered(p, i: i, sigma: 0.1)], camera: .identity,
+                               continuous: true, frameHeight: 36)
+            i += 1
+        }
+        var w = atChestWindow(time: now, chest: true, region: true)
+        w.context.time = tracker.bodyContext.time
+        w.context.body = tracker.bodyContext
+        w.context.hand = PartReading()
+        w.roi.region = atRegion(x: 33, y: 13, time: now - 0.05, hz: 1.2)
+        return w
+    }
+    return (run, tracker.bodyContext)
+}
+
+func atRidingCheck() {
+    // H1：手跟着上身一起往复。扣过全身中位速度的手腕节奏只剩 ~40%（看起来像安静的手 → 以前认成轻抚、封顶 20）；
+    // 没扣的看得出来 → 不是轻抚、不封顶、照常跟节奏
+    let base = atRidingRun(tuned: false, context: false)
+    let new = atRidingRun(tuned: true, context: true)
+    let bc = new.body
+    let residualAmp = bc.rightWristRhythm.amplitude
+    let rawAmp = bc.rightWristRaw.amplitude
+    let touch = ActionContext.selfTouch(bc)
+    let repro = touch != nil && ActionContext.quietTouch(PartRhythm(follow: bc.rightWristRhythm))
+        && !ActionContext.quietTouch(PartRhythm(follow: bc.rightWristRaw))
+    let baseMean = vs3Late(base.run.values)
+    let newMean = vs3Late(new.run.values)
+    let newPeak = new.run.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 0
+    vcheck(repro && !new.run.kinds.contains(.caress) && new.run.locked.last == true && newPeak > 20
+           && newMean >= 0.95 * baseMean,
+           "动作调优 R3（H1）：骑乘手放胸口、髋出画（上身整体 1.2 Hz、0.25 躯干）：扣过的手腕幅度 "
+           + "\(String(format: "%.3f", residualAmp)) / 没扣的 \(String(format: "%.3f", rawAmp)) → 不认轻抚、不封顶"
+           + "（强度 \(Int(baseMean)) → \(Int(newMean))，峰 \(newPeak)，锁 \(new.run.locked.last ?? false)，kinds \(Set(new.run.kinds.map { $0.rawValue }))）")
+}
+atRidingCheck()
+
+func atPoseCapRhythmCheck() {
+    // M1：低纹理近景里的真插入：块运动只有 0.1，姿态 0.7 且髋的节奏置信度 0.8 → 姿态上界不压（和关着一样）；
+    // 同样的窗口没有姿态节奏（关键点抖动）→ 照样压
+    func run(tuned: Bool, rhythmic: Bool) -> Double {
+        var c = VSChain()
+        c.normalizer.actionTuned = tuned
+        var out: [Double] = []
+        for _ in 0..<60 {
+            var w = MotionWindow(meanEnergy: 2, peakEnergy: 2, frames: 5, cutCount: 0, heldCount: 0)
+            w.subjectFrames = 5
+            w.subjectScore = 0.1
+            w.subjectFollowHz = 1.5
+            w.subjectFollowRhythm = 0.5
+            w.poseFrames = 3
+            w.posePresentFrames = 3
+            w.poseScore = 0.7
+            w.poseConfidence = 0.8
+            w.poseTrust = 1
+            if rhythmic {
+                w.poseRhythmHz = 1.5
+                w.poseRhythmConfidence = 0.8
+                w.poseRhythmPart = 1
+                w.poseRhythmRate = 9
+            }
+            out.append(c.step(w))
+        }
+        return vs3Late(out)
+    }
+    let old = run(tuned: false, rhythmic: true)
+    let new = run(tuned: true, rhythmic: true)
+    let jitter = run(tuned: true, rhythmic: false)
+    vcheck(new >= 0.95 * old && old >= 40 && jitter <= 0.6 * old,
+           "动作调优 R3（M1）：块运动 0.1 + 姿态 0.7、髋节奏可信 → 姿态上界不压（关 \(Int(old)) / 开 \(Int(new))）；"
+           + "没有姿态节奏时照样压（\(Int(jitter))）")
+}
+atPoseCapRhythmCheck()
+
+func atPartialMovingCheck() {
+    // M2：只认到髋 / 膝的近景里慢慢往复：髋 0.8 Hz、0.15 躯干（躯干 = 髋宽 × 2 = 32 像素），膝跟着 0.3 倍，
+    // 约 9 Hz 姿态采样、关键点抖 0.3 像素；关节置信度 0.3 / 0.5 → 髋的节奏还在（死区加倍随髋节奏撤回）
+    func run(confidence: Double) -> PoseReading {
+        var tracker = PoseMotionTracker()
+        tracker.actionTuned = true
+        tracker.contextEnabled = true
+        var last = PoseReading()
+        var i = 0
+        for k in 0..<Int(14 * 15) where k % 5 == 0 || k % 5 == 2 || k % 5 == 4 {
+            let t = Double(k) * vsDt
+            let d = 0.15 * 32 * sin(2 * Double.pi * 0.8 * t)
+            var p = atPartialHips(confidence: confidence)
+            p.y[PoseJoint.leftHip.rawValue] += d
+            p.y[PoseJoint.rightHip.rawValue] += d
+            p.y[PoseJoint.leftKnee.rawValue] += 0.3 * d
+            p.y[PoseJoint.rightKnee.rawValue] += 0.3 * d
+            last = tracker.update(time: t, candidates: [vs3Jittered(p, i: i, sigma: 0.3)], camera: .identity,
+                                  continuous: true, frameHeight: 36)
+            i += 1
+        }
+        return last
+    }
+    var ok = true
+    var notes: [String] = []
+    for c in [0.3, 0.5] {
+        let r = run(confidence: c)
+        ok = ok && r.present && r.rhythmPart == 1 && abs(r.rhythmHz - 0.8) <= 0.1 && r.rhythmConfidence >= 0.4
+        notes.append("置信度 \(c)：第 \(r.rhythmPart) 组 \(String(format: "%.2f", r.rhythmHz)) Hz "
+                     + "\(String(format: "%.2f", r.rhythmConfidence))")
+    }
+    vcheck(ok, "动作调优 R3（M2）：部分骨架慢慢往复（0.8 Hz、0.15 躯干）髋的节奏不被加倍的死区吃掉（\(notes)）")
+}
+atPartialMovingCheck()
 
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")

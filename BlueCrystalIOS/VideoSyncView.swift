@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import AVKit
 import UniformTypeIdentifiers
+import PhotosUI
 import Combine
 
 /// 视频联动播放器（ViewModel）：本地视频 + 声音 / 画面联动。
@@ -99,6 +100,9 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-context P3（默认关）：动作识别只改交给频率跟随器 / 相位锁的那份窗口副本（强度那条路不看）；
     /// 撞击声相位校正只给脉动的相位加一个有界偏移（RhythmPulseDriver.phaseOffset）。都不新增发送路径
     private var actionContext = ActionContext()
+    /// 调试记录（默认关）：只记数字，不存画面；只读不改控制路径，关着时不做任何事
+    let debugLog = MotionDebugLog()
+    var debugRecording = false
     private var onsetDetector = AudioOnsetDetector()
     private var audioAnchor = AudioPhaseAnchor()
     /// Timer 间隔：平时 0.3 秒（和以前逐位相同）；相位脉动打开时 0.1 秒，每 3 次里 1 次走完整拍
@@ -552,6 +556,9 @@ final class VideoSyncPlayer: ObservableObject {
         // 上次运行留下的视频副本清掉
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SyncVideos", isDirectory: true)
         try? FileManager.default.removeItem(at: dir)
+        // 同样清掉上次没导完的相册视频副本、导出过的调试表格
+        PhotoVideoPicker.purgeImports()
+        MotionDebugLog.purgeExports()
     }
 
     private static func importVideo(from url: URL) -> URL? {
@@ -674,6 +681,13 @@ final class VideoSyncPlayer: ObservableObject {
         guard isPlaying else { return }
         stopAll()
         statusLine = "打开文件前已停止"
+    }
+
+    /// 导出调试表格之前：分享面板同样会盖住底部停止键，正在联动就先停下
+    func stopBeforeExport() {
+        guard isPlaying else { return }
+        stopAll()
+        statusLine = "导出表格前已停止"
     }
 
     /// 被动停机（看门狗/退后台/单次上限/输出被拒）：只归零 UI，不补发停止帧
@@ -938,18 +952,22 @@ final class VideoSyncPlayer: ObservableObject {
         // P3：动作识别开着时，跟随器 / 相位锁吃按动作改写过的窗口副本（未知 = 原窗口）；关着时就是原窗口（= P2）
         var input = window
         if visualSettings.usesRhythmContext, motionSignal {
-            input = actionContext.refine(window, now: CACurrentMediaTime())
+            // rhythm-action tune：跟随器上一拍牢牢锁着的频率（轻抚判断：锁在别的往复上就不算轻抚）
+            let lockHz = ActionContext.lockedHz(locked: rhythm.locked, weight: rhythm.weight, hz: rhythm.hz)
+            input = actionContext.refine(window, now: CACurrentMediaTime(), followerHz: lockHz)
             let text = actionContext.statusText()
             if text != contextStatus { contextStatus = text }
         } else if contextStatus != nil {
             resetContext()
         }
-        if motionSignal { rhythm.step(input, dt: dt, active: activity > 0) } else { rhythm.reset() }
+        // rhythm-action tune：认出轻抚 / 摸自己时当成「画面不在往复」（跟随器 / 相位锁不锁、已锁的按不动放开）
+        let moving = activity > 0 && !(visualSettings.usesRhythmContext && actionContext.suppressesRhythm)
+        if motionSignal { rhythm.step(input, dt: dt, active: moving) } else { rhythm.reset() }
         if visualSettings.rhythmPulse {
             // P2：相位锁跟在频率跟随器后面（跟随器没锁 / 镜头切换 / 不动 2 拍 → 相位锁立刻放开）
             if motionSignal {
                 phaseLock.step(input, followerHz: rhythm.hz, followerLocked: rhythm.locked,
-                               followerSource: rhythm.source, now: CACurrentMediaTime(), dt: dt, active: activity > 0)
+                               followerSource: rhythm.source, now: CACurrentMediaTime(), dt: dt, active: moving)
             } else {
                 phaseLock.reset()
             }
@@ -972,8 +990,15 @@ final class VideoSyncPlayer: ObservableObject {
     private func motionTick(_ p: AVPlayer, ble: BLEManager, t: Double, now: TimeInterval, dt: TimeInterval) {
         let window = motionMeter?.drain() ?? .empty
         motionFlow.note(window, now: now)
-        let target = motionNormalizer.step(window, gainDb: visualSettings.motionGainDb,
+        // rhythm-action tune（动作识别开着才生效；关着时这几行和以前逐位相同）：慢 / 轻动作按绝对刻度压低、
+        // 姿态不能比画面本身的运动高太多；认出轻抚 / 摸自己时强度最多到 ActionContext.caressCeiling（上一拍的判断，只降不升）
+        let tuned = visualSettings.usesRhythmContext
+        motionNormalizer.actionTuned = tuned
+        // 慢 / 轻动作的压低只给轻抚 / 还没认出动作且没锁节奏的（上一拍的判断；关着时不看）
+        if tuned { motionNormalizer.gentleAllowed = actionContext.allowsGentle(followerLocked: rhythm.locked) }
+        var target = motionNormalizer.step(window, gainDb: visualSettings.motionGainDb,
                                            auto: visualSettings.autoMotion, dt: dt)
+        if tuned, let ceiling = actionContext.intensityCeiling { target = min(target, ceiling) }
         let shaped = motionShaper.step(target: target, dt: dt)
         motionLevel = shaped.level
         let poseAssist = motionNormalizer.poseWeight >= 0.2
@@ -994,15 +1019,17 @@ final class VideoSyncPlayer: ObservableObject {
                                                          confidence: motionNormalizer.confidence,
                                                          motionSignal: motionSignal)
         let rateLevel = rhythmLevel(window, motionSignal: motionSignal, activity: motionActivity, dt: dt)
+        // rhythm-action tune：认出轻抚时这一拍伸缩不跟节奏（activity 当 0；关着时就是 motionActivity）
+        let rhythmActivity = tuned && actionContext.suppressesRhythm ? 0 : motionActivity
         guard settings.enabled else {
             // 联动关着：不发、升幅基准留在 0；强度条只预览打开后会是多少
             outputStage.reset()
             handover.cancel()
             if visualSettings.rhythmFollow {
                 let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
-                                                 rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
+                                                 rateLevel: rateLevel, weight: rhythm.weight, activity: rhythmActivity)
                 intensity = min(SyncOutputStage.hardCap(settings), levels.max() ?? 0)
-                updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: levels[0],
+                updateRhythmStatus(rateLevel: rateLevel, activity: rhythmActivity, thrust: levels[0],
                                    value: value, hasSignal: hasSignal)
             } else {
                 intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
@@ -1013,26 +1040,33 @@ final class VideoSyncPlayer: ObservableObject {
         if visualSettings.rhythmFollow {
             // 伸缩按动作频率（weight × 画面强度交接），震动照旧；同一个出口：上限 / 升幅 ≤ +20 / 归零保持
             let levels = RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
-                                             rateLevel: rateLevel, weight: rhythm.weight, activity: motionActivity)
+                                             rateLevel: rateLevel, weight: rhythm.weight, activity: rhythmActivity)
             if visualSettings.rhythmPulse {
                 // P3：撞击声校正（开着才有）只调脉动相位，有界、对不上就回 0
                 updateAudioAnchor(p, dt: dt)
                 // P2：锁上相位才在 P1 档位上叠加脉动（往里时加强）；没锁 / 没标定 / 太快 / 太弱 = P1 原样
                 vals = pulse.beat(levels: levels, lock: phaseLock, visual: visualSettings, settings: settings,
-                                  hasSignal: hasSignal, value: value, activity: motionActivity,
+                                  hasSignal: hasSignal, value: value, activity: rhythmActivity,
                                   followerWeight: rhythm.weight, now: CACurrentMediaTime(), stage: &outputStage)
                 let text = pulse.statusText(lock: phaseLock, visual: visualSettings)
                 if text != pulseStatus { pulseStatus = text }
             } else {
                 vals = outputStage.step(levels: levels, settings: settings, now: CACurrentMediaTime(), timed: false)
             }
-            updateRhythmStatus(rateLevel: rateLevel, activity: motionActivity, thrust: vals[0],
+            updateRhythmStatus(rateLevel: rateLevel, activity: rhythmActivity, thrust: vals[0],
                                value: value, hasSignal: hasSignal)
         } else {
             vals = outputStage.step(value, settings: settings, hasSignal: hasSignal, now: CACurrentMediaTime())
         }
         let shown = vals.max() ?? 0
         intensity = shown
+        if debugRecording {
+            debugLog.append(t: t, window: window, normalizer: motionNormalizer, target: target,
+                            shapedLevel: shaped.level, value: value, hasSignal: hasSignal,
+                            kind: actionContext.kind.rawValue, context: contextStatus,
+                            rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
+                            activity: rhythmActivity, rateLevel: rateLevel, out: vals)
+        }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
             needsResync = false
@@ -1253,6 +1287,20 @@ struct VideoSyncView: View {
     @StateObject private var vm = VideoSyncPlayer()
     /// 文件选择器（只有视频一种素材）
     @State private var showPicker = false
+    /// 相册选择器（PHPicker，只列视频，不需要相册权限）
+    @State private var showPhotoPicker = false
+    /// 选来源：相册 / 文件
+    @State private var showSourceChoice = false
+    /// 相册视频正在拷出来（iCloud 视频可能要下载一会儿）：期间选视频的入口都不可用，素材卡片上显示进度和取消
+    @State private var photoImporting = false
+    /// 正在拷的那次的进度（取消 = 换视频 / 离开页面 / 点取消）
+    @State private var photoProgress: Progress?
+    /// 相册导入的代数：每次开始 / 取消 +1，回调带着发起时的代数，不一样就不认（拷出来的文件删掉）
+    @State private var photoImportGen = 0
+    /// 调试记录（默认关，只记数字）
+    @AppStorage("bcMotionDebugLog") private var debugLogOn = false
+    @State private var debugExportURL: URL?
+    @State private var debugRows = 0
     /// 苹果播放器自己的全屏：onDisappear 不把全屏误判成离开页面
     @State private var systemFullScreen = false
     @Environment(\.scenePhase) private var scenePhase
@@ -1340,6 +1388,8 @@ struct VideoSyncView: View {
     /// 选择器弹出前先停（选择器会盖住页面底部的停止键；选择器里另有一个停止键）。
     /// blockedReasonShown：这个入口自己把被拦的原因写在旁边了（幕布），不再往停止键上钉第二份
     private func openPicker(blockedReasonShown: Bool = false) {
+        // 相册视频还在导入：先取消导入（素材卡片上的取消键）才能再选
+        guard !photoImporting else { return }
         guard !pickerBlocked else {
             Haptics.warning()
             UIAccessibility.post(notification: .announcement, argument: pickerBlockedMessage)
@@ -1347,7 +1397,56 @@ struct VideoSyncView: View {
             return
         }
         vm.stopBeforePicker()
-        showPicker = true
+        showSourceChoice = true
+    }
+
+    /// 相册里选中了一个（主线程）：开始拷贝，记下进度和代数
+    private func startPhotoImport(_ provider: NSItemProvider) {
+        cancelPhotoImport()
+        let gen = photoImportGen
+        let progress = PhotoVideoPicker.copyVideo(from: provider) { url in
+            finishPhotoImport(url, gen: gen)
+        }
+        guard let progress else {
+            loadPhotoVideo(nil)
+            return
+        }
+        photoProgress = progress
+        photoImporting = true
+        vm.statusLine = "正在从相册导入视频…"
+    }
+
+    /// 拷贝回调（主线程）：过期的（取消过 / 又开始了新的）不认，拷出来的文件删掉
+    private func finishPhotoImport(_ url: URL?, gen: Int) {
+        guard gen == photoImportGen else {
+            if let url { try? FileManager.default.removeItem(at: url) }
+            return
+        }
+        photoImportGen += 1
+        photoProgress = nil
+        photoImporting = false
+        loadPhotoVideo(url)
+    }
+
+    /// 取消正在进行的相册导入（换视频 / 离开页面 / 点取消；没在导入时只让代数 +1）
+    private func cancelPhotoImport() {
+        photoImportGen += 1
+        photoProgress?.cancel()
+        photoProgress = nil
+        if photoImporting {
+            photoImporting = false
+            vm.statusLine = "已取消相册导入"
+        }
+    }
+
+    /// 相册视频拷出来之后（主线程）：和文件选择器同一条 loadVideo
+    private func loadPhotoVideo(_ url: URL?) {
+        guard let url else {
+            vm.videoName = "导入失败：相册视频"
+            vm.statusLine = "相册视频无法读取（iCloud 视频请先在相册里下载），请重新选择"
+            return
+        }
+        vm.loadVideo(url: url)
     }
 
     /// 被拦下的说明只显示一小会儿（3 秒）；减弱动态效果时只淡入淡出
@@ -1427,6 +1526,21 @@ struct VideoSyncView: View {
             vm.applySettings(audioSettings)
             vm.applyVisualSettings(visualSettings)
             vm.attachPrivacy(privacy)
+            vm.debugRecording = debugLogOn
+        }
+        .onChange(of: debugLogOn) { on in
+            vm.debugRecording = on
+            if !on { vm.debugLog.clear(); debugRows = 0 }
+        }
+        // 分享面板同其它弹出层：先停（导出键里），底部带停止条，挂隐私遮挡
+        .sheet(isPresented: Binding(get: { debugExportURL != nil }, set: { if !$0 { debugExportURL = nil } })) {
+            VStack(spacing: 0) {
+                if let url = debugExportURL { ActivityShareSheet(items: [url]) }
+                pickerStopBar
+            }
+            .privacyCover()
+            .environmentObject(privacy)
+            .environmentObject(ble)
         }
         // 设备那边处理好了：钉着的"先处理设备卡片"立刻收掉
         .onChange(of: pickerBlocked) { blocked in
@@ -1452,6 +1566,8 @@ struct VideoSyncView: View {
                 DocumentPicker(contentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
                                onCancel: { showPicker = false }) { url in
                     showPicker = false
+                    // 换成文件里的视频：还在拷的相册视频作废
+                    cancelPhotoImport()
                     vm.loadVideo(url: url)
                 }
                 pickerStopBar
@@ -1460,8 +1576,31 @@ struct VideoSyncView: View {
             .environmentObject(privacy)
             .environmentObject(ble)
         }
+        // 选来源：相册 / 文件
+        .confirmationDialog("选择视频来源", isPresented: $showSourceChoice, titleVisibility: .visible) {
+            Button("从相册选择") { if !pickerBlocked { showPhotoPicker = true } }
+            Button("从文件选择") { if !pickerBlocked { showPicker = true } }
+            Button("取消", role: .cancel) {}
+        }
+        .sheet(isPresented: $showPhotoPicker) {
+            VStack(spacing: 0) {
+                PhotoVideoPicker(onCancel: { showPhotoPicker = false }) { provider in
+                    showPhotoPicker = false
+                    startPhotoImport(provider)
+                }
+                pickerStopBar
+            }
+            .privacyCover()
+            .environmentObject(privacy)
+            .environmentObject(ble)
+        }
         // 系统全屏弹出时部分系统版本也会触发 onDisappear：全屏中不停机
-        .onDisappear { if !systemFullScreen { vm.stopAll() } }
+        .onDisappear {
+            if !systemFullScreen {
+                vm.stopAll()
+                cancelPhotoImport()
+            }
+        }
         // 解锁页上的停止：和本页停止键同一个 stopAll
         .onReceive(privacy.stopAllRequested) { _ in vm.stopAll() }
     }
@@ -1521,7 +1660,9 @@ struct VideoSyncView: View {
                 )
             }
             .buttonStyle(PressableStyle())
-            // 不用 disabled：变灰会把原因那行字一起压暗。点了由 openPicker 拦下（震动 + 旁白说明）
+            // 不用 disabled：变灰会把原因那行字一起压暗。点了由 openPicker 拦下（震动 + 旁白说明）。
+            // 相册视频导入中才禁用（进度在素材卡片上）
+            .disabled(photoImporting)
             .accessibilityHint(pickerBlocked ? "先处理设备卡片上的提示" : "选择视频")
         }
     }
@@ -1695,6 +1836,7 @@ struct VideoSyncView: View {
                 }
                 .tint(Velvet.gold)
                 rhythmControls
+                debugLogControls
             }
         } else {
             VStack(alignment: .leading, spacing: 14) {
@@ -1744,6 +1886,40 @@ struct VideoSyncView: View {
                 }
                 .tint(Velvet.gold)
             }
+        }
+    }
+
+    /// 调试记录：画面联动每一拍的数字（运动量、归一化、动作类型、节奏、输出）存成表格导出；不存画面
+    @ViewBuilder private var debugLogControls: some View {
+        Toggle(isOn: $debugLogOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("调试记录")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("播放时把每一拍的运动量、识别结果和输出强度记成表格（只有数字，没有画面），最多约 30 分钟")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+        if debugLogOn {
+            HStack {
+                Button("导出表格") {
+                    vm.stopBeforeExport()
+                    debugRows = vm.debugLog.count
+                    debugExportURL = vm.debugLog.writeCSV()
+                }
+                .buttonStyle(.borderless)
+                Spacer()
+                Button("清空", role: .destructive) {
+                    vm.debugLog.clear()
+                    debugRows = 0
+                }
+                .buttonStyle(.borderless)
+            }
+            .font(.subheadline)
+            .frame(minHeight: 44)
         }
     }
 
@@ -2041,7 +2217,7 @@ struct VideoSyncView: View {
             }
             // 设备需要处理时不灰掉视频准备项：点了由 openPicker 拦下并说明，和选视频幕布一致
             ReadinessChip(title: "视频", done: hasVideo, icon: "film",
-                          hint: "选择视频") { openPicker() }
+                          hint: "选择视频", enabled: !photoImporting) { openPicker() }
         }
     }
 
@@ -2050,8 +2226,26 @@ struct VideoSyncView: View {
         VStack(alignment: .leading, spacing: 12) {
             SectionLabel(title: "素材", systemImage: "film.stack")
             // 被拦下的原因常驻写在本卡片底部（blockedReasonShown）：点这一行时不再往停止键上钉第二份
-            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择") {
+            materialRow(icon: "film", title: "视频", value: vm.videoName, action: "选择",
+                        enabled: !photoImporting) {
                 openPicker(blockedReasonShown: vm.player != nil)
+            }
+            if photoImporting {
+                // 相册视频导入中（iCloud 视频可能要先下载）：进度 + 取消
+                HStack(spacing: 10) {
+                    if let progress = photoProgress {
+                        ProgressView(progress)
+                            .tint(Velvet.gold)
+                    } else {
+                        ProgressView()
+                    }
+                    Button("取消导入", role: .cancel) { cancelPhotoImport() }
+                        .buttonStyle(.borderless)
+                        .font(.subheadline)
+                }
+                .frame(minHeight: 44)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("正在从相册导入视频")
             }
             if pickerBlocked && vm.player != nil {
                 // 已选过视频后幕布不在了，素材行是唯一入口：被拦的原因常驻写在这里
@@ -2064,7 +2258,7 @@ struct VideoSyncView: View {
         .velvetCard()
     }
 
-    private func materialRow(icon: String, title: String, value: String, action: String,
+    private func materialRow(icon: String, title: String, value: String, action: String, enabled: Bool = true,
                              perform: @escaping () -> Void) -> some View {
         HStack(spacing: 10) {
             Image(systemName: icon)
@@ -2080,6 +2274,7 @@ struct VideoSyncView: View {
             // 同上：设备需要处理时不用 disabled（灰了不知道为什么），点一下由 openPicker 拦下并说明
             Button(action, action: perform)
                 .buttonStyle(PillButtonStyle(kind: .secondary))
+                .disabled(!enabled)
         }
     }
 
@@ -2164,6 +2359,80 @@ private struct ReadinessChip: View {
     }
 }
 
+/// 系统相册选择器（PHPicker：只列视频、不需要相册权限）。选中后只把 NSItemProvider 交出去（主线程），
+/// 拷贝由页面用 copyVideo 发起：页面持有 Progress（换视频 / 离开页面时取消）和代数（过期的回调不认）。
+struct PhotoVideoPicker: UIViewControllerRepresentable {
+    var onCancel: () -> Void = {}
+    /// 选中了一个（主线程）
+    let onPick: (NSItemProvider) -> Void
+
+    /// 相册视频拷出来的临时目录（loadVideo 再移进 SyncVideos；启动时清掉上次留下的）
+    static var importDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("PhotoImports", isDirectory: true)
+    }
+
+    static func purgeImports() {
+        try? FileManager.default.removeItem(at: importDirectory)
+    }
+
+    /// loadFileRepresentation 给的临时文件在回调返回后就删，所以在回调里（后台）同步拷到 importDirectory；
+    /// 拷失败删掉半截文件。completion 回主线程，nil = 读不出来 / 被取消。没有视频类型时返回 nil、不回调
+    static func copyVideo(from provider: NSItemProvider, completion: @escaping (URL?) -> Void) -> Progress? {
+        let types = [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie]
+        guard let type = types.first(where: { provider.hasItemConformingToTypeIdentifier($0.identifier) }) else {
+            return nil
+        }
+        let dir = importDirectory
+        return provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, _ in
+            var copied: URL?
+            if let url {
+                let fm = FileManager.default
+                try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+                let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+                let dest = dir.appendingPathComponent("相册视频-" + String(UUID().uuidString.prefix(8)) + "." + ext)
+                do {
+                    try fm.copyItem(at: url, to: dest)
+                    copied = dest
+                } catch {
+                    try? fm.removeItem(at: dest)
+                }
+            }
+            DispatchQueue.main.async { completion(copied) }
+        }
+    }
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var config = PHPickerConfiguration()
+        config.filter = .videos
+        config.selectionLimit = 1
+        config.preferredAssetRepresentationMode = .current
+        let vc = PHPickerViewController(configuration: config)
+        vc.delegate = context.coordinator
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let onPick: (NSItemProvider) -> Void
+        let onCancel: () -> Void
+        init(onPick: @escaping (NSItemProvider) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            guard let provider = results.first?.itemProvider else {
+                onCancel()
+                return
+            }
+            onPick(provider)
+        }
+    }
+}
+
 /// 系统文件选择器（asCopy: true，文件拷进沙盒，不玩 security-scoped 杂技）
 struct DocumentPicker: UIViewControllerRepresentable {
     let contentTypes: [UTType]
@@ -2198,4 +2467,86 @@ struct DocumentPicker: UIViewControllerRepresentable {
             onPick(url)
         }
     }
+}
+
+
+/// 画面联动调试记录：每一拍一行数字，环形缓冲（最多 maxRows 行），只在主线程用。不存画面，不参与控制
+final class MotionDebugLog {
+    static let maxRows = 6000
+    static let header = "video_t,host_t,frames,mean_energy,peak_energy,coverage,near_field,cut_count,"
+        + "subject_score,subject_hz,pose_frames,pose_present,pose_score,pose_conf,pose_trust,"
+        + "pose_rhythm_hz,pose_rhythm_conf,pose_rhythm_part,subject_follow_hz,roi_valid,roi_x0,roi_y0,roi_x1,roi_y1,roi_hz,roi_share,"
+        + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
+        + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1"
+    private var rows: [String] = []
+    private var start = 0
+
+    var count: Int { rows.count }
+
+    func clear() {
+        rows.removeAll(keepingCapacity: false)
+        start = 0
+    }
+
+    func append(t: Double, window w: MotionWindow, normalizer n: MotionNormalizer, target: Double,
+                shapedLevel: Double, value: Double, hasSignal: Bool, kind: Int, context: String?,
+                rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
+                rateLevel: Int?, out: [Int]) {
+        func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
+        let r = w.roi.region
+        let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
+        let fields: [String] = [
+            f(t), f(CACurrentMediaTime()), String(w.frames), f(w.meanEnergy), f(w.peakEnergy), f(w.coverage),
+            f(w.nearField), String(w.cutCount), f(w.subjectScore), f(w.subjectHz), String(w.poseFrames),
+            String(w.posePresentFrames), f(w.poseScore), f(w.poseConfidence), f(w.poseTrust),
+            f(w.poseRhythmHz), f(w.poseRhythmConfidence), String(w.poseRhythmPart), f(w.subjectFollowHz),
+            r.valid ? "1" : "0", f(r.x0), f(r.y0), f(r.x1), f(r.y1), f(r.hz), f(r.share),
+            f(n.refLow), f(n.refHigh), f(n.confidence), f(n.poseWeight), f(target), f(shapedLevel), f(value),
+            hasSignal ? "1" : "0", String(kind), ctx,
+            f(rhythmHz), f(rhythmWeight), rhythmLocked ? "1" : "0", f(activity), rateLevel.map(String.init) ?? "",
+            String(out.count > 0 ? out[0] : 0), String(out.count > 1 ? out[1] : 0)
+        ]
+        let line = fields.joined(separator: ",")
+        if rows.count < Self.maxRows {
+            rows.append(line)
+        } else {
+            rows[start] = line
+            start = (start + 1) % Self.maxRows
+        }
+    }
+
+    /// 导出的表格放这里（每次导出前清掉上一份；启动时也清）
+    static var exportDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("MotionDebug", isDirectory: true)
+    }
+
+    static func purgeExports() {
+        try? FileManager.default.removeItem(at: exportDirectory)
+    }
+
+    /// 写到临时目录（先删掉以前导出的），返回文件地址（失败 nil）
+    func writeCSV() -> URL? {
+        var text = Self.header + "\n"
+        for i in 0..<rows.count { text += rows[(start + i) % rows.count] + "\n" }
+        let stamp = Int(Date().timeIntervalSince1970)
+        let fm = FileManager.default
+        Self.purgeExports()
+        try? fm.createDirectory(at: Self.exportDirectory, withIntermediateDirectories: true)
+        let url = Self.exportDirectory.appendingPathComponent("bluecrystal-motion-\(stamp).csv")
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+}
+
+/// 系统分享面板（导出调试表格）
+struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

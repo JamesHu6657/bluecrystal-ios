@@ -195,6 +195,8 @@ private final class PoseWorker {
         }
         tracker.phaseFitEnabled = phaseFit
         tracker.contextEnabled = context
+        // rhythm-action tune：近景只认到身体一部分时按解剖比例估尺度、另一个人的髋也攒节奏（跟动作识别开关走）
+        tracker.actionTuned = context
         handTracker.phaseFitEnabled = phaseFit
         faceTracker.phaseFitEnabled = phaseFit
         if !context, contextWasOn {
@@ -568,6 +570,9 @@ final class VideoMotionTap {
         let flags = rhythmFlags
         analyzer.phaseFitEnabled = flags.phaseFit
         if analyzer.contextEnabled != flags.context { analyzer.contextEnabled = flags.context }
+        // rhythm-action tune：块运动噪声防护 + 周期区域稳定性（跟动作识别开关走；关着时逐位不变）
+        if analyzer.actionTuned != flags.context { analyzer.actionTuned = flags.context }
+        roiTracker.noiseGuard = flags.context
         roiTracker.phaseFitEnabled = flags.phaseFit
         if !flags.context, roiWasOn { roiTracker.reset() }
         roiWasOn = flags.context
