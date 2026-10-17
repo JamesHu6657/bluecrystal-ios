@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# 声画融合关着 = f706431（v1.8.3）逐位相同（PR Checks 里跑；本地有 swiftc 就能跑，macOS / Linux 都行）：
+# 同一个只用 f706431 已有接口的整条链模拟（声音模式、画面 P1 / P2 / P3 含撞击声相位校正、P4 前瞻），
+# 分别和 BASE 的 VisualSync.swift、当前工作区的 VisualSync.swift 编译，输出必须逐字节相同；
+# 当前工作区再加 -D AV_FUSION_ON 编一份（融合部件在旁边跟着跑；F1 起才有内容），输出也必须相同（融合只显示、不改输出）。
+# 用法：Tests/FusionOffCompare/run.sh [BASE]（默认 f706431；CI 的 checkout 要拿到这个提交：fetch-depth: 0）
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+BASE="${1:-f706431}"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+git show "$BASE:BlueCrystalIOS/VisualSync.swift" > "$TMP/VisualSync.base.swift"
+PURE="BlueCrystalIOS/Protocol.swift BlueCrystalIOS/Models.swift BlueCrystalIOS/SafetyLedger.swift BlueCrystalIOS/AIProgram.swift"
+SWIFTC="${SWIFTC:-swiftc}"
+if command -v xcrun >/dev/null 2>&1; then SWIFTC="xcrun swiftc"; fi
+HARNESS="Tests/FusionOffCompare/LinuxShim.swift Tests/FusionOffCompare/main.swift"
+$SWIFTC -O -swift-version 5 $PURE "$TMP/VisualSync.base.swift" $HARNESS -o "$TMP/base" & P1=$!
+$SWIFTC -O -swift-version 5 $PURE BlueCrystalIOS/VisualSync.swift $HARNESS -o "$TMP/head" & P2=$!
+$SWIFTC -O -swift-version 5 -D AV_FUSION_ON $PURE BlueCrystalIOS/VisualSync.swift $HARNESS -o "$TMP/fusion" & P3=$!
+wait $P1; wait $P2; wait $P3
+"$TMP/base" > "$TMP/base.txt"
+"$TMP/head" > "$TMP/head.txt"
+"$TMP/fusion" > "$TMP/fusion.txt"
+sum() { sha256sum "$1" 2>/dev/null | cut -c1-16 || shasum -a 256 "$1" | cut -c1-16; }
+status=0
+for v in head fusion; do
+  if cmp -s "$TMP/base.txt" "$TMP/$v.txt"; then
+    echo "FusionOffCompare: $v identical ($(wc -l < "$TMP/base.txt") lines, sha256 $(sum "$TMP/base.txt")) vs $BASE"
+  else
+    echo "FAIL FusionOffCompare: $v DIFFERENT vs $BASE"
+    diff "$TMP/base.txt" "$TMP/$v.txt" | head -n 20 || true
+    status=1
+  fi
+done
+exit $status

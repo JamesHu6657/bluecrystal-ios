@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # 声画融合关着对照要拿到 f706431（v1.8.3）的 VisualSync.swift
+          fetch-depth: 0
 
       - name: Select Xcode 16.4
         run: |
@@ -73,6 +75,13 @@ jobs:
           # 检查程序顶层很大，8 MB 默认栈不够（Debug 构建），把栈加到 64 MB
           ulimit -s 65520 || true
           "$RUNNER_TEMP/visual-sync-checks" 2>&1 | tee -a tests.log
+
+      # 声画融合（av-fusion）关着 = f706431（v1.8.3）逐位相同：同一份整条链模拟和 f706431 / 当前分支 / 当前分支 + 融合部件跟着跑
+      # 各编一份，输出必须逐字节相同（-O 构建，栈够用）
+      - name: Fusion off compare (vs f706431)
+        run: |
+          set -euo pipefail
+          bash Tests/FusionOffCompare/run.sh f706431 2>&1 | tee -a tests.log
 
       # 只编译（BLEManager / 各 View 只有这里能验证），不打包、不上传
       - name: Compile app (no signing, no IPA)

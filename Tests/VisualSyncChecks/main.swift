@@ -6946,6 +6946,493 @@ do {
            "P4 预扫描初始化：只在还没学过时用（热身照旧从 0 起）；学过 / 不可信时不动；坏值夹回实时能到的范围；输出仍在 0~100")
 }
 
+// MARK: - av-fusion F0（观测与标定）：都放在函数里（顶层栈已经很满）
+func avFusionF0Checks() {
+    // 调试表格声画列：表头 / 有数 / 空列 三者列数一致；NaN / ∞ 写空；撞击时刻用分号连、没有逗号
+    let headerCount = AVDebugColumns.f0Header.split(separator: ",", omittingEmptySubsequences: false).count
+    var bands = AudioBandSummary()
+    bands.add([AudioBandFrame(time: 1, low: 0.01, mid: 0.001, high: 0), AudioBandFrame(time: 1.01, low: 0.03, mid: 0.001, high: 0)])
+    let clock = MediaClockSnapshot(host: 100, item: 5, rate: 1)
+    let full = AVDebugColumns.f0Fields(onsets: [1.2345, .nan, 1.8], bands: bands, tapLead: 0.0815, tapValid: 7, tapInvalid: 1,
+                                       clock: clock)
+    let blank = AVDebugColumns.f0Fields(onsets: [], bands: AudioBandSummary(), tapLead: .nan, tapValid: 0, tapInvalid: 0,
+                                        clock: MediaClockSnapshot(host: .infinity, item: .nan, rate: .nan))
+    let line = full.joined(separator: ",")
+    vcheck(headerCount == 11 && full.count == headerCount && blank.count == headerCount && AVDebugColumns.f0Empty.count == headerCount
+           && (full[0] == "1.234;1.800" || full[0] == "1.235;1.800"),
+           "F0 调试列：表头 \(headerCount) 列，有数 / 空 / 占位列数一致；撞击时刻分号分隔（\(full[0])）")
+    vcheck(full[1] == "2" && full[2] == "-16.99" && full[3] == "-30.00" && full[4] == "-120.00" && full[5] == "81.5"
+           && full[6] == "7" && full[7] == "1" && full[8] == "100.0000" && full[10] == "1.000"
+           && line.split(separator: ",", omittingEmptySubsequences: false).count == headerCount,
+           "F0 调试列数值：频带均值 dB / 提前量毫秒 / 回调计数 / 播放器时钟（\(line)）")
+    vcheck(blank[0] == "" && blank[1] == "0" && blank[2] == "" && blank[5] == "" && blank[8] == "" && blank[9] == ""
+           && blank[10] == "" && AVDebugColumns.f0Empty.allSatisfy { $0.isEmpty } && AVDebugColumns.field(.nan) == ""
+           && AVDebugColumns.field(-.infinity) == "",
+           "F0 调试列：NaN / ∞ / 没有块 → 空格子（不是 nan / inf）")
+
+    // tap 回调时间环形缓冲：关着什么都不记；满 64 条后留最新的、旧 → 新；计数照记；drain 清零；开关切换清掉
+    let ring = AudioTapTimingRing()
+    ring.record(AudioTapTiming(host: 1, itemStart: 0, frames: 512))
+    let offEmpty = ring.count == 0 && ring.validCount == 0 && ring.invalidCount == 0 && ring.drain().timings.isEmpty
+    ring.setEnabled(true)
+    for k in 0..<100 {
+        ring.record(AudioTapTiming(host: Double(k), itemStart: k % 10 == 9 ? .nan : Double(k) * 0.01, frames: 480))
+    }
+    let d = ring.drain()
+    let ordered = d.timings.count == AudioTapTimingRing.capacity && d.timings.first?.host == 36 && d.timings.last?.host == 99
+        && zip(d.timings, d.timings.dropFirst()).allSatisfy { $0.host + 1 == $1.host }
+    let counted = d.valid == 90 && d.invalid == 10 && d.timings.filter { !$0.valid }.count == 7
+    let cleared = ring.count == 0 && ring.drain().timings.isEmpty
+    ring.record(AudioTapTiming(host: 1, itemStart: 1, frames: 0))
+    ring.setEnabled(false)
+    ring.record(AudioTapTiming(host: 2, itemStart: 2, frames: 10))
+    let offAgain = ring.count == 0 && ring.validCount == 0 && ring.invalidCount == 0
+    vcheck(offEmpty && ordered && counted && cleared && offAgain && !AudioTapTiming(host: 1, itemStart: 1, frames: 0).valid,
+           "F0 回调时间缓冲：关着不记；满 \(AudioTapTimingRing.capacity) 条留最新、旧 → 新；有效 / 无效计数；取走清零；关掉清掉")
+
+    // 播放器时钟换算：视频时间 ↔ host 时间（倍速 2 时视频走两倍）；倍速 0 / 非有限 → NaN
+    let c2 = MediaClockSnapshot(host: 50, item: 10, rate: 2)
+    let paused = MediaClockSnapshot(host: 50, item: 10, rate: 0)
+    vcheck(abs(c2.host(forItem: 11) - 50.5) < 1e-12 && abs(c2.item(forHost: 51) - 12) < 1e-12
+           && abs(c2.item(forHost: c2.host(forItem: 13.37)) - 13.37) < 1e-12
+           && paused.host(forItem: 11).isNaN && paused.item(forHost: 51).isNaN && c2.host(forItem: .nan).isNaN,
+           "F0 播放器时钟：视频时间 ↔ host 时间按倍速互换，暂停 / 无效 → NaN")
+
+    // tap 提前量：tap 比出声早 L（固定种子抖动 ±3 ms + 几个 seek 离谱值）→ 中位数在 2.5 ms 内；倍速 2 一样；无效时钟 / 无效记录不进
+    var leadOK = true
+    var leads: [String] = []
+    // 自己的固定种子（不受前面测试用掉多少 vsRandom 影响）
+    var jSeed: UInt64 = 0xF0F0
+    func jRandom() -> Double {
+        jSeed = jSeed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(jSeed >> 11) / Double(1 << 53)
+    }
+    for (rate, lead) in [(1.0, 0.12), (2.0, 0.045), (1.0, -0.02)] {
+        var est = AudioTapLeadEstimator()
+        var host = 1000.0
+        var item = 3.0
+        for k in 0..<60 {
+            var batch: [AudioTapTiming] = []
+            for _ in 0..<3 {
+                // 回调时刻抖动 ±3 ms（tap 处理时刻不均匀；声音照样按播放器时钟放出来）
+                let jitter = (jRandom() - 0.5) * 0.006
+                batch.append(AudioTapTiming(host: host + jitter, itemStart: item, frames: 1024))
+                host += 0.0213
+                item += 0.0213 * rate
+            }
+            if k % 17 == 5 { batch.append(AudioTapTiming(host: host, itemStart: item + 30, frames: 1024)) }
+            batch.append(AudioTapTiming(host: host, itemStart: .nan, frames: 1024))
+            // 主线程这一刻读到的时钟：视频时间 item 在 host + lead 时被听到
+            let snap = MediaClockSnapshot(host: host + lead, item: item, rate: rate)
+            est.add(batch, clock: snap)
+        }
+        leads.append(String(format: "%.1f", est.lead * 1000))
+        leadOK = leadOK && abs(est.lead - lead) < 0.0025 && est.samples.count == AudioTapLeadEstimator.sampleCapacity
+    }
+    var none = AudioTapLeadEstimator()
+    none.add([AudioTapTiming(host: 1, itemStart: 1, frames: 10)], clock: MediaClockSnapshot(host: 1, item: 1, rate: 0))
+    none.add([AudioTapTiming(host: 1, itemStart: .nan, frames: 10)], clock: MediaClockSnapshot(host: 1, item: 1, rate: 1))
+    vcheck(leadOK && none.lead.isNaN && none.samples.isEmpty,
+           "F0 tap 提前量：中位数 \(leads.joined(separator: " / ")) ms（应 120 / 45 / −20）；seek 离谱值、无效时钟 / 记录不进")
+}
+avFusionF0Checks()
+
+// MARK: - av-fusion F1：声音特征 + 耦合度（只显示）
+
+/// F1 合成声音（固定种子 LCG；24 kHz 省时间——设备上是 44.1 / 48 kHz，帧长 / 子块 / 降采样倍数都按采样率算）
+struct AVSynth {
+    static let rate: Double = 24_000
+    var seed: UInt64
+    init(seed: UInt64) { self.seed = seed }
+    mutating func noise() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53) * 2 - 1
+    }
+
+    /// 咔哒串：每个时刻一下 20 毫秒衰减的宽带噪声
+    static func clicks(_ times: [Double], amp: Double = 0.6) -> (Double, inout AVSynth) -> Double {
+        let sorted = times.sorted()
+        return { t, s in
+            var x = 0.0
+            var lo = 0
+            var hi = sorted.count
+            while lo < hi {
+                let m = (lo + hi) / 2
+                if sorted[m] <= t { lo = m + 1 } else { hi = m }
+            }
+            var k = lo - 1
+            while k >= 0, t - sorted[k] < 0.15 {
+                x += amp * exp(-(t - sorted[k]) / 0.02) * s.noise()
+                k -= 1
+            }
+            return x
+        }
+    }
+
+    /// 配乐：120 BPM 底鼓（每拍）+ 踩镲（每半拍）+ 持续的强力和弦（196 / 294 / 392 Hz）
+    static func music(start: Double = 0, bpm: Double = 120, chord: Double = 0.12) -> (Double, inout AVSynth) -> Double {
+        let beat = 60 / bpm
+        var lastNoise = 0.0
+        return { t, s in
+            var x = chord * (sin(2 * .pi * 196 * t) + sin(2 * .pi * 294 * t) + sin(2 * .pi * 392 * t)) / 3
+            let tt = t - start
+            guard tt >= 0 else { return x }
+            let kb = tt - (tt / beat).rounded(.down) * beat
+            x += 0.7 * sin(2 * .pi * (55 * kb + 1.5 * (1 - exp(-kb / 0.03)))) * exp(-kb / 0.12)
+            let half = beat / 2
+            let kh = tt - (tt / half).rounded(.down) * half
+            let n = s.noise()
+            let hp = n - lastNoise
+            lastNoise = n
+            x += 0.25 * hp * exp(-kh / 0.015)
+            return x
+        }
+    }
+
+    /// 人声样：150 Hz 谐波（1/h）× 4 Hz 音节包络
+    static func voice(f0: Double = 150) -> (Double, inout AVSynth) -> Double {
+        { t, _ in
+            var x = 0.0
+            var h = 1.0
+            while f0 * h < 4000 {
+                x += sin(2 * .pi * f0 * h * t) / h
+                h += 1
+            }
+            let env = 0.5 - 0.5 * cos(2 * .pi * 4 * t)
+            return 0.25 * x * env
+        }
+    }
+
+    /// 呻吟样：每 1.5 秒一声，200 → 350 Hz 滑音（6 个谐波），1.5 秒的正弦平方包络
+    static func moan() -> (Double, inout AVSynth) -> Double {
+        { t, _ in
+            let p = 1.5
+            let k = (t / p).rounded(.down)
+            let u = t - k * p
+            // 相位 = ∫ f：f = 200 + 150 u / p
+            let phase = 2 * .pi * (200 * u + 75 * u * u / p)
+            var x = 0.0
+            for h in 1...6 { x += sin(Double(h) * phase) / Double(h) }
+            let env = pow(sin(.pi * u / p), 2)
+            return 0.3 * x * env
+        }
+    }
+
+    static func whiteNoise(_ amp: Double = 0.2) -> (Double, inout AVSynth) -> Double { { _, s in amp * s.noise() } }
+
+    static func hum(_ amp: Double = 0.3) -> (Double, inout AVSynth) -> Double {
+        { t, _ in amp * (sin(2 * .pi * 50 * t) + 0.5 * sin(2 * .pi * 100 * t) + 0.25 * sin(2 * .pi * 150 * t)) }
+    }
+
+    static func floor(_ amp: Double = 0.004) -> (Double, inout AVSynth) -> Double { { _, s in amp * s.noise() } }
+}
+
+/// F1 测试用的一整条链：合成声音 → 6 段 splitter（+ P3 三频带）→ 每 0.3 秒一拍 AVFusionEngine.beat。
+/// 画面相位锁按 hz(t)（nil = 不锁）每拍喂一个读数；倍速 1、host 时间 = 视频时间
+struct AVF1Run {
+    var beats: [(t: Double, b: AVFusionBeat)] = []
+    var engine = AVFusionEngine()
+    var frames = 0
+
+    init(seconds: Double, signals: [(Double, inout AVSynth) -> Double], seed: UInt64 = 7,
+         lockHz: Double? = nil, phase0: Double = 0, activity: Double = 0.5, cutAt: Double? = nil,
+         relockAfterCut: Double = 1.0, chunk: Int = 512) {
+        var synth = AVSynth(seed: seed)
+        var splitter = AudioFeatureSplitter()
+        splitter.configure(sampleRate: AVSynth.rate)
+        var bands = AudioBandSplitter()
+        bands.configure(sampleRate: AVSynth.rate)
+        var lock = RhythmPhaseLock()
+        var i = 0
+        var tick = 0.0
+        var drain = AudioFeatureDrain()
+        drain.pcmRate = AudioFeatureSplitter.pcmRate(forSampleRate: AVSynth.rate)
+        var bandFrames: [AudioBandFrame] = []
+        var cutDone = false
+        while tick + 0.3 <= seconds {
+            tick += 0.3
+            let end = Int(tick * AVSynth.rate)
+            while i < end {
+                let n = min(chunk, end - i)
+                let start = Double(i) / AVSynth.rate
+                splitter.begin(start: start, frames: n)
+                bands.begin(start: start, frames: n)
+                var f = AudioFeatureFrame()
+                var p: Float = 0
+                for j in 0..<n {
+                    let t = Double(i + j) / AVSynth.rate
+                    var x = 0.0
+                    for s in signals { x += s(t, &synth) }
+                    let flags = splitter.add(x, frame: &f, pcm: &p)
+                    if flags & AudioFeatureSplitter.frameReady != 0 { drain.frames.append(f) }
+                    if flags & AudioFeatureSplitter.pcmReady != 0 { drain.pcm.append(p) }
+                    if let b = bands.add(x, at: t) { bandFrames.append(b) }
+                }
+                i += n
+            }
+            frames += drain.frames.count
+            engine.addBands(bandFrames)
+            engine.addFeatures(drain)
+            bandFrames.removeAll()
+            drain.frames.removeAll()
+            drain.pcm.removeAll()
+            let now = tick
+            var cut = false
+            if let c = cutAt, !cutDone, now >= c {
+                cut = true
+                cutDone = true
+                lock.reset()
+            }
+            if let hz = lockHz, !(cutAt.map { now >= $0 && now < $0 + relockAfterCut } ?? false) {
+                var w = MotionWindow()
+                w.frames = 5
+                w.subjectFrames = 5
+                w.subjectScore = 0.5
+                let tr = now - 0.03
+                w.subjectPhase = StrokeRhythm.PhaseFit(time: tr, phase: StrokeRhythm.wrapPhase(2 * Double.pi * hz * tr + phase0),
+                                                       hz: hz, quality: 0.9, linearity: 0.95, amplitude: 3, epoch: 0)
+                lock.step(w, followerHz: hz, followerLocked: true, followerSource: .flow, now: now, dt: 0.3, active: true)
+            }
+            let clock = MediaClockSnapshot(host: now, item: now, rate: 1)
+            let b = engine.beat(clock: clock, lock: lock, activity: activity, cut: cut, audioReady: true, dt: 0.3)
+            beats.append((now, b))
+        }
+    }
+
+    func first(_ ok: (AVFusionBeat) -> Bool) -> Double? { beats.first { ok($0.b) }?.t }
+    var last: AVFusionBeat { beats.last!.b }
+}
+
+/// 画面相位 2π·hz·t（phase0 = 0）每过 0 一下咔哒（再偏 offset 秒）
+func avClickTimes(hz: Double, from: Double, to: Double, offset: Double = 0) -> [Double] {
+    var out: [Double] = []
+    var k = (from * hz).rounded(.up)
+    while k / hz <= to {
+        out.append(k / hz + offset)
+        k += 1
+    }
+    return out
+}
+
+func avFusionF1Checks() {
+    func f2(_ x: Double?) -> String { x.map { String(format: "%.2f", $0) } ?? "—" }
+    // 咔哒串和画面同步（1.6 Hz，咔哒落在画面相位 0）：4 秒内 C ≥ 0.6，回差 2 秒后进「耦合」并一直耦合
+    let clicks = AVF1Run(seconds: 10, signals: [AVSynth.clicks(avClickTimes(hz: 1.6, from: 0.3, to: 12)), AVSynth.floor()],
+                         lockHz: 1.6)
+    let clickC = clicks.first { $0.c >= 0.6 }
+    let clickIn = clicks.first { $0.state == .coupled }
+    vcheck((clickC ?? 99) <= 4.0 + 1e-9 && (clickIn ?? 99) <= 6.3 + 1e-9 && clicks.last.state == .coupled
+           && clicks.beats.filter { $0.t >= 7 }.allSatisfy { $0.b.coupled && $0.b.c >= 0.8 },
+           "F1 咔哒串和画面同步：C ≥ 0.6 在 \(f2(clickC)) 秒（≤ 4），耦合在 \(f2(clickIn)) 秒，之后一直耦合")
+    vcheck(clicks.beats.allSatisfy { $0.b.impacts <= 8 && $0.b.pMusic < 0.3 && $0.b.pVoice < 0.3 }
+           && abs(clicks.last.fa - 1.6) < 0.05 && clicks.last.r > 0.9,
+           "F1 咔哒串：撞击频率 \(f2(clicks.last.fa)) Hz ≈ 画面 1.6 Hz、相位集中度 \(f2(clicks.last.r))、不像配乐 / 人声")
+    // 偏移 +150 毫秒的咔哒串：相位偏一个固定量，集中度不变 → 仍耦合
+    let off = AVF1Run(seconds: 10, signals: [AVSynth.clicks(avClickTimes(hz: 1.6, from: 0.3, to: 12, offset: 0.15)),
+                                              AVSynth.floor()], lockHz: 1.6)
+    let offIn = off.first { $0.state == .coupled }
+    vcheck((offIn ?? 99) <= 7 && off.last.state == .coupled && off.last.r > 0.9,
+           "F1 偏移 +150 毫秒的咔哒串：仍耦合（\(f2(offIn)) 秒进入，集中度 \(f2(off.last.r))）")
+    // 配乐 + 画面恰好同频（2 Hz）：切镜前看起来耦合；12 秒切镜、考验 2 秒节拍接上 → 像配乐，C ≤ 0.3、退出耦合
+    let music = AVF1Run(seconds: 22, signals: [AVSynth.music()], lockHz: 2, cutAt: 12)
+    let tested = music.beats.filter { $0.t >= 12.4 && $0.t < 13.9 }.allSatisfy { $0.b.state == .cutTest }
+    let after = music.beats.filter { $0.t >= 17.5 }
+    let musicOut = music.beats.first { $0.t > 14 && !$0.b.coupled }?.t
+    vcheck(tested && after.allSatisfy { $0.b.c <= 0.3 && !$0.b.coupled && $0.b.crossCut == 1 && $0.b.pMusic >= 0.8 - 1e-9 }
+           && music.last.state == .music && (musicOut ?? 99) <= 17,
+           "F1 配乐 + 画面同频：切镜考验 2 秒、节拍接上 → 像配乐（P_music \(f2(music.last.pMusic))），"
+           + "C \(f2(music.last.c)) ≤ 0.3，\(f2(musicOut)) 秒退出耦合")
+    // 画面静止 + 配乐：画面不动时声音照样有节奏 → P_music ≥ 0.6，状态「像配乐」，不耦合
+    let still = AVF1Run(seconds: 12, signals: [AVSynth.music()], activity: 0)
+    vcheck(still.beats.filter { $0.t >= 4 }.allSatisfy { $0.b.pMusic >= 0.6 - 1e-9 && $0.b.still == 1 && !$0.b.coupled }
+           && still.last.state == .music && still.beats.allSatisfy { $0.b.c == 0 },
+           "F1 画面静止 + 配乐：P_music \(f2(still.last.pMusic)) ≥ 0.6，像配乐，C 一直 0")
+    // 人声样 / 呻吟样：没有宽带短促的撞击（≤ 1 次/秒）、谐波度高 → P_voice ≥ 0.6，不耦合
+    for (name, sig) in [("人声样", AVSynth.voice()), ("呻吟样", AVSynth.moan())] {
+        let r = AVF1Run(seconds: 10, signals: [sig, AVSynth.floor()], lockHz: 1.6)
+        let maxImpacts = r.beats.map { $0.b.impacts }.max() ?? 0
+        vcheck(maxImpacts <= 4 && r.beats.filter { $0.t >= 2 }.allSatisfy { $0.b.pVoice >= 0.6 && !$0.b.coupled && $0.b.c < 0.1 }
+               && r.last.state == .voice,
+               "F1 \(name)：撞击最多 \(maxImpacts) 次 / 4 秒（≤ 1 次/秒），P_voice \(f2(r.last.pVoice)) ≥ 0.6，不耦合")
+    }
+    // 白噪声 / 50 Hz 哼声：没有起音 → 0 次撞击、不耦合
+    for (name, sig) in [("白噪声", AVSynth.whiteNoise()), ("50 Hz 哼声", AVSynth.hum())] {
+        let r = AVF1Run(seconds: 8, signals: [sig], lockHz: 1.6)
+        vcheck(r.beats.allSatisfy { $0.b.impacts == 0 && $0.b.c == 0 && !$0.b.coupled } && r.engine.extractor.events.isEmpty
+               && r.last.state == .uncoupled,
+               "F1 \(name)：0 次撞击、C = 0、不耦合")
+    }
+    // 画面没锁相位：不耦合，状态「画面相位还没锁上」
+    let unlocked = AVF1Run(seconds: 6, signals: [AVSynth.clicks(avClickTimes(hz: 1.6, from: 0.3, to: 12)), AVSynth.floor()])
+    vcheck(unlocked.beats.allSatisfy { $0.b.c == 0 && !$0.b.coupled } && unlocked.last.state == .noLock,
+           "F1 画面相位没锁：不耦合（状态 no_lock）")
+
+    // 没声音 / 时间不可用
+    var silent = AVFusionEngine()
+    let silentBeat = silent.beat(clock: MediaClockSnapshot(host: 1, item: 1, rate: 1), lock: RhythmPhaseLock(), activity: 0.5,
+                                 cut: false, audioReady: false, dt: 0.3)
+    var noTime = AVFusionEngine()
+    var bad = AudioFeatureDrain()
+    bad.invalidChunks = 3
+    noTime.addFeatures(bad)
+    let noTimeBeat = noTime.beat(clock: MediaClockSnapshot(host: 1, item: 1, rate: 1), lock: RhythmPhaseLock(), activity: 0.5,
+                                 cut: false, audioReady: true, dt: 0.3)
+    let paused = silent.beat(clock: MediaClockSnapshot(host: 1, item: .nan, rate: 0), lock: RhythmPhaseLock(), activity: 0.5,
+                             cut: false, audioReady: true, dt: 0.3)
+    vcheck(silentBeat.state == .noAudio && noTimeBeat.state == .noTime && paused.state == .noAudio
+           && silentBeat.statusText.hasPrefix("声画：没声音") && noTimeBeat.statusText.hasPrefix("声画：时间不可用")
+           && music.last.statusText.hasPrefix("声画：像配乐") && clicks.last.statusText.hasPrefix("声画：耦合"),
+           "F1 状态行：没声音 / 时间不可用 / 像配乐 / 耦合")
+
+    // 实时线程部分：6 段 splitter 在 1~4096 帧随机切块下和一次喂完逐位相同
+    func splitRun(_ samples: [Double], chunks: [Int], start: Double = 3.25, rate: Double = 48000)
+        -> (frames: [AudioFeatureFrame], pcm: [Float]) {
+        var sp = AudioFeatureSplitter()
+        sp.configure(sampleRate: rate)
+        var frames: [AudioFeatureFrame] = []
+        var pcm: [Float] = []
+        var i = 0
+        var k = 0
+        while i < samples.count {
+            let n = min(chunks[k % chunks.count], samples.count - i)
+            k += 1
+            sp.begin(start: start + Double(i) / rate, frames: n)
+            var f = AudioFeatureFrame()
+            var p: Float = 0
+            for j in 0..<n {
+                let flags = sp.add(samples[i + j], frame: &f, pcm: &p)
+                if flags & AudioFeatureSplitter.frameReady != 0 { frames.append(f) }
+                if flags & AudioFeatureSplitter.pcmReady != 0 { pcm.append(p) }
+            }
+            i += n
+        }
+        return (frames, pcm)
+    }
+    var synth = AVSynth(seed: 99)
+    let gen = AVSynth.music()
+    let clickGen = AVSynth.clicks([0.2, 0.7, 1.1])
+    let samples = (0..<72_000).map { j -> Double in
+        let t = Double(j) / 48000
+        return gen(t, &synth) + clickGen(t, &synth)
+    }
+    let whole = splitRun(samples, chunks: [samples.count])
+    var chunkSame = !whole.frames.isEmpty && whole.frames.count == 150 && whole.pcm.count == 12_000
+    var lcg: UInt64 = 0x5eed_f1
+    for _ in 0..<6 {
+        var chunks: [Int] = []
+        for _ in 0..<64 {
+            lcg = lcg &* 6364136223846793005 &+ 1442695040888963407
+            chunks.append(1 + Int((lcg >> 33) % 4096))
+        }
+        let r = splitRun(samples, chunks: chunks)
+        if r.frames != whole.frames || r.pcm != whole.pcm { chunkSame = false }
+    }
+    vcheck(chunkSame && abs(whole.frames[0].time - (3.25 + 0.005)) < 1e-12 && whole.frames.allSatisfy { $0.totalEnergy > 0 },
+           "F1 6 段 splitter：1~4096 帧随机切块和一次喂完逐位相同（\(whole.frames.count) 帧 / \(whole.pcm.count) 个 PCM）")
+    // seek：没满的半帧丢掉，从新位置重新起算；时间拿不到（NaN）这一段不出帧
+    var sp = AudioFeatureSplitter()
+    sp.configure(sampleRate: 48000)
+    var fr = AudioFeatureFrame()
+    var pc: Float = 0
+    var out: [AudioFeatureFrame] = []
+    sp.begin(start: 1, frames: 720)
+    for j in 0..<720 where sp.add(samples[j], frame: &fr, pcm: &pc) & AudioFeatureSplitter.frameReady != 0 { out.append(fr) }
+    sp.begin(start: 20, frames: 480)
+    for j in 0..<480 where sp.add(samples[j], frame: &fr, pcm: &pc) & AudioFeatureSplitter.frameReady != 0 { out.append(fr) }
+    var nanCount = 0
+    sp.begin(start: .nan, frames: 960)
+    for j in 0..<960 where sp.add(samples[j], frame: &fr, pcm: &pc) != 0 { nanCount += 1 }
+    var unknown = AudioFeatureSplitter()
+    unknown.configure(sampleRate: .nan)
+    unknown.begin(start: 0, frames: 10)
+    vcheck(out.count == 2 && abs(out[0].time - 1.005) < 1e-12 && abs(out[1].time - 20.005) < 1e-12 && nanCount == 0
+           && unknown.add(0.5, frame: &fr, pcm: &pc) == 0 && AudioFeatureSplitter.decimation(forSampleRate: 44100) == 6
+           && AudioFeatureSplitter.decimation(forSampleRate: 48000) == 6 && AudioFeatureSplitter.decimation(forSampleRate: 0) == 0,
+           "F1 6 段 splitter：seek 丢掉没满的半帧、从新位置起算；时间拿不到 / 采样率认不出不出帧")
+
+    // AudioBandBacklog：融合每拍先取走、撞击声校正晚些再取 ≡ 校正单独从电平计环形缓冲（1024，满了丢最旧的）取
+    var backlogSame = true
+    var lcg2: UInt64 = 0xb4c1
+    func rnd(_ n: Int) -> Int {
+        lcg2 = lcg2 &* 6364136223846793005 &+ 1442695040888963407
+        return Int((lcg2 >> 33) % UInt64(n))
+    }
+    for _ in 0..<200 {
+        var refRing: [AudioBandFrame] = []      // 融合关着：只有校正取
+        var fusedRing: [AudioBandFrame] = []    // 融合开着：两边都从它取
+        var backlog = AudioBandBacklog()
+        var t = 0.0
+        for _ in 0..<40 {
+            let produced = rnd(3) == 0 ? rnd(1500) : rnd(60)
+            for _ in 0..<produced {
+                t += 0.01
+                let b = AudioBandFrame(time: t, low: Float(rnd(1000)), mid: Float(rnd(1000)), high: Float(rnd(1000)))
+                refRing.append(b)
+                fusedRing.append(b)
+                if refRing.count > AudioLevelMeterRingModel.capacity { refRing.removeFirst() }
+                if fusedRing.count > AudioLevelMeterRingModel.capacity { fusedRing.removeFirst() }
+            }
+            if rnd(4) != 0 {        // 融合这一拍取走
+                backlog.keep(fusedRing)
+                fusedRing.removeAll()
+            }
+            if rnd(3) == 0 {        // 校正这一拍取
+                let a = refRing
+                refRing.removeAll()
+                let b = backlog.take(adding: fusedRing)
+                fusedRing.removeAll()
+                if a != b { backlogSame = false }
+            }
+        }
+    }
+    var plain = AudioBandBacklog()
+    let fresh = [AudioBandFrame(time: 1, low: 1, mid: 2, high: 3)]
+    vcheck(backlogSame && plain.take(adding: fresh) == fresh && plain.frames.isEmpty
+           && AudioBandBacklog.capacity == AudioLevelMeterRingModel.capacity,
+           "F1 频带块共用：融合先取 + backlog 接上 ≡ 校正单独取（200 组随机，含溢出）；backlog 空时原样返回")
+
+    // 设置：默认关；读回存的值；只在跟随画面时生效；不改 Timer 间隔 / 其他开关
+    let def = VisualSyncSettings()
+    var on = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: true, avFusion: true)
+    let onAudio = VisualSyncSettings(source: .audio, avFusion: true)
+    vcheck(!def.avFusion && !VisualSyncSettings.defaultAVFusion && VisualSyncSettings.Keys.avFusion == "bcVisualSyncAVFusion"
+           && on.usesAVFusion && !onAudio.usesAVFusion && !def.usesAVFusion,
+           "F1 设置：默认关、键名 bcVisualSyncAVFusion、只在跟随画面时生效（跟随声音不变）")
+    let offTick = on.tickInterval
+    let offAnchor = on.usesAudioAnchor
+    on.avFusion = false
+    vcheck(on.tickInterval == offTick && on.usesAudioAnchor == offAnchor && !on.usesAVFusion,
+           "F1 设置：开关不改 Timer 间隔 / 撞击声校正 / 其他判断")
+    if let defaults = UserDefaults(suiteName: "bc.visualsync.f1") {
+        defaults.removePersistentDomain(forName: "bc.visualsync.f1")
+        let none = VisualSyncSettings.load(from: defaults)
+        defaults.set(true, forKey: VisualSyncSettings.Keys.avFusion)
+        defaults.set(1, forKey: VisualSyncSettings.Keys.source)
+        let stored = VisualSyncSettings.load(from: defaults)
+        vcheck(!none.avFusion && stored.avFusion && stored.usesAVFusion, "F1 设置：没存过关、读回存的值")
+        defaults.removePersistentDomain(forName: "bc.visualsync.f1")
+    } else {
+        vcheck(false, "F1 设置：创建测试用 UserDefaults")
+    }
+
+    // 调试列：表头 / 有数 / 空列 列数一致；NaN 写空
+    let f1Count = AVDebugColumns.f1Header.split(separator: ",", omittingEmptySubsequences: false).count
+    let full = AVDebugColumns.f1Fields(clicks.last)
+    let empty = AVDebugColumns.f1Fields(AVFusionBeat())
+    vcheck(f1Count == 21 && full.count == f1Count && empty.count == f1Count && AVDebugColumns.f1Empty.count == f1Count
+           && AVDebugColumns.f1Empty.allSatisfy { $0.isEmpty } && full[0] == "coupled" && full[3] == "1"
+           && empty[7] == "" && empty[18] == "" && empty[19] == "" && !full.joined().contains(",")
+           && !(full + empty).contains { $0.contains("nan") || $0.contains("inf") },
+           "F1 调试列：\(f1Count) 列，有数 / 空 / 占位列数一致；NaN 写空")
+}
+
+/// 电平计频带环形缓冲的容量（AudioLevelMeter 在 Linux 上编不了：照它的 bandCapacity 写一份）
+enum AudioLevelMeterRingModel {
+    static let capacity = 1024
+}
+
+avFusionF1Checks()
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)
