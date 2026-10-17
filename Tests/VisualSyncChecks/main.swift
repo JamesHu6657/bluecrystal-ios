@@ -8002,6 +8002,52 @@ func avFusionF2Checks() {
         vcheck(false, "F2 设置：创建测试用 UserDefaults")
     }
 
+    // 复审 L2–L6
+    func evs(_ hz: Double, from a: Double = 0.2, to b: Double) -> [AudioOnsetEvent] {
+        var out: [AudioOnsetEvent] = []
+        var t = a
+        while t <= b { out.append(AudioOnsetEvent(time: t, strength: 30, risingBands: 6, steepBands: 6, shortBands: 6)); t += 1 / hz }
+        return out
+    }
+    // L2：倍速 2、视频里 0.3 Hz（画面上 0.6 Hz，在跟随器范围里）→ 按倍速搜得到；倍速 1 时 0.3 Hz 不在范围、搜不到
+    let slow = evs(0.3, to: 20)
+    let at2 = AVRhythmVote.audioRhythm(slow, start: 0, end: 20, rate: 2)
+    let at1 = AVRhythmVote.audioRhythm(slow, start: 0, end: 20, rate: 1)
+    vcheck(abs(at2.hz - 0.3) / 0.3 < 0.1 && !(abs(at1.hz - 0.3) / 0.3 < 0.1),
+           "F2 L2 声音滞后搜索按倍速：2× 时找到视频 0.3 Hz（\(f2(at2.hz))），1× 时不找（\(f2(at1.hz))）")
+    // L3：画面 2.1 Hz、声音 3.9 Hz（像两倍）→ 换过去 4.2 Hz 超出跟随器范围，不换；画面 1.95 Hz 时照常换到 3.9
+    let fast = evs(3.9, to: 10)
+    let clk = MediaClockSnapshot(host: 10, item: 10, rate: 1)
+    var v3 = AVRhythmVote()
+    let o3 = v3.refine(f2Window(10, hz: 2.1, phaseHz: 2.1), enabled: true, coupled: true, events: fast, impactHz: 3.9, clock: clk,
+                       followerHz: 2.1, followerLocked: true)
+    var v3b = AVRhythmVote()
+    let o3b = v3b.refine(f2Window(10, hz: 1.95, phaseHz: 1.95), enabled: true, coupled: true, events: fast, impactHz: 3.9,
+                         clock: clk, followerHz: 1.95, followerLocked: true)
+    vcheck(v3.action != .octaveUp && abs(o3.subjectFollowHz - 2.1) < 1e-12 && v3b.action == .octaveUp
+           && abs(o3b.subjectFollowHz - 3.9) < 1e-9,
+           "F2 L3 换八度要落在跟随器范围：2.1 Hz 不换到 4.2（声音 \(f2(v3.audioHz))）、1.95 Hz 换到 3.9")
+    // L4：画面 1.6 Hz、声音最近也 1.6、跟随器还在 1 Hz → 平时 1 拍确认；P4 前瞻频率接管时不缩短
+    let jumpEv = evs(1.6, to: 10)
+    var v4 = AVRhythmVote()
+    _ = v4.refine(f2Window(10, hz: 1.6, phaseHz: 1.6), enabled: true, coupled: true, events: jumpEv, impactHz: 1.6, clock: clk,
+                  followerHz: 1, followerLocked: true)
+    var v4b = AVRhythmVote()
+    _ = v4b.refine(f2Window(10, hz: 1.6, phaseHz: 1.6), enabled: true, coupled: true, events: jumpEv, impactHz: 1.6, clock: clk,
+                   followerHz: 1, followerLocked: true, lookaheadFrequency: true)
+    vcheck(v4.fastJump && v4.fastJumpHz > 0 && !v4b.fastJump && v4b.fastJumpHz == 0,
+           "F2 L4 P4 前瞻频率接管时不缩短跳频确认（平时 fastJump \(v4.fastJump)，前瞻时 \(v4b.fastJump)）")
+    // L5：相位脉动关着 → 节奏确认不生效
+    let noPulse = VisualSyncSettings(source: .motion, rhythmFollow: true, rhythmPulse: false, avFusion: true, avRhythmConfirm: true)
+    vcheck(!noPulse.usesAVRhythmConfirm && noPulse.usesAVFusion, "F2 L5 相位脉动关着时节奏确认不生效（融合照旧）")
+    // L6：融合特征要不要算的真值表
+    var table = true
+    for m in 0..<8 {
+        let a = m & 1 != 0, r = m & 2 != 0, z = m & 4 != 0
+        if VisualSyncSettings.fusionFeaturesWanted(usesAVFusion: a, running: r, analyzing: z) != (a && r && z) { table = false }
+    }
+    vcheck(table, "F2 L6 fusionFeaturesWanted 真值表（融合 && 在联动 && 画面分析在跑）")
+
     // 调试列 / 状态行
     let f2Count = AVDebugColumns.f2Header.split(separator: ",", omittingEmptySubsequences: false).count
     var someVote = AVRhythmVote()

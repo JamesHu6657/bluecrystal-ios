@@ -173,6 +173,14 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
     // F2：融合开着、节奏确认关着（= 开关默认值）
     var f2vis = vis
     f2vis.avFusion = true
+#if AV_F2_CONFIRM
+    // 复审 L6：节奏确认开着、耦合强制不成立（S1）→ 跟随器这条路照样逐位相同（撞击声校正的耦合门是 F2 有意的改动，
+    // 在 VisualSyncChecks 里测，这里照旧给 nil）
+    f2vis.avRhythmConfirm = true
+    let forceS1 = true
+#else
+    let forceS1 = false
+#endif
     var vote = AVRhythmVote()
     var voted = 0
 #endif
@@ -225,10 +233,11 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             if vis.usesRhythmContext { input = ctx.refine(input, now: now) }
 #if AV_F2_ON
             // 照 VideoSyncPlayer.rhythmLevel：P4、P3 之后投票（复审 H1；看上一拍融合状态、跟随器上一拍的结果）
-            input = vote.refine(input, enabled: f2vis.usesAVRhythmConfirm, coupled: AVRhythmVote.isS2(fusion.last),
+            input = vote.refine(input, enabled: f2vis.usesAVRhythmConfirm, coupled: !forceS1 && AVRhythmVote.isS2(fusion.last),
                                 events: fusion.engine.extractor.events, impactHz: fusion.last?.fa ?? 0,
                                 clock: MediaClockSnapshot(host: now, item: now, rate: 1), followerHz: follower.hz,
-                                followerLocked: follower.locked)
+                                followerLocked: follower.locked,
+                                lookaheadFrequency: vis.usesLookahead && coord.lookahead.frequencyEngaged)
             if vote.action != .none || vote.fastJump { voted += 1 }
 #endif
 #if AV_F2_ON
@@ -254,7 +263,7 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
                     let known = vis.usesRhythmContext && ctx.directionKnown
 #if AV_F2_ON
                     // 照 updateAudioAnchor：节奏确认关着时 coupled = nil（P3 原样）
-                    let coupled: Bool? = f2vis.usesAVRhythmConfirm ? fusion.last?.state == .coupled : nil
+                    let coupled: Bool? = f2vis.usesAVRhythmConfirm && !forceS1 ? fusion.last?.state == .coupled : nil
                     driver.phaseOffset = audioAnchor.step(onsets: onsets, audioHz: r.hz, audioConfidence: r.confidence, lock: lock,
                                                           directionKnown: known, now: now, dt: dt, coupled: coupled)
 #else
@@ -285,7 +294,7 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
     FileHandle.standardError.write("fusion \(name): rows \(fusion.rows) coupled beats \(fusion.coupledBeats)\n".data(using: .utf8)!)
 #endif
 #if AV_F2_ON
-    FileHandle.standardError.write("f2 \(name): voted beats \(voted) (switch off → 0)\n".data(using: .utf8)!)
+    FileHandle.standardError.write("f2 \(name): voted beats \(voted) (switch off / forced S1 → 0)\n".data(using: .utf8)!)
 #endif
     print(name, out.count)
     print(out)

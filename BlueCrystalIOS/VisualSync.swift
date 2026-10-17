@@ -3788,7 +3788,13 @@ struct VisualSyncSettings: Equatable {
     /// av-fusion F1：声画融合真正生效（跟随画面 + 开关）。不是第三种来源；不影响 tickInterval
     var usesAVFusion: Bool { source == .motion && avFusion }
     /// av-fusion F2：节奏由声音确认真正生效（融合 + 伸缩跟随动作频率 + 开关）。声音只给画面节奏投票、不开锁；不影响 tickInterval
-    var usesAVRhythmConfirm: Bool { usesAVFusion && rhythmFollow && avRhythmConfirm }
+    /// 复审 L5：耦合要相位锁，相位脉动关着时 F1 一直报「没锁」→ 也要开相位脉动
+    var usesAVRhythmConfirm: Bool { usesAVFusion && rhythmFollow && rhythmPulse && avRhythmConfirm }
+
+    /// 复审 L6：融合的 6 段特征 / 频带用不用得上（融合生效、在联动、画面分析在跑）；播放器和测试共用
+    static func fusionFeaturesWanted(usesAVFusion: Bool, running: Bool, analyzing: Bool) -> Bool {
+        usesAVFusion && running && analyzing
+    }
 }
 
 /// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
@@ -9264,7 +9270,9 @@ struct AVRhythmVote {
 
     /// 最近一段（视频时间 start ~ end）的撞击（isImpact）按强度做成脉冲串（σ = 1.5 格的高斯），归一化自相关在 0.4~4 Hz 里
     /// 找局部峰，取最短的、不低于最高峰 85% 的那个，抛物线细化。返回视频时间上的 Hz 和那个峰（不够 3 次撞击 / 窗口不到 2 秒 0）
-    static func audioRhythm(_ events: [AudioOnsetEvent], start: Double, end: Double) -> (hz: Double, confidence: Double) {
+    /// rate（复审 L2）：倍速；滞后搜索范围按画面上看到的快慢（RhythmFollower.hzRange × 倍速，换成视频时间）
+    static func audioRhythm(_ events: [AudioOnsetEvent], start: Double, end: Double,
+                            rate: Double = 1) -> (hz: Double, confidence: Double) {
         guard start.isFinite, end.isFinite, end - start >= 2 else { return (0, 0) }
         let hits = impacts(events, start: start, end: end)
         guard hits.count >= minImpacts else { return (0, 0) }
@@ -9292,8 +9300,9 @@ struct AVRhythmVote {
             r0 += sig[k] * sig[k]
         }
         guard r0.isFinite, r0 > 1e-12 else { return (0, 0) }
-        let minLag = Int((1 / RhythmFollower.hzRange.upperBound / bin).rounded(.down))
-        let maxLag = min(n / 2, Int((1 / RhythmFollower.hzRange.lowerBound / bin).rounded(.up)))
+        let r = rate.isFinite && rate > 0 ? rate : 1
+        let minLag = Int((r / RhythmFollower.hzRange.upperBound / bin).rounded(.down))
+        let maxLag = min(n / 2, Int((r / RhythmFollower.hzRange.lowerBound / bin).rounded(.up)))
         guard maxLag > minLag + 2, maxLag + 1 < n else { return (0, 0) }
         var corr = [Double](repeating: 0, count: maxLag + 2)
         for lag in (minLag - 1)...(maxLag + 1) {
@@ -9337,7 +9346,8 @@ struct AVRhythmVote {
     /// impactHz：上一拍 F1 的 f_a（撞击间隔中位数 × 倍速，干净度判断用）；clock：这一拍的播放器时钟；
     /// followerHz / followerLocked：跟随器上一拍的结果（跳频确认用）
     mutating func refine(_ w: MotionWindow, enabled: Bool, coupled: Bool, events: [AudioOnsetEvent], impactHz: Double,
-                         clock: MediaClockSnapshot, followerHz: Double, followerLocked: Bool) -> MotionWindow {
+                         clock: MediaClockSnapshot, followerHz: Double, followerLocked: Bool,
+                         lookaheadFrequency: Bool = false) -> MotionWindow {
         guard enabled else {
             if active || action != .none || fastJump || audioHz != 0 || recentHz != 0 { reset() }
             return w
@@ -9357,7 +9367,7 @@ struct AVRhythmVote {
         let endHost = w.subjectPhase.isValid ? w.subjectPhase.time : clock.host
         let end = clock.item(forHost: endHost)
         let start = end - Self.windowSeconds * clock.rate
-        let r = Self.audioRhythm(events, start: start, end: end)
+        let r = Self.audioRhythm(events, start: start, end: end, rate: clock.rate)
         let ha = r.hz * clock.rate
         let hr = Self.recentHz(events, start: start, end: end) * clock.rate
         recentHz = hr.isFinite ? hr : 0
@@ -9374,7 +9384,9 @@ struct AVRhythmVote {
         if followerLocked, abs(d) <= tol {
             out.subjectFollowRhythm = MotionStats.clamp01(w.subjectFollowRhythm + Self.confidenceBonus)
             action = .agree
-        } else if followerLocked, clean, abs(abs(d) - log(2)) <= tol {
+        } else if followerLocked, clean, abs(abs(d) - log(2)) <= tol,
+                  RhythmFollower.hzRange.contains(vf * (d > 0 ? 2 : 0.5)) {
+            // 复审 L3：换过去的频率要在跟随器范围里，否则跟随器会丢掉这个候选（有效候选变成没候选），那就不换
             let k: Double = d > 0 ? 2 : 0.5
             out.subjectFollowHz = vf * k
             out.subjectFollowAmplitude = w.subjectFollowAmplitude / k
@@ -9386,7 +9398,8 @@ struct AVRhythmVote {
             action = d > 0 ? .octaveUp : .octaveDown
         }
         let hv = out.subjectFollowHz
-        if followerLocked, followerHz.isFinite, followerHz > 0, recentHz > 0 {
+        // 复审 L4：P4 前瞻的频率读数对的是「现在 + 延迟」，声音窗口止于现在（差约 2 秒），方向核对没意义 → 前瞻频率接管时不缩短确认
+        if !lookaheadFrequency, followerLocked, followerHz.isFinite, followerHz > 0, recentHz > 0 {
             let dv = log(hv / followerHz)
             let da = log(recentHz / followerHz)
             fastJump = abs(dv) > tol && abs(da) > tol && (dv > 0) == (da > 0)

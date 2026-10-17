@@ -604,7 +604,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// 画面分析在跑（有画面轨、没发热暂停）。暂停 / 停止 / 没画面 / 不在跟随画面 / 开关关着时实时线程不跑 6 段带通，
     /// 主线程也不做 FFT。撞击声校正的频带照旧只看 usesAudioAnchor（融合关着时这里和 f706431 逐位相同）
     private var fusionFeaturesWanted: Bool {
-        visualSettings.usesAVFusion && timer != nil && motionStatus.isAnalyzing
+        VisualSyncSettings.fusionFeaturesWanted(usesAVFusion: visualSettings.usesAVFusion, running: timer != nil,
+                                                analyzing: motionStatus.isAnalyzing)
     }
 
     /// av-fusion：把 fusionFeaturesWanted 交给电平计（变了才动；电平计自己也只在变化时清缓冲）
@@ -1238,7 +1239,8 @@ final class VideoSyncPlayer: ObservableObject {
         let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
         let out = rhythmVote.refine(window, enabled: true, coupled: AVRhythmVote.isS2(fusionBeat),
                                     events: fusion.extractor.events, impactHz: fusionBeat?.fa ?? 0, clock: clock,
-                                    followerHz: rhythm.hz, followerLocked: rhythm.locked)
+                                    followerHz: rhythm.hz, followerLocked: rhythm.locked,
+                                    lookaheadFrequency: visualSettings.usesLookahead && lookahead.lookahead.frequencyEngaged)
         let text = rhythmVote.statusText
         if text != voteStatus { voteStatus = text }
         return out
@@ -2197,7 +2199,7 @@ struct VideoSyncView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if avFusion, rhythmFollow, avRhythmConfirm, let vote = vm.voteStatus {
+                if avFusion, rhythmFollow, rhythmPulse, avRhythmConfirm, let vote = vm.voteStatus {
                     Text(vote)
                         .font(.caption2.monospacedDigit())
                         .foregroundColor(.secondary)
@@ -2326,7 +2328,7 @@ struct VideoSyncView: View {
                     Text("节奏由声音确认（实验）")
                         .font(.subheadline)
                         .foregroundColor(Velvet.text)
-                    Text("声画耦合时用撞击声确认画面的往复快慢：一致时更快锁上、读成一半 / 两倍时改正、跳频更早跟上；配乐 / 人声 / 画面不动时不起作用，频率仍以画面为准")
+                    Text("声画耦合时用撞击声确认画面的往复快慢：一致时更快锁上、读成一半 / 两倍时改正、跳频更早跟上；配乐 / 人声 / 画面不动时不起作用，频率仍以画面为准" + (rhythmPulse ? "" : "；要同时开「相位脉动」才起作用"))
                         .font(.caption2)
                         .foregroundColor(Velvet.textMuted)
                         .fixedSize(horizontal: false, vertical: true)
