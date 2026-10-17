@@ -8458,7 +8458,117 @@ func avFusionF4Checks() {
 }
 
 avFusionF3Checks()
+
+/// av-fusion F5 的检查（音画偏移估计 + 手动偏移）
+func avFusionF5Checks() {
+    var seed: UInt64 = 0xF5F5
+    func rnd() -> Double {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(seed >> 11) / Double(1 << 53)
+    }
+    func wrap(_ x: Double) -> Double { atan2(sin(x), cos(x)) }
+
+    // 设置
+    let def = VisualSyncSettings()
+    let fusionOn = VisualSyncSettings(source: .motion, avFusion: true, avOffsetMs: 120)
+    let fusionOff = VisualSyncSettings(source: .motion, avFusion: false, avOffsetMs: 120, avAutoOffset: true)
+    vcheck(def.avOffsetMs == 0 && !def.avAutoOffset && !def.usesAVAutoOffset && def.manualAVOffset == 0
+           && VisualSyncSettings.Keys.avOffsetMs == "bcVisualSyncAVOffsetMs"
+           && VisualSyncSettings.Keys.avAutoOffset == "bcVisualSyncAVAutoOffset"
+           && VisualSyncSettings(avOffsetMs: 999).avOffsetMs == 300 && VisualSyncSettings(avOffsetMs: -999).avOffsetMs == -300
+           && VisualSyncSettings(avOffsetMs: .nan).avOffsetMs == 0
+           && abs(fusionOn.manualAVOffset - 0.12) < 1e-12 && fusionOff.manualAVOffset == 0 && !fusionOff.usesAVAutoOffset
+           && fusionOn.tickInterval == def.tickInterval,
+           "F5 设置：默认 0 / 关、键名、夹 ±300（NaN → 0）、融合没生效时偏移 0、不改 Timer 间隔")
+
+    // 时钟挪动：0 / NaN 原样（逐位）；正偏移 = 撞击按 t − τ 算
+    let c = MediaClockSnapshot(host: 100.123, item: 12.5, rate: 1.5)
+    let s0 = c.shifted(byItem: 0)
+    let sn = c.shifted(byItem: .nan)
+    let sp = c.shifted(byItem: 0.12)
+    vcheck(s0.host.bitPattern == c.host.bitPattern && s0.item.bitPattern == c.item.bitPattern && s0.rate.bitPattern == c.rate.bitPattern
+           && sn == c && abs(sp.host(forItem: 12.62) - c.host(forItem: 12.5)) < 1e-9,
+           "F5 时钟挪动：偏移 0 / NaN 逐位原样；+120 毫秒时 12.62 秒的撞击按 12.50 秒对画面")
+    // 偏移 0 时整条融合链逐位相同（同一组起音、同一个锁）
+    let lock = plLocked(hz: 1.2, until: 20)
+    var e1 = AVFusionEngine()
+    var e2 = AVFusionEngine()
+    var same = true
+    for k in 0..<60 {
+        let t = 14 + Double(k) * 0.3
+        let clk = MediaClockSnapshot(host: t, item: t, rate: 1)
+        let b1 = e1.beat(clock: clk, lock: lock, activity: 0.5, cut: false, audioReady: true, dt: 0.3)
+        let b2 = e2.beat(clock: clk.shifted(byItem: AVOffset.effective(settings: VisualSyncSettings(source: .motion, avFusion: true),
+                                                                        estimator: nil)),
+                         lock: lock, activity: 0.5, cut: false, audioReady: true, dt: 0.3)
+        if b1.statusText != b2.statusText || b1.c.bitPattern != b2.c.bitPattern || b1.state != b2.state { same = false }
+    }
+    vcheck(same, "F5：手动偏移 0 时融合每拍结果逐位相同（60 拍）")
+
+    // 合成 (f, μ)：μ = φ0 + 2π f τ + 噪声 → 分离出 τ 和 φ0
+    func estimate(tau: Double, phi0: Double, freqs: [Double], noise: Double = 0.1, n: Int = 40,
+                  random: Bool = false) -> AVOffsetEstimator {
+        var est = AVOffsetEstimator()
+        for k in 0..<n {
+            let f = freqs[k % freqs.count] + (rnd() - 0.5) * 0.02
+            let mu = random ? rnd() * 2 * Double.pi : wrap(phi0 + 2 * Double.pi * f * tau + (rnd() - 0.5) * 2 * noise)
+            est.add(hz: f, mu: mu, r: 0.8, now: Double(k))
+        }
+        return est
+    }
+    let a = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.0, 1.3, 1.6])
+    let b = estimate(tau: -0.2, phi0: 3.0, freqs: [0.7, 1.1, 1.5])
+    let z = estimate(tau: 0, phi0: -2.5, freqs: [0.9, 1.4])
+    let aOK = a.estimate.map { abs($0 - 0.12) <= 0.012 } ?? false
+    let bOK = b.estimate.map { abs($0 + 0.2) <= 0.015 } ?? false
+    let zOK = z.estimate.map { abs($0) <= 0.015 } ?? false
+    // φ0 是格中心频率上拟合出来的，和真值差 ≤ 0.15 弧度
+    let phiOK = abs(wrap(a.phi0 - 1.0)) <= 0.15 && abs(wrap(b.phi0 - 3.0)) <= 0.2
+    vcheck(aOK && bOK && zOK && phiOK,
+           "F5 估计：+120 / −200 / 0 毫秒分别估成 \(a.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "–") / "
+           + "\(b.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "–") / \(z.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "–") 毫秒，"
+           + "φ0 分开（含绕过 ±π）")
+    // 频率跨度不够 / 样本不够 / 相位和频率没关系 → 不估
+    let narrow = estimate(tau: 0.12, phi0: 1.0, freqs: [1.0, 1.15])
+    let single = estimate(tau: 0.12, phi0: 1.0, freqs: [1.2])
+    let few = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.6], n: 5)
+    let noisy = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.0, 1.2, 1.4, 1.6, 1.8], n: 80, random: true)
+    var weak = AVOffsetEstimator()
+    for k in 0..<40 { weak.add(hz: k % 2 == 0 ? 0.8 : 1.6, mu: 1, r: 0.3, now: Double(k)) }
+    vcheck(narrow.estimate == nil && single.estimate == nil && few.estimate == nil && noisy.estimate == nil
+           && weak.sampleCount == 0 && narrow.spanHz < AVOffsetEstimator.minSpanHz,
+           "F5：频率跨度 < 0.4 Hz / 只有一个频率 / 样本 < 8 / 相位和频率没关系 / 集中度 < 0.5 → 不估 τ")
+    // 120 秒前的样本过期：只剩一个频率时估计消失
+    var aging = estimate(tau: 0.12, phi0: 1.0, freqs: [0.8, 1.6])
+    let hadIt = aging.estimate != nil
+    for k in 0..<10 { aging.add(hz: 1.6, mu: wrap(1.0 + 2 * Double.pi * 1.6 * 0.12), r: 0.8, now: 200 + Double(k)) }
+    vcheck(hadIt && aging.estimate == nil && aging.bins.count == 1, "F5：120 秒前的样本过期，频率只剩一格时不再估")
+    // 实际用的偏移：自动开且估出来 → 估计；自动开没估出 → 手动；自动关 → 手动；融合关 → 0；都夹 ±0.3
+    let autoOn = VisualSyncSettings(source: .motion, avFusion: true, avOffsetMs: -50, avAutoOffset: true)
+    let autoOff = VisualSyncSettings(source: .motion, avFusion: true, avOffsetMs: -50, avAutoOffset: false)
+    vcheck(abs(AVOffset.effective(settings: autoOn, estimator: a) - (a.estimate ?? 9)) < 1e-12
+           && abs(AVOffset.effective(settings: autoOn, estimator: narrow) + 0.05) < 1e-12
+           && abs(AVOffset.effective(settings: autoOff, estimator: a) + 0.05) < 1e-12
+           && AVOffset.effective(settings: fusionOff, estimator: a) == 0
+           && AVOffset.effective(settings: autoOn, estimator: nil) == -0.05,
+           "F5 实际偏移：自动估出 → 估计值；估不出 / 自动关 → 手动值；融合关 → 0")
+    // 撞击上的相位均值：没锁 / < 3 次 → nil；锁着时 μ 是各撞击相位的圆均值
+    let clk = MediaClockSnapshot(host: 20, item: 20, rate: 1)
+    let times = [18.0, 18.4, 19.1, 19.6]
+    let mp = AVOffsetEstimator.meanPhase(itemTimes: times, clock: clk, lock: lock)
+    var sx = 0.0, sy = 0.0
+    for t in times { if let ph = lock.phase(at: t) { sx += cos(ph); sy += sin(ph) } }
+    vcheck(mp != nil && abs(wrap(mp!.mu - atan2(sy, sx))) < 1e-12
+           && AVOffsetEstimator.meanPhase(itemTimes: [18, 19], clock: clk, lock: lock) == nil
+           && AVOffsetEstimator.meanPhase(itemTimes: times, clock: clk, lock: RhythmPhaseLock()) == nil,
+           "F5：撞击相位均值（锁着、≥ 3 次才有）")
+    vcheck(AVDebugColumns.f5Header.split(separator: ",").count == 4 && AVDebugColumns.f5Fields(effective: 0.12, estimator: a).count == 4
+           && AVDebugColumns.f5Fields(effective: 0, estimator: nil)[0] == "0" && AVDebugColumns.f5Empty.allSatisfy { $0.isEmpty },
+           "F5 调试列 4 列")
+}
+
 avFusionF4Checks()
+avFusionF5Checks()
 
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")

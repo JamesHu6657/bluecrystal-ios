@@ -3655,6 +3655,9 @@ struct VisualSyncSettings: Equatable {
         static let avVibrationAudio = "bcVisualSyncAVVibrationAudio"
         /// av-fusion F4：互为回落（画面暂时不可用时按声音补，默认关）
         static let avFallback = "bcVisualSyncAVFallback"
+        /// av-fusion F5：片子本身的音画偏移（毫秒，正 = 声音比画面晚；默认 0）、自动估计（默认关）
+        static let avOffsetMs = "bcVisualSyncAVOffsetMs"
+        static let avAutoOffset = "bcVisualSyncAVAutoOffset"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -3701,6 +3704,10 @@ struct VisualSyncSettings: Equatable {
     static let defaultAVVibrationAudio = false
     /// av-fusion F4：互为回落（默认关）
     static let defaultAVFallback = false
+    /// av-fusion F5：手动音画偏移（毫秒，−300~300，默认 0）、自动估计（默认关）
+    static let defaultAVOffsetMs: Double = 0
+    static let avOffsetRange: ClosedRange<Double> = -300...300
+    static let defaultAVAutoOffset = false
 
     var source: VisualSyncSource
     var motionGainDb: Double
@@ -3721,6 +3728,8 @@ struct VisualSyncSettings: Equatable {
     var avAccentDepth: Double
     var avVibrationAudio: Bool
     var avFallback: Bool
+    var avOffsetMs: Double
+    var avAutoOffset: Bool
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
          autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
@@ -3731,7 +3740,8 @@ struct VisualSyncSettings: Equatable {
          prescan: Bool = defaultPrescan, avFusion: Bool = defaultAVFusion,
          avRhythmConfirm: Bool = defaultAVRhythmConfirm, avAccent: Bool = defaultAVAccent,
          avAccentDepth: Double = defaultAVAccentDepth, avVibrationAudio: Bool = defaultAVVibrationAudio,
-         avFallback: Bool = defaultAVFallback) {
+         avFallback: Bool = defaultAVFallback, avOffsetMs: Double = defaultAVOffsetMs,
+         avAutoOffset: Bool = defaultAVAutoOffset) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
@@ -3759,6 +3769,10 @@ struct VisualSyncSettings: Equatable {
             : Self.defaultAVAccentDepth
         self.avVibrationAudio = avVibrationAudio
         self.avFallback = avFallback
+        self.avOffsetMs = avOffsetMs.isFinite
+            ? min(Self.avOffsetRange.upperBound, max(Self.avOffsetRange.lowerBound, avOffsetMs))
+            : Self.defaultAVOffsetMs
+        self.avAutoOffset = avAutoOffset
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -3787,7 +3801,9 @@ struct VisualSyncSettings: Equatable {
             avAccent: defaults.object(forKey: Keys.avAccent) as? Bool ?? defaultAVAccent,
             avAccentDepth: defaults.object(forKey: Keys.avAccentDepth) as? Double ?? defaultAVAccentDepth,
             avVibrationAudio: defaults.object(forKey: Keys.avVibrationAudio) as? Bool ?? defaultAVVibrationAudio,
-            avFallback: defaults.object(forKey: Keys.avFallback) as? Bool ?? defaultAVFallback)
+            avFallback: defaults.object(forKey: Keys.avFallback) as? Bool ?? defaultAVFallback,
+            avOffsetMs: defaults.object(forKey: Keys.avOffsetMs) as? Double ?? defaultAVOffsetMs,
+            avAutoOffset: defaults.object(forKey: Keys.avAutoOffset) as? Bool ?? defaultAVAutoOffset)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
@@ -3824,6 +3840,10 @@ struct VisualSyncSettings: Equatable {
     var usesAVVibrationAudio: Bool { usesAVAccent && avVibrationAudio }
     /// av-fusion F4：互为回落生效（融合 + 开关）。画面暂时不可用时按声音补、画面回来交回；相位飞轮另要相位脉动在跑。不影响 tickInterval
     var usesAVFallback: Bool { usesAVFusion && avFallback }
+    /// av-fusion F5：自动估计音画偏移生效（融合 + 开关）；手动偏移在融合生效时就用（0 = 不改）
+    var usesAVAutoOffset: Bool { usesAVFusion && avAutoOffset }
+    /// av-fusion F5：手动偏移（秒）；融合没生效时 0
+    var manualAVOffset: Double { usesAVFusion ? avOffsetMs / 1000 : 0 }
 
     /// 复审 L6：融合的 6 段特征 / 频带用不用得上（融合生效、在联动、画面分析在跑）；播放器和测试共用
     static func fusionFeaturesWanted(usesAVFusion: Bool, running: Bool, analyzing: Bool) -> Bool {
@@ -7948,6 +7968,13 @@ struct MediaClockSnapshot: Equatable {
 
     var isValid: Bool { host.isFinite && item.isFinite && rate.isFinite && rate > 0.01 }
 
+    /// av-fusion F5：音画偏移补偿。offset > 0 = 声音比画面晚 offset 秒（视频时间）：撞击按 t − offset 算，
+    /// 等价于把读声音时用的视频时间往后挪 offset。offset == 0 / 非法时原样返回（逐位不变）
+    func shifted(byItem offset: Double) -> MediaClockSnapshot {
+        guard offset != 0, offset.isFinite else { return self }
+        return MediaClockSnapshot(host: host, item: item + offset, rate: rate)
+    }
+
     /// 视频时间 → 这一刻应该被看到 / 听到的 host 时间（无效 NaN）
     func host(forItem t: Double) -> Double {
         guard isValid, t.isFinite else { return .nan }
@@ -9791,5 +9818,142 @@ extension AVDebugColumns {
 
     static var f4Empty: [String] {
         [String](repeating: "", count: f4Header.split(separator: ",", omittingEmptySubsequences: false).count)
+    }
+}
+
+// MARK: - av-fusion F5：音画偏移估计 + 手动偏移
+//
+// 开关 bcVisualSyncAVOffsetMs（−300~300 毫秒，默认 0）、bcVisualSyncAVAutoOffset（默认关）。场景分类（SoundAnalysis）这一期不做（见文档）。
+// 模型（研究页 §4.2 第 5 条）：S2 里撞击时刻（视频时间 t）上的画面相位均值 μ 和画面频率 f（视频时间 Hz）满足 μ = φ0 + 2π·f·τ，
+// τ = 片子本身的音画偏移（正 = 声音晚）。φ0 是动作本身「哪个相位出声」，和频率无关；所以只有频率变化够大时才能把 τ 和 φ0 分开。
+// 估计：按频率分格（0.05 Hz）保留最近 120 秒的样本（每格圆均值 + 权重），在 τ ∈ [−0.3, 0.3] 秒上按 1 毫秒网格找
+// |Σ w·e^{i(μ − 2π f τ)}| 最大的 τ（自动处理相位绕圈）；要 ≥ 2 格、频率跨度 ≥ 0.4 Hz、总样本 ≥ 8、拟合集中度 ≥ 0.8 才给出 τ，否则 nil。
+// 测量用不带偏移的时钟（不形成反馈）。结果只用来挪读声音时的视频时间（MediaClockSnapshot.shifted），不碰出口。
+
+struct AVOffsetEstimator: Equatable {
+    static let binHz = 0.05
+    static let keepSeconds = 120.0
+    static let minSpanHz = 0.4
+    static let minBins = 2
+    static let minSamples = 8
+    static let minFit = 0.8
+    static let minR = 0.5
+    static let maxOffset = 0.3
+    static let gridStep = 0.001
+
+    struct Bin: Equatable {
+        var sx: Double = 0
+        var sy: Double = 0
+        var weight: Double = 0
+        var count = 0
+        var lastAt: Double = -.infinity
+    }
+
+    private(set) var bins: [Int: Bin] = [:]
+    private(set) var estimate: Double?
+    private(set) var fit: Double = 0
+    private(set) var spanHz: Double = 0
+    private(set) var phi0: Double = .nan
+
+    mutating func reset() { self = AVOffsetEstimator() }
+
+    var sampleCount: Int { bins.values.reduce(0) { $0 + $1.count } }
+
+    /// 撞击时刻（视频时间）上的画面相位均值 μ 和集中度 R（< 3 次 / 没锁 → nil）
+    static func meanPhase(itemTimes: [Double], clock: MediaClockSnapshot, lock: RhythmPhaseLock) -> (mu: Double, r: Double)? {
+        guard lock.locked, clock.isValid else { return nil }
+        var sx = 0.0
+        var sy = 0.0
+        var n = 0
+        for t in itemTimes {
+            guard let ph = lock.phase(at: clock.host(forItem: t)), ph.isFinite else { continue }
+            sx += cos(ph)
+            sy += sin(ph)
+            n += 1
+        }
+        guard n >= AVCouplingEstimator.minPhaseImpacts else { return nil }
+        let r = (sx * sx + sy * sy).squareRoot() / Double(n)
+        guard r.isFinite else { return nil }
+        return (atan2(sy, sx), r)
+    }
+
+    /// 加一个样本：f 视频时间 Hz，μ 弧度，r 集中度（< 0.5 不收），now host 时间
+    mutating func add(hz f: Double, mu: Double, r: Double, now: Double) {
+        guard f.isFinite, f > 0, mu.isFinite, r.isFinite, r >= Self.minR, now.isFinite else { return }
+        let key = Int((f / Self.binHz).rounded())
+        var b = bins[key] ?? Bin()
+        b.sx += r * cos(mu)
+        b.sy += r * sin(mu)
+        b.weight += r
+        b.count += 1
+        b.lastAt = now
+        bins[key] = b
+        bins = bins.filter { now - $0.value.lastAt <= Self.keepSeconds }
+        refit()
+    }
+
+    private mutating func refit() {
+        estimate = nil
+        fit = 0
+        phi0 = .nan
+        let keys = bins.keys.sorted()
+        spanHz = keys.count >= 2 ? Double(keys.last! - keys.first!) * Self.binHz : 0
+        guard keys.count >= Self.minBins, spanHz >= Self.minSpanHz - 1e-9, sampleCount >= Self.minSamples else { return }
+        // 每格一个点：频率 = 格中心，相位 = 圆均值，权重 = 累计集中度
+        let pts: [(f: Double, mu: Double, w: Double)] = keys.compactMap { k in
+            guard let b = bins[k], b.weight > 0 else { return nil }
+            return (Double(k) * Self.binHz, atan2(b.sy, b.sx), b.weight)
+        }
+        let total = pts.reduce(0) { $0 + $1.w }
+        guard total > 0 else { return }
+        var best = -1.0
+        var bestTau = 0.0
+        var bestPhi = 0.0
+        let steps = Int((2 * Self.maxOffset / Self.gridStep).rounded())
+        for i in 0...steps {
+            let tau = -Self.maxOffset + Double(i) * Self.gridStep
+            var cx = 0.0
+            var cy = 0.0
+            for p in pts {
+                let a = p.mu - 2 * Double.pi * p.f * tau
+                cx += p.w * cos(a)
+                cy += p.w * sin(a)
+            }
+            let m = (cx * cx + cy * cy).squareRoot() / total
+            if m > best + 1e-12 {
+                best = m
+                bestTau = tau
+                bestPhi = atan2(cy, cx)
+            }
+        }
+        fit = best
+        guard best >= Self.minFit else { return }
+        estimate = min(Self.maxOffset, max(-Self.maxOffset, bestTau))
+        phi0 = bestPhi
+    }
+}
+
+/// av-fusion F5：这一拍用的偏移（秒）：自动估计生效且估出来了 → 估计值；否则手动值。都夹 ±0.3
+enum AVOffset {
+    static func effective(settings v: VisualSyncSettings, estimator: AVOffsetEstimator?) -> Double {
+        let raw = v.usesAVAutoOffset ? (estimator?.estimate ?? v.manualAVOffset) : v.manualAVOffset
+        guard raw.isFinite else { return 0 }
+        return min(AVOffsetEstimator.maxOffset, max(-AVOffsetEstimator.maxOffset, raw))
+    }
+}
+
+extension AVDebugColumns {
+    /// F5 调试列：实际用的偏移（毫秒）、自动估计（毫秒，估不出空）、频率跨度、拟合集中度
+    static let f5Header = "av_offset_ms,av_offset_est_ms,av_offset_span_hz,av_offset_fit"
+
+    static func f5Fields(effective: Double, estimator: AVOffsetEstimator?) -> [String] {
+        [String(format: "%.0f", effective * 1000),
+         estimator?.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "",
+         estimator.map { String(format: "%.2f", $0.spanHz) } ?? "",
+         estimator.map { String(format: "%.2f", $0.fit) } ?? ""]
+    }
+
+    static var f5Empty: [String] {
+        [String](repeating: "", count: f5Header.split(separator: ",", omittingEmptySubsequences: false).count)
     }
 }
