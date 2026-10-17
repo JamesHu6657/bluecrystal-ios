@@ -2376,6 +2376,10 @@ struct PoseMotionTracker {
     /// rhythm-action tune：左右手腕各自的节奏（轻抚要看摸着身体的那只手自己在不在慢慢动；只在 actionTuned 时攒）
     private var leftWristRhythm = StrokeRhythm()
     private var rightWristRhythm = StrokeRhythm()
+    /// 同上，但不扣全身中位速度（只扣了相机）：手跟着上身一起动（骑乘手放胸口、乳交）时扣过的只剩 40%，
+    /// 「安静 / 在往复」要两个都看（只在 actionTuned 时攒）
+    private var leftWristRaw = StrokeRhythm()
+    private var rightWristRaw = StrokeRhythm()
 
     mutating func reset() {
         bodyContext = PoseBodyContext()
@@ -2383,6 +2387,8 @@ struct PoseMotionTracker {
         otherHips.reset()
         leftWristRhythm.reset()
         rightWristRhythm.reset()
+        leftWristRaw.reset()
+        rightWristRaw.reset()
         hasPrevious = false
         scale = 0
         speedCount = 0
@@ -2619,10 +2625,12 @@ struct PoseMotionTracker {
                     if usable[lw] {
                         leftWristRhythm.add(time: time, x: ux[lw] - (1 - Self.rigidShare) * cx,
                                             y: uy[lw] - (1 - Self.rigidShare) * cy)
+                        leftWristRaw.add(time: time, x: ux[lw], y: uy[lw])
                     }
                     if usable[rw] {
                         rightWristRhythm.add(time: time, x: ux[rw] - (1 - Self.rigidShare) * cx,
                                              y: uy[rw] - (1 - Self.rigidShare) * cy)
+                        rightWristRaw.add(time: time, x: ux[rw], y: uy[rw])
                     }
                 }
                 let hipUsable = Self.groups[Self.hipGroup].contains { usable[$0.rawValue] }
@@ -2643,6 +2651,8 @@ struct PoseMotionTracker {
                 wrists.reset()
                 leftWristRhythm.reset()
                 rightWristRhythm.reset()
+                leftWristRaw.reset()
+                rightWristRaw.reset()
             }
             // 断过 / 换了人：上一个人的速度历史也不算（新的人重新攒够样本才有读数）
             if !continuous || pick.switched {
@@ -2887,8 +2897,10 @@ struct PoseMotionTracker {
                 c.rightWristX = previous.x[rw]
                 c.rightWristY = previous.y[rw]
             }
-            c.leftWristRhythm.follow = leftWristRhythm.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
-            c.rightWristRhythm.follow = rightWristRhythm.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
+            c.leftWristRhythm = leftWristRhythm.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
+            c.rightWristRhythm = rightWristRhythm.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
+            c.leftWristRaw = leftWristRaw.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
+            c.rightWristRaw = rightWristRaw.freshFollowEstimate(at: time, maxAge: Self.rhythmMaxAge)
         }
         func fit(_ r: inout StrokeRhythm, _ f: StrokeRhythm.FollowEstimate) -> StrokeRhythm.PhaseFit {
             guard phaseFitEnabled, f.hz > 0 else { return StrokeRhythm.PhaseFit() }
@@ -5152,9 +5164,13 @@ struct PoseBodyContext: Equatable {
     var rightWristX: Double = 0
     var rightWristY: Double = 0
     var otherHips = PartRhythm()
-    /// 左右手腕各自的节奏（只有 follow；轻抚看摸着身体的那只、撸动看另一只）
-    var leftWristRhythm = PartRhythm()
-    var rightWristRhythm = PartRhythm()
+    /// 左右手腕各自的节奏（轻抚看摸着身体的那只、撸动看另一只）。只存 follow（没有相位）：
+    /// 这份上下文随 MotionWindow 到处拷贝，不放用不上的 PhaseFit
+    var leftWristRhythm = StrokeRhythm.FollowEstimate()
+    var rightWristRhythm = StrokeRhythm.FollowEstimate()
+    /// 左右手腕不扣全身中位速度的节奏（判断那只手安静 / 在往复时和上面的一起看）
+    var leftWristRaw = StrokeRhythm.FollowEstimate()
+    var rightWristRaw = StrokeRhythm.FollowEstimate()
 }
 
 /// 一只手 / 一张脸的检测（分析帧像素）。size：换算成「约一个躯干长」的尺度（手 = 3 × 腕到中指根，脸 = 2.5 × 脸框高）
@@ -5909,6 +5925,8 @@ struct ActionContext {
         var x: Double
         var y: Double
         var rhythm = PartRhythm()
+        /// 那只手腕不扣全身中位速度的节奏（手跟着上身一起往复时只有它看得出来）
+        var rawRhythm = PartRhythm()
         var hasOther = false
         var otherX: Double = 0
         var otherY: Double = 0
@@ -6066,22 +6084,22 @@ struct ActionContext {
                 length = d
             }
         }
-        var wrists: [(x: Double, y: Double, rhythm: PartRhythm)] = []
-        if b.hasLeftWrist { wrists.append((b.leftWristX, b.leftWristY, b.leftWristRhythm)) }
-        if b.hasRightWrist { wrists.append((b.rightWristX, b.rightWristY, b.rightWristRhythm)) }
+        var wrists: [(x: Double, y: Double, rhythm: StrokeRhythm.FollowEstimate, raw: StrokeRhythm.FollowEstimate)] = []
+        if b.hasLeftWrist { wrists.append((b.leftWristX, b.leftWristY, b.leftWristRhythm, b.leftWristRaw)) }
+        if b.hasRightWrist { wrists.append((b.rightWristX, b.rightWristY, b.rightWristRhythm, b.rightWristRaw)) }
         for (i, w) in wrists.enumerated() {
             let rx = w.x - b.chestX
             let ry = w.y - b.chestY
             let along = rx * ax + ry * ay
             let across = abs(rx * ay - ry * ax)
             if along >= -torsoAbove * length, along <= torsoBelow * length, across <= torsoAcross * b.scale {
-                var t = SelfTouch(x: w.x, y: w.y, rhythm: w.rhythm)
+                var t = SelfTouch(x: w.x, y: w.y, rhythm: PartRhythm(follow: w.rhythm), rawRhythm: PartRhythm(follow: w.raw))
                 if wrists.count == 2 {
                     let o = wrists[1 - i]
                     t.hasOther = true
                     t.otherX = o.x
                     t.otherY = o.y
-                    t.otherRhythm = o.rhythm
+                    t.otherRhythm = PartRhythm(follow: o.rhythm)
                 }
                 return t
             }
@@ -6166,7 +6184,10 @@ struct ActionContext {
         // 那只手规则、大幅地和参考频率同步往复（手在胸口 / 肚子前撸、乳交、骑乘时手放胸口）：不当成摸自己，
         // 它照常算撸动等的依据，也不算轻抚（reciprocatingSelf）
         let touched: SelfTouch? = ctxFresh ? Self.selfTouch(body) : nil
-        let reciprocatingSelf = touched.map { Self.reciprocatingTouch($0.rhythm, refHz: refHz) } ?? false
+        // 扣过全身中位速度的、没扣的都看：手跟着上身一起往复（骑乘手放胸口、乳交）时扣过的只剩 40%，看起来像安静的手
+        let reciprocatingSelf = touched.map {
+            Self.reciprocatingTouch($0.rhythm, refHz: refHz) || Self.reciprocatingTouch($0.rawRhythm, refHz: refHz)
+        } ?? false
         let selfTouch: SelfTouch? = reciprocatingSelf ? nil : touched
         // 撸动看的手腕：平时是两腕的平均；一只手摸着自己时只看另一只（它可能在撸动）
         var wristPart = body.wrists
@@ -6288,7 +6309,7 @@ struct ActionContext {
                 let lockedElsewhere = followerHz > 0 && followerHz.isFinite && !Self.agreesLoosely(ownHz, followerHz)
                 caressBlocked = caressBlocked || lockedElsewhere
                 // 硬上限 + 不跟节奏只给动作小 / 不规则的手（规则大幅的往复不封顶，最多 selfPaced 的软压低）
-                let quiet = Self.quietTouch(st.rhythm)
+                let quiet = Self.quietTouch(st.rhythm) && Self.quietTouch(st.rawRhythm)
                 if !caressBlocked && regionOK && quiet { ev.caress = min(Self.caressEvidence, own) }
                 selfPaced = !caressBlocked && own >= Self.minEvidence
                 quietSelf = selfPaced && quiet

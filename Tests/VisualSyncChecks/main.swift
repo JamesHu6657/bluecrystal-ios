@@ -5082,7 +5082,7 @@ func atChestWindow(time: Double, chest: Bool, region: Bool = false, amplitude: D
         c.body.hasRightWrist = true
         c.body.rightWristX = 33
         c.body.rightWristY = 12
-        c.body.rightWristRhythm = rh
+        c.body.rightWristRhythm = rh.follow
     }
     w.context = c
     if region {
@@ -5338,11 +5338,11 @@ func atTwoHandWindow(time: Double, handOnRest: Bool, region: Bool) -> MotionWind
     stroke.follow = StrokeRhythm.FollowEstimate(hz: 1.5, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
     w.context.body.rightWristX = 33
     w.context.body.rightWristY = 15
-    w.context.body.rightWristRhythm = PartRhythm()
+    w.context.body.rightWristRhythm = StrokeRhythm.FollowEstimate()
     w.context.body.hasLeftWrist = true
     w.context.body.leftWristX = 31
     w.context.body.leftWristY = 21
-    w.context.body.leftWristRhythm = stroke
+    w.context.body.leftWristRhythm = stroke.follow
     w.context.body.wristX = 32
     w.context.body.wristY = 18
     w.context.body.wrists = stroke
@@ -5369,7 +5369,7 @@ func atPassiveOralWindow(time: Double, region: Bool) -> MotionWindow {
     w.context.body.wrists = PartRhythm()
     w.context.body.rightWristX = 33
     w.context.body.rightWristY = 15
-    w.context.body.rightWristRhythm = PartRhythm()
+    w.context.body.rightWristRhythm = StrokeRhythm.FollowEstimate()
     w.context.body.wristX = 33
     w.context.body.wristY = 15
     var bob = PartRhythm()
@@ -5704,11 +5704,12 @@ func atCaressHzWindow(time: Double, wristHz: Double, refHz: Double) -> MotionWin
     rh.follow = StrokeRhythm.FollowEstimate(hz: wristHz, confidence: 0.8, amplitude: 0.08, sampleRate: 9)
     w.context.hand.rhythm = rh
     w.context.body.wrists = rh
-    w.context.body.rightWristRhythm = rh
+    w.context.body.rightWristRhythm = rh.follow
     return w
 }
 
-do {
+// R3 的检查都放在函数里：顶层 do 块的局部变量都算在 main 的栈帧里，main 已经接近 8 MB 栈上限
+func atCaressHzCheck() {
     // H3：慢慢摸胸口，手腕 1.0 Hz / 画面 1.25 Hz（差 25%），手腕减半（0.6 / 1.2）、画面减半（1.25 / 0.625）：照样认轻抚、输出 ≤ 20
     var ok = true
     var notes: [String] = []
@@ -5738,6 +5739,7 @@ do {
     vcheck(lockedElse.kind != .caress && !lockedElse.allowsGentle(followerLocked: true),
            "动作调优 R3（H3）：放宽后跟随器锁在 1.67 倍频率上仍不认轻抚（\(lockedElse.kind)）")
 }
+atCaressHzCheck()
 
 /// 别人给被认到的人撸（1.5 Hz、手检测在胯上），被撸的人右手放在小腹上不动、离撸动的手 5 像素（0.3 个身体尺度）
 func atPartnerHandjobWindow(time: Double) -> MotionWindow {
@@ -5749,7 +5751,7 @@ func atPartnerHandjobWindow(time: Double) -> MotionWindow {
     stroke.follow = StrokeRhythm.FollowEstimate(hz: 1.5, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
     w.context.body.rightWristX = 33
     w.context.body.rightWristY = 16
-    w.context.body.rightWristRhythm = PartRhythm()
+    w.context.body.rightWristRhythm = StrokeRhythm.FollowEstimate()
     w.context.body.wristX = 33
     w.context.body.wristY = 16
     w.context.body.wrists = PartRhythm()
@@ -5760,7 +5762,7 @@ func atPartnerHandjobWindow(time: Double) -> MotionWindow {
     return w
 }
 
-do {
+func atPartnerHandjobCheck() {
     // H2：手检测落在别人撸动的手上、离被撸的人放着的手腕很近：不能归给自己（以前 → quietSelf：不跟节奏 + gentle 压）
     let w0 = atPartnerHandjobWindow(time: 10)
     let near = ActionContext.selfTouch(w0.context.body).map {
@@ -5781,6 +5783,62 @@ do {
            "动作调优 R3（H2）：别人撸、被撸的人手放小腹（离撸的手 0.3 尺度）→ 撸动（看手），不是轻抚 / 只来自自己的手；"
            + "强度 \(Int(baseMean)) → \(Int(newMean))、伸缩 \(Int(baseThrust)) → \(Int(newThrust))（\(ac.kind)）")
 }
+atPartnerHandjobCheck()
+
+/// 骑乘、手放自己胸口、髋出画：头 / 肩 / 两腕整个上身一起 1.2 Hz 上下（幅度 0.25 躯干），右手腕贴在胸口，左手垂在身侧。
+/// 真的跑 PoseMotionTracker（调优开），每拍把它的 bodyContext 放进胸口窗口（区域就在胸口，最容易误认轻抚）
+func atRidingRun(tuned: Bool, context: Bool) -> (run: ATRun, body: PoseBodyContext) {
+    var tracker = PoseMotionTracker()
+    tracker.actionTuned = true
+    tracker.contextEnabled = true
+    let torso = 13.0  // 1.3 × 肩宽 10
+    var poseT = 99.0
+    var i = 0
+    let run = atRun(tuned: tuned, context: context) { now in
+        while poseT + 1.0 / 9 <= now - 0.05 {
+            poseT += 1.0 / 9
+            let dy = 0.25 * torso * sin(2 * Double.pi * 1.2 * poseT)
+            var p = PoseCandidate()
+            p.confidence = 0.9
+            for (j, x, y) in [(PoseJoint.nose, 32.0, 4.0), (.neck, 32, 8), (.leftShoulder, 27, 10), (.rightShoulder, 37, 10),
+                              (.rightWrist, 33, 14), (.leftWrist, 24, 19)] {
+                p.set(j, x: x, y: y + dy, confidence: 0.9)
+            }
+            _ = tracker.update(time: poseT, candidates: [vs3Jittered(p, i: i, sigma: 0.1)], camera: .identity,
+                               continuous: true, frameHeight: 36)
+            i += 1
+        }
+        var w = atChestWindow(time: now, chest: true, region: true)
+        w.context.time = tracker.bodyContext.time
+        w.context.body = tracker.bodyContext
+        w.context.hand = PartReading()
+        w.roi.region = atRegion(x: 33, y: 13, time: now - 0.05, hz: 1.2)
+        return w
+    }
+    return (run, tracker.bodyContext)
+}
+
+func atRidingCheck() {
+    // H1：手跟着上身一起往复。扣过全身中位速度的手腕节奏只剩 ~40%（看起来像安静的手 → 以前认成轻抚、封顶 20）；
+    // 没扣的看得出来 → 不是轻抚、不封顶、照常跟节奏
+    let base = atRidingRun(tuned: false, context: false)
+    let new = atRidingRun(tuned: true, context: true)
+    let bc = new.body
+    let residualAmp = bc.rightWristRhythm.amplitude
+    let rawAmp = bc.rightWristRaw.amplitude
+    let touch = ActionContext.selfTouch(bc)
+    let repro = touch != nil && ActionContext.quietTouch(PartRhythm(follow: bc.rightWristRhythm))
+        && !ActionContext.quietTouch(PartRhythm(follow: bc.rightWristRaw))
+    let baseMean = vs3Late(base.run.values)
+    let newMean = vs3Late(new.run.values)
+    let newPeak = new.run.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 0
+    vcheck(repro && !new.run.kinds.contains(.caress) && new.run.locked.last == true && newPeak > 20
+           && newMean >= 0.95 * baseMean,
+           "动作调优 R3（H1）：骑乘手放胸口、髋出画（上身整体 1.2 Hz、0.25 躯干）：扣过的手腕幅度 "
+           + "\(String(format: "%.3f", residualAmp)) / 没扣的 \(String(format: "%.3f", rawAmp)) → 不认轻抚、不封顶"
+           + "（强度 \(Int(baseMean)) → \(Int(newMean))，峰 \(newPeak)，锁 \(new.run.locked.last ?? false)，kinds \(Set(new.run.kinds.map { $0.rawValue }))）")
+}
+atRidingCheck()
 
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
