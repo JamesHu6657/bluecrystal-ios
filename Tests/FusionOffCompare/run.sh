@@ -2,7 +2,8 @@
 # 声画融合关着 = f706431（v1.8.3）逐位相同（PR Checks 里跑；本地有 swiftc 就能跑，macOS / Linux 都行）：
 # 同一个只用 f706431 已有接口的整条链模拟（声音模式、画面 P1 / P2 / P3 含撞击声相位校正、P4 前瞻），
 # 分别和 BASE 的 VisualSync.swift、当前工作区的 VisualSync.swift 编译，输出必须逐字节相同；
-# 当前工作区再加 -D AV_FUSION_ON 编一份（融合部件在旁边跟着跑；F1 起才有内容），输出也必须相同（融合只显示、不改输出）。
+# 当前工作区再加 -D AV_FUSION_ON 编一份（融合部件在旁边跟着跑；F1 起才有内容），输出也必须相同（融合只显示、不改输出）；
+# 再加 -D AV_FUSION_ON -D AV_F2_ON 编一份（融合开着、「节奏由声音确认」关着，F2 的接线全走一遍），输出也必须相同。
 # 用法：Tests/FusionOffCompare/run.sh [BASE]（默认 f706431；CI 的 checkout 要拿到这个提交：fetch-depth: 0）
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -17,13 +18,15 @@ HARNESS="Tests/FusionOffCompare/LinuxShim.swift Tests/FusionOffCompare/main.swif
 $SWIFTC -O -swift-version 5 $PURE "$TMP/VisualSync.base.swift" $HARNESS -o "$TMP/base" & P1=$!
 $SWIFTC -O -swift-version 5 $PURE BlueCrystalIOS/VisualSync.swift $HARNESS -o "$TMP/head" & P2=$!
 $SWIFTC -O -swift-version 5 -D AV_FUSION_ON $PURE BlueCrystalIOS/VisualSync.swift $HARNESS -o "$TMP/fusion" & P3=$!
-wait $P1; wait $P2; wait $P3
+$SWIFTC -O -swift-version 5 -D AV_FUSION_ON -D AV_F2_ON $PURE BlueCrystalIOS/VisualSync.swift $HARNESS -o "$TMP/f2" & P4=$!
+wait $P1; wait $P2; wait $P3; wait $P4
 "$TMP/base" > "$TMP/base.txt"
 "$TMP/head" > "$TMP/head.txt"
 "$TMP/fusion" > "$TMP/fusion.txt"
+"$TMP/f2" > "$TMP/f2.txt"
 sum() { sha256sum "$1" 2>/dev/null | cut -c1-16 || shasum -a 256 "$1" | cut -c1-16; }
 status=0
-for v in head fusion; do
+for v in head fusion f2; do
   if cmp -s "$TMP/base.txt" "$TMP/$v.txt"; then
     echo "FusionOffCompare: $v identical ($(wc -l < "$TMP/base.txt") lines, sha256 $(sum "$TMP/base.txt")) vs $BASE"
   else
