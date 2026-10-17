@@ -2369,6 +2369,10 @@ struct PoseMotionTracker {
     static let hipWidthTorso: Double = 2
     static let thighTorso: Double = 1
     static let partialDeadZoneScale: Double = 2
+    /// 髋已经在往复（节奏置信度 0.3 → 0.6）时，死区加倍 / 尺度下限 0.25 × 画面高按比例撤掉：
+    /// 关键点抖动出不来像样的节奏，静止的特写照样压；真的慢慢往复的部分骨架不被死区吃掉
+    static let partialRelaxLow: Double = 0.3
+    static let partialRelaxHigh: Double = 0.6
     private var otherHips = StrokeRhythm()
     private var otherTime: Double = 0
     private var otherSmoothX: Double = 0
@@ -2439,7 +2443,8 @@ struct PoseMotionTracker {
     /// 比真实的躯干小好几倍，检测抖动除以它就成了「很快的动作」。这里再按解剖比例估：髋宽 × 2、大腿（髋→膝）× 1；
     /// 没有躯干长 / 肩宽可量（partial，只是身体的一部分）时至少 0.25 × 画面高（这么近的身体不会更小）。
     /// 完整的人（躯干 / 肩宽都在）结果和 bodyScale 相同（髋宽 × 2、大腿都比躯干短）；只会变大（速度变小，安全方向）
-    static func tunedBodyScale(_ p: PoseCandidate, frameHeight: Double) -> (scale: Double, partial: Bool) {
+    static func tunedBodyScale(_ p: PoseCandidate, frameHeight: Double,
+                               floorShare: Double = partialScaleShare) -> (scale: Double, partial: Bool) {
         let base = bodyScale(p, frameHeight: frameHeight)
         guard p.isWellFormed else { return (base, true) }
         func ok(_ j: PoseJoint) -> Bool { p.c[j.rawValue] >= minJointConfidence }
@@ -2457,13 +2462,15 @@ struct PoseMotionTracker {
         if ok(.leftHip) && ok(.rightHip) { s = max(s, hipWidthTorso * dist(.leftHip, .rightHip)) }
         if ok(.leftHip) && ok(.leftKnee) { s = max(s, thighTorso * dist(.leftHip, .leftKnee)) }
         if ok(.rightHip) && ok(.rightKnee) { s = max(s, thighTorso * dist(.rightHip, .rightKnee)) }
-        s = max(s, partialScaleShare * max(0, frameHeight))
+        s = max(s, floorShare * max(0, frameHeight))
         return (s.isFinite ? s : base, true)
     }
 
-    /// 尺度：actionTuned 时按 tunedBodyScale，否则原来的 bodyScale
-    private func scaleOf(_ p: PoseCandidate, frameHeight: Double) -> (scale: Double, partial: Bool) {
-        actionTuned ? Self.tunedBodyScale(p, frameHeight: frameHeight) : (Self.bodyScale(p, frameHeight: frameHeight), false)
+    /// 尺度：actionTuned 时按 tunedBodyScale，否则原来的 bodyScale。relax：见 partialRelaxLow（0 = 不撤）
+    private func scaleOf(_ p: PoseCandidate, frameHeight: Double, relax: Double = 0) -> (scale: Double, partial: Bool) {
+        guard actionTuned else { return (Self.bodyScale(p, frameHeight: frameHeight), false) }
+        let floor = Self.partialScaleShare - (Self.partialScaleShare - Self.minScaleShare) * relax
+        return Self.tunedBodyScale(p, frameHeight: frameHeight, floorShare: floor)
     }
 
     private static func jointCount(_ p: PoseCandidate) -> Int {
@@ -2548,10 +2555,18 @@ struct PoseMotionTracker {
                       time: time)
         }
         let person = candidates[pick.index]
-        let measured = scaleOf(person, frameHeight: frameHeight)
+        // rhythm-action tune：髋已经在往复时撤掉部分骨架的死区加倍 / 尺度下限（只在调优开着时算）
+        var relax = 0.0
+        if actionTuned {
+            let h = hips.freshEstimate(at: time, maxAge: Self.rhythmMaxAge)
+            if h.confidence.isFinite {
+                relax = StrokeScore.ramp(h.confidence, low: Self.partialRelaxLow, high: Self.partialRelaxHigh)
+            }
+        }
+        let measured = scaleOf(person, frameHeight: frameHeight, relax: relax)
         let size = measured.scale
-        // rhythm-action tune：只认到身体一部分时检测抖动大得多，死区加倍（关着时 × 1，逐位不变）
-        let zoneScale = actionTuned && measured.partial ? Self.partialDeadZoneScale : 1
+        // rhythm-action tune：只认到身体一部分时检测抖动大得多，死区加倍（髋在往复时按 relax 撤回；关着时 × 1，逐位不变）
+        let zoneScale = actionTuned && measured.partial ? 1 + (Self.partialDeadZoneScale - 1) * (1 - relax) : 1
         let dt = time - previousTime
         let linked = !pick.switched && hasPrevious && continuous && dt > Self.minGap && dt <= Self.maxGap && scale > 0
         if linked {
@@ -2972,6 +2987,9 @@ struct PoseBlend {
     /// 真的大幅往复时块运动分数本身就不低（主体 P80 和面积无关），这个上界几乎不起作用
     static let tunedSupportBase: Double = 0.1
     static let tunedSupportSlope: Double = 2
+    /// 这个上界只在姿态没有像样的节奏时用：髋 / 头这组节奏置信度 ≥ 0.4（关键点抖动出不来）= 真的往复，
+    /// 低纹理近景里块运动偏小时姿态照常起作用
+    static let tunedRhythmConfidence: Double = 0.4
 
     private(set) var weight: Double = 0
     private(set) var heldScore: Double = 0
@@ -3009,9 +3027,17 @@ struct PoseBlend {
         }
         if !weight.isFinite { weight = 0 }
         var poseScore = heldScore
-        if tuned { poseScore = min(poseScore, Self.tunedSupportBase + Self.tunedSupportSlope * flow) }
+        if tuned && !Self.rhythmicPose(w) {
+            poseScore = min(poseScore, Self.tunedSupportBase + Self.tunedSupportSlope * flow)
+        }
         let blended = weight * poseScore + (1 - weight) * flow
         return MotionStats.clamp01(max(blended, flow * (1 - Self.flowFloorShare * weight)))
+    }
+
+    /// 这一拍姿态的节奏来自髋 / 头（姿态分数就是按这两组算的），且置信度够
+    static func rhythmicPose(_ w: MotionWindow) -> Bool {
+        w.posePresentFrames > 0 && (w.poseRhythmPart == 1 || w.poseRhythmPart == 2)
+            && w.poseRhythmConfidence.isFinite && w.poseRhythmConfidence >= tunedRhythmConfidence
     }
 }
 

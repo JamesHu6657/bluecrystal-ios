@@ -266,7 +266,13 @@ func vsWindow(_ mean: Double, _ peak: Double? = nil) -> MotionWindow {
 
 /// 归一化 + 平滑一拍（0.3 秒），返回乘过热身置信度的 0~100
 struct VSChain {
-    var normalizer = MotionNormalizer()
+    /// gentleAllowed = false：同 VideoSyncPlayer 在没有正面依据（轻抚 / 节奏只来自摸着自己的手）时的设法。
+    /// 只在 actionTuned 时看；要测「有正面依据」的场景自己设 true
+    var normalizer: MotionNormalizer = {
+        var n = MotionNormalizer()
+        n.gentleAllowed = false
+        return n
+    }()
     var shaper = MotionShaper()
 
     mutating func step(_ w: MotionWindow, auto: Bool = true, gainDb: Double = 0) -> Double {
@@ -1369,7 +1375,8 @@ func vs3Analyze(_ scene: VS3Scene, seconds: Double = 14) -> VS3Analysis {
 func vs3Output(_ windows: [MotionWindow], cap: Double = 100, auto: Bool = true,
                tuned: Bool = false) -> (mean: Double, max: Int, rise: Int) {
     var chain = VSChain()
-    // tuned：归一化也按动作调优（gentle 默认允许 = 还没认出动作、没锁节奏，最不利的情况）
+    // tuned：归一化也按动作调优。gentleAllowed 是 VSChain 的 false（没有轻抚的正面依据，同真机）：
+    // 压低只来自 MotionNormalizer.unrhythmic（画面完全没节奏）
     chain.normalizer.actionTuned = tuned
     var stage = SyncOutputStage()
     let settings = AudioSyncSettings(maxPercent: cap)
@@ -5497,6 +5504,7 @@ do {
     let new = atRun(tuned: true, context: true) { atSlowThrustWindow(time: $0) }
     var crushed = MotionNormalizer()
     crushed.actionTuned = true
+    crushed.gentleAllowed = true  // 对照：一直按轻动作压会是多少
     var crushedChain = VSChain()
     crushedChain.normalizer = crushed
     var crushedOut: [Double] = []
@@ -5839,6 +5847,78 @@ func atRidingCheck() {
            + "（强度 \(Int(baseMean)) → \(Int(newMean))，峰 \(newPeak)，锁 \(new.run.locked.last ?? false)，kinds \(Set(new.run.kinds.map { $0.rawValue }))）")
 }
 atRidingCheck()
+
+func atPoseCapRhythmCheck() {
+    // M1：低纹理近景里的真插入：块运动只有 0.1，姿态 0.7 且髋的节奏置信度 0.8 → 姿态上界不压（和关着一样）；
+    // 同样的窗口没有姿态节奏（关键点抖动）→ 照样压
+    func run(tuned: Bool, rhythmic: Bool) -> Double {
+        var c = VSChain()
+        c.normalizer.actionTuned = tuned
+        var out: [Double] = []
+        for _ in 0..<60 {
+            var w = MotionWindow(meanEnergy: 2, peakEnergy: 2, frames: 5, cutCount: 0, heldCount: 0)
+            w.subjectFrames = 5
+            w.subjectScore = 0.1
+            w.subjectFollowHz = 1.5
+            w.subjectFollowRhythm = 0.5
+            w.poseFrames = 3
+            w.posePresentFrames = 3
+            w.poseScore = 0.7
+            w.poseConfidence = 0.8
+            w.poseTrust = 1
+            if rhythmic {
+                w.poseRhythmHz = 1.5
+                w.poseRhythmConfidence = 0.8
+                w.poseRhythmPart = 1
+                w.poseRhythmRate = 9
+            }
+            out.append(c.step(w))
+        }
+        return vs3Late(out)
+    }
+    let old = run(tuned: false, rhythmic: true)
+    let new = run(tuned: true, rhythmic: true)
+    let jitter = run(tuned: true, rhythmic: false)
+    vcheck(new >= 0.95 * old && old >= 40 && jitter <= 0.6 * old,
+           "动作调优 R3（M1）：块运动 0.1 + 姿态 0.7、髋节奏可信 → 姿态上界不压（关 \(Int(old)) / 开 \(Int(new))）；"
+           + "没有姿态节奏时照样压（\(Int(jitter))）")
+}
+atPoseCapRhythmCheck()
+
+func atPartialMovingCheck() {
+    // M2：只认到髋 / 膝的近景里慢慢往复：髋 0.8 Hz、0.15 躯干（躯干 = 髋宽 × 2 = 32 像素），膝跟着 0.3 倍，
+    // 约 9 Hz 姿态采样、关键点抖 0.3 像素；关节置信度 0.3 / 0.5 → 髋的节奏还在（死区加倍随髋节奏撤回）
+    func run(confidence: Double) -> PoseReading {
+        var tracker = PoseMotionTracker()
+        tracker.actionTuned = true
+        tracker.contextEnabled = true
+        var last = PoseReading()
+        var i = 0
+        for k in 0..<Int(14 * 15) where k % 5 == 0 || k % 5 == 2 || k % 5 == 4 {
+            let t = Double(k) * vsDt
+            let d = 0.15 * 32 * sin(2 * Double.pi * 0.8 * t)
+            var p = atPartialHips(confidence: confidence)
+            p.y[PoseJoint.leftHip.rawValue] += d
+            p.y[PoseJoint.rightHip.rawValue] += d
+            p.y[PoseJoint.leftKnee.rawValue] += 0.3 * d
+            p.y[PoseJoint.rightKnee.rawValue] += 0.3 * d
+            last = tracker.update(time: t, candidates: [vs3Jittered(p, i: i, sigma: 0.3)], camera: .identity,
+                                  continuous: true, frameHeight: 36)
+            i += 1
+        }
+        return last
+    }
+    var ok = true
+    var notes: [String] = []
+    for c in [0.3, 0.5] {
+        let r = run(confidence: c)
+        ok = ok && r.present && r.rhythmPart == 1 && abs(r.rhythmHz - 0.8) <= 0.1 && r.rhythmConfidence >= 0.4
+        notes.append("置信度 \(c)：第 \(r.rhythmPart) 组 \(String(format: "%.2f", r.rhythmHz)) Hz "
+                     + "\(String(format: "%.2f", r.rhythmConfidence))")
+    }
+    vcheck(ok, "动作调优 R3（M2）：部分骨架慢慢往复（0.8 Hz、0.15 躯干）髋的节奏不被加倍的死区吃掉（\(notes)）")
+}
+atPartialMovingCheck()
 
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
