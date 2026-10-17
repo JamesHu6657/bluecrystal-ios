@@ -1131,6 +1131,41 @@ P4 + 子拍脉动整段（出口不变量 + 峰相位 + 跳频后相位误差比
    扫一半关掉开关：进度行消失、不再解码。扫完前就开始播放：提示「已经开始播放，这次按实时学（不再扫描，换视频后重新扫）」，Instruments 里预扫描那路解码随即停掉（前瞻开着时前瞻照常读）。
 9. 动作停下 / 切镜：0.5 秒内伸缩回落、脉动消失，和不开前瞻一样；STOP 一下就停。
 
+### av-fusion F0/F1：声画融合（F0 观测与标定；F1 耦合度，只显示，默认关）
+
+研究页「BlueCrystal 声画融合联动研究」的 F0 / F1 两步。融合**不是第三种联动来源**：`VisualSyncSource` / `resolveSource` / 来源选择界面都不动，
+声音模式一行不改；F1 只在「跟随画面」下多一个默认关的开关。两步都不改任何输出：输出只走 `tick()` → `SyncOutputStage` 限幅 → `BLEManager.sendTick`，
+没有新的发送路径，STOP 照旧一下就停，安全上限不变。新类型都在 `VisualSync.swift` 末尾 `// MARK: - av-fusion`，实时线程部分在 `AudioLevelTap.swift`，
+没有新 Swift 文件；`BLEManager.swift` / `SafetyLedger.swift` / `Protocol.swift` / `AIProgram.swift` / `Models.swift` / `project.pbxproj` 都没动。
+
+#### F0：观测与标定（不加开关，跟着「调试记录」走）
+
+目标：先把「声音和画面在手机上到底差多少」量出来，再谈融合。F0 不改控制，只加观测：
+
+- **tap 回调时间**（`AudioTapTiming` / `AudioTapTimingRing`）：每次 MTAudioProcessingTap 回调记 host 时间（`CACurrentMediaTime`）、
+  这段第一个样本的视频时间（`MTAudioProcessingTapGetSourceAudio` 给的时间范围，拿不到记 NaN）和样本数。环形缓冲 64 条、init 时一次分配，
+  在 `AudioLevelMeter` 已有的 `os_unfair_lock` 第一段里写（不多加锁、不分配）。**只在调试记录开着时写**（`setTimingEnabled`）：关着时实时线程只多看一个布尔，
+  不多读一个样本；`setBandsEnabled(usesAudioAnchor)` 的表达式 F0 一点没动。
+- **播放器时钟快照**（`MediaClockSnapshot`）：主线程每拍读一次 host 时间 / `currentTime` / `rate`，视频时间 ↔ host 时间互换。
+- **tap 提前量**（`AudioTapLeadEstimator`）：提前量 = 这段声音按播放器时钟该出声的 host 时刻 − tap 处理它的 host 时刻；最近 32 个的中位数，
+  离谱的（> 2 秒，seek / 时钟跳）丢掉。这是「tap 看到的撞击」要换成「耳朵听到的撞击」时要减掉的量，F1 的时间可用判断也看它。
+- **调试表格新列**（`AVDebugColumns`，接在 `MotionDebugLog` 原有列后面，原列不变）：
+  `av_onsets`（这一拍新出现的撞击时刻，视频秒，分号分隔；撞击声相位校正开着才有）、`av_band_frames` / `av_band_low_db` / `av_band_mid_db` / `av_band_high_db`
+  （这一拍取走的三频带块数和均值能量 dB；同样只在 P3 频带已经在流的时候有）、`av_tap_lead_ms`、`av_tap_valid` / `av_tap_invalid`（这一拍时间范围有效 / 无效的回调数）、
+  `av_play_host` / `av_play_item` / `av_play_rate`。非有限数一律写空格子。频带块是 `updateAudioAnchor` 取走后顺手汇总的同一份，撞击检测吃到的数据不变。
+- **测试视频**（`Tools/make-rhythm-test-videos.sh` 新增 §4.3 一组）：同帧闪白 + 宽带咔哒基线（1.6 Hz）、声音晚 120 ms / 早 200 ms、纯配乐（120 BPM 底鼓 + 踩镲 + 和弦，画面静止）、
+  画面 1.6 Hz + 同频配乐（鼓点错开 0.23 秒，15 秒切镜音乐不断）、类人声（150 Hz 谐波 + 4 Hz 音节包络）。真机怎么量见 `docs/rhythm-calibration.md` 第 11 节。
+
+F0 的测试（`Tests/VisualSyncChecks/main.swift`「av-fusion F0」，都在函数里）：调试列表头 / 有数 / 空列列数一致、NaN / ∞ 写空、撞击时刻分号分隔；回调时间缓冲关着不记、
+满 64 条留最新且旧 → 新、有效 / 无效计数、取走清零、关掉清掉；播放器时钟互换（倍速 2、暂停 → NaN）；提前量中位数（±3 ms 抖动 + seek 离谱值，1× / 2× / 负提前量各一组，误差 < 2.5 ms）。
+
+#### 融合关着 = f706431 逐位相同（`Tests/FusionOffCompare/run.sh`，PR Checks 里跑）
+
+照 `Tests/P4OffCompare` 的做法，一开始就建好：同一份只用 f706431（v1.8.3）已有接口的整条链模拟——声音模式两组（电平 → `AudioReactiveShaper` → 通道档位 / 出口限速）、
+画面 P1 / P2+切镜 / P3（动作识别）/ P3+撞击声相位校正（合成 48 kHz 声音 → `AudioBandSplitter` → `AudioOnsetDetector` → `AudioPhaseAnchor`，含声音偏 80 ms 和同频配乐 + 切镜）/
+P4 前瞻——分别和 f706431 的 `VisualSync.swift`、当前分支的 `VisualSync.swift`、当前分支加 `-D AV_FUSION_ON`（融合部件在旁边吃同样的画面 / 声音跟着跑）编译（`-O`），
+三份输出（每拍输出档位、原值、浮点位模式）必须逐字节相同。CI 的 checkout 改成 `fetch-depth: 0` 才拿得到 f706431。
+
 ## 11. 风险与待定
 
 1. **伸缩档位的真实含义**：0x08 帧里「伸缩」是速度档还是幅度档需要真机确认，决定节奏系数是映射到伸缩还是震动更合理（默认按速度档设计）。rhythm-follow P1 也按速度档设计，P0 标定（`docs/rhythm-calibration.md` 第 1 步）先确认。

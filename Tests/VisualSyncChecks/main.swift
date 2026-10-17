@@ -6946,6 +6946,97 @@ do {
            "P4 预扫描初始化：只在还没学过时用（热身照旧从 0 起）；学过 / 不可信时不动；坏值夹回实时能到的范围；输出仍在 0~100")
 }
 
+// MARK: - av-fusion F0（观测与标定）：都放在函数里（顶层栈已经很满）
+func avFusionF0Checks() {
+    // 调试表格声画列：表头 / 有数 / 空列 三者列数一致；NaN / ∞ 写空；撞击时刻用分号连、没有逗号
+    let headerCount = AVDebugColumns.f0Header.split(separator: ",", omittingEmptySubsequences: false).count
+    var bands = AudioBandSummary()
+    bands.add([AudioBandFrame(time: 1, low: 0.01, mid: 0.001, high: 0), AudioBandFrame(time: 1.01, low: 0.03, mid: 0.001, high: 0)])
+    let clock = MediaClockSnapshot(host: 100, item: 5, rate: 1)
+    let full = AVDebugColumns.f0Fields(onsets: [1.2345, .nan, 1.8], bands: bands, tapLead: 0.0815, tapValid: 7, tapInvalid: 1,
+                                       clock: clock)
+    let blank = AVDebugColumns.f0Fields(onsets: [], bands: AudioBandSummary(), tapLead: .nan, tapValid: 0, tapInvalid: 0,
+                                        clock: MediaClockSnapshot(host: .infinity, item: .nan, rate: .nan))
+    let line = full.joined(separator: ",")
+    vcheck(headerCount == 11 && full.count == headerCount && blank.count == headerCount && AVDebugColumns.f0Empty.count == headerCount
+           && (full[0] == "1.234;1.800" || full[0] == "1.235;1.800"),
+           "F0 调试列：表头 \(headerCount) 列，有数 / 空 / 占位列数一致；撞击时刻分号分隔（\(full[0])）")
+    vcheck(full[1] == "2" && full[2] == "-16.99" && full[3] == "-30.00" && full[4] == "-120.00" && full[5] == "81.5"
+           && full[6] == "7" && full[7] == "1" && full[8] == "100.0000" && full[10] == "1.000"
+           && line.split(separator: ",", omittingEmptySubsequences: false).count == headerCount,
+           "F0 调试列数值：频带均值 dB / 提前量毫秒 / 回调计数 / 播放器时钟（\(line)）")
+    vcheck(blank[0] == "" && blank[1] == "0" && blank[2] == "" && blank[5] == "" && blank[8] == "" && blank[9] == ""
+           && blank[10] == "" && AVDebugColumns.f0Empty.allSatisfy { $0.isEmpty } && AVDebugColumns.field(.nan) == ""
+           && AVDebugColumns.field(-.infinity) == "",
+           "F0 调试列：NaN / ∞ / 没有块 → 空格子（不是 nan / inf）")
+
+    // tap 回调时间环形缓冲：关着什么都不记；满 64 条后留最新的、旧 → 新；计数照记；drain 清零；开关切换清掉
+    let ring = AudioTapTimingRing()
+    ring.record(AudioTapTiming(host: 1, itemStart: 0, frames: 512))
+    let offEmpty = ring.count == 0 && ring.validCount == 0 && ring.invalidCount == 0 && ring.drain().timings.isEmpty
+    ring.setEnabled(true)
+    for k in 0..<100 {
+        ring.record(AudioTapTiming(host: Double(k), itemStart: k % 10 == 9 ? .nan : Double(k) * 0.01, frames: 480))
+    }
+    let d = ring.drain()
+    let ordered = d.timings.count == AudioTapTimingRing.capacity && d.timings.first?.host == 36 && d.timings.last?.host == 99
+        && zip(d.timings, d.timings.dropFirst()).allSatisfy { $0.host + 1 == $1.host }
+    let counted = d.valid == 90 && d.invalid == 10 && d.timings.filter { !$0.valid }.count == 7
+    let cleared = ring.count == 0 && ring.drain().timings.isEmpty
+    ring.record(AudioTapTiming(host: 1, itemStart: 1, frames: 0))
+    ring.setEnabled(false)
+    ring.record(AudioTapTiming(host: 2, itemStart: 2, frames: 10))
+    let offAgain = ring.count == 0 && ring.validCount == 0 && ring.invalidCount == 0
+    vcheck(offEmpty && ordered && counted && cleared && offAgain && !AudioTapTiming(host: 1, itemStart: 1, frames: 0).valid,
+           "F0 回调时间缓冲：关着不记；满 \(AudioTapTimingRing.capacity) 条留最新、旧 → 新；有效 / 无效计数；取走清零；关掉清掉")
+
+    // 播放器时钟换算：视频时间 ↔ host 时间（倍速 2 时视频走两倍）；倍速 0 / 非有限 → NaN
+    let c2 = MediaClockSnapshot(host: 50, item: 10, rate: 2)
+    let paused = MediaClockSnapshot(host: 50, item: 10, rate: 0)
+    vcheck(abs(c2.host(forItem: 11) - 50.5) < 1e-12 && abs(c2.item(forHost: 51) - 12) < 1e-12
+           && abs(c2.item(forHost: c2.host(forItem: 13.37)) - 13.37) < 1e-12
+           && paused.host(forItem: 11).isNaN && paused.item(forHost: 51).isNaN && c2.host(forItem: .nan).isNaN,
+           "F0 播放器时钟：视频时间 ↔ host 时间按倍速互换，暂停 / 无效 → NaN")
+
+    // tap 提前量：tap 比出声早 L（固定种子抖动 ±3 ms + 几个 seek 离谱值）→ 中位数在 2.5 ms 内；倍速 2 一样；无效时钟 / 无效记录不进
+    var leadOK = true
+    var leads: [String] = []
+    // 自己的固定种子（不受前面测试用掉多少 vsRandom 影响）
+    var jSeed: UInt64 = 0xF0F0
+    func jRandom() -> Double {
+        jSeed = jSeed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Double(jSeed >> 11) / Double(1 << 53)
+    }
+    for (rate, lead) in [(1.0, 0.12), (2.0, 0.045), (1.0, -0.02)] {
+        var est = AudioTapLeadEstimator()
+        var host = 1000.0
+        var item = 3.0
+        for k in 0..<60 {
+            var batch: [AudioTapTiming] = []
+            for _ in 0..<3 {
+                // 回调时刻抖动 ±3 ms（tap 处理时刻不均匀；声音照样按播放器时钟放出来）
+                let jitter = (jRandom() - 0.5) * 0.006
+                batch.append(AudioTapTiming(host: host + jitter, itemStart: item, frames: 1024))
+                host += 0.0213
+                item += 0.0213 * rate
+            }
+            if k % 17 == 5 { batch.append(AudioTapTiming(host: host, itemStart: item + 30, frames: 1024)) }
+            batch.append(AudioTapTiming(host: host, itemStart: .nan, frames: 1024))
+            // 主线程这一刻读到的时钟：视频时间 item 在 host + lead 时被听到
+            let snap = MediaClockSnapshot(host: host + lead, item: item, rate: rate)
+            est.add(batch, clock: snap)
+        }
+        leads.append(String(format: "%.1f", est.lead * 1000))
+        leadOK = leadOK && abs(est.lead - lead) < 0.0025 && est.samples.count == AudioTapLeadEstimator.sampleCapacity
+    }
+    var none = AudioTapLeadEstimator()
+    none.add([AudioTapTiming(host: 1, itemStart: 1, frames: 10)], clock: MediaClockSnapshot(host: 1, item: 1, rate: 0))
+    none.add([AudioTapTiming(host: 1, itemStart: .nan, frames: 10)], clock: MediaClockSnapshot(host: 1, item: 1, rate: 1))
+    vcheck(leadOK && none.lead.isNaN && none.samples.isEmpty,
+           "F0 tap 提前量：中位数 \(leads.joined(separator: " / ")) ms（应 120 / 45 / −20）；seek 离谱值、无效时钟 / 记录不进")
+}
+avFusionF0Checks()
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)
