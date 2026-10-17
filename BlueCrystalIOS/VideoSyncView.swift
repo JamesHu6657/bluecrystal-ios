@@ -123,6 +123,8 @@ final class VideoSyncPlayer: ObservableObject {
     @Published private(set) var fallbackStatus: String?
     /// av-fusion F5：音画偏移估计（自动估计开着才收样本）
     private var offsetEstimator = AVOffsetEstimator()
+    /// 复审 M4：上一个样本用到的最新撞击时刻（没有新撞击就不加样本，免得同一组撞击重复算）
+    private var lastOffsetImpact = -Double.infinity
     @Published private(set) var offsetStatus: String?
     /// av-fusion（F1 复审 L2）：电平计现在算没算 6 段扩展特征（fusionFeaturesWanted 上次交给电平计的值）
     private var fusionAudioOn = false
@@ -189,7 +191,10 @@ final class VideoSyncPlayer: ObservableObject {
     /// 界面设置变化（@AppStorage）。关掉联动立刻归零但视频继续播；其余变化下一拍生效
     func applySettings(_ s: AudioSyncSettings) {
         let wasEnabled = settings.enabled
+        let oldChannels = settings.channels
         settings = s
+        // av-fusion F3b（复审 H2）：通道一变，震动跟声音从头来
+        if s.channels != oldChannels { vibrationAudio.reset() }
         if wasEnabled && !s.enabled {
             shaper.reset()
             motionShaper.reset()
@@ -1132,6 +1137,9 @@ final class VideoSyncPlayer: ObservableObject {
         resetContext()
         resetPulse()
         resetLookahead()
+        // av-fusion F3（复审 H2）：关联动 / 缓冲 / 跟随频率开关 / seek 等都从这里走 → 重音、震动跟声音从头来
+        accent.reset()
+        vibrationAudio.reset()
     }
 
     /// rhythm-lookahead P4：方向 / 提前量从头来（核对历史保留；读帧那边重读时 RhythmLookahead 自己清，换视频全清）
@@ -1207,6 +1215,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-phase P2：相位从头锁、脉动停掉（下一个完整拍按 P1 出口规则继续）
     private func resetPulse() {
         phaseLock.reset()
+        // av-fusion F4：相位锁从头来时飞轮也清（不能拿 seek 前的锁去外推）
+        flywheel.reset()
         pulse.reset()
         if pulseStatus != nil { pulseStatus = nil }
         resetAnchor()
@@ -1235,7 +1245,11 @@ final class VideoSyncPlayer: ObservableObject {
             return
         }
         let since = itemNow - (AudioPhaseAnchor.windowSeconds + 0.5) * rate
-        let onsets = onsetDetector.onsets(since: since).map { now + ($0 - itemNow) / rate }
+        // av-fusion F5（复审 M3）：撞击声校正看的是绝对相位，偏移在这里最要紧——撞击按 t − τ 对画面；τ == 0 时这一行和以前逐位相同
+        let tau = currentAVOffset
+        let onsets = tau == 0
+            ? onsetDetector.onsets(since: since).map { now + ($0 - itemNow) / rate }
+            : onsetDetector.onsets(since: since).map { now + ($0 - tau - itemNow) / rate }
         // 声音节奏按视频时间算，画面频率是 host 时间上看到的快慢：乘倍速再比
         let r = onsetDetector.rhythm()
         let known = visualSettings.usesRhythmContext && actionContext.directionKnown
@@ -1260,15 +1274,23 @@ final class VideoSyncPlayer: ObservableObject {
     }
 
     /// av-fusion F5：读声音用的播放器时钟——按这一拍的音画偏移挪视频时间（偏移 0 时就是原来的时钟，逐位不变）
-    private func avClock(_ p: AVPlayer) -> MediaClockSnapshot {
+    /// instant：只看最近一瞬间响度的读法（F3 重音、F3b 震动）。声音晚（τ > 0）时这一瞬间对应的撞击还没解码出来，
+    /// 只能按已有的声音读，所以只补「声音早」（τ < 0）的那一半（复审 M3）
+    private func avClock(_ p: AVPlayer, instant: Bool = false) -> MediaClockSnapshot {
         let raw = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
-        return raw.shifted(byItem: AVOffset.effective(settings: visualSettings,
-                                                      estimator: visualSettings.usesAVAutoOffset ? offsetEstimator : nil))
+        let tau = currentAVOffset
+        return raw.shifted(byItem: instant ? min(0, tau) : tau)
+    }
+
+    /// av-fusion F5：这一拍用的音画偏移（秒；融合没生效 / 手动 0 且没在自动估计 = 0）
+    private var currentAVOffset: Double {
+        AVOffset.effective(settings: visualSettings, estimator: visualSettings.usesAVAutoOffset ? offsetEstimator : nil)
     }
 
     /// av-fusion F5：换视频 / 开关变化时从头估（seek 不清：同一个片子的偏移不变）
     private func resetOffsetEstimator() {
         offsetEstimator.reset()
+        lastOffsetImpact = -.infinity
         if offsetStatus != nil { offsetStatus = nil }
     }
 
@@ -1280,7 +1302,9 @@ final class VideoSyncPlayer: ObservableObject {
             let end = clock.item(forHost: clock.host)
             let hits = AVRhythmVote.impacts(fusion.extractor.events, start: end - AVCouplingEstimator.windowSeconds * clock.rate,
                                             end: end).map { $0.time }
-            if let m = AVOffsetEstimator.meanPhase(itemTimes: hits, clock: clock, lock: phaseLock) {
+            if let newest = hits.last, newest != lastOffsetImpact,
+               let m = AVOffsetEstimator.meanPhase(itemTimes: hits, clock: clock, lock: phaseLock) {
+                lastOffsetImpact = newest
                 offsetEstimator.add(hz: phaseLock.hz / clock.rate, mu: m.mu, r: m.r, now: clock.host)
             }
         }
@@ -1293,6 +1317,36 @@ final class VideoSyncPlayer: ObservableObject {
             text = "音画偏移：等声画耦合后开始估计，先按手动值"
         }
         if text != offsetStatus { offsetStatus = text }
+    }
+
+    /// av-fusion F0~F5 调试列（复审 L3：一步一步拼，不写成一长串 + / ?? / 三元，免得类型检查超时）
+    private func motionAVDebugFields(_ p: AVPlayer) -> [String] {
+        var av: [String] = avDebugFields(p)
+        if let b = fusionBeat {
+            av += AVDebugColumns.f1Fields(b)
+        } else {
+            av += AVDebugColumns.f1Empty
+        }
+        av += rhythmVote.active ? AVDebugColumns.f2Fields(rhythmVote) : AVDebugColumns.f2Empty
+        if visualSettings.usesAVAccent {
+            let vib: AVVibrationAudio? = visualSettings.usesAVVibrationAudio ? vibrationAudio : nil
+            av += AVDebugColumns.f3Fields(accent: accent, vibration: vib)
+        } else {
+            av += AVDebugColumns.f3Empty
+        }
+        if visualSettings.usesAVFallback {
+            av += AVDebugColumns.f4Fields(fallback: avFallback, flywheel: flywheel)
+        } else {
+            av += AVDebugColumns.f4Empty
+        }
+        // 复审 L2：F5 默认（手动 0、自动关）时列为空，和 F3 / F4 一样
+        if visualSettings.usesAVAutoOffset || visualSettings.manualAVOffset != 0 {
+            let est: AVOffsetEstimator? = visualSettings.usesAVAutoOffset ? offsetEstimator : nil
+            av += AVDebugColumns.f5Fields(effective: currentAVOffset, estimator: est)
+        } else {
+            av += AVDebugColumns.f5Empty
+        }
+        return av
     }
 
     /// av-fusion F4：互为回落 / 飞轮从头来（暂停 / seek / 缓冲 / 关联动 / 换视频都走这里 → 下一拍走原路径）
@@ -1325,10 +1379,16 @@ final class VideoSyncPlayer: ObservableObject {
         }
         let clock = avClock(p)
         let end = clock.item(forHost: clock.host)
-        let hz = clock.isValid && end.isFinite
+        var hz = clock.isValid && end.isFinite
             ? AVRhythmVote.recentHz(fusion.extractor.events, start: end - AVRhythmVote.windowSeconds * clock.rate, end: end)
                 * clock.rate
             : 0
+        // 复审 L1：丢锁之前的撞击也能凑出一致的频率，所以还要最近一个半周期里真有撞击（声音还在跟着这个节奏响）
+        if hz > 0, phaseLock.hz > 0 || flywheel.snapshot != nil {
+            let period = 1 / max(0.1, flywheel.snapshot?.hz ?? phaseLock.hz)
+            let recent = AVRhythmVote.impacts(fusion.extractor.events, start: end - 1.5 * period * clock.rate, end: end)
+            if recent.isEmpty { hz = 0 }
+        }
         return flywheel.step(lock: phaseLock, s2: AVRhythmVote.isS2(fusionBeat), audioHz: hz, now: clock.host) ?? phaseLock
     }
 
@@ -1338,7 +1398,7 @@ final class VideoSyncPlayer: ObservableObject {
             if accent.active { accent.reset() }
             return 1
         }
-        let clock = avClock(p)
+        let clock = avClock(p, instant: true)
         return accent.step(events: fusion.extractor.events, clock: clock, s2: AVRhythmVote.isS2(fusionBeat),
                            lockHz: phaseLock.hz, depth: visualSettings.avAccentDepth / 100)
     }
@@ -1352,7 +1412,7 @@ final class VideoSyncPlayer: ObservableObject {
         }
         let floorPercent = SyncOutputStage.floorPercent(settings: settings, hasSignal: hasSignal)
         let floorLevel = floorPercent.isFinite ? max(0, Int(floorPercent.rounded())) : 0
-        let clock = avClock(p)
+        let clock = avClock(p, instant: true)
         var out = levels
         out[1] = vibrationAudio.step(video: levels[1], floor: floorLevel, events: fusion.extractor.events, clock: clock,
                                      beat: fusionBeat, activity: activity, channelsBoth: settings.channels == .both,
@@ -1551,10 +1611,10 @@ final class VideoSyncPlayer: ObservableObject {
         let vals: [Int]
         if visualSettings.rhythmFollow {
             // 伸缩按动作频率（weight × 画面强度交接），震动照旧；同一个出口：上限 / 升幅 ≤ +20 / 归零保持
-            // av-fusion F3：重音（S2 才 ≠ 1）——脉动关着时乘在进 target 的强度上，开着时改调脉动深度；F3b 只改震动通道
+            // av-fusion F3：重音（S2 才 ≠ 1）只调脉动深度（S2 要相位锁，相位锁只在相位脉动开着时跑，所以重音要求脉动开着，
+            // 复审 M2）；F3b 只改震动通道
             let accentG = accentGain(p)
-            let accentValue = accentG != 1 && !visualSettings.rhythmPulse ? min(100, max(0, value * accentG)) : value
-            let levels = vibrationLevels(RhythmOutput.target(value: accentValue, settings: settings, hasSignal: hasSignal,
+            let levels = vibrationLevels(RhythmOutput.target(value: value, settings: settings, hasSignal: hasSignal,
                                                              rateLevel: rateLevel, weight: rhythm.weight,
                                                              activity: rhythmActivity),
                                          player: p, hasSignal: hasSignal, activity: rhythmActivity, dt: dt)
@@ -1594,20 +1654,7 @@ final class VideoSyncPlayer: ObservableObject {
                             kind: actionContext.kind.rawValue, context: contextStatus,
                             rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
                             activity: rhythmActivity, rateLevel: rateLevel, out: vals,
-                            av: avDebugFields(p) + (fusionBeat.map(AVDebugColumns.f1Fields) ?? AVDebugColumns.f1Empty)
-                                + (rhythmVote.active ? AVDebugColumns.f2Fields(rhythmVote) : AVDebugColumns.f2Empty)
-                                + (visualSettings.usesAVAccent
-                                   ? AVDebugColumns.f3Fields(accent: accent,
-                                                             vibration: visualSettings.usesAVVibrationAudio ? vibrationAudio : nil)
-                                   : AVDebugColumns.f3Empty)
-                                + (visualSettings.usesAVFallback ? AVDebugColumns.f4Fields(fallback: avFallback, flywheel: flywheel)
-                                   : AVDebugColumns.f4Empty)
-                                + (visualSettings.usesAVFusion
-                                   ? AVDebugColumns.f5Fields(effective: AVOffset.effective(settings: visualSettings,
-                                                                                           estimator: visualSettings.usesAVAutoOffset
-                                                                                               ? offsetEstimator : nil),
-                                                             estimator: visualSettings.usesAVAutoOffset ? offsetEstimator : nil)
-                                   : AVDebugColumns.f5Empty))
+                            av: motionAVDebugFields(p))
         }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
@@ -2365,17 +2412,20 @@ struct VideoSyncView: View {
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if avFusion, rhythmFollow, rhythmPulse, avRhythmConfirm, let vote = vm.voteStatus {
-                    Text(vote)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if avFusion, avFallbackOn, let fallback = vm.fallbackStatus {
-                    Text(fallback)
-                        .font(.caption2)
-                        .foregroundColor(Velvet.gold)
-                        .fixedSize(horizontal: false, vertical: true)
+                // 复审 L3：F2 / F4 状态行放进一个 Group（这一块的子视图不超过 10 个）
+                Group {
+                    if avFusion, rhythmFollow, rhythmPulse, avRhythmConfirm, let vote = vm.voteStatus {
+                        Text(vote)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if avFusion, avFallbackOn, let fallback = vm.fallbackStatus {
+                        Text(fallback)
+                            .font(.caption2)
+                            .foregroundColor(Velvet.gold)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             } else {
                 MeterBar(title: "电平", fraction: vm.level / 100, color: Velvet.blush,
@@ -2509,7 +2559,10 @@ struct VideoSyncView: View {
             .tint(Velvet.gold)
         }
         if avFusion {
-            accentControls
+            // 复审 M2：重音 / 震动跟声音要相位锁 → 伸缩跟随动作频率 + 相位脉动都开着才显示
+            if rhythmFollow, rhythmPulse {
+                accentControls
+            }
             Toggle(isOn: $avFallbackOn) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("画面不可用时按声音补（实验）")
@@ -2581,7 +2634,7 @@ struct VideoSyncView: View {
                 Text("声音重音（实验）")
                     .font(.subheadline)
                     .foregroundColor(Velvet.text)
-                Text("声画耦合时，撞击声比最近几下响就把这一下稍微加强、轻就稍微减弱（最多 ± 深度）；开着相位脉动时改调脉动深度。配乐 / 人声 / 没耦合时不起作用")
+                Text("声画耦合时，撞击声比最近几下响就把这一下稍微加强、轻就稍微减弱（最多 ± 深度）（调的是相位脉动的深度）。配乐 / 人声 / 没耦合时不起作用")
                     .font(.caption2)
                     .foregroundColor(Velvet.textMuted)
                     .fixedSize(horizontal: false, vertical: true)

@@ -31,8 +31,9 @@ wait $P1; wait $P2; wait $P3; wait $P4; wait $P5; wait $P6; wait $P7
 "$TMP/fusion" > "$TMP/fusion.txt"
 "$TMP/f2" > "$TMP/f2.txt"
 "$TMP/f2s1" > "$TMP/f2s1.txt"
-"$TMP/f3s1" > "$TMP/f3s1.txt"
-"$TMP/f4s1" > "$TMP/f4s1.txt"
+"$TMP/f3s1" > "$TMP/f3s1.txt" 2> "$TMP/f3s1.err"
+"$TMP/f4s1" > "$TMP/f4s1.txt" 2> "$TMP/f4s1.err"
+cat "$TMP/f3s1.err" "$TMP/f4s1.err" >&2
 sum() { sha256sum "$1" 2>/dev/null | cut -c1-16 || shasum -a 256 "$1" | cut -c1-16; }
 status=0
 for v in head fusion f2 f2s1 f3s1 f4s1; do
@@ -41,6 +42,16 @@ for v in head fusion f2 f2s1 f3s1 f4s1; do
   else
     echo "FAIL FusionOffCompare: $v DIFFERENT vs $BASE"
     diff "$TMP/base.txt" "$TMP/$v.txt" | head -n 20 || true
+    status=1
+  fi
+done
+# 复审 M5 正对照：同样的输入下，真实 S2 / 画面断开时 F3 / F4 必须真能改东西（不然上面的「逐字节相同」证明不了什么）
+for tag in f3 f4; do
+  n=$(grep -h "^$tag positive control" "$TMP"/f3s1.err "$TMP"/f4s1.err | awk '{s += $NF} END {print s + 0}')
+  if [ "$n" -gt 0 ]; then
+    echo "FusionOffCompare: $tag positive control changed $n beats (as expected)"
+  else
+    echo "FAIL FusionOffCompare: $tag positive control changed nothing"
     status=1
   fi
 done

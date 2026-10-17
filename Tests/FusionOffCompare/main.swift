@@ -189,12 +189,19 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
     var accent = AVAccent()
     var vibA = AVVibrationAudio()
     var f3touched = 0
+    // 复审 M5 正对照：同样的输入，按真实的融合状态（S2）算的影子重音 / 震动——不进输出，只证明这条路真能改东西
+    var accentShadow = AVAccent()
+    var vibShadow = AVVibrationAudio()
+    var f3shadow = 0
 #endif
 #if AV_F4_ON
     // F4：互为回落 / 相位飞轮的接线走一遍；画面一直有新鲜样本、不在 S2 → 一拍都不该改
     var fallback = AVFallbackBlend()
     var flywheel = AVPhaseFlywheel()
     var f4touched = 0
+    // 复审 M5 正对照：影子回落按真实融合状态记门，每 6 秒里有 2 秒当画面断了
+    var fallbackShadow = AVFallbackBlend()
+    var f4shadow = 0
 #endif
     var tick = 0.0
     var lastFull = 0.0
@@ -244,6 +251,11 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             fallback.note(beat: fusion.last, now: now)
             let fb = fallback.step(blended: (value, true), motionSignal: true, audio: 80, audioSignal: true, now: now, dt: dt)
             if fb.value.bitPattern != value.bitPattern || !fb.hasSignal { f4touched += 1 }
+            fallbackShadow.note(beat: fusion.last, now: now)
+            let gone = now.truncatingRemainder(dividingBy: 6) >= 4
+            let sfb = fallbackShadow.step(blended: gone ? (0, false) : (value, true), motionSignal: !gone, audio: 80,
+                                          audioSignal: true, now: now, dt: dt)
+            if gone, sfb.value > 0 { f4shadow += 1 }
 #endif
             let clock = RhythmLookahead.Clock(hostNow: now, itemNow: now, rate: 1)
             var input = coord.refine(w, enabled: vis.usesLookahead, timeline: tl, clock: clock, latency: latency)
@@ -267,13 +279,20 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #if AV_F3_ON
             let g = accent.step(events: fusion.engine.extractor.events, clock: MediaClockSnapshot(host: now, item: now, rate: 1),
                                 s2: false, lockHz: lock.hz, depth: 0.15)
-            let accentValue = g != 1 && !pulse ? min(100, max(0, value * g)) : value
-            var levels = RhythmOutput.target(value: accentValue, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
+            var levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
             let videoVib = levels[1]
             levels[1] = vibA.step(video: levels[1], floor: 10, events: fusion.engine.extractor.events,
                                   clock: MediaClockSnapshot(host: now, item: now, rate: 1), beat: nil, activity: act,
                                   channelsBoth: true, depth: 0.15, now: now, dt: dt)
             if g != 1 || levels[1] != videoVib { f3touched += 1 }
+            let sg = accentShadow.step(events: fusion.engine.extractor.events, clock: MediaClockSnapshot(host: now, item: now, rate: 1),
+                                       s2: AVRhythmVote.isS2(fusion.last), lockHz: lock.hz, depth: 0.15)
+            var shadowBeat = fusion.last
+            shadowBeat?.pMusic = 0
+            let sv = vibShadow.step(video: videoVib, floor: 10, events: fusion.engine.extractor.events,
+                                    clock: MediaClockSnapshot(host: now, item: now, rate: 1), beat: shadowBeat, activity: act,
+                                    channelsBoth: true, depth: 0.15, now: now, dt: dt)
+            if sg != 1 || sv != videoVib { f3shadow += 1 }
             driver.accentGain = pulse ? g : 1
 #else
             let levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
@@ -328,9 +347,11 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #endif
 #if AV_F4_ON
     FileHandle.standardError.write("f4 \(name): touched beats \(f4touched) (video always fresh, not S2 → 0)\n".data(using: .utf8)!)
+    FileHandle.standardError.write("f4 positive control \(name): \(f4shadow)\n".data(using: .utf8)!)
 #endif
 #if AV_F3_ON
     FileHandle.standardError.write("f3 \(name): touched beats \(f3touched) (forced S1 → 0)\n".data(using: .utf8)!)
+    FileHandle.standardError.write("f3 positive control \(name): \(f3shadow)\n".data(using: .utf8)!)
 #endif
 #if AV_F2_ON
     FileHandle.standardError.write("f2 \(name): voted beats \(voted) (switch off / forced S1 → 0)\n".data(using: .utf8)!)

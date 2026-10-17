@@ -3835,7 +3835,8 @@ struct VisualSyncSettings: Equatable {
     /// 复审 L5：耦合要相位锁，相位脉动关着时 F1 一直报「没锁」→ 也要开相位脉动
     var usesAVRhythmConfirm: Bool { usesAVFusion && rhythmFollow && rhythmPulse && avRhythmConfirm }
     /// av-fusion F3：声音重音生效（融合 + 开关）；只在声画耦合（S2）的拍上起作用，不影响 tickInterval
-    var usesAVAccent: Bool { usesAVFusion && avAccent }
+    /// 复审 M2：S2 要相位锁，相位锁只在「伸缩跟随动作频率 + 相位脉动」开着时跑 → 重音 / F3b 也要这两个开着（和 F2 一样）
+    var usesAVAccent: Bool { usesAVFusion && rhythmFollow && rhythmPulse && avAccent }
     /// av-fusion F3b：震动跟声音（重音的子开关）；通道「两个都用」和每拍四道门在 AVVibrationAudio 里判断
     var usesAVVibrationAudio: Bool { usesAVAccent && avVibrationAudio }
     /// av-fusion F4：互为回落生效（融合 + 开关）。画面暂时不可用时按声音补、画面回来交回；相位飞轮另要相位脉动在跑。不影响 tickInterval
@@ -9643,30 +9644,46 @@ struct AVVibrationAudio: Equatable {
     mutating func step(video: Int, floor: Int, events: [AudioOnsetEvent], clock: MediaClockSnapshot, beat: AVFusionBeat?,
                        activity: Double, channelsBoth: Bool, depth: Double, now: Double, dt: Double) -> Int {
         if let b = beat, b.crossCut > 0 || b.still > 0, now.isFinite { evidenceAt = now }
+        // 复审 H2：画面这一拍没有震动（0 / 没信号 / 通道不是两个都用）或画面不动 → 立刻回画面值（降总是安全的），状态清掉
+        guard video > 0, channelsBoth, activity.isFinite, activity > 0 else {
+            mix = 0
+            audioTarget = nil
+            level = nil
+            gated = false
+            return video
+        }
         var target: Int?
         if channelsBoth, AVRhythmVote.isS2(beat), let b = beat, b.pMusic.isFinite, b.pMusic < Self.musicGate,
            now.isFinite, now - evidenceAt >= Self.evidenceSeconds, activity.isFinite, activity > 0 {
             target = Self.audioLevel(video: video, floor: floor, events: events, clock: clock, depth: depth)
         }
         gated = target != nil
-        let step = dt.isFinite && dt > 0 ? dt : 0
+        // 复审 H2：dt 夹到一拍（0.3 秒），卡顿后不会一步爬满 / 淡完
+        let step = dt.isFinite && dt > 0 ? min(dt, AudioReactiveShaper.interval) : 0
         if let t = target {
             audioTarget = t
             mix = min(1, mix + step / Self.riseSeconds)
         } else {
             mix = max(0, mix - step / Self.fadeSeconds)
         }
-        guard mix > 0, let a = audioTarget else {
-            mix = 0
+        // 复审 H2：上界按这一拍的画面值重算（画面降了，旧的声音目标也跟着被压住）
+        let beta = depth.isFinite ? min(VisualSyncSettings.avAccentDepthRange.upperBound / 100, max(0, depth)) : 0
+        let upper = min(BCProtocol.maxManualLevel, Int((Double(video) * (1 + beta)).rounded(.down)))
+        var out = video
+        if mix > 0, let a = audioTarget {
+            // 淡出期间声音目标还按「上一次」的大小算（不再更新，但不超过这一拍的上界），和画面值线性混合
+            let blended = (Double(video) + (Double(min(a, upper)) - Double(video)) * mix).rounded()
+            out = blended.isFinite ? Int(blended) : video
+        }
+        // 淡回时每拍最多降 12（不超过这一拍的上界）；混合比到 0 后也继续按 12 降到画面值
+        if !gated, let prev = level { out = max(out, min(prev - Self.maxDropPerBeat, upper)) }
+        out = min(BCProtocol.maxManualLevel, max(0, out))
+        if mix == 0, out <= video {
             audioTarget = nil
             level = nil
             return video
         }
-        // 淡出期间声音目标还按「上一次」的大小算（不再更新），和画面值线性混合
-        let blended = (Double(video) + (Double(a) - Double(video)) * mix).rounded()
-        var out = blended.isFinite ? Int(blended) : video
-        if !gated, let prev = level { out = max(out, min(prev - Self.maxDropPerBeat, video)) }
-        out = min(BCProtocol.maxManualLevel, max(0, out))
+        if mix == 0 { audioTarget = nil }
         level = out
         return out
     }
@@ -9700,8 +9717,9 @@ struct AVFallbackBlend: Equatable {
     static let unavailableSeconds = 0.6
     static let rampSeconds = 1.5
     static let gateSeconds = 10.0
-    static let musicGate = 0.3
     static let maxDropPerBeat = 12.0
+    /// 复审 H1：一次断开最多替补 30 秒，之后 1.5 秒淡回原路径（发热暂停时融合也停了，没有新证据能关门）
+    static let maxSubstituteSeconds = 30.0
 
     /// 声音占比 0~1
     private(set) var share: Double = 0
@@ -9712,7 +9730,6 @@ struct AVFallbackBlend: Equatable {
     /// 上一拍 F4 交出去的值（交回时每拍降 ≤ 12 的基准）；nil = F4 没在起作用
     private(set) var lastValue: Double?
     private var coupledAt = -Double.infinity
-    private var lowMusicAt = -Double.infinity
 
     var active: Bool { lastValue != nil }
     /// 状态行用：画面不可用、正在按声音补
@@ -9720,15 +9737,16 @@ struct AVFallbackBlend: Equatable {
 
     mutating func reset() { self = AVFallbackBlend() }
 
-    /// 每个完整拍记一次融合判断（门用）：耦合 → 记时刻；有声音、P_music < 0.3 → 记时刻
+    /// 每个完整拍记一次融合判断（门用）：只有真的耦合才记时刻。
+    /// 复审 H1：研究页的「或 P_music < 0.3」不用——没有切镜 / 静止证据时 P_music 最多 0.3，「< 0.3」几乎总成立，
+    /// 单镜头的配乐 / 说话片子会一直开门；所以只认「最近 10 秒内耦合过」
     mutating func note(beat: AVFusionBeat?, now: Double) {
         guard let b = beat, now.isFinite else { return }
         if b.state == .coupled { coupledAt = now }
-        if b.state != .noAudio, b.pMusic.isFinite, b.pMusic < Self.musicGate { lowMusicAt = now }
     }
 
     func gateOpen(now: Double) -> Bool {
-        now.isFinite && (now - coupledAt <= Self.gateSeconds || now - lowMusicAt <= Self.gateSeconds)
+        now.isFinite && now - coupledAt <= Self.gateSeconds
     }
 
     /// blended：handover.blend 的结果（F4 关着时就是这一拍的值）；audio：声音强度（shaper.smoothed，0~100）
@@ -9743,9 +9761,10 @@ struct AVFallbackBlend: Equatable {
             unavailableFor += step
             if unavailableFor >= Self.unavailableSeconds {
                 if episodeAllowed == nil { episodeAllowed = audioSignal && gateOpen(now: now) }
-                if episodeAllowed == true, audioSignal {
-                    share = HandoverRamp.step(share, dt: step, seconds: Self.rampSeconds, up: true)
-                }
+                // 复审 M1：门不满足 / 声音没了 / 替补超过 30 秒 → 占比淡回 0（不冻在交回到一半的值上）
+                let up = episodeAllowed == true && audioSignal
+                    && unavailableFor < Self.unavailableSeconds + Self.maxSubstituteSeconds
+                share = HandoverRamp.step(share, dt: step, seconds: Self.rampSeconds, up: up)
             }
         }
         let videoPart = blended.value.isFinite ? min(100, max(0, blended.value)) : 0
@@ -9834,17 +9853,24 @@ struct AVOffsetEstimator: Equatable {
     static let binHz = 0.05
     static let keepSeconds = 120.0
     static let minSpanHz = 0.4
-    static let minBins = 2
-    static let minSamples = 8
-    static let minFit = 0.8
+    static let minBins = 3
+    static let minBinSamples = 5
+    /// 复审 M4：拟合集中度门槛（3 格时只剩 1 个自由度，门槛更高）
+    static let minFit = 0.85
+    static let minFitThreeBins = 0.9
+    /// 复审 M4：格内样本相位要一致（合成长度 / 集中度之和 ≥ 0.6）才算一个点——随机相位的噪声在格内就互相抵消、被丢掉
+    static let minBinConsistency = 0.7
     static let minR = 0.5
     static let maxOffset = 0.3
+    static let coarseStep = 0.005
     static let gridStep = 0.001
+    /// 复审 M4：估计值每次更新最多挪 20 毫秒（不让时钟在两拍之间跳几百毫秒）
+    static let maxStepPerUpdate = 0.02
 
     struct Bin: Equatable {
         var sx: Double = 0
         var sy: Double = 0
-        var weight: Double = 0
+        var rsum: Double = 0
         var count = 0
         var lastAt: Double = -.infinity
     }
@@ -9877,41 +9903,28 @@ struct AVOffsetEstimator: Equatable {
         return (atan2(sy, sx), r)
     }
 
-    /// 加一个样本：f 视频时间 Hz，μ 弧度，r 集中度（< 0.5 不收），now host 时间
+    /// 加一个样本：f 视频时间 Hz，μ 弧度，r 集中度（< 0.5 不收），now host 时间。调用方只在有新撞击时加（样本不重复）
     mutating func add(hz f: Double, mu: Double, r: Double, now: Double) {
         guard f.isFinite, f > 0, mu.isFinite, r.isFinite, r >= Self.minR, now.isFinite else { return }
         let key = Int((f / Self.binHz).rounded())
         var b = bins[key] ?? Bin()
         b.sx += r * cos(mu)
         b.sy += r * sin(mu)
-        b.weight += r
+        b.rsum += r
         b.count += 1
         b.lastAt = now
         bins[key] = b
-        bins = bins.filter { now - $0.value.lastAt <= Self.keepSeconds }
+        if bins.values.contains(where: { now - $0.lastAt > Self.keepSeconds }) {
+            bins = bins.filter { now - $0.value.lastAt <= Self.keepSeconds }
+        }
         refit()
     }
 
-    private mutating func refit() {
-        estimate = nil
-        fit = 0
-        phi0 = .nan
-        let keys = bins.keys.sorted()
-        spanHz = keys.count >= 2 ? Double(keys.last! - keys.first!) * Self.binHz : 0
-        guard keys.count >= Self.minBins, spanHz >= Self.minSpanHz - 1e-9, sampleCount >= Self.minSamples else { return }
-        // 每格一个点：频率 = 格中心，相位 = 圆均值，权重 = 累计集中度
-        let pts: [(f: Double, mu: Double, w: Double)] = keys.compactMap { k in
-            guard let b = bins[k], b.weight > 0 else { return nil }
-            return (Double(k) * Self.binHz, atan2(b.sy, b.sx), b.weight)
-        }
+    /// 这组点（频率、相位、权重）在 τ 网格上的最好拟合（先 5 毫秒粗找，再 ±5 毫秒按 1 毫秒细找）
+    static func bestFit(_ pts: [(f: Double, mu: Double, w: Double)]) -> (fit: Double, tau: Double, phi: Double) {
         let total = pts.reduce(0) { $0 + $1.w }
-        guard total > 0 else { return }
-        var best = -1.0
-        var bestTau = 0.0
-        var bestPhi = 0.0
-        let steps = Int((2 * Self.maxOffset / Self.gridStep).rounded())
-        for i in 0...steps {
-            let tau = -Self.maxOffset + Double(i) * Self.gridStep
+        guard total > 0 else { return (0, 0, 0) }
+        func score(_ tau: Double) -> (Double, Double) {
             var cx = 0.0
             var cy = 0.0
             for p in pts {
@@ -9919,17 +9932,62 @@ struct AVOffsetEstimator: Equatable {
                 cx += p.w * cos(a)
                 cy += p.w * sin(a)
             }
-            let m = (cx * cx + cy * cy).squareRoot() / total
-            if m > best + 1e-12 {
-                best = m
-                bestTau = tau
-                bestPhi = atan2(cy, cx)
-            }
+            return ((cx * cx + cy * cy).squareRoot() / total, atan2(cy, cx))
         }
-        fit = best
-        guard best >= Self.minFit else { return }
-        estimate = min(Self.maxOffset, max(-Self.maxOffset, bestTau))
-        phi0 = bestPhi
+        var best = (fit: -1.0, tau: 0.0, phi: 0.0)
+        let coarse = Int((2 * maxOffset / coarseStep).rounded())
+        for i in 0...coarse {
+            let tau = -maxOffset + Double(i) * coarseStep
+            let (m, ph) = score(tau)
+            if m > best.fit + 1e-12 { best = (m, tau, ph) }
+        }
+        let center = best.tau
+        let fine = Int((coarseStep / gridStep).rounded())
+        for i in -fine...fine {
+            let tau = min(maxOffset, max(-maxOffset, center + Double(i) * gridStep))
+            let (m, ph) = score(tau)
+            if m > best.fit + 1e-12 { best = (m, tau, ph) }
+        }
+        return best
+    }
+
+    private mutating func refit() {
+        fit = 0
+        // 复审 M4：每格至少 5 个样本、格内相位一致才算一个点；权重 = 合成向量长度
+        let keys = bins.keys.sorted().filter { k in
+            guard let b = bins[k], b.count >= Self.minBinSamples, b.rsum > 0 else { return false }
+            return (b.sx * b.sx + b.sy * b.sy).squareRoot() / b.rsum >= Self.minBinConsistency
+        }
+        spanHz = keys.count >= 2 ? Double(keys.last! - keys.first!) * Self.binHz : 0
+        let pts: [(f: Double, mu: Double, w: Double)] = keys.compactMap { k in
+            guard let b = bins[k] else { return nil }
+            let w = (b.sx * b.sx + b.sy * b.sy).squareRoot()
+            guard w.isFinite, w > 0 else { return nil }
+            return (Double(k) * Self.binHz, atan2(b.sy, b.sx), w)
+        }
+        guard pts.count >= Self.minBins, spanHz >= Self.minSpanHz - 1e-9 else {
+            // 样本本身就不够（过期 / 频率太集中 / 每格太少）：不估；样本够、只是格内暂时不一致（偏移在变）：保持上一次的值
+            let counted = bins.keys.sorted().filter { (bins[$0]?.count ?? 0) >= Self.minBinSamples }
+            let rawSpan = counted.count >= 2 ? Double(counted.last! - counted.first!) * Self.binHz : 0
+            if counted.count < Self.minBins || rawSpan < Self.minSpanHz - 1e-9 {
+                estimate = nil
+                phi0 = .nan
+            }
+            return
+        }
+        let best = Self.bestFit(pts)
+        fit = best.fit
+        guard best.fit >= (pts.count == Self.minBins ? Self.minFitThreeBins : Self.minFit) else {
+            // 拟合不够好：保持上一次的估计（有的话），不在两拍之间来回跳
+            return
+        }
+        let target = min(Self.maxOffset, max(-Self.maxOffset, best.tau))
+        if let prev = estimate {
+            estimate = prev + min(Self.maxStepPerUpdate, max(-Self.maxStepPerUpdate, target - prev))
+        } else {
+            estimate = target
+        }
+        phi0 = best.phi
     }
 }
 
@@ -9947,8 +10005,13 @@ extension AVDebugColumns {
     static let f5Header = "av_offset_ms,av_offset_est_ms,av_offset_span_hz,av_offset_fit"
 
     static func f5Fields(effective: Double, estimator: AVOffsetEstimator?) -> [String] {
-        [String(format: "%.0f", effective * 1000),
-         estimator?.estimate.map { String(format: "%.0f", $0 * 1000) } ?? "",
+        // 复审 L2：−0 写成 0
+        func ms(_ x: Double) -> String {
+            let v = (x * 1000).rounded()
+            return String(format: "%.0f", v == 0 ? 0 : v)
+        }
+        return [ms(effective),
+         estimator?.estimate.map(ms) ?? "",
          estimator.map { String(format: "%.2f", $0.spanHz) } ?? "",
          estimator.map { String(format: "%.2f", $0.fit) } ?? ""]
     }
