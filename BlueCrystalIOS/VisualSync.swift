@@ -7764,3 +7764,182 @@ struct LookaheadCoordinator {
 
     func statusText(reader: String?) -> String { lookahead.statusText(reader: reader) }
 }
+
+// MARK: - av-fusion
+// 声画融合（F0 观测与标定）：只观测、不参与控制。所有类型都是纯状态，VideoSyncPlayer 和 VisualSyncChecks 用同一份。
+// F0 不加开关：跟着已有的「调试记录」（bcMotionDebugLog）走——关着时实时线程只多看一个布尔，不多读一个样本
+
+/// av-fusion F0：音频 tap 一次回调的时间记录（实时线程写）。
+/// host：回调时的 host 时间（CACurrentMediaTime，秒）；itemStart：这段第一个样本的视频时间（拿不到 NaN）
+struct AudioTapTiming: Equatable {
+    var host: Double = .nan
+    var itemStart: Double = .nan
+    var frames: Int = 0
+
+    var valid: Bool { host.isFinite && itemStart.isFinite && frames > 0 }
+}
+
+/// av-fusion F0：tap 回调时间的环形缓冲（固定容量，init 时一次分配，record 不分配）。
+/// 自己不加锁：调用方（AudioLevelMeter）在已有的 os_unfair_lock 里读写。enabled == false 时 record 什么都不写
+final class AudioTapTimingRing {
+    static let capacity = 64
+    private let buffer: UnsafeMutablePointer<AudioTapTiming>
+    private var head = 0
+    private(set) var count = 0
+    private(set) var enabled = false
+    /// 上次 drain 以来时间范围有效 / 无效的回调数（满了丢最旧的记录，计数照记）
+    private(set) var validCount = 0
+    private(set) var invalidCount = 0
+
+    init() {
+        buffer = UnsafeMutablePointer<AudioTapTiming>.allocate(capacity: Self.capacity)
+        buffer.initialize(repeating: AudioTapTiming(), count: Self.capacity)
+    }
+
+    deinit {
+        buffer.deinitialize(count: Self.capacity)
+        buffer.deallocate()
+    }
+
+    func setEnabled(_ on: Bool) {
+        guard on != enabled else { return }
+        enabled = on
+        clear()
+    }
+
+    func clear() {
+        head = 0
+        count = 0
+        validCount = 0
+        invalidCount = 0
+    }
+
+    /// 实时线程：写一条（满了覆盖最旧的）
+    func record(_ t: AudioTapTiming) {
+        guard enabled else { return }
+        buffer[head] = t
+        head = (head + 1) % Self.capacity
+        count = min(Self.capacity, count + 1)
+        if t.valid { validCount += 1 } else { invalidCount += 1 }
+    }
+
+    /// 主线程：取走全部记录（旧 → 新）和计数，清零
+    func drain() -> (timings: [AudioTapTiming], valid: Int, invalid: Int) {
+        var out: [AudioTapTiming] = []
+        out.reserveCapacity(count)
+        let start = (head + Self.capacity - count) % Self.capacity
+        for k in 0..<count { out.append(buffer[(start + k) % Self.capacity]) }
+        let r = (out, validCount, invalidCount)
+        clear()
+        return r
+    }
+}
+
+/// av-fusion F0：同一时刻读到的播放器时钟（host 时间、视频时间、倍速）。视频时间 ↔ host 时间互换（倍速不变的那一小段内）
+struct MediaClockSnapshot: Equatable {
+    var host: Double = .nan
+    var item: Double = .nan
+    var rate: Double = .nan
+
+    var isValid: Bool { host.isFinite && item.isFinite && rate.isFinite && rate > 0.01 }
+
+    /// 视频时间 → 这一刻应该被看到 / 听到的 host 时间（无效 NaN）
+    func host(forItem t: Double) -> Double {
+        guard isValid, t.isFinite else { return .nan }
+        return host + (t - item) / rate
+    }
+
+    /// host 时间 → 视频时间（无效 NaN）
+    func item(forHost h: Double) -> Double {
+        guard isValid, h.isFinite else { return .nan }
+        return item + (h - host) * rate
+    }
+}
+
+/// av-fusion F0：tap 提前量 = 这段声音按播放器时钟该放出来的 host 时刻 − tap 处理它的 host 时刻（正 = tap 先于出声）。
+/// 最近 sampleCapacity 个的中位数；离谱的（> maxAbsLead，seek / 时钟跳）丢掉。只用于调试记录和 F1 的时间可用判断
+struct AudioTapLeadEstimator {
+    static let sampleCapacity = 32
+    static let maxAbsLead: Double = 2
+    private(set) var samples: [Double] = []
+    private var next = 0
+
+    mutating func reset() {
+        samples.removeAll(keepingCapacity: true)
+        next = 0
+    }
+
+    mutating func add(_ timings: [AudioTapTiming], clock: MediaClockSnapshot) {
+        guard clock.isValid else { return }
+        for t in timings where t.valid {
+            let lead = clock.host(forItem: t.itemStart) - t.host
+            guard lead.isFinite, abs(lead) <= Self.maxAbsLead else { continue }
+            if samples.count < Self.sampleCapacity {
+                samples.append(lead)
+            } else {
+                samples[next] = lead
+                next = (next + 1) % Self.sampleCapacity
+            }
+        }
+    }
+
+    /// 中位数（秒；没有样本 NaN）
+    var lead: Double {
+        guard !samples.isEmpty else { return .nan }
+        let s = samples.sorted()
+        let m = s.count / 2
+        return s.count % 2 == 1 ? s[m] : 0.5 * (s[m - 1] + s[m])
+    }
+}
+
+/// av-fusion F0：一拍内取走的三频带块的汇总（调试记录用；均值能量换成 dB，没有块时 NaN）
+struct AudioBandSummary: Equatable {
+    private(set) var frames = 0
+    private var low: Double = 0
+    private var mid: Double = 0
+    private var high: Double = 0
+
+    mutating func add(_ bands: [AudioBandFrame]) {
+        for b in bands {
+            low += Double(max(0, b.low))
+            mid += Double(max(0, b.mid))
+            high += Double(max(0, b.high))
+            frames += 1
+        }
+    }
+
+    private func db(_ sum: Double) -> Double {
+        frames > 0 ? 10 * log10(sum / Double(frames) + 1e-12) : .nan
+    }
+
+    var lowDb: Double { db(low) }
+    var midDb: Double { db(mid) }
+    var highDb: Double { db(high) }
+}
+
+/// av-fusion F0：调试表格（MotionDebugLog）后面加的声画列。纯格式化：非有限数写空，列数和表头一致
+enum AVDebugColumns {
+    static let f0Header = "av_onsets,av_band_frames,av_band_low_db,av_band_mid_db,av_band_high_db,"
+        + "av_tap_lead_ms,av_tap_valid,av_tap_invalid,av_play_host,av_play_item,av_play_rate"
+
+    static func field(_ x: Double, digits: Int = 4) -> String {
+        x.isFinite ? String(format: "%.\(digits)f", x) : ""
+    }
+
+    /// 撞击时刻（视频时间，秒）用分号连起来（CSV 里不能有逗号）；非有限的跳过
+    static func list(_ xs: [Double]) -> String {
+        xs.filter { $0.isFinite }.map { String(format: "%.3f", $0) }.joined(separator: ";")
+    }
+
+    static func f0Fields(onsets: [Double], bands: AudioBandSummary, tapLead: Double, tapValid: Int, tapInvalid: Int,
+                         clock: MediaClockSnapshot) -> [String] {
+        [list(onsets), String(bands.frames), field(bands.lowDb, digits: 2), field(bands.midDb, digits: 2),
+         field(bands.highDb, digits: 2), field(tapLead * 1000, digits: 1), String(tapValid), String(tapInvalid),
+         field(clock.host), field(clock.item), field(clock.rate, digits: 3)]
+    }
+
+    /// 没在记录 / 这一拍没数据时的空列（列数不变）
+    static var f0Empty: [String] {
+        [String](repeating: "", count: f0Header.split(separator: ",", omittingEmptySubsequences: false).count)
+    }
+}

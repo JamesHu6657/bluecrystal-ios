@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import MediaToolbox
+import QuartzCore
 import os
 
 /// 一个视频音轨的电平计：MTAudioProcessingTap 在实时音频线程上写，主线程每 0.3 秒取走一次。
@@ -33,6 +34,9 @@ final class AudioLevelMeter {
     private var splitterResetPending = true
     private var splitter = AudioBandSplitter()
     private let pendingBands: UnsafeMutablePointer<AudioBandFrame>
+
+    /// av-fusion F0（观测与标定）：每次回调的 host 时间 / 视频时间范围，只在调试记录开着时写（锁里读写；关着时实时线程只多看一个布尔）
+    private let timings = AudioTapTimingRing()
 
     init() {
         lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
@@ -68,6 +72,20 @@ final class AudioLevelMeter {
         os_unfair_lock_unlock(lock)
     }
 
+    /// 主线程（av-fusion F0）：调试记录开着时才记回调时间。关掉时丢掉没取走的记录
+    func setTimingEnabled(_ on: Bool) {
+        os_unfair_lock_lock(lock)
+        timings.setEnabled(on)
+        os_unfair_lock_unlock(lock)
+    }
+
+    /// 主线程（av-fusion F0）：取走上次以来的回调时间记录（旧 → 新）和时间范围有效 / 无效的回调数
+    func drainTapTimings() -> (timings: [AudioTapTiming], valid: Int, invalid: Int) {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        return timings.drain()
+    }
+
     /// 主线程：取走上次以来的频带能量块（时间 = 视频时间，秒），按时间先后
     func drainBands() -> [AudioBandFrame] {
         os_unfair_lock_lock(lock)
@@ -97,6 +115,7 @@ final class AudioLevelMeter {
         bandHead = 0
         bandCount = 0
         splitterResetPending = true
+        timings.clear()
         os_unfair_lock_unlock(lock)
     }
 
@@ -111,6 +130,7 @@ final class AudioLevelMeter {
         bandHead = 0
         bandCount = 0
         splitterResetPending = true
+        timings.clear()
         os_unfair_lock_unlock(lock)
     }
 
@@ -131,6 +151,8 @@ final class AudioLevelMeter {
         let resetSplitter = splitterResetPending
         splitterResetPending = false
         let rate = bandSampleRate
+        // av-fusion F0：调试记录开着才记（固定容量环形缓冲，不分配；CACurrentMediaTime 不阻塞）
+        if timings.enabled { timings.record(AudioTapTiming(host: CACurrentMediaTime(), itemStart: start, frames: frames)) }
         os_unfair_lock_unlock(lock)
         if resetCarries {
             for i in 0..<Self.maxCarryChannels { carries[i] = AudioBlockCarry() }

@@ -105,7 +105,18 @@ final class VideoSyncPlayer: ObservableObject {
     private var actionContext = ActionContext()
     /// 调试记录（默认关）：只记数字，不存画面；只读不改控制路径，关着时不做任何事
     let debugLog = MotionDebugLog()
-    var debugRecording = false
+    var debugRecording = false {
+        didSet {
+            guard debugRecording != oldValue else { return }
+            // av-fusion F0：tap 回调时间只在调试记录开着时记（关着时实时线程只多看一个布尔）
+            meter?.setTimingEnabled(debugRecording)
+            resetAVDebug()
+        }
+    }
+    /// av-fusion F0（观测与标定，只在调试记录开着时动）：tap 提前量、这一拍取走的频带块汇总、上一行记到的视频时间
+    private var tapLead = AudioTapLeadEstimator()
+    private var beatBands = AudioBandSummary()
+    private var avLoggedItem = -Double.infinity
     private var onsetDetector = AudioOnsetDetector()
     private var audioAnchor = AudioPhaseAnchor()
     /// rhythm-lookahead P4（默认关）：前瞻 / 预扫描另开一路解码（LookaheadReader，只在设置生效时建；关着时不建、不解码）。
@@ -450,6 +461,8 @@ final class VideoSyncPlayer: ObservableObject {
         let m = AudioLevelMeter()
         meter = m
         m.setBandsEnabled(visualSettings.usesAudioAnchor)
+        m.setTimingEnabled(debugRecording)
+        resetAVDebug()
         AudioLevelTap.install(on: item, asset: asset, meter: m) { [weak self, weak item] status in
             guard let self = self, let item = item,
                   item === self.player?.currentItem, gen == self.meterGen else { return }
@@ -1070,7 +1083,32 @@ final class VideoSyncPlayer: ObservableObject {
         onsetDetector.reset()
         pulse.phaseOffset = 0
         _ = meter?.drainBands()
+        avLoggedItem = -Double.infinity
         if anchorStatus != nil { anchorStatus = nil }
+    }
+
+    /// av-fusion F0：调试记录的声画列从头来（换视频 / 开关调试记录）
+    private func resetAVDebug() {
+        tapLead.reset()
+        beatBands = AudioBandSummary()
+        avLoggedItem = -Double.infinity
+    }
+
+    /// av-fusion F0：这一拍的声画调试列（调试记录开着才调）：取走 tap 回调时间、读一次播放器时钟、
+    /// 这一拍新出现的撞击时刻（撞击声校正开着才有）和频带汇总。只读，不改任何控制状态
+    private func avDebugFields(_ p: AVPlayer) -> [String] {
+        let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
+        let drained: (timings: [AudioTapTiming], valid: Int, invalid: Int) = meter?.drainTapTimings() ?? ([], 0, 0)
+        tapLead.add(drained.timings, clock: clock)
+        var onsets: [Double] = []
+        if visualSettings.usesAudioAnchor {
+            onsets = onsetDetector.onsets(since: avLoggedItem).filter { $0 > avLoggedItem }
+            if let last = onsets.last { avLoggedItem = last }
+        }
+        let fields = AVDebugColumns.f0Fields(onsets: onsets, bands: beatBands, tapLead: tapLead.lead,
+                                             tapValid: drained.valid, tapInvalid: drained.invalid, clock: clock)
+        beatBands = AudioBandSummary()
+        return fields
     }
 
     /// rhythm-phase P2：相位从头锁、脉动停掉（下一个完整拍按 P1 出口规则继续）
@@ -1088,7 +1126,10 @@ final class VideoSyncPlayer: ObservableObject {
             if pulse.phaseOffset != 0 || anchorStatus != nil { resetAnchor() }
             return
         }
-        for band in m.drainBands() { onsetDetector.add(band) }
+        let drained = m.drainBands()
+        for band in drained { onsetDetector.add(band) }
+        // av-fusion F0：调试记录开着时顺便汇总这一拍的频带块（只读；撞击检测照旧吃同一份）
+        if debugRecording { beatBands.add(drained) }
         let now = CACurrentMediaTime()
         let rate = Double(p.rate)
         let itemNow = p.currentTime().seconds
@@ -1274,7 +1315,7 @@ final class VideoSyncPlayer: ObservableObject {
                             shapedLevel: shaped.level, value: value, hasSignal: hasSignal,
                             kind: actionContext.kind.rawValue, context: contextStatus,
                             rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
-                            activity: rhythmActivity, rateLevel: rateLevel, out: vals)
+                            activity: rhythmActivity, rateLevel: rateLevel, out: vals, av: avDebugFields(p))
         }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
@@ -2740,7 +2781,8 @@ final class MotionDebugLog {
         + "subject_score,subject_hz,pose_frames,pose_present,pose_score,pose_conf,pose_trust,"
         + "pose_rhythm_hz,pose_rhythm_conf,pose_rhythm_part,subject_follow_hz,roi_valid,roi_x0,roi_y0,roi_x1,roi_y1,roi_hz,roi_share,"
         + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
-        + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1"
+        + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1,"
+        + AVDebugColumns.f0Header
     private var rows: [String] = []
     private var start = 0
 
@@ -2754,7 +2796,7 @@ final class MotionDebugLog {
     func append(t: Double, window w: MotionWindow, normalizer n: MotionNormalizer, target: Double,
                 shapedLevel: Double, value: Double, hasSignal: Bool, kind: Int, context: String?,
                 rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
-                rateLevel: Int?, out: [Int]) {
+                rateLevel: Int?, out: [Int], av: [String] = AVDebugColumns.f0Empty) {
         func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
         let r = w.roi.region
         let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
@@ -2768,7 +2810,7 @@ final class MotionDebugLog {
             hasSignal ? "1" : "0", String(kind), ctx,
             f(rhythmHz), f(rhythmWeight), rhythmLocked ? "1" : "0", f(activity), rateLevel.map(String.init) ?? "",
             String(out.count > 0 ? out[0] : 0), String(out.count > 1 ? out[1] : 0)
-        ]
+        ] + av
         let line = fields.joined(separator: ",")
         if rows.count < Self.maxRows {
             rows.append(line)
