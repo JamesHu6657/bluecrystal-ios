@@ -5691,6 +5691,97 @@ do {
     }
 }
 
+// MARK: - rhythm-action tune R3：轻抚依据的频率一致放宽；归给自己的手要安静
+
+/// 摸胸口的窗口，但姿态手腕（和手检测）的频率是 wristHz，块运动 / 区域 / 姿态读数是 refHz（两个估计对不上 / 一个减半）
+func atCaressHzWindow(time: Double, wristHz: Double, refHz: Double) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: true, region: true)
+    w.subjectHz = refHz
+    w.subjectFollowHz = refHz
+    w.poseRhythmHz = refHz
+    w.roi.region.hz = refHz
+    var rh = PartRhythm()
+    rh.follow = StrokeRhythm.FollowEstimate(hz: wristHz, confidence: 0.8, amplitude: 0.08, sampleRate: 9)
+    w.context.hand.rhythm = rh
+    w.context.body.wrists = rh
+    w.context.body.rightWristRhythm = rh
+    return w
+}
+
+do {
+    // H3：慢慢摸胸口，手腕 1.0 Hz / 画面 1.25 Hz（差 25%），手腕减半（0.6 / 1.2）、画面减半（1.25 / 0.625）：照样认轻抚、输出 ≤ 20
+    var ok = true
+    var notes: [String] = []
+    for (wristHz, refHz) in [(1.0, 1.25), (0.6, 1.2), (1.25, 0.625)] {
+        var strict = PartRhythm()
+        strict.follow = StrokeRhythm.FollowEstimate(hz: wristHz, confidence: 0.8, amplitude: 0.08, sampleRate: 9)
+        // 严的 ±15% 下这只手的依据是 0（这几组确实对不上）
+        let strictZero = ActionContext.support(strict, x: 33, y: 12, size: 8, refHz: refHz, region: nil,
+                                               frameWidth: 64, frameHeight: 36) == 0
+        let run = atRun(tuned: true, context: true) { atCaressHzWindow(time: $0, wristHz: wristHz, refHz: refHz) }
+        let ac = atSettle { atCaressHzWindow(time: $0, wristHz: wristHz, refHz: refHz) }
+        let peak = run.out.suffix(15).map { $0.max() ?? 0 }.max() ?? 99
+        let fine = strictZero && run.kinds.last == .caress && ac.kind == .caress && ac.suppressesRhythm
+            && run.locked.suffix(10).allSatisfy { !$0 } && peak <= 20
+        ok = ok && fine
+        notes.append("\(wristHz)/\(refHz): \(ac.kind) 峰 \(peak) 锁 \(run.locked.last ?? true)")
+    }
+    vcheck(ok, "动作调优 R3（H3）：手腕 / 画面频率差 25% 或差一个八度时摸胸口照样认轻抚、不跟节奏、输出 ≤ 20（\(notes)）")
+
+    // 放宽只到 ±35% / 八度 ±15%：锁在 1.67 倍（2.0 / 1.2）仍算锁在别的频率上（不认轻抚）
+    var lockedElse = ActionContext()
+    var t = 10.0
+    while t < 13 {
+        _ = lockedElse.refine(atChestWindow(time: t, chest: true, region: true), now: t, followerHz: 2.0)
+        t += 0.3
+    }
+    vcheck(lockedElse.kind != .caress && !lockedElse.allowsGentle(followerLocked: true),
+           "动作调优 R3（H3）：放宽后跟随器锁在 1.67 倍频率上仍不认轻抚（\(lockedElse.kind)）")
+}
+
+/// 别人给被认到的人撸（1.5 Hz、手检测在胯上），被撸的人右手放在小腹上不动、离撸动的手 5 像素（0.3 个身体尺度）
+func atPartnerHandjobWindow(time: Double) -> MotionWindow {
+    var w = atChestWindow(time: time, chest: true)
+    w.subjectHz = 1.5
+    w.subjectFollowHz = 1.5
+    w.poseRhythmHz = 1.5
+    var stroke = PartRhythm()
+    stroke.follow = StrokeRhythm.FollowEstimate(hz: 1.5, confidence: 0.8, amplitude: 0.2, sampleRate: 9)
+    w.context.body.rightWristX = 33
+    w.context.body.rightWristY = 16
+    w.context.body.rightWristRhythm = PartRhythm()
+    w.context.body.wristX = 33
+    w.context.body.wristY = 16
+    w.context.body.wrists = PartRhythm()
+    w.context.hand.x = 33
+    w.context.hand.y = 21
+    w.context.hand.rhythm = stroke
+    w.roi.region = atRegion(x: 33, y: 21, time: time - 0.05, hz: 1.5)
+    return w
+}
+
+do {
+    // H2：手检测落在别人撸动的手上、离被撸的人放着的手腕很近：不能归给自己（以前 → quietSelf：不跟节奏 + gentle 压）
+    let w0 = atPartnerHandjobWindow(time: 10)
+    let near = ActionContext.selfTouch(w0.context.body).map {
+        (($0.x - w0.context.hand.x) * ($0.x - w0.context.hand.x) + ($0.y - w0.context.hand.y) * ($0.y - w0.context.hand.y))
+            .squareRoot() <= ActionContext.selfHandReach * w0.context.body.scale
+    } ?? false
+    let ac = atSettle { atPartnerHandjobWindow(time: $0) }
+    let base = atRun(tuned: false, context: false) { atPartnerHandjobWindow(time: $0) }
+    let new = atRun(tuned: true, context: true) { atPartnerHandjobWindow(time: $0) }
+    let baseMean = vs3Late(base.values)
+    let newMean = vs3Late(new.values)
+    let baseThrust = Double(base.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    let newThrust = Double(new.out.suffix(15).map { $0[0] }.reduce(0, +)) / 15
+    vcheck(near && ac.kind == .stroke && ac.usesHand && !ac.suppressesRhythm && ac.intensityCeiling == nil
+           && ac.evidence.caress == 0 && !ac.allowsGentle(followerLocked: false)
+           && !new.kinds.contains(.caress) && new.locked.last == true
+           && newMean >= 0.95 * baseMean && newThrust >= 0.9 * baseThrust,
+           "动作调优 R3（H2）：别人撸、被撸的人手放小腹（离撸的手 0.3 尺度）→ 撸动（看手），不是轻抚 / 只来自自己的手；"
+           + "强度 \(Int(baseMean)) → \(Int(newMean))、伸缩 \(Int(baseThrust)) → \(Int(newThrust))（\(ac.kind)）")
+}
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)

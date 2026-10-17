@@ -5980,11 +5980,15 @@ struct ActionContext {
     static func reciprocatingTouch(_ r: PartRhythm, refHz: Double) -> Bool {
         let f = r.follow
         guard !quietTouch(r), f.hz.isFinite, RhythmFollower.hzRange.contains(f.hz) else { return false }
-        return refHz > 0 ? agrees(f.hz, refHz) : true
+        return refHz > 0 ? agreesLoosely(f.hz, refHz) : true
     }
 
+    /// 轻抚这条路的频率一致（锁定判断 / 轻抚依据 / 摸着自己的手在往复）：同频 ±35%，或差一个八度（一个估计减半 / 加倍）±15%。
+    /// 八度那支用严的 ±15%：两支都放宽的话 0.37~2.7 倍几乎全算一致，就分不出「锁在别的频率上」了
     private static func agreesLoosely(_ a: Double, _ b: Double) -> Bool {
-        a > 0 && b > 0 && a.isFinite && b.isFinite && abs(log(a / b)) <= log(1 + lockAgreeRatio)
+        guard a > 0, b > 0, a.isFinite, b.isFinite else { return false }
+        let r = abs(log(a / b))
+        return r <= log(1 + lockAgreeRatio) || abs(r - log(2.0)) <= log(1 + agreeRatio)
     }
 
     /// rhythm-action tune：传给 refine 的 followerHz（锁定且权重够才算牢牢锁着；否则 0）
@@ -6085,11 +6089,16 @@ struct ActionContext {
         return nil
     }
 
-    /// rhythm-action tune：一只手自己慢慢动的依据（节奏 ≤ caressMaxHz 才算；其余同 support）
+    /// rhythm-action tune：一只手自己慢慢动的依据（节奏 ≤ caressMaxHz 才算；其余同 support，但频率一致按 agreesLoosely：
+    /// 姿态手腕和块运动 / 区域是两个估计，慢而不规则的轻抚差 15% 以上、或者一个减半了很常见）
     static func slowSupport(_ r: PartRhythm, x: Double, y: Double, size: Double, refHz: Double, region: PeriodicityROI?,
                             frameWidth w: Double, frameHeight h: Double) -> Double {
-        guard r.follow.hz.isFinite, r.follow.hz <= caressMaxHz else { return 0 }
-        return support(r, x: x, y: y, size: size, refHz: refHz, region: region, frameWidth: w, frameHeight: h)
+        let f = r.follow
+        guard f.hz.isFinite, f.hz <= caressMaxHz, RhythmFollower.hzRange.contains(f.hz), f.confidence.isFinite,
+              f.confidence >= minPartConfidence, x.isFinite, y.isFinite else { return 0 }
+        let agree = refHz > 0 ? (agreesLoosely(f.hz, refHz) ? 1 : 0) : noRefAgreement
+        let near = proximity(x, y, size: size, region: region, frameWidth: w, frameHeight: h)
+        return MotionStats.clamp01(f.confidence) * agree * near
     }
 
     /// rhythm-action tune：到最近的「对象髋」的距离（以那个身体的尺度计；没有就 ∞）。
@@ -6165,12 +6174,16 @@ struct ActionContext {
         var wristY = body.wristY
         var caressBlocked = false
         if ctxFresh {
-            // 手检测就是摸着自己的那只手：不算撸动的依据（离那只手腕近、且比离另一只手腕近）
+            // 手检测就是摸着自己的那只手：不算撸动的依据（离那只手腕近、且比离另一只手腕近，而且它自己也安静）。
+            // 离那只手腕近、却规则大幅地往复的手（别人在撸，被撸的人手放在小腹上）不归给自己：照常算撸动依据，也挡住轻抚
             var handIsSelf = false
+            var handReciprocating = false
             if let st = selfTouch, hand.present {
                 let dSelf = Self.distance(hand.x, hand.y, st.x, st.y)
                 let dOther = st.hasOther ? Self.distance(hand.x, hand.y, st.otherX, st.otherY) : Double.infinity
-                handIsSelf = dSelf <= Self.selfHandReach * max(body.scale, 1e-6) && dSelf < dOther
+                let nearSelf = dSelf <= Self.selfHandReach * max(body.scale, 1e-6) && dSelf < dOther
+                handIsSelf = nearSelf && Self.quietTouch(hand.rhythm)
+                handReciprocating = nearSelf && Self.reciprocatingTouch(hand.rhythm, refHz: refHz)
             }
             if hand.present && !handIsSelf {
                 sHand = Self.support(hand.rhythm, x: hand.x, y: hand.y, size: hand.size, refHz: refHz, region: region,
@@ -6249,6 +6262,7 @@ struct ActionContext {
             let competitor = max(ev.stroke, ev.oral, ev.insertion)
             let strong = w.subjectFrames > 0 && w.subjectScore.isFinite && w.subjectScore >= Self.caressMaxSubject
             caressBlocked = hipsActive || competitor >= Self.minEvidence || strong || reciprocatingSelf
+                || handReciprocating
             if let st = selfTouch {
                 var own = Self.slowSupport(st.rhythm, x: st.x, y: st.y, size: 0.5 * body.scale, refHz: refHz,
                                            region: region, frameWidth: fw, frameHeight: fh)
