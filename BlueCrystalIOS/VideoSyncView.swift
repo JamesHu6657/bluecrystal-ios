@@ -1244,17 +1244,25 @@ final class VideoSyncPlayer: ObservableObject {
         return out
     }
 
-    /// av-fusion F1：每个完整拍一次（跟随画面 + 融合开着才算）：取走频带块（撞击声校正也开着时存进 backlog 留给它）和特征，
-    /// 读一次播放器时钟 → 耦合度 / 配乐 / 人声的判断 → 状态行和调试列。只读相位锁和画面强度，不改任何控制状态
-    private func updateFusion(_ p: AVPlayer, window: MotionWindow, activity: Double, dt: TimeInterval) {
-        guard visualSettings.usesAVFusion, fusionFeaturesWanted, let m = meter else {
-            if fusionBeat != nil || fusionStatus != nil { resetFusion() }
-            return
-        }
+    /// av-fusion：取走电平计里的频带块（撞击声校正也开着时存进 backlog 留给它）和特征，交给融合。
+    /// F2（复审 M4）：节奏确认开着时完整拍一开始（投票之前）先取一次，投票看到的起音到「现在」为止、不再晚一拍；
+    /// updateFusion 照旧再取一次（中间新到的接在后面，backlog 顺序不变）。融合关着 / 用不上时什么都不做
+    private func drainFusionAudio() {
+        guard visualSettings.usesAVFusion, fusionFeaturesWanted, let m = meter else { return }
         let fresh = m.drainBands()
         if visualSettings.usesAudioAnchor { bandBacklog.keep(fresh) }
         fusion.addBands(fresh)
         fusion.addFeatures(m.drainFeatures())
+    }
+
+    /// av-fusion F1：每个完整拍一次（跟随画面 + 融合开着才算）：取走频带块（撞击声校正也开着时存进 backlog 留给它）和特征，
+    /// 读一次播放器时钟 → 耦合度 / 配乐 / 人声的判断 → 状态行和调试列。只读相位锁和画面强度，不改任何控制状态
+    private func updateFusion(_ p: AVPlayer, window: MotionWindow, activity: Double, dt: TimeInterval) {
+        guard visualSettings.usesAVFusion, fusionFeaturesWanted, meter != nil else {
+            if fusionBeat != nil || fusionStatus != nil { resetFusion() }
+            return
+        }
+        drainFusionAudio()
         let clock = MediaClockSnapshot(host: CACurrentMediaTime(), item: p.currentTime().seconds, rate: Double(p.rate))
         let b = fusion.beat(clock: clock, lock: phaseLock, activity: activity, cut: window.cutCount > 0,
                             audioReady: audioStatus == .ready, dt: dt)
@@ -1378,6 +1386,8 @@ final class VideoSyncPlayer: ObservableObject {
         let motionActivity = RhythmOutput.motionActivity(level: shaped.level, smoothed: shaped.smoothed,
                                                          confidence: motionNormalizer.confidence,
                                                          motionSignal: motionSignal)
+        // av-fusion F2（复审 M4）：节奏确认开着时投票前先把这一拍的声音交给融合（关着时不走 = F1 原样）
+        if visualSettings.usesAVRhythmConfirm { drainFusionAudio() }
         let rateLevel = rhythmLevel(window, motionSignal: motionSignal, activity: motionActivity, dt: dt)
         // rhythm-action tune：认出轻抚时这一拍伸缩不跟节奏（activity 当 0；关着时就是 motionActivity）
         let rhythmActivity = tuned && actionContext.suppressesRhythm ? 0 : motionActivity

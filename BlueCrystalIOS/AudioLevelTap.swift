@@ -145,20 +145,26 @@ final class AudioLevelMeter {
 
     /// 主线程（av-fusion F1）：取走上次以来的特征帧 / PCM（旧 → 新）和时间范围拿不到的回调数
     func drainFeatures() -> AudioFeatureDrain {
+        // F2 复审 L1：先在锁里看一眼有多少，锁外把数组容量备好（多留一次回调的余量），再进锁只拷贝——
+        // 主线程拿着锁时不分配内存，实时线程在回调开头 / 末尾等锁的时间只剩拷贝（余量不够时 append 仍会照常扩容，结果不变）
+        os_unfair_lock_lock(lock)
+        let frameHint = featureCount
+        let pcmHint = pcmCount
+        os_unfair_lock_unlock(lock)
+        var out = AudioFeatureDrain()
+        out.frames.reserveCapacity(min(Self.featureCapacity, frameHint + Self.pendingFeatureCapacity))
+        out.pcm.reserveCapacity(min(Self.pcmCapacity, pcmHint + Self.pendingPCMCapacity))
         os_unfair_lock_lock(lock)
         defer { os_unfair_lock_unlock(lock) }
-        var out = AudioFeatureDrain()
         out.pcmRate = AudioFeatureSplitter.pcmRate(forSampleRate: bandSampleRate)
         out.invalidChunks = featureInvalid
         featureInvalid = 0
         if featureCount > 0 {
-            out.frames.reserveCapacity(featureCount)
             let start = (featureHead + Self.featureCapacity - featureCount) % Self.featureCapacity
             for k in 0..<featureCount { out.frames.append(features[(start + k) % Self.featureCapacity]) }
             featureCount = 0
         }
         if pcmCount > 0 {
-            out.pcm.reserveCapacity(pcmCount)
             let start = (pcmHead + Self.pcmCapacity - pcmCount) % Self.pcmCapacity
             for k in 0..<pcmCount { out.pcm.append(pcm[(start + k) % Self.pcmCapacity]) }
             pcmCount = 0

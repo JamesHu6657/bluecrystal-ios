@@ -7503,12 +7503,17 @@ struct AVF2Run {
                 }
                 i += n
             }
-            engine.addBands(bandFrames)
-            for b in bandFrames { onsets.add(b) }
-            engine.addFeatures(drain)
-            bandFrames.removeAll()
-            drain.frames.removeAll()
-            drain.pcm.removeAll()
+            // 复审 M4：照播放器——节奏确认开着时 motionTick 在投票前先 drainFusionAudio（投票看到的起音到「现在」）；
+            // 关着时这一拍的声音在 updateFusion（跟随器 / 相位锁之后）才取走（对跟随器没影响，融合结果也一样）
+            func feed() {
+                engine.addBands(bandFrames)
+                for b in bandFrames { onsets.add(b) }
+                engine.addFeatures(drain)
+                bandFrames.removeAll()
+                drain.frames.removeAll()
+                drain.pcm.removeAll()
+            }
+            if voteOn { feed() }
             let raw = window(k, now)
             let clock = MediaClockSnapshot(host: now, item: now, rate: 1)
             let isCoupled = forced.map { $0(now) } ?? AVRhythmVote.isS2(last)
@@ -7519,6 +7524,7 @@ struct AVF2Run {
             follower.step(input, dt: dt, active: act, fastJumpHz: vote.fastJumpHz)
             lock.step(input, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source,
                       now: now, dt: dt, active: act)
+            if !voteOn { feed() }
             let b = engine.beat(clock: clock, lock: lock, activity: act ? 0.5 : 0, cut: raw.cutCount > 0, audioReady: true,
                                 dt: dt)
             last = b
@@ -7560,13 +7566,16 @@ func f2Window(_ t: Double, hz: Double, conf: Double = 0.6, amp: Double = 6, phas
 }
 
 /// F2 跳频：画面 x = 4·cos Φ(t)（15 Hz 采样、速度差分）→ 真的 StrokeRhythm（followEstimate + 相位拟合），
-/// 咔哒落在 Φ ≡ 0（每个往复一下，和画面同相）；Φ 在 at 秒处从 f0 跳到 f1（相位连续）
-func f2JumpRun(vote: Bool, f0: Double = 1, f1: Double = 1.6, at s: Double = 12, seconds: Double = 18) -> AVF2Run {
+/// 咔哒落在 Φ ≡ 0（每个往复一下，和画面同相）；Φ 在 at 秒处从 f0 跳到 f1（相位连续）。
+/// audioF1（复审 M4 的反例用）：咔哒在 at 秒处跳到这个频率（nil = 和画面一样跳到 f1）
+func f2JumpRun(vote: Bool, f0: Double = 1, f1: Double = 1.6, audioF1: Double? = nil, at s: Double = 12,
+               seconds: Double = 18) -> AVF2Run {
     func phi(_ t: Double) -> Double { t < s ? 2 * Double.pi * f0 * t : 2 * Double.pi * (f0 * s + f1 * (t - s)) }
+    let af1 = audioF1 ?? f1
     var clicks: [Double] = []
     var m = 1.0
     while true {
-        let t = m <= f0 * s ? m / f0 : s + (m - f0 * s) / f1
+        let t = m <= f0 * s ? m / f0 : s + (m - f0 * s) / af1
         if t > seconds + 1 { break }
         clicks.append(t)
         m += 1
@@ -7751,7 +7760,8 @@ func avFusionF2Checks() {
     func f2(_ x: Double?) -> String { x.map { String(format: "%.2f", $0) } ?? "—" }
     let clicks2 = AVSynth.clicks(avClickTimes(hz: 2, from: 0.3, to: 40))
 
-    // 1a. 画面 2 Hz、15 fps 上半整数周期（7.5 格），halvedLag 没减半 → 块运动报 1 Hz；声音 2 Hz 咔哒、耦合（S2 从 3 秒起，单元测试直接给）
+    // 1a.（refine 的单元测试，复审 M3：耦合是强行给的，真链路里误报从头开始时不会耦合，见 1c）
+    //     画面 2 Hz、15 fps 上半整数周期（7.5 格），halvedLag 没减半 → 块运动报 1 Hz；声音 2 Hz 咔哒、耦合（S2 从 3 秒起，单元测试直接给）
     //     → 窗口副本改成 2 Hz，跟随器 1.5 秒内正确锁在 2 Hz；不投票时一直锁在 1 Hz
     let misOn = AVF2Run(seconds: 9, signals: [clicks2, AVSynth.floor()], vote: true, coupled: { $0 >= 3 }) { _, t in
         f2Window(t, hz: 1, phaseHz: 1)
@@ -7785,6 +7795,23 @@ func avFusionF2Checks() {
            && late.contains { $0.action == .octaveUp } && wrongOff >= 5,
            "F2 八度消歧端到端：\(f2(coupledAt)) 秒进入耦合；之后 2/3 拍误报 1 Hz，投票时跟随器一直 2 Hz、一直耦合；"
            + "不投票时 \(wrongOff) 拍不在 2 Hz")
+
+    // 1c（复审 M3）端到端、持续误报：画面 2 Hz 前 7 秒读对（耦合建立），之后一直误报 1 Hz（相位作废）。
+    //     F2 只桥接短暂翻八度：桥接有界（≤ 4 秒）后干净地回到画面的 1 Hz 一次、不来回摆，耦合退出；不投票时 1c 之后就是 1 Hz
+    func sustained(_ k: Int, _ t: Double) -> MotionWindow {
+        t >= 7 ? f2Window(t, hz: 1) : f2Window(t, hz: 2, phaseHz: 2)
+    }
+    let susOn = AVF2Run(seconds: 18, signals: [clicks2, AVSynth.floor()], vote: true, window: sustained)
+    let susLate = susOn.beats.filter { $0.t >= 7 }
+    let bridgeEnd = susLate.last { $0.followerLocked && susOn.near(2, $0.followerHz) }?.t
+    let afterBridge = susLate.filter { $0.t > (bridgeEnd ?? 7) }
+    var flips = 0
+    for j in 1..<max(1, susLate.count) where susOn.near(2, susLate[j - 1].followerHz) != susOn.near(2, susLate[j].followerHz) { flips += 1 }
+    vcheck(((bridgeEnd ?? 7) - 7) <= 4 + 1e-9 && flips <= 1
+           && !afterBridge.contains { susOn.near(2, $0.followerHz) }
+           && (susOn.beats.last.map { $0.fusion.state != .coupled } ?? false)
+           && !afterBridge.suffix(5).contains { $0.action == .octaveUp },
+           "F2 持续误报（7 秒后画面一直报 1 Hz）：桥接 \(f2(bridgeEnd.map { $0 - 7 })) 秒（≤ 4）后回到画面读数、切换 \(flips) 次（≤ 1）、耦合退出")
 
     // 一下两响（往里重、往外轻，半个周期隔开）：撞击间隔中位数 = 2 倍、强度加权的自相关 = 整周期 → 不干净，不改八度
     var twoClicks: [Double] = []
@@ -7861,6 +7888,25 @@ func avFusionF2Checks() {
     vcheck(jOn != nil && jOff != nil && (jOff ?? 0) - (jOn ?? 99) >= 0.3 - 1e-9 && coupledBefore && sameBefore
            && jumpOn.beats.contains { $0.fastJump },
            "F2 跳频 1 → 1.6 Hz：耦合时 \(f2(jOn)) 秒确认，不投票 \(f2(jOff)) 秒（早 \(f2((jOff ?? 0) - (jOn ?? 0))) 秒 ≥ 0.3）")
+
+    // 复审 M4 反例 1：画面一直 1 Hz、只有声音在 12 秒跳到 1.6 Hz → 声音不发起跳频：从不 fastJump，跟随器和不投票逐位相同
+    let audioOnlyOn = f2JumpRun(vote: true, f1: 1, audioF1: 1.6)
+    let audioOnlyOff = f2JumpRun(vote: false, f1: 1, audioF1: 1.6)
+    let audioOnlySame = zip(audioOnlyOn.beats, audioOnlyOff.beats).allSatisfy {
+        $0.0.followerHz.bitPattern == $0.1.followerHz.bitPattern && $0.0.followerLocked == $0.1.followerLocked
+    }
+    vcheck(audioOnlySame && !audioOnlyOn.beats.contains { $0.fastJump }
+           && audioOnlyOn.beats.filter { $0.t > 13 }.allSatisfy { $0.followerLocked && audioOnlyOn.near(1, $0.followerHz) },
+           "F2 只有声音变速（画面一直 1 Hz、声音跳到 1.6 Hz）：不 fastJump，跟随器和不投票逐位相同、留在 1 Hz")
+    // 复审 M4 反例 2：画面 1 → 1.6 Hz、声音反方向 1 → 0.625 Hz → 从不 fastJump，跟随器和不投票逐位相同（跳变照常 2 拍确认）
+    let oppositeOn = f2JumpRun(vote: true, audioF1: 0.625)
+    let oppositeOff = f2JumpRun(vote: false, audioF1: 0.625)
+    let oppositeSame = zip(oppositeOn.beats, oppositeOff.beats).allSatisfy {
+        $0.0.followerHz.bitPattern == $0.1.followerHz.bitPattern && $0.0.followerLocked == $0.1.followerLocked
+    }
+    let oppositeJump = oppositeOn.beats.first { $0.t > 12 && $0.followerHz >= thresh }?.t
+    vcheck(oppositeSame && !oppositeOn.beats.contains { $0.fastJump } && oppositeJump != nil,
+           "F2 声音反方向跳（画面 1 → 1.6、声音 1 → 0.625 Hz）：不 fastJump，跟随器和不投票逐位相同（\(f2(oppositeJump)) 秒照常确认）")
 
     // 复审 M2：声音核对的是块运动读数（1.6 Hz），跟随器这一拍却挑了反方向的姿态读数（0.6 Hz，置信更高、采样率看得清）→
     // fastJumpHz 不缩短确认，逐位等于不给；跟随器挑的就是块运动读数时 1 拍就跳
