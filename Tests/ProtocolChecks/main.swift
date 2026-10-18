@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(Combine)
 import Combine
+#endif
 
 // CI 检查（修 L15）：swiftc 直接编译 Protocol.swift + Models.swift + SafetyLedger.swift + AIProgram.swift + 本文件后运行。
 // 钉住实抓帧字节、官方换算、legacy 安全上限、AI 指令解析/停止词/回复授权，任何一项不符就以非零退出码失败。
@@ -1216,6 +1218,7 @@ check(untaggedData != nil && near(untaggedRestored.remainingBudget(), 1100)
 // MARK: - 第二轮审查 M1：被动停机通知必须在发送的同一个主线程 block 里生效
 // AIControlVM 依赖 UIKit，这里编不到；钉住修法依赖的 Combine 语义：直接订阅在 send 里同步执行，
 // receive(on: DispatchQueue.main) 会再排一次主队列（中间排着的回复能读到新代次、旧授权）
+#if canImport(Combine)
 do {
     let subject = PassthroughSubject<String?, Never>()
     var revokedDirect = false
@@ -1227,6 +1230,10 @@ do {
     check(revokedDirect, "直接订阅：send 返回前授权就已作废（AIControlVM 现在的写法）")
     check(!revokedHopped, "receive(on: main) 还没执行：这就是旧写法留下的窗口（审查重现）")
 }
+#else
+// Linux（swift-corelibs）没有 Combine：这两条只在 Apple 平台（CI）上跑
+print("SKIP: Combine 语义两条（本平台没有 Combine）")
+#endif
 
 // MARK: - 第三轮审查
 
