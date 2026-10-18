@@ -3648,6 +3648,8 @@ struct VisualSyncSettings: Equatable {
         static let prescan = "bcVisualSyncPrescan"
         /// av-fusion F1：声画融合（实验，默认关；F1 只显示耦合度，不改输出）
         static let avFusion = "bcVisualSyncAVFusion"
+        /// av-fusion F2：节奏由声音确认（实验，默认关；融合 + 伸缩跟随动作频率都开着才显示 / 生效）
+        static let avRhythmConfirm = "bcVisualSyncAVRhythmConfirm"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -3684,6 +3686,9 @@ struct VisualSyncSettings: Equatable {
     /// av-fusion F1：默认关。关着时实时线程不算 6 段频带 / 包络 / PCM，频带块开关仍是 usesAudioAnchor，和 f706431 逐位相同
     /// （FusionOffCompare 钉住）；开着时 F1 也只显示「声画：」状态行和调试列，交给出口的值和关着时逐位相同
     static let defaultAVFusion = false
+    /// av-fusion F2：默认关。关着时交给跟随器 / 相位锁的窗口、跟随器的跳变确认、撞击声校正的条件都和 F1 逐位相同
+    /// （融合开着也一样 = f706431，FusionOffCompare 的 AV_F2_ON 变体钉住）
+    static let defaultAVRhythmConfirm = false
 
     var source: VisualSyncSource
     var motionGainDb: Double
@@ -3699,6 +3704,7 @@ struct VisualSyncSettings: Equatable {
     var rhythmLookahead: Bool
     var prescan: Bool
     var avFusion: Bool
+    var avRhythmConfirm: Bool
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
          autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
@@ -3706,7 +3712,8 @@ struct VisualSyncSettings: Equatable {
          pulseDepth: Double = defaultPulseDepth, pulseLatencyMs: Double = defaultPulseLatencyMs,
          pulseInvert: Bool = defaultPulseInvert, rhythmContext: Bool = defaultRhythmContext,
          rhythmAudioAnchor: Bool = defaultRhythmAudioAnchor, rhythmLookahead: Bool = defaultRhythmLookahead,
-         prescan: Bool = defaultPrescan, avFusion: Bool = defaultAVFusion) {
+         prescan: Bool = defaultPrescan, avFusion: Bool = defaultAVFusion,
+         avRhythmConfirm: Bool = defaultAVRhythmConfirm) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
@@ -3727,6 +3734,7 @@ struct VisualSyncSettings: Equatable {
         self.rhythmLookahead = rhythmLookahead
         self.prescan = prescan
         self.avFusion = avFusion
+        self.avRhythmConfirm = avRhythmConfirm
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -3750,7 +3758,8 @@ struct VisualSyncSettings: Equatable {
             rhythmAudioAnchor: defaults.object(forKey: Keys.rhythmAudioAnchor) as? Bool ?? defaultRhythmAudioAnchor,
             rhythmLookahead: defaults.object(forKey: Keys.rhythmLookahead) as? Bool ?? defaultRhythmLookahead,
             prescan: defaults.object(forKey: Keys.prescan) as? Bool ?? defaultPrescan,
-            avFusion: defaults.object(forKey: Keys.avFusion) as? Bool ?? defaultAVFusion)
+            avFusion: defaults.object(forKey: Keys.avFusion) as? Bool ?? defaultAVFusion,
+            avRhythmConfirm: defaults.object(forKey: Keys.avRhythmConfirm) as? Bool ?? defaultAVRhythmConfirm)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }
@@ -3778,6 +3787,14 @@ struct VisualSyncSettings: Equatable {
     var usesExtraDecode: Bool { usesLookahead || usesPrescan }
     /// av-fusion F1：声画融合真正生效（跟随画面 + 开关）。不是第三种来源；不影响 tickInterval
     var usesAVFusion: Bool { source == .motion && avFusion }
+    /// av-fusion F2：节奏由声音确认真正生效（融合 + 伸缩跟随动作频率 + 开关）。声音只给画面节奏投票、不开锁；不影响 tickInterval
+    /// 复审 L5：耦合要相位锁，相位脉动关着时 F1 一直报「没锁」→ 也要开相位脉动
+    var usesAVRhythmConfirm: Bool { usesAVFusion && rhythmFollow && rhythmPulse && avRhythmConfirm }
+
+    /// 复审 L6：融合的 6 段特征 / 频带用不用得上（融合生效、在联动、画面分析在跑）；播放器和测试共用
+    static func fusionFeaturesWanted(usesAVFusion: Bool, running: Bool, analyzing: Bool) -> Bool {
+        usesAVFusion && running && analyzing
+    }
 }
 
 /// 播放中切换来源的交接（algo-opt-1）。纯计算，结果仍只经 VideoSyncPlayer.tick() → sendTick 发出：
@@ -4167,6 +4184,8 @@ struct RhythmFollower {
     static let jumpRatio: Double = 0.3
     static let jumpConfirmSeconds: TimeInterval = 0.6
     static let jumpConfirmBeats = 2
+    /// av-fusion F2：声音耦合着、而且同方向跳了时（AVRhythmVote.fastJumpHz）跳变确认缩成 1 拍（累计 ≥ 1 拍 − 半拍）
+    static let fastJumpConfirmBeats = 1
     /// 待确认读数彼此要一致（最大 / 最小 ≤ 这个倍数）才跳；不一致时从最新这一拍重新数（r2 复审 L2）
     static let jumpAgreeSpread: Double = 1.45
     /// 锁定中一拍没有合格候选：待确认的跳变先留着（隔拍掉线也能凑够），连续缺这么久才清掉（r2 复审 L1）
@@ -4246,9 +4265,11 @@ struct RhythmFollower {
 
     /// 每拍一次。没有画面信号时调用方应 reset（不保持）。
     /// active：画面自己的强度确实在动（RhythmOutput.activity > 0）；false 时不锁定，锁定中连续 2 拍（有帧）false 才解锁、weight 快速归零；
-    /// frames == 0 的窗口不算 false（没有信息，按一拍没候选保持）
+    /// frames == 0 的窗口不算 false（没有信息，按一拍没候选保持）。
+    /// fastJumpHz（av-fusion F2，默认 0 = 原样）：声音确认过的跳变目标（AVRhythmVote.fastJumpHz）；这一拍真正用的候选读数
+    /// 和它同方向、差 ≤ jumpRatio 时，跳变确认只要 1 拍（F2 复审 M2：姿态 / 区域读数没被声音核对过，不跟着缩短）
     @discardableResult
-    mutating func step(_ w: MotionWindow, dt: TimeInterval, active: Bool = true) -> RhythmFollower {
+    mutating func step(_ w: MotionWindow, dt: TimeInterval, active: Bool = true, fastJumpHz: Double = 0) -> RhythmFollower {
         let step = dt.isFinite ? min(1, max(0.01, dt)) : AudioReactiveShaper.interval
         let gate = locked ? Self.releaseConfidence : Self.lockConfidence
         // r3 复审 L1：这一拍一帧都没分析到（上一帧还在算被丢、解码卡顿）= 没有信息，不当成「画面不动」，按一拍没候选保持
@@ -4277,7 +4298,7 @@ struct RhythmFollower {
                 hz = c.hz
                 clearPending()
             } else {
-                track(c.hz, step: step)
+                track(c.hz, step: step, fastHz: fastJumpHz)
             }
         } else if locked {
             inactiveTicks = 0
@@ -4305,7 +4326,7 @@ struct RhythmFollower {
     /// - 满 jumpConfirmBeats 拍、累计时间 ≥ jumpConfirmSeconds − 半拍（每拍最多按 beatSeconds 算），
     ///   待确认读数彼此一致（最大 / 最小 ≤ jumpAgreeSpread），且它们的对数平均偏离当前频率 30% 以上，才直接跳到对数平均；
     ///   平均只偏 15~30%（比如 ±20% 的逐拍抖动）不跳，照常平滑；读数彼此不一致时从最新这一拍重新数（不跳到谁也没读到的中间值）
-    private mutating func track(_ reading: Double, step: TimeInterval) {
+    private mutating func track(_ reading: Double, step: TimeInterval, fastHz: Double) {
         let d = log(reading / hz)
         if abs(d) <= log(1 + Self.jumpRatio) {
             let a = 1 - exp(-step / Self.smoothSeconds)
@@ -4330,8 +4351,13 @@ struct RhythmFollower {
         pendingLogMax = max(pendingLogMax, lr)
         let beat = min(step, Self.beatSeconds)
         pendingRun += beat
-        guard pendingBeats >= Self.jumpConfirmBeats,
-              pendingRun >= Self.jumpConfirmSeconds - 0.5 * beat - 1e-9 else { return }
+        // av-fusion F2（复审 M2）：只有这一拍真正用的读数和声音确认过的目标同方向、差 ≤ jumpRatio 才缩成 1 拍
+        let fast = fastHz.isFinite && fastHz > 0 && (fastHz > hz) == (reading > hz)
+            && abs(log(reading / fastHz)) <= log(1 + Self.jumpRatio)
+        let beatsNeeded = fast ? Self.fastJumpConfirmBeats : Self.jumpConfirmBeats
+        let secondsNeeded = fast ? Self.beatSeconds : Self.jumpConfirmSeconds
+        guard pendingBeats >= beatsNeeded,
+              pendingRun >= secondsNeeded - 0.5 * beat - 1e-9 else { return }
         let mean = pendingLogSum / Double(pendingBeats)
         if abs(mean - log(hz)) > log(1 + Self.jumpRatio) {
             hz = exp(mean)
@@ -6879,23 +6905,27 @@ struct AudioPhaseAnchor {
     private(set) var active = false
     private(set) var concentration: Double = 0
     private(set) var audioHz: Double = 0
+    /// av-fusion F2：这一拍因为声画不耦合（像配乐 / 人声 / 还没证明同步）没有对齐
+    private(set) var uncoupled = false
     private var lastGood = -Double.infinity
 
     mutating func reset() {
         self = AudioPhaseAnchor()
     }
 
-    /// onsets：撞击时刻（host 时间）；返回这一拍的相位偏移（弧度）
+    /// onsets：撞击时刻（host 时间）；返回这一拍的相位偏移（弧度）。
+    /// coupled（av-fusion F2）：nil = 不看耦合（F2 关着，和以前逐位相同）；false = 声画还没证明耦合，这一拍不对齐（按条件不满足保持 / 回 0）
     @discardableResult
     mutating func step(onsets: [Double], audioHz hz: Double, audioConfidence: Double, lock: RhythmPhaseLock,
-                       directionKnown: Bool, now: Double, dt: TimeInterval) -> Double {
+                       directionKnown: Bool, now: Double, dt: TimeInterval, coupled: Bool? = nil) -> Double {
         guard now.isFinite, lock.locked, lock.hz > 0, lock.phase(at: now) != nil else {
             reset()
             return 0
         }
         audioHz = hz.isFinite ? max(0, hz) : 0
+        uncoupled = coupled == false
         let agree = audioHz > 0 && audioConfidence.isFinite && audioConfidence >= Self.minRhythmConfidence
-            && abs(log(audioHz / lock.hz)) <= log(1 + Self.agreeRatio)
+            && abs(log(audioHz / lock.hz)) <= log(1 + Self.agreeRatio) && !uncoupled
         var good = false
         concentration = 0
         if agree {
@@ -6937,6 +6967,11 @@ struct AudioPhaseAnchor {
         if active {
             return String(format: "撞击声校正：声音 %.2f 次/秒和画面一致，已对齐（集中度 %.2f，偏移 %+d°）", audioHz,
                           concentration, Int((offset * 180 / Double.pi).rounded()))
+        }
+        if uncoupled {
+            return offset != 0
+                ? String(format: "撞击声校正：声画不耦合（像配乐 / 人声），保持偏移 %+d° 后慢慢回 0", Int((offset * 180 / Double.pi).rounded()))
+                : "撞击声校正：声画不耦合（像配乐 / 人声），只按画面相位"
         }
         if offset != 0 {
             return String(format: "撞击声校正：暂时对不上，保持偏移 %+d° 后慢慢回 0", Int((offset * 180 / Double.pi).rounded()))
@@ -9165,5 +9200,254 @@ extension AVDebugColumns {
 
     static var f1Empty: [String] {
         [String](repeating: "", count: f1Header.split(separator: ",", omittingEmptySubsequences: false).count)
+    }
+}
+
+// MARK: - av-fusion F2：节奏由声音确认（默认关）
+// 开关 bcVisualSyncAVRhythmConfirm（VisualSyncSettings.avRhythmConfirm；usesAVRhythmConfirm = 融合 + 伸缩跟随动作频率 + 开关）。
+// 画面为主、声音作证：频率 / 相位仍由画面（P1~P4）决定，声音只在已经证明和画面说的是同一件事（F1 的「耦合」）之后才说话，
+// 而且只纠正、不发起——activity 只看画面（声音永远不能让静止的画面动起来）、声音不能开节奏锁，只能在画面已经有候选时加置信度 /
+// 选八度 / 缩短跳变确认。每一拍按状态走（主线程，完整拍）：
+//   S0 关（开关关 / 不在跟随画面）= main；S1 只有画面（不耦合 / 没声音 / 时间不可用 / 切镜考验）= 现在的跟随画面；
+//   S2 耦合（上一拍融合状态 = coupled、那一拍画面相位锁还锁着，AVRhythmVote.isS2）= 画面结果 + 声音确认（AVRhythmVote）+ 撞击声校正的耦合条件。S2 → S1 单调退回。
+// 只改交给 RhythmFollower / RhythmPhaseLock 的那份窗口副本（P4 前瞻、P3 动作识别之后，和 P3 / P4 同一个做法；复审 H1：
+// 研究页原写「P3 之前」，但那样加的置信 / 换的八度会进动作识别的参考频率、区域取舍和轻抚判断，声音就间接改了 activity 和强度上限，
+// 所以排到 P3 之后：动作识别只看画面，投票核对的也正是跟随器这一拍拿到的读数）
+// 和跟随器这一拍的跳变确认拍数；不碰出口、不新增发送路径。
+
+/// av-fusion F2：声音给画面节奏投票（主线程每个完整拍一次）。只在 S2（coupled = AVRhythmVote.isS2：上一拍 AVFusionBeat.state ==
+/// .coupled，即 C ≥ 0.6 持续 2 秒进入、时间可用、声音在场、没在切镜考验，而且那一拍画面相位锁还锁着）而且这一拍有块运动节奏候选时
+/// 才改窗口副本；加置信 / 换八度还要跟随器（上一拍）已经被画面锁上（复审 M1：声音不开锁）：
+/// 1. 一致：声音节奏和画面跟随频率差 ≤ 15%（和 F1 的 A_f 同一个口径）→ subjectFollowRhythm + 0.1（夹 0~1）；
+/// 2. 八度消歧：两边正好差 2 倍 / 一半（八度两边各 15%）、声音是干净的单一脉冲串 → 画面频率乘 2 / 除 2
+///    （幅度按频率反比换算；按错的八度拟合的相位作废，相位锁等下一个读数；姿态和块运动同一个八度时一起换）。
+///    声音节奏按「最短且 ≥ 最高峰 85%」取周期，只用来消歧、不发起。一下两响（往里 / 往外各一声）的风险：
+///    两响强弱不同时按幅度加权的自相关落在整周期，和撞击间隔中位数（F1 的 f_a）差一个八度 → 不算干净、不管；
+///    两响一样强时声音和画面本来就差一倍、F1 的 A_f = 0 进不了耦合（S2 只能在声音和画面同频时建立）；
+/// 3. 跳频确认：跟随器锁着、画面读数偏离跟随频率 15% 以上、声音同方向也偏了 15% 以上、而且和画面读数差 ≤ 30% → fastJump，
+///    fastJumpHz = 这个画面读数（声音核对过的目标）。跟随器只在它这一拍真正用的候选读数和目标同方向、差 ≤ 30% 时
+///    才把跳变确认从 2 拍缩到 1 拍（RhythmFollower.step(fastJumpHz:)；复审 M2：跟随器挑了姿态读数时声音没核对过，不缩）。
+///    声音这边看同一个对齐窗口里最后 4 下撞击的间隔中位数（4 秒自相关要攒够新节奏才换峰，比画面晚；跳了多少仍要 ≥ 30% 才跳，
+///    由跟随器自己判断）。
+/// 声音的 4 秒窗口和画面 followEstimate 的 4 秒窗口按播放器时钟对齐：画面窗口的终点 = 最后一个相位拟合的时刻（没有时 = 现在），
+/// 换成视频时间后往前 4 秒 × 倍速。enabled == false / 不在 S2 / 条件不满足时窗口原样交回（== 而且位模式相同）、fastJump = false
+struct AVRhythmVote {
+    enum Action: String {
+        case none
+        case agree
+        case octaveUp = "octave_up"
+        case octaveDown = "octave_down"
+    }
+
+    static let agreeRatio: Double = AVCouplingEstimator.agreeRatio
+    static let confidenceBonus: Double = RhythmFollower.agreeBonus
+    /// 声音节奏的自相关峰低于这个不投票
+    static let minAudioConfidence: Double = 0.3
+    /// 跳频确认：声音和画面这一拍的读数差 ≤ 30%（= 跟随器的 jumpRatio）
+    static let jumpSpread: Double = RhythmFollower.jumpRatio
+    /// 和 StrokeRhythm 的窗口同长
+    static let windowSeconds: Double = StrokeRhythm.window
+    static let bin: Double = 0.01
+    static let harmonicShare: Double = AudioBeatGrid.harmonicShare
+    static let minImpacts = 3
+    static let recentImpacts = 4
+
+    private(set) var action = Action.none
+    private(set) var fastJump = false
+    /// fastJump 时声音核对过的跳变目标（画面这一拍的读数，Hz；没有 0）→ RhythmFollower.step(fastJumpHz:)
+    private(set) var fastJumpHz: Double = 0
+    /// 这一拍声音节奏（host 时间上的 Hz，已乘倍速；没有 0）/ 自相关峰 / 最近几下撞击间隔的频率（跳频方向用）
+    private(set) var audioHz: Double = 0
+    private(set) var recentHz: Double = 0
+    private(set) var audioConfidence: Double = 0
+    /// 声音节奏和撞击间隔中位数一致（单一脉冲串）
+    private(set) var clean = false
+    private(set) var active = false
+
+    mutating func reset() {
+        self = AVRhythmVote()
+    }
+
+    /// 最近一段（视频时间 start ~ end）的撞击（isImpact）按强度做成脉冲串（σ = 1.5 格的高斯），归一化自相关在 0.4~4 Hz 里
+    /// 找局部峰，取最短的、不低于最高峰 85% 的那个，抛物线细化。返回视频时间上的 Hz 和那个峰（不够 3 次撞击 / 窗口不到 2 秒 0）
+    /// rate（复审 L2）：倍速；滞后搜索范围按画面上看到的快慢（RhythmFollower.hzRange × 倍速，换成视频时间）
+    static func audioRhythm(_ events: [AudioOnsetEvent], start: Double, end: Double,
+                            rate: Double = 1) -> (hz: Double, confidence: Double) {
+        guard start.isFinite, end.isFinite, end - start >= 2 else { return (0, 0) }
+        let hits = impacts(events, start: start, end: end)
+        guard hits.count >= minImpacts else { return (0, 0) }
+        let n = Int(((end - start) / bin).rounded(.up)) + 1
+        var sig = [Double](repeating: 0, count: n)
+        let sigma = 1.5
+        for e in hits {
+            // 按幅度加权：strength 是各段上升 dB 之和，换成每段平均上升的幅度倍数（一下两响差 12 dB ≈ 4 倍；直接用 dB 只差 1.4 倍）
+            let weight = pow(10, e.strength / Double(AudioFeatureFrame.bandCount) / 20)
+            let c = (e.time - start) / bin
+            let lo = max(0, Int((c - 4 * sigma).rounded(.down)))
+            let hi = min(n - 1, Int((c + 4 * sigma).rounded(.up)))
+            guard lo <= hi else { continue }
+            for k in lo...hi {
+                let d = (Double(k) - c) / sigma
+                sig[k] += weight * exp(-0.5 * d * d)
+            }
+        }
+        var mean = 0.0
+        for v in sig { mean += v }
+        mean /= Double(n)
+        var r0 = 0.0
+        for k in 0..<n {
+            sig[k] -= mean
+            r0 += sig[k] * sig[k]
+        }
+        guard r0.isFinite, r0 > 1e-12 else { return (0, 0) }
+        let r = rate.isFinite && rate > 0 ? rate : 1
+        let minLag = Int((r / RhythmFollower.hzRange.upperBound / bin).rounded(.down))
+        let maxLag = min(n / 2, Int((r / RhythmFollower.hzRange.lowerBound / bin).rounded(.up)))
+        guard maxLag > minLag + 2, maxLag + 1 < n else { return (0, 0) }
+        var corr = [Double](repeating: 0, count: maxLag + 2)
+        for lag in (minLag - 1)...(maxLag + 1) {
+            var s = 0.0
+            for k in 0..<(n - lag) { s += sig[k] * sig[k + lag] }
+            corr[lag] = s / r0 * Double(n) / Double(n - lag)
+        }
+        var best = 0.0
+        var bestLag = 0
+        for lag in minLag...maxLag where corr[lag] > best && corr[lag] >= corr[lag - 1] && corr[lag] >= corr[lag + 1] {
+            best = corr[lag]
+            bestLag = lag
+        }
+        guard bestLag > 0 else { return (0, 0) }
+        for lag in minLag..<bestLag where corr[lag] >= harmonicShare * best
+            && corr[lag] >= corr[lag - 1] && corr[lag] >= corr[lag + 1] {
+            bestLag = lag
+            break
+        }
+        let a = corr[bestLag - 1]
+        let b = corr[bestLag]
+        let c = corr[bestLag + 1]
+        let den = a - 2 * b + c
+        let offset = den < -1e-12 ? min(0.5, max(-0.5, 0.5 * (a - c) / den)) : 0
+        let hz = 1 / ((Double(bestLag) + offset) * bin)
+        return hz.isFinite ? (hz, MotionStats.clamp01(b)) : (0, 0)
+    }
+
+    /// 窗口（视频时间 start ~ end）里的撞击（旧 → 新）
+    static func impacts(_ events: [AudioOnsetEvent], start: Double, end: Double) -> [AudioOnsetEvent] {
+        events.filter { $0.isImpact && $0.time > start && $0.time <= end && $0.strength.isFinite && $0.strength > 0 }
+    }
+
+    /// 跳频确认看的声音读数：同一个对齐窗口里最后 recentImpacts 次撞击的间隔中位数（视频时间上的 Hz；不够 0）。
+    /// 4 秒自相关在跳频后要攒够新节奏才换峰（比画面的 followEstimate 晚），方向只看窗口末尾最新的几下
+    static func recentHz(_ events: [AudioOnsetEvent], start: Double, end: Double) -> Double {
+        AVCouplingEstimator.impactHz(impacts(events, start: start, end: end).suffix(recentImpacts).map { $0.time })
+    }
+
+    /// 每个完整拍、P4 前瞻和 P3 动作识别之后（复审 H1）。coupled：上一拍融合状态是不是 .coupled（S2）；events：融合的起音（视频时间）；
+    /// impactHz：上一拍 F1 的 f_a（撞击间隔中位数 × 倍速，干净度判断用）；clock：这一拍的播放器时钟；
+    /// followerHz / followerLocked：跟随器上一拍的结果（跳频确认用）
+    mutating func refine(_ w: MotionWindow, enabled: Bool, coupled: Bool, events: [AudioOnsetEvent], impactHz: Double,
+                         clock: MediaClockSnapshot, followerHz: Double, followerLocked: Bool,
+                         lookaheadFrequency: Bool = false) -> MotionWindow {
+        guard enabled else {
+            if active || action != .none || fastJump || audioHz != 0 || recentHz != 0 { reset() }
+            return w
+        }
+        active = true
+        action = .none
+        fastJump = false
+        fastJumpHz = 0
+        audioHz = 0
+        audioConfidence = 0
+        recentHz = 0
+        clean = false
+        let vf = w.subjectFollowHz
+        guard coupled, clock.isValid, w.frames > 0, w.cutCount == 0, w.heldCount == 0, w.subjectFrames > 0,
+              vf.isFinite, RhythmFollower.hzRange.contains(vf), w.subjectFollowRhythm.isFinite, w.subjectFollowRhythm > 0
+        else { return w }
+        let endHost = w.subjectPhase.isValid ? w.subjectPhase.time : clock.host
+        let end = clock.item(forHost: endHost)
+        let start = end - Self.windowSeconds * clock.rate
+        let r = Self.audioRhythm(events, start: start, end: end, rate: clock.rate)
+        let ha = r.hz * clock.rate
+        let hr = Self.recentHz(events, start: start, end: end) * clock.rate
+        recentHz = hr.isFinite ? hr : 0
+        let tol = log(1 + Self.agreeRatio)
+        var out = w
+        if ha.isFinite, ha > 0, r.confidence >= Self.minAudioConfidence {
+            audioHz = ha
+            audioConfidence = r.confidence
+            clean = impactHz.isFinite && impactHz > 0 && abs(log(ha / impactHz)) <= tol
+        }
+        let d = audioHz > 0 ? log(audioHz / vf) : Double.infinity
+        // 复审 M1：加置信 / 换八度只在跟随器（上一拍）已经被画面自己锁上时做——没锁时 +0.1 会把 0.30~0.39 的候选推过 0.40 的开锁门、
+        // 换八度会替新锁选频率，那就是声音开锁了
+        if followerLocked, abs(d) <= tol {
+            out.subjectFollowRhythm = MotionStats.clamp01(w.subjectFollowRhythm + Self.confidenceBonus)
+            action = .agree
+        } else if followerLocked, clean, abs(abs(d) - log(2)) <= tol,
+                  RhythmFollower.hzRange.contains(vf * (d > 0 ? 2 : 0.5)) {
+            // 复审 L3：换过去的频率要在跟随器范围里，否则跟随器会丢掉这个候选（有效候选变成没候选），那就不换
+            let k: Double = d > 0 ? 2 : 0.5
+            out.subjectFollowHz = vf * k
+            out.subjectFollowAmplitude = w.subjectFollowAmplitude / k
+            out.subjectPhase = StrokeRhythm.PhaseFit()
+            if w.posePresentFrames > 0, w.poseRhythmHz.isFinite, w.poseRhythmHz > 0, abs(log(w.poseRhythmHz / vf)) <= tol {
+                out.poseRhythmHz = w.poseRhythmHz * k
+                out.posePhase = StrokeRhythm.PhaseFit()
+            }
+            action = d > 0 ? .octaveUp : .octaveDown
+        }
+        let hv = out.subjectFollowHz
+        // 复审 L4：P4 前瞻的频率读数对的是「现在 + 延迟」，声音窗口止于现在（差约 2 秒），方向核对没意义 → 前瞻频率接管时不缩短确认
+        if !lookaheadFrequency, followerLocked, followerHz.isFinite, followerHz > 0, recentHz > 0 {
+            let dv = log(hv / followerHz)
+            let da = log(recentHz / followerHz)
+            fastJump = abs(dv) > tol && abs(da) > tol && (dv > 0) == (da > 0)
+                && abs(log(recentHz / hv)) <= log(1 + Self.jumpSpread)
+            if fastJump { fastJumpHz = hv }
+        }
+        return out
+    }
+
+    /// S2（复审 M1）：上一拍融合状态是耦合，**而且**那一拍画面相位锁还锁着（fv > 0 = 耦合度这一拍有新鲜的画面证据）。
+    /// C 是 τ = 1 秒的 EMA、退出要再撑 1.5 秒，相位锁放开（跟随器解锁 / 切镜 / 不动）后「耦合」还会挂约 2.3 秒；
+    /// 切镜考验期间耦合度挂起不清，考验完新镜头头几拍也还是「耦合」——这些拍都不算 S2
+    static func isS2(_ beat: AVFusionBeat?) -> Bool {
+        guard let b = beat else { return false }
+        return b.state == .coupled && b.fv > 0
+    }
+
+    /// 复审 H1：rhythmLevel 里 P4 之后两步的顺序（播放器和测试共用这一个函数）：先 P3 动作识别（只看画面），再投票。
+    /// context / vote 为 nil = 那一步关着（窗口原样往下走）
+    static func contextThenVote(_ w: MotionWindow, context: ((MotionWindow) -> MotionWindow)?,
+                                vote: ((MotionWindow) -> MotionWindow)?) -> MotionWindow {
+        let c = context.map { $0(w) } ?? w
+        return vote.map { $0(c) } ?? c
+    }
+
+    var statusText: String {
+        switch action {
+        case .none:
+            return fastJump ? "节奏确认：声音同方向跳了，跳频只确认 1 拍" : "节奏确认：没有投票（只看画面）"
+        case .agree:
+            return String(format: "节奏确认：声音 %.2f 次/秒和画面一致，置信 +0.1%@", audioHz, fastJump ? "，跳频只确认 1 拍" : "")
+        case .octaveUp, .octaveDown:
+            return String(format: "节奏确认：画面读成了%@，按声音 %.2f 次/秒改成%@", action == .octaveUp ? "一半" : "两倍", audioHz,
+                          action == .octaveUp ? "两倍" : "一半")
+        }
+    }
+}
+
+extension AVDebugColumns {
+    /// av-fusion F2：节奏由声音确认（开关关着时整组空）
+    static let f2Header = "av_vote,av_vote_hz,av_vote_conf,av_vote_clean,av_fast_jump"
+
+    static func f2Fields(_ v: AVRhythmVote) -> [String] {
+        [v.action.rawValue, field(v.audioHz, digits: 3), field(v.audioConfidence, digits: 3), v.clean ? "1" : "0",
+         v.fastJump ? "1" : "0"]
+    }
+
+    static var f2Empty: [String] {
+        [String](repeating: "", count: f2Header.split(separator: ",", omittingEmptySubsequences: false).count)
     }
 }
