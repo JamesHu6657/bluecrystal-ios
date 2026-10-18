@@ -184,6 +184,26 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
     var vote = AVRhythmVote()
     var voted = 0
 #endif
+#if AV_F3_ON
+    // F3：重音 / 震动跟声音的接线全走一遍，耦合强制不成立（S1）→ g = 1、震动 = 画面值，输出照样逐位相同
+    var accent = AVAccent()
+    var vibA = AVVibrationAudio()
+    var f3touched = 0
+    // 复审 M5 正对照：同样的输入，按真实的融合状态（S2）算的影子重音 / 震动——不进输出，只证明这条路真能改东西
+    var accentShadow = AVAccent()
+    var vibShadow = AVVibrationAudio()
+    var f3shadow = 0
+    var f3bShadow = 0
+#endif
+#if AV_F4_ON
+    // F4：互为回落 / 相位飞轮的接线走一遍；画面一直有新鲜样本、不在 S2 → 一拍都不该改
+    var fallback = AVFallbackBlend()
+    var flywheel = AVPhaseFlywheel()
+    var f4touched = 0
+    // 复审 M5 正对照：影子回落按真实融合状态记门，每 6 秒里有 2 秒当画面断了
+    var fallbackShadow = AVFallbackBlend()
+    var f4shadow = 0
+#endif
     var tick = 0.0
     var lastFull = 0.0
     var out = ""
@@ -228,6 +248,16 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
             let shaped = shaper.step(target: target, dt: dt)
             let value = norm.confidence * shaped.smoothed
             let act = RhythmOutput.motionActivity(level: shaped.level, smoothed: shaped.smoothed, confidence: norm.confidence, motionSignal: true)
+#if AV_F4_ON
+            fallback.note(beat: fusion.last, now: now)
+            let fb = fallback.step(blended: (value, true), motionSignal: true, audio: 80, audioSignal: true, now: now, dt: dt)
+            if fb.value.bitPattern != value.bitPattern || !fb.hasSignal { f4touched += 1 }
+            fallbackShadow.note(beat: fusion.last, now: now)
+            let gone = now.truncatingRemainder(dividingBy: 6) >= 4
+            let sfb = fallbackShadow.step(blended: gone ? (0, false) : (value, true), motionSignal: !gone, audio: 80,
+                                          audioSignal: true, now: now, dt: dt)
+            if gone, sfb.value > 0 { f4shadow += 1 }
+#endif
             let clock = RhythmLookahead.Clock(hostNow: now, itemNow: now, rate: 1)
             var input = coord.refine(w, enabled: vis.usesLookahead, timeline: tl, clock: clock, latency: latency)
             if vis.usesRhythmContext { input = ctx.refine(input, now: now) }
@@ -247,7 +277,28 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #endif
             if pulse { lock.step(input, followerHz: follower.hz, followerLocked: follower.locked, followerSource: follower.source, now: now, dt: dt, active: act > 0) }
             let rate = follower.weight > 0 && follower.hz > 0 ? vis.rateMap.level(forHz: follower.hz) : nil
+#if AV_F3_ON
+            let g = accent.step(events: fusion.engine.extractor.events, clock: MediaClockSnapshot(host: now, item: now, rate: 1),
+                                s2: false, lockHz: lock.hz, depth: 0.15)
+            var levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
+            let videoVib = levels[1]
+            levels[1] = vibA.step(video: levels[1], floor: 10, events: fusion.engine.extractor.events,
+                                  clock: MediaClockSnapshot(host: now, item: now, rate: 1), beat: nil, activity: act,
+                                  channelsBoth: true, depth: 0.15, now: now, dt: dt)
+            if g != 1 || levels[1] != videoVib { f3touched += 1 }
+            let sg = accentShadow.step(events: fusion.engine.extractor.events, clock: MediaClockSnapshot(host: now, item: now, rate: 1),
+                                       s2: AVRhythmVote.isS2(fusion.last), lockHz: lock.hz, depth: 0.15)
+            var shadowBeat = fusion.last
+            shadowBeat?.pMusic = 0
+            let sv = vibShadow.step(video: videoVib, floor: 10, events: fusion.engine.extractor.events,
+                                    clock: MediaClockSnapshot(host: now, item: now, rate: 1), beat: shadowBeat, activity: act,
+                                    channelsBoth: true, depth: 0.15, now: now, dt: dt)
+            if sg != 1 { f3shadow += 1 }
+            if sv != videoVib { f3bShadow += 1 }
+            driver.accentGain = pulse ? g : 1
+#else
             let levels = RhythmOutput.target(value: value, settings: st, hasSignal: true, rateLevel: rate, weight: follower.weight, activity: act)
+#endif
 #if AV_FUSION_ON
             // F1：融合每拍先取走频带块（撞击声校正开着时经 backlog 原样交回）
             pendingBands = fusion.shareBands(pendingBands)
@@ -277,6 +328,9 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
                     driver.phaseOffset = coord.applyLead(to: driver.phaseOffset, enabled: true, timeline: tl, clock: clock,
                                                          latency: latency, lock: lock, dt: dt)
                 }
+#if AV_F4_ON
+                if flywheel.step(lock: lock, s2: false, audioHz: lock.hz, now: now) != nil { f4touched += 1 }
+#endif
                 o = driver.beat(levels: levels, lock: lock, visual: vis, settings: st, hasSignal: true, value: value, activity: act,
                                 followerWeight: follower.weight, now: now, stage: &stage)
             } else {
@@ -292,6 +346,15 @@ func run(_ name: String, pulse: Bool, context: Bool, anchor: Bool, lookahead: Bo
 #if AV_FUSION_ON
     // 融合的结果只写 stderr（不进逐字节对照的 stdout）
     FileHandle.standardError.write("fusion \(name): rows \(fusion.rows) coupled beats \(fusion.coupledBeats)\n".data(using: .utf8)!)
+#endif
+#if AV_F4_ON
+    FileHandle.standardError.write("f4 \(name): touched beats \(f4touched) (video always fresh, not S2 → 0)\n".data(using: .utf8)!)
+    FileHandle.standardError.write("f4 positive control \(name): \(f4shadow)\n".data(using: .utf8)!)
+#endif
+#if AV_F3_ON
+    FileHandle.standardError.write("f3 \(name): touched beats \(f3touched) (forced S1 → 0)\n".data(using: .utf8)!)
+    FileHandle.standardError.write("f3 positive control \(name): \(f3shadow)\n".data(using: .utf8)!)
+    FileHandle.standardError.write("f3b positive control \(name): \(f3bShadow)\n".data(using: .utf8)!)
 #endif
 #if AV_F2_ON
     FileHandle.standardError.write("f2 \(name): voted beats \(voted) (switch off / forced S1 → 0)\n".data(using: .utf8)!)
