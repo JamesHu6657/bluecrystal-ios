@@ -543,6 +543,15 @@ enum AudioLevelTap {
                 Unmanaged<AudioLevelMeter>.fromOpaque(MTAudioProcessingTapGetStorage(tap))
                     .takeUnretainedValue().process(bufferListInOut, frames: Int(numberFramesOut.pointee), start: start)
             })
+#if compiler(>=6.2)
+        // Xcode 26+ SDK 里输出参数已由 ARC 管理（MTAudioProcessingTap?），直接返回
+        var tap: MTAudioProcessingTap?
+        let status = MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks,
+                                                kMTAudioProcessingTapCreationFlag_PreEffects,
+                                                &tap)
+        guard status == noErr, let created = tap else { return nil }
+        return created
+#else
         // Xcode 16 SDK 里输出参数是 Unmanaged（+1 引用）：成功后 takeRetainedValue 交给 ARC
         var tap: Unmanaged<MTAudioProcessingTap>?
         let status = MTAudioProcessingTapCreate(kCFAllocatorDefault, &callbacks,
@@ -551,5 +560,6 @@ enum AudioLevelTap {
         // 创建失败时 init 是否已经跑过无法确定：宁可漏掉这一个小对象，也不冒重复 release 的险
         guard status == noErr, let created = tap else { return nil }
         return created.takeRetainedValue()
+#endif
     }
 }

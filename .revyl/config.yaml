@@ -1,0 +1,13 @@
+project:
+    id: bbeb5657-bff2-4e75-b49f-bf673e8f28cf
+session:
+    idle_timeout_seconds: 1800
+build:
+    framework: ios
+    profiles:
+        development:
+            ios:
+                app_id: 1b45eba9-b096-44eb-b6b6-c8ad3f86578d
+                build_commands:
+                    - xcodebuild -project BlueCrystalIOS.xcodeproj -scheme 'BlueCrystalIOS' -configuration Debug -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -derivedDataPath build CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=
+                output_path: build/Build/Products/Debug-iphonesimulator/*.app
