@@ -29,6 +29,64 @@ final class VideoSyncPlayer: ObservableObject {
     @Published private(set) var intensity: Int = 0
     @Published private(set) var audioStatus: AudioLevelTap.Status = .none
     @Published private(set) var motionStatus: VideoMotionTap.Status = .none
+    #if targetEnvironment(simulator)
+    /// 模拟器诊断读数（motion-zero-diag）：只在模拟器构建、调试记录开着、跟随画面时有；真机构建没有这段
+    @Published private(set) var simDiag: String?
+    private var simCounts = SimDiagCounts()
+    struct SimDiagCounts {
+        var ticks = 0
+        var waiting = 0
+        var seekWait = 0
+        var motionTicks = 0
+        var framesTicks = 0
+        var personTicks = 0
+        var levelMax = 0.0
+        var outMax = 0
+    }
+    /// 主线程：这一拍走到哪一步（stage）+ 取帧 / 姿态计数 + 这一拍的窗口和输出
+    private func simDiagNote(stage: String, window: MotionWindow? = nil, target: Double = 0, out: [Int] = []) {
+        guard debugRecording, visualSettings.source == .motion else { return }
+        var c = simCounts
+        c.ticks += 1
+        if stage == "wait" { c.waiting += 1 }
+        if stage == "seek" { c.seekWait += 1 }
+        if let w = window {
+            c.motionTicks += 1
+            if w.frames > 0 { c.framesTicks += 1 }
+            if w.posePresentFrames > 0 { c.personTicks += 1 }
+            c.levelMax = max(c.levelMax, motionLevel)
+            c.outMax = max(c.outMax, out.max() ?? 0)
+        }
+        simCounts = c
+        let tcs: String
+        switch player?.timeControlStatus {
+        case .playing?: tcs = "play"
+        case .paused?: tcs = "pause"
+        case .waitingToPlayAtSpecifiedRate?: tcs = "wait"
+        default: tcs = "nil"
+        }
+        var lines: [String] = []
+        lines.append(String(format: "DIAG %@ t=%.1f tcs=%@ st=%@", stage, currentSeconds, tcs, String(describing: motionStatus)))
+        lines.append("ticks=\(c.ticks) mot=\(c.motionTicks) fr>0=\(c.framesTicks) person=\(c.personTicks) wait=\(c.waiting) seek=\(c.seekWait) lvlMax=\(Int(c.levelMax)) outMax=\(c.outMax)")
+        if let tap = motionTap {
+            let d = tap.diagSnapshot()
+            lines.append("tap call=\(d.analyzeCalls) badT=\(d.badItemTime) noNew=\(d.noNewBuffer) fill=\(d.stillFills) copyNil=\(d.copyNil) badFmt=\(d.badFormat) fmt=\(String(d.lastFormat, radix: 16)) \(d.width)x\(d.height) ana=\(d.analyzed) smp=\(d.samples) item=\(String(format: "%.1f", d.lastItem))")
+            lines.append(String(format: "pose runs=%d seen=%d backoff=%d fail=%d ms=%.0f", d.pose.runs, d.pose.seenRuns,
+                                d.pose.backoff ? 1 : 0, d.pose.failures, d.pose.lastTookMs))
+        } else {
+            lines.append("tap=nil")
+        }
+        if let w = window {
+            lines.append(String(format: "win f=%d e=%.2f subj=%d/%.3f near=%.2f cut=%d ppl=%d j=%d h=%d fc=%d pres=%d/%d pw=%.2f",
+                                w.frames, w.representative, w.subjectFrames, w.subjectScore, w.nearField, w.cutCount,
+                                w.poseRawPeople, w.poseRawJoints, w.poseRawHands, w.poseRawFaces,
+                                w.posePresentFrames, w.poseFrames, motionNormalizer.poseWeight))
+            lines.append(String(format: "kind=%d tgt=%.1f lvl=%.1f conf=%.2f out=%@", actionContext.kind.rawValue, target,
+                                motionLevel, motionNormalizer.confidence, out.map(String.init).joined(separator: ",")))
+        }
+        simDiag = lines.joined(separator: "\n")
+    }
+    #endif
     /// rhythm-follow P1：伸缩跟随动作频率时的状态（没打开 / 没在跟画面时 nil）
     @Published private(set) var rhythmStatus: String?
     /// rhythm-phase P2：相位脉动的状态（没打开时 nil）
@@ -1062,6 +1120,9 @@ final class VideoSyncPlayer: ObservableObject {
             // 等待落点前进期间 tap 可能已经在走：丢掉这几帧，恢复时不把跳转处的旧声音 / 旧画面当成一阵强输出
             _ = meter?.drain()
             _ = motionMeter?.drain()
+            #if targetEnvironment(simulator)
+            simDiagNote(stage: "seek")
+            #endif
             return
         case .stalled:
             handleStall()
@@ -1090,6 +1151,9 @@ final class VideoSyncPlayer: ObservableObject {
                 statusLine = "视频缓冲中，设备暂停输出"
             }
             needsResync = true
+            #if targetEnvironment(simulator)
+            simDiagNote(stage: "wait")
+            #endif
             return
         }
         guard t.isFinite else { return }
@@ -1618,6 +1682,9 @@ final class VideoSyncPlayer: ObservableObject {
             } else {
                 intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
             }
+            #if targetEnvironment(simulator)
+            simDiagNote(stage: "off", window: window, target: target, out: [intensity])
+            #endif
             return
         }
         let vals: [Int]
@@ -1660,6 +1727,9 @@ final class VideoSyncPlayer: ObservableObject {
         }
         let shown = vals.max() ?? 0
         intensity = shown
+        #if targetEnvironment(simulator)
+        simDiagNote(stage: "tick", window: window, target: target, out: vals)
+        #endif
         if debugRecording {
             debugLog.append(t: t, window: window, normalizer: motionNormalizer, target: target,
                             shapedLevel: shaped.level, value: value, hasSignal: hasSignal,
@@ -2445,6 +2515,16 @@ struct VideoSyncView: View {
             }
             MeterBar(title: "强度", fraction: Double(vm.intensity) / 100, color: Velvet.rose,
                      valueText: "\(vm.intensity)%")
+            #if targetEnvironment(simulator)
+            if followsMotion, debugLogOn, let diag = vm.simDiag {
+                Text(diag)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Velvet.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("simMotionDiag")
+            }
+            #endif
         }
     }
 
