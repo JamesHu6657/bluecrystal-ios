@@ -1281,14 +1281,33 @@ struct AISettingsView: View {
 
     /// 底部停止条：和解锁页的停止同一条路径（sendStop + 各页 VM 的 stopAll）；
     /// 设备需要处理时（needsAttentionCard，同选择器和解锁页），连紧凑设备卡片（解除锁定 / 强制断开）一起带上；
-    /// 打字时卡片收成两行（同 AI 页），点红字收起键盘看全文
+    /// 打字时卡片收成一行提示（整张卡会挡住提示词输入框），点一下收起键盘看完整卡片；停止键始终在
     private var stopBar: some View {
         let showCard: Bool = ble.needsAttentionCard
         let typing: Bool = focusedField != nil
         return VStack(spacing: 0) {
-            if showCard {
-                DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false,
-                                 collapsed: typing)
+            if showCard && typing {
+                // 打字时键盘已占半屏，整张卡会压住提示词输入框：先收成一行提示，点一下收起键盘、卡片完整回来
+                // （解除锁定 / 强制断开都在卡上，一下就能点到；停止键始终在下面）
+                Button {
+                    focusedField = nil
+                } label: {
+                    Label("设备需要处理，点这里收起键盘查看", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(Velvet.warning)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 12)
+                        .background(Velvet.danger.opacity(0.15), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("收起键盘，显示设备状态卡片")
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+            } else if showCard {
+                DeviceStatusCard(allowDisconnect: false, connectTitle: "连接", compact: true, showsConnect: false)
                     .padding(.horizontal, 20)
                     .padding(.top, 8)
             }
