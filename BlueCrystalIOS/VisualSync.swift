@@ -2297,6 +2297,24 @@ struct PoseReading: Equatable {
     var rawJoints = 0
     var rawHands = 0
     var rawFaces = 0
+    /// 调试（motion-zero）：Vision 原始结果里最高的人置信度、关节最多的那个人有几个关节置信度 ≥ 0.1（19 个都算）。
+    /// 只进调试表格：拿来判断近景时是 Vision 根本没认到人，还是认到了但置信度在 0.3 门槛下面
+    var rawConfidence: Double = 0
+    var rawLowJoints = 0
+}
+
+/// 近景姿态放宽（实验，VisualSyncSettings.closeUpPose，默认关）：特写 / 只露出身体一部分时，Vision 常常认到了人，
+/// 但人和关节的置信度落在 0.1~0.3 之间，被 PoseMotionTracker 的 0.3 门槛整个丢掉（真机 1.8.5 表格里有人的拍只有 1~3%）。
+/// 打开时把 [0.1, 0.3) 的置信度抬到 0.3（门槛等于降到 0.1），≥ 0.3 和 < 0.1 的原样；跟踪器其余逻辑不变：
+/// 这些关节按 0.3 那一档算检测抖动死区（基础死区 × 2），姿态照旧只能细化块运动（PoseBlend 下限 0.68 × 块运动）。关着时不调用
+enum PoseCloseUp {
+    static let lowConfidence: Double = 0.1
+
+    static func lift(_ c: Double) -> Double {
+        guard c.isFinite else { return 0 }
+        if c >= lowConfidence && c < PoseMotionTracker.minJointConfidence { return PoseMotionTracker.minJointConfidence }
+        return min(1, max(0, c))
+    }
 }
 
 /// 姿态 → 主体强度（algo-opt-3）：关节速度按躯干长度（或肩宽、关节包围框对角线）归一（远近 / 缩放无关），
@@ -3073,6 +3091,8 @@ struct MotionWindow: Equatable {
     var poseRawJoints: Int = 0
     var poseRawHands: Int = 0
     var poseRawFaces: Int = 0
+    var poseRawConfidence: Double = 0
+    var poseRawLowJoints: Int = 0
     /// 最后一次有人时的关节可信度（PoseReading.trust；手搭的窗口不填 = 1）
     var poseTrust: Double = 1
     /// 往复频率跟随（rhythm-follow P1）：块运动主体最后一个读数的跟随频率 / 置信度 / 单程幅度（分析帧像素；
@@ -3123,6 +3143,8 @@ struct MotionWindowAccumulator {
     private var poseRawJoints = 0
     private var poseRawHands = 0
     private var poseRawFaces = 0
+    private var poseRawConfidence: Double = 0
+    private var poseRawLowJoints = 0
     private var poseScore: Double = 0
     private var poseConfidence: Double = 0
     private var poseTrust: Double = 1
@@ -3193,6 +3215,8 @@ struct MotionWindowAccumulator {
         poseRawJoints = max(poseRawJoints, r.rawJoints)
         poseRawHands = max(poseRawHands, r.rawHands)
         poseRawFaces = max(poseRawFaces, r.rawFaces)
+        if r.rawConfidence.isFinite { poseRawConfidence = max(poseRawConfidence, r.rawConfidence) }
+        poseRawLowJoints = max(poseRawLowJoints, r.rawLowJoints)
         guard r.present, r.score.isFinite, r.confidence.isFinite else { return }
         // 切镜前那些帧的读数（切镜样本之后才回来的）不算
         guard !(r.time < lastCutTime) else { return }
@@ -3237,6 +3261,8 @@ struct MotionWindowAccumulator {
         window.poseRawJoints = poseRawJoints
         window.poseRawHands = poseRawHands
         window.poseRawFaces = poseRawFaces
+        window.poseRawConfidence = poseRawConfidence
+        window.poseRawLowJoints = poseRawLowJoints
         window.poseScore = poseScore
         window.poseConfidence = poseConfidence
         window.poseTrust = poseTrust
@@ -3682,6 +3708,8 @@ struct VisualSyncSettings: Equatable {
         /// av-fusion F5：片子本身的音画偏移（毫秒，正 = 声音比画面晚；默认 0）、自动估计（默认关）
         static let avOffsetMs = "bcVisualSyncAVOffsetMs"
         static let avAutoOffset = "bcVisualSyncAVAutoOffset"
+        /// motion-zero / close-up：近景姿态放宽（实验，默认关）
+        static let closeUpPose = "bcVisualSyncCloseUpPose"
     }
 
     /// 默认跟随声音：老用户行为逐位不变
@@ -3732,6 +3760,8 @@ struct VisualSyncSettings: Equatable {
     static let defaultAVOffsetMs: Double = 0
     static let avOffsetRange: ClosedRange<Double> = -300...300
     static let defaultAVAutoOffset = false
+    /// 近景姿态放宽（实验，默认关 = 和以前逐位相同）：见 PoseCloseUp
+    static let defaultCloseUpPose = false
 
     var source: VisualSyncSource
     var motionGainDb: Double
@@ -3754,6 +3784,7 @@ struct VisualSyncSettings: Equatable {
     var avFallback: Bool
     var avOffsetMs: Double
     var avAutoOffset: Bool
+    var closeUpPose: Bool
 
     init(source: VisualSyncSource = defaultSource, motionGainDb: Double = defaultMotionGainDb,
          autoMotion: Bool = defaultAutoMotion, rhythmFollow: Bool = defaultRhythmFollow,
@@ -3765,7 +3796,7 @@ struct VisualSyncSettings: Equatable {
          avRhythmConfirm: Bool = defaultAVRhythmConfirm, avAccent: Bool = defaultAVAccent,
          avAccentDepth: Double = defaultAVAccentDepth, avVibrationAudio: Bool = defaultAVVibrationAudio,
          avFallback: Bool = defaultAVFallback, avOffsetMs: Double = defaultAVOffsetMs,
-         avAutoOffset: Bool = defaultAVAutoOffset) {
+         avAutoOffset: Bool = defaultAVAutoOffset, closeUpPose: Bool = defaultCloseUpPose) {
         self.source = source
         self.motionGainDb = motionGainDb.isFinite
             ? min(Self.motionGainRange.upperBound, max(Self.motionGainRange.lowerBound, motionGainDb))
@@ -3797,6 +3828,7 @@ struct VisualSyncSettings: Equatable {
             ? min(Self.avOffsetRange.upperBound, max(Self.avOffsetRange.lowerBound, avOffsetMs))
             : Self.defaultAVOffsetMs
         self.avAutoOffset = avAutoOffset
+        self.closeUpPose = closeUpPose
     }
 
     /// 存储里的来源值：认不出（含 P2 才有的 2）一律按声音
@@ -3827,7 +3859,8 @@ struct VisualSyncSettings: Equatable {
             avVibrationAudio: defaults.object(forKey: Keys.avVibrationAudio) as? Bool ?? defaultAVVibrationAudio,
             avFallback: defaults.object(forKey: Keys.avFallback) as? Bool ?? defaultAVFallback,
             avOffsetMs: defaults.object(forKey: Keys.avOffsetMs) as? Double ?? defaultAVOffsetMs,
-            avAutoOffset: defaults.object(forKey: Keys.avAutoOffset) as? Bool ?? defaultAVAutoOffset)
+            avAutoOffset: defaults.object(forKey: Keys.avAutoOffset) as? Bool ?? defaultAVAutoOffset,
+            closeUpPose: defaults.object(forKey: Keys.closeUpPose) as? Bool ?? defaultCloseUpPose)
     }
 
     var gainMultiplier: Double { pow(10, motionGainDb / 20) }

@@ -29,6 +29,70 @@ final class VideoSyncPlayer: ObservableObject {
     @Published private(set) var intensity: Int = 0
     @Published private(set) var audioStatus: AudioLevelTap.Status = .none
     @Published private(set) var motionStatus: VideoMotionTap.Status = .none
+    #if targetEnvironment(simulator)
+    /// 模拟器诊断读数（motion-zero-diag）：只在模拟器构建、调试记录开着、跟随画面时有；真机构建没有这段
+    @Published private(set) var simDiag: String?
+    private var simCounts = SimDiagCounts()
+    struct SimDiagCounts {
+        var ticks = 0
+        var waiting = 0
+        var seekWait = 0
+        var motionTicks = 0
+        var framesTicks = 0
+        var personTicks = 0
+        var levelMax = 0.0
+        var outMax = 0
+    }
+    /// 主线程：这一拍走到哪一步（stage）+ 取帧 / 姿态计数 + 这一拍的窗口和输出
+    private func simDiagNote(stage: String, window: MotionWindow? = nil, target: Double = 0, out: [Int] = []) {
+        guard debugRecording, visualSettings.source == .motion else { return }
+        var c = simCounts
+        c.ticks += 1
+        if stage == "wait" { c.waiting += 1 }
+        if stage == "seek" { c.seekWait += 1 }
+        if let w = window {
+            c.motionTicks += 1
+            if w.frames > 0 { c.framesTicks += 1 }
+            if w.posePresentFrames > 0 { c.personTicks += 1 }
+            c.levelMax = max(c.levelMax, motionLevel)
+            c.outMax = max(c.outMax, out.max() ?? 0)
+        }
+        simCounts = c
+        let tcs: String
+        switch player?.timeControlStatus {
+        case .playing?: tcs = "play"
+        case .paused?: tcs = "pause"
+        case .waitingToPlayAtSpecifiedRate?: tcs = "wait"
+        default: tcs = "nil"
+        }
+        var lines: [String] = []
+        lines.append(String(format: "DIAG %@ t=%.1f tcs=%@ st=%@", stage, currentSeconds, tcs, String(describing: motionStatus)))
+        lines.append("ticks=\(c.ticks) mot=\(c.motionTicks) fr>0=\(c.framesTicks) person=\(c.personTicks) wait=\(c.waiting) seek=\(c.seekWait) lvlMax=\(Int(c.levelMax)) outMax=\(c.outMax)")
+        if let tap = motionTap {
+            let d = tap.diagSnapshot()
+            lines.append("tap call=\(d.analyzeCalls) badT=\(d.badItemTime) noNew=\(d.noNewBuffer) fill=\(d.stillFills) copyNil=\(d.copyNil) badFmt=\(d.badFormat) fmt=\(String(d.lastFormat, radix: 16)) \(d.width)x\(d.height) ana=\(d.analyzed) smp=\(d.samples) item=\(String(format: "%.1f", d.lastItem))")
+            lines.append(String(format: "pose runs=%d seen=%d backoff=%d fail=%d ms=%.0f", d.pose.runs, d.pose.seenRuns,
+                                d.pose.backoff ? 1 : 0, d.pose.failures, d.pose.lastTookMs))
+            lines.append(String(format: "vis ppl=%d cand=%d pres=%d last conf=%.2f j11=%d jlow=%d", d.pose.rawPeopleRuns,
+                                d.pose.candidateRuns, d.pose.presentRuns, d.pose.lastPersonConf, d.pose.lastJoints11,
+                                d.pose.lastJointsLow))
+            if !d.pose.lastError.isEmpty { lines.append("err " + d.pose.lastError) }
+        } else {
+            lines.append("tap=nil")
+        }
+        if let w = window {
+            lines.append(String(format: "win f=%d e=%.2f subj=%d/%.3f near=%.2f cut=%d ppl=%d j=%d jl=%d pc=%.2f h=%d fc=%d pres=%d/%d pw=%.2f cu=%d",
+                                w.frames, w.representative, w.subjectFrames, w.subjectScore, w.nearField, w.cutCount,
+                                w.poseRawPeople, w.poseRawJoints, w.poseRawLowJoints, w.poseRawConfidence,
+                                w.poseRawHands, w.poseRawFaces,
+                                w.posePresentFrames, w.poseFrames, motionNormalizer.poseWeight,
+                                visualSettings.closeUpPose ? 1 : 0))
+            lines.append(String(format: "kind=%d tgt=%.1f lvl=%.1f conf=%.2f out=%@", actionContext.kind.rawValue, target,
+                                motionLevel, motionNormalizer.confidence, out.map(String.init).joined(separator: ",")))
+        }
+        simDiag = lines.joined(separator: "\n")
+    }
+    #endif
     /// rhythm-follow P1：伸缩跟随动作频率时的状态（没打开 / 没在跟画面时 nil）
     @Published private(set) var rhythmStatus: String?
     /// rhythm-phase P2：相位脉动的状态（没打开时 nil）
@@ -628,7 +692,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-context P3：分析那边的两个开关（相位拟合只在相位脉动用得上时算；动作识别开着才跑手 / 脸 / 周期区域），
     /// 撞击声频带只在校正开着时分
     private func applyRhythmFlags() {
-        motionTap?.setRhythmFlags(phaseFit: visualSettings.usesPulseTiming, context: visualSettings.usesRhythmContext)
+        motionTap?.setRhythmFlags(phaseFit: visualSettings.usesPulseTiming, context: visualSettings.usesRhythmContext,
+                                  closeUp: visualSettings.closeUpPose)
         applyFusionAudioFlags()
         configureReader()
     }
@@ -1062,6 +1127,9 @@ final class VideoSyncPlayer: ObservableObject {
             // 等待落点前进期间 tap 可能已经在走：丢掉这几帧，恢复时不把跳转处的旧声音 / 旧画面当成一阵强输出
             _ = meter?.drain()
             _ = motionMeter?.drain()
+            #if targetEnvironment(simulator)
+            simDiagNote(stage: "seek")
+            #endif
             return
         case .stalled:
             handleStall()
@@ -1090,6 +1158,9 @@ final class VideoSyncPlayer: ObservableObject {
                 statusLine = "视频缓冲中，设备暂停输出"
             }
             needsResync = true
+            #if targetEnvironment(simulator)
+            simDiagNote(stage: "wait")
+            #endif
             return
         }
         guard t.isFinite else { return }
@@ -1618,6 +1689,9 @@ final class VideoSyncPlayer: ObservableObject {
             } else {
                 intensity = SyncOutputStage.preview(value, settings: settings, hasSignal: hasSignal)
             }
+            #if targetEnvironment(simulator)
+            simDiagNote(stage: "off", window: window, target: target, out: [intensity])
+            #endif
             return
         }
         let vals: [Int]
@@ -1660,13 +1734,16 @@ final class VideoSyncPlayer: ObservableObject {
         }
         let shown = vals.max() ?? 0
         intensity = shown
+        #if targetEnvironment(simulator)
+        simDiagNote(stage: "tick", window: window, target: target, out: vals)
+        #endif
         if debugRecording {
             debugLog.append(t: t, window: window, normalizer: motionNormalizer, target: target,
                             shapedLevel: shaped.level, value: value, hasSignal: hasSignal,
                             kind: actionContext.kind.rawValue, context: contextStatus,
                             rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
                             activity: rhythmActivity, rateLevel: rateLevel, out: vals,
-                            av: motionAVDebugFields(p))
+                            av: motionAVDebugFields(p), closeUp: visualSettings.closeUpPose)
         }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
@@ -1947,6 +2024,7 @@ struct VideoSyncView: View {
     @AppStorage(VisualSyncSettings.Keys.avFallback) private var avFallbackOn = VisualSyncSettings.defaultAVFallback
     @AppStorage(VisualSyncSettings.Keys.avOffsetMs) private var avOffsetMs = VisualSyncSettings.defaultAVOffsetMs
     @AppStorage(VisualSyncSettings.Keys.avAutoOffset) private var avAutoOffset = VisualSyncSettings.defaultAVAutoOffset
+    @AppStorage(VisualSyncSettings.Keys.closeUpPose) private var closeUpPose = VisualSyncSettings.defaultCloseUpPose
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -1971,7 +2049,7 @@ struct VideoSyncView: View {
                            rhythmLookahead: rhythmLookahead, prescan: prescan, avFusion: avFusion,
                            avRhythmConfirm: avRhythmConfirm, avAccent: avAccent, avAccentDepth: avAccentDepth,
                            avVibrationAudio: avVibrationAudio, avFallback: avFallbackOn,
-                           avOffsetMs: avOffsetMs, avAutoOffset: avAutoOffset)
+                           avOffsetMs: avOffsetMs, avAutoOffset: avAutoOffset, closeUpPose: closeUpPose)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -2445,6 +2523,16 @@ struct VideoSyncView: View {
             }
             MeterBar(title: "强度", fraction: Double(vm.intensity) / 100, color: Velvet.rose,
                      valueText: "\(vm.intensity)%")
+            #if targetEnvironment(simulator)
+            if followsMotion, debugLogOn, let diag = vm.simDiag {
+                Text(diag)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(Velvet.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("simMotionDiag")
+            }
+            #endif
         }
     }
 
@@ -2489,6 +2577,7 @@ struct VideoSyncView: View {
                 if autoMotion { prescanControls }
                 rhythmControls
                 fusionControls
+                closeUpPoseControl
                 debugLogControls
             }
         } else {
@@ -2687,6 +2776,22 @@ struct VideoSyncView: View {
     }
 
     /// 调试记录：画面联动每一拍的数字（运动量、归一化、动作类型、节奏、输出）存成表格导出；不存画面
+    /// 近景姿态放宽（实验，默认关）：只改姿态辅助认人的门槛，不改块运动、出口和任何安全逻辑
+    private var closeUpPoseControl: some View {
+        Toggle(isOn: $closeUpPose) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("近景姿态放宽（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("特写 / 只露出身体一部分时，人体姿态更容易认出来（置信度门槛 0.3 → 0.1）；可能把画面里的抖动当成动作。配合调试记录对比开 / 关")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+    }
+
     @ViewBuilder private var debugLogControls: some View {
         Toggle(isOn: $debugLogOn) {
             VStack(alignment: .leading, spacing: 2) {
@@ -3313,7 +3418,7 @@ final class MotionDebugLog {
         + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
         + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1,"
         + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header + "," + AVDebugColumns.f2Header + "," + AVDebugColumns.f3Header + "," + AVDebugColumns.f4Header + "," + AVDebugColumns.f5Header
-        + ",pose_raw_people,pose_raw_joints,pose_raw_hands,pose_raw_faces"
+        + ",pose_raw_people,pose_raw_joints,pose_raw_hands,pose_raw_faces,pose_raw_conf,pose_raw_joints_low,close_up_pose"
     private var rows: [String] = []
     private var start = 0
 
@@ -3329,7 +3434,7 @@ final class MotionDebugLog {
                 rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
                 rateLevel: Int?, out: [Int], av: [String] = AVDebugColumns.f0Empty + AVDebugColumns.f1Empty
                     + AVDebugColumns.f2Empty + AVDebugColumns.f3Empty + AVDebugColumns.f4Empty
-                    + AVDebugColumns.f5Empty) {
+                    + AVDebugColumns.f5Empty, closeUp: Bool = false) {
         func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
         let r = w.roi.region
         let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
@@ -3345,7 +3450,8 @@ final class MotionDebugLog {
             String(out.count > 0 ? out[0] : 0), String(out.count > 1 ? out[1] : 0)
         ]
         fields.append(contentsOf: av)
-        let raw: [String] = [String(w.poseRawPeople), String(w.poseRawJoints), String(w.poseRawHands), String(w.poseRawFaces)]
+        let raw: [String] = [String(w.poseRawPeople), String(w.poseRawJoints), String(w.poseRawHands), String(w.poseRawFaces),
+                             f(w.poseRawConfidence), String(w.poseRawLowJoints), closeUp ? "1" : "0"]
         fields.append(contentsOf: raw)
         let line = fields.joined(separator: ",")
         if rows.count < Self.maxRows {

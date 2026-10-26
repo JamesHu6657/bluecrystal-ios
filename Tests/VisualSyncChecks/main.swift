@@ -8674,6 +8674,48 @@ func avFusionF5Checks() {
 avFusionF4Checks()
 avFusionF5Checks()
 
+/// 近景姿态放宽（实验，默认关）：只把 [0.1, 0.3) 抬到 0.3；默认关、读不到存储时也是关；
+/// 抬过的候选人能过 PoseMotionTracker 的门槛并在连续几帧后给出读数，不抬时同样的检测一直是「没人」
+func closeUpPoseChecks() {
+    vcheck(VisualSyncSettings.defaultCloseUpPose == false && VisualSyncSettings().closeUpPose == false,
+           "近景姿态放宽：默认关")
+    vcheck(PoseCloseUp.lift(0.05) == 0.05 && PoseCloseUp.lift(0.1) == 0.3 && PoseCloseUp.lift(0.29) == 0.3
+           && PoseCloseUp.lift(0.3) == 0.3 && PoseCloseUp.lift(0.75) == 0.75 && PoseCloseUp.lift(1.4) == 1
+           && PoseCloseUp.lift(.nan) == 0 && PoseCloseUp.lift(-1) == 0,
+           "近景姿态放宽：[0.1, 0.3) → 0.3，其余原样（夹在 0~1）")
+    var mono = true
+    var prev = -1.0
+    for i in 0...100 {
+        let v = PoseCloseUp.lift(Double(i) / 100)
+        if v < prev || v < Double(i) / 100 - 1e-12 { mono = false }
+        prev = v
+    }
+    vcheck(mono, "近景姿态放宽：单调、不降")
+    // 一个低置信度（0.2）的人在画面里上下往复：不抬 → 一直没人；抬 → 几帧后有读数
+    func run(lifted: Bool) -> Int {
+        var tr = PoseMotionTracker()
+        var present = 0
+        for k in 0..<40 {
+            let t = Double(k) / 9
+            let dy = 3 * sin(2 * .pi * 1.2 * t)
+            var p = PoseCandidate()
+            p.confidence = lifted ? PoseCloseUp.lift(0.2) : 0.2
+            let joints: [(PoseJoint, Double, Double)] = [(.neck, 18, 14), (.leftShoulder, 12, 16), (.rightShoulder, 24, 16),
+                                                         (.root, 18, 34), (.leftHip, 14, 34), (.rightHip, 22, 34)]
+            for (j, x, y) in joints {
+                p.set(j, x: x, y: y + (j == .root || j == .leftHip || j == .rightHip ? dy : dy * 0.3),
+                      confidence: lifted ? PoseCloseUp.lift(0.2) : 0.2)
+            }
+            if tr.update(time: t, candidates: [p], camera: .identity, continuous: true, frameHeight: 64).present { present += 1 }
+        }
+        return present
+    }
+    let plain = run(lifted: false)
+    let lifted = run(lifted: true)
+    vcheck(plain == 0 && lifted > 20, "近景姿态放宽：置信度 0.2 的人不抬 → 一直没人（\(plain)），抬 → 有读数（\(lifted)/40）")
+}
+closeUpPoseChecks()
+
 if vsFailures > 0 {
     print("VisualSyncChecks: \(vsFailures) FAIL")
     exit(1)
