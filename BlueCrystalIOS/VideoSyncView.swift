@@ -71,8 +71,8 @@ final class VideoSyncPlayer: ObservableObject {
         if let tap = motionTap {
             let d = tap.diagSnapshot()
             lines.append("tap call=\(d.analyzeCalls) badT=\(d.badItemTime) noNew=\(d.noNewBuffer) fill=\(d.stillFills) copyNil=\(d.copyNil) badFmt=\(d.badFormat) fmt=\(String(d.lastFormat, radix: 16)) \(d.width)x\(d.height) ana=\(d.analyzed) smp=\(d.samples) item=\(String(format: "%.1f", d.lastItem))")
-            lines.append(String(format: "pose runs=%d seen=%d backoff=%d fail=%d ms=%.0f cpu=%d", d.pose.runs, d.pose.seenRuns,
-                                d.pose.backoff ? 1 : 0, d.pose.failures, d.pose.lastTookMs, d.pose.cpuForced ? 1 : 0))
+            lines.append(String(format: "pose runs=%d seen=%d backoff=%d fail=%d ms=%.0f", d.pose.runs, d.pose.seenRuns,
+                                d.pose.backoff ? 1 : 0, d.pose.failures, d.pose.lastTookMs))
             lines.append(String(format: "vis ppl=%d cand=%d pres=%d last conf=%.2f j11=%d jlow=%d", d.pose.rawPeopleRuns,
                                 d.pose.candidateRuns, d.pose.presentRuns, d.pose.lastPersonConf, d.pose.lastJoints11,
                                 d.pose.lastJointsLow))
@@ -81,10 +81,12 @@ final class VideoSyncPlayer: ObservableObject {
             lines.append("tap=nil")
         }
         if let w = window {
-            lines.append(String(format: "win f=%d e=%.2f subj=%d/%.3f near=%.2f cut=%d ppl=%d j=%d h=%d fc=%d pres=%d/%d pw=%.2f",
+            lines.append(String(format: "win f=%d e=%.2f subj=%d/%.3f near=%.2f cut=%d ppl=%d j=%d jl=%d pc=%.2f h=%d fc=%d pres=%d/%d pw=%.2f cu=%d",
                                 w.frames, w.representative, w.subjectFrames, w.subjectScore, w.nearField, w.cutCount,
-                                w.poseRawPeople, w.poseRawJoints, w.poseRawHands, w.poseRawFaces,
-                                w.posePresentFrames, w.poseFrames, motionNormalizer.poseWeight))
+                                w.poseRawPeople, w.poseRawJoints, w.poseRawLowJoints, w.poseRawConfidence,
+                                w.poseRawHands, w.poseRawFaces,
+                                w.posePresentFrames, w.poseFrames, motionNormalizer.poseWeight,
+                                visualSettings.closeUpPose ? 1 : 0))
             lines.append(String(format: "kind=%d tgt=%.1f lvl=%.1f conf=%.2f out=%@", actionContext.kind.rawValue, target,
                                 motionLevel, motionNormalizer.confidence, out.map(String.init).joined(separator: ",")))
         }
@@ -690,7 +692,8 @@ final class VideoSyncPlayer: ObservableObject {
     /// rhythm-context P3：分析那边的两个开关（相位拟合只在相位脉动用得上时算；动作识别开着才跑手 / 脸 / 周期区域），
     /// 撞击声频带只在校正开着时分
     private func applyRhythmFlags() {
-        motionTap?.setRhythmFlags(phaseFit: visualSettings.usesPulseTiming, context: visualSettings.usesRhythmContext)
+        motionTap?.setRhythmFlags(phaseFit: visualSettings.usesPulseTiming, context: visualSettings.usesRhythmContext,
+                                  closeUp: visualSettings.closeUpPose)
         applyFusionAudioFlags()
         configureReader()
     }
@@ -1740,7 +1743,7 @@ final class VideoSyncPlayer: ObservableObject {
                             kind: actionContext.kind.rawValue, context: contextStatus,
                             rhythmHz: rhythm.hz, rhythmWeight: rhythm.weight, rhythmLocked: rhythm.locked,
                             activity: rhythmActivity, rateLevel: rateLevel, out: vals,
-                            av: motionAVDebugFields(p))
+                            av: motionAVDebugFields(p), closeUp: visualSettings.closeUpPose)
         }
         let active = ActiveChannels(values: vals)
         if needsResync || active != lastActive {
@@ -2021,6 +2024,7 @@ struct VideoSyncView: View {
     @AppStorage(VisualSyncSettings.Keys.avFallback) private var avFallbackOn = VisualSyncSettings.defaultAVFallback
     @AppStorage(VisualSyncSettings.Keys.avOffsetMs) private var avOffsetMs = VisualSyncSettings.defaultAVOffsetMs
     @AppStorage(VisualSyncSettings.Keys.avAutoOffset) private var avAutoOffset = VisualSyncSettings.defaultAVAutoOffset
+    @AppStorage(VisualSyncSettings.Keys.closeUpPose) private var closeUpPose = VisualSyncSettings.defaultCloseUpPose
     /// 标定表的编辑稿：按「完成」/ 收起键盘 / 输入框消失时才写回 rateTable（播放中不按半截的表出档位）
     @State private var rateTableDraft = VisualSyncSettings.defaultRateTable
     @FocusState private var rateTableFocused: Bool
@@ -2045,7 +2049,7 @@ struct VideoSyncView: View {
                            rhythmLookahead: rhythmLookahead, prescan: prescan, avFusion: avFusion,
                            avRhythmConfirm: avRhythmConfirm, avAccent: avAccent, avAccentDepth: avAccentDepth,
                            avVibrationAudio: avVibrationAudio, avFallback: avFallbackOn,
-                           avOffsetMs: avOffsetMs, avAutoOffset: avAutoOffset)
+                           avOffsetMs: avOffsetMs, avAutoOffset: avAutoOffset, closeUpPose: closeUpPose)
     }
 
     private var sourceBinding: Binding<VisualSyncSource> {
@@ -2573,6 +2577,7 @@ struct VideoSyncView: View {
                 if autoMotion { prescanControls }
                 rhythmControls
                 fusionControls
+                closeUpPoseControl
                 debugLogControls
             }
         } else {
@@ -2771,6 +2776,22 @@ struct VideoSyncView: View {
     }
 
     /// 调试记录：画面联动每一拍的数字（运动量、归一化、动作类型、节奏、输出）存成表格导出；不存画面
+    /// 近景姿态放宽（实验，默认关）：只改姿态辅助认人的门槛，不改块运动、出口和任何安全逻辑
+    private var closeUpPoseControl: some View {
+        Toggle(isOn: $closeUpPose) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("近景姿态放宽（实验）")
+                    .font(.subheadline)
+                    .foregroundColor(Velvet.text)
+                Text("特写 / 只露出身体一部分时，人体姿态更容易认出来（置信度门槛 0.3 → 0.1）；可能把画面里的抖动当成动作。配合调试记录对比开 / 关")
+                    .font(.caption2)
+                    .foregroundColor(Velvet.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .tint(Velvet.gold)
+    }
+
     @ViewBuilder private var debugLogControls: some View {
         Toggle(isOn: $debugLogOn) {
             VStack(alignment: .leading, spacing: 2) {
@@ -3397,7 +3418,7 @@ final class MotionDebugLog {
         + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
         + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1,"
         + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header + "," + AVDebugColumns.f2Header + "," + AVDebugColumns.f3Header + "," + AVDebugColumns.f4Header + "," + AVDebugColumns.f5Header
-        + ",pose_raw_people,pose_raw_joints,pose_raw_hands,pose_raw_faces"
+        + ",pose_raw_people,pose_raw_joints,pose_raw_hands,pose_raw_faces,pose_raw_conf,pose_raw_joints_low,close_up_pose"
     private var rows: [String] = []
     private var start = 0
 
@@ -3413,7 +3434,7 @@ final class MotionDebugLog {
                 rhythmHz: Double, rhythmWeight: Double, rhythmLocked: Bool, activity: Double,
                 rateLevel: Int?, out: [Int], av: [String] = AVDebugColumns.f0Empty + AVDebugColumns.f1Empty
                     + AVDebugColumns.f2Empty + AVDebugColumns.f3Empty + AVDebugColumns.f4Empty
-                    + AVDebugColumns.f5Empty) {
+                    + AVDebugColumns.f5Empty, closeUp: Bool = false) {
         func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
         let r = w.roi.region
         let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
@@ -3429,7 +3450,8 @@ final class MotionDebugLog {
             String(out.count > 0 ? out[0] : 0), String(out.count > 1 ? out[1] : 0)
         ]
         fields.append(contentsOf: av)
-        let raw: [String] = [String(w.poseRawPeople), String(w.poseRawJoints), String(w.poseRawHands), String(w.poseRawFaces)]
+        let raw: [String] = [String(w.poseRawPeople), String(w.poseRawJoints), String(w.poseRawHands), String(w.poseRawFaces),
+                             f(w.poseRawConfidence), String(w.poseRawLowJoints), closeUp ? "1" : "0"]
         fields.append(contentsOf: raw)
         let line = fields.joined(separator: ",")
         if rows.count < Self.maxRows {

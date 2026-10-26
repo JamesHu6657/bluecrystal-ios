@@ -4,9 +4,6 @@ import CoreVideo
 import QuartzCore
 import ImageIO
 import Vision
-#if targetEnvironment(simulator)
-import CoreML
-#endif
 import UIKit
 import os
 
@@ -86,7 +83,6 @@ struct PoseDiag {
     var lastPersonConf = 0.0
     var lastJoints11 = 0
     var lastJointsLow = 0
-    var cpuForced = false
     var lastError = ""
 }
 #endif
@@ -176,31 +172,7 @@ private final class PoseWorker {
         candidates.reserveCapacity(4)
         handCandidates.reserveCapacity(4)
         faceCandidates.reserveCapacity(4)
-        #if targetEnvironment(simulator)
-        // 模拟器没有神经引擎，Vision 默认设备会报错（3 次后姿态就停用）：模拟器构建里强制 CPU，好在模拟器上看到姿态的真实结果
-        diagState.cpuForced = Self.forceCPU(request)
-        _ = Self.forceCPU(handRequest)
-        _ = Self.forceCPU(faceRequest)
-        #endif
     }
-
-    #if targetEnvironment(simulator)
-    private static func forceCPU(_ r: VNRequest) -> Bool {
-        if #available(iOS 17.0, *) {
-            guard let devices = try? r.supportedComputeStageDevices, let main = devices[.main] else { return false }
-            for d in main {
-                if case .cpu(_) = d {
-                    r.setComputeDevice(d, for: .main)
-                    return true
-                }
-            }
-            return false
-        } else {
-            r.usesCPUOnly = true
-            return true
-        }
-    }
-    #endif
 
     deinit {
         lock.deinitialize(count: 1)
@@ -226,7 +198,7 @@ private final class PoseWorker {
     /// phaseFit / context：rhythm-context P3 的两个开关（相位拟合 / 动作识别），由画面分析那边按设置带过来
     func submit(_ buffer: CVPixelBuffer, time: Double, camera: CameraTransform, continuous: Bool,
                 frameWidth: Int, frameHeight: Int, generation: Int, meter: VideoMotionMeter,
-                phaseFit: Bool = false, context: Bool = false) -> Bool {
+                phaseFit: Bool = false, context: Bool = false, closeUp: Bool = false) -> Bool {
         guard frameWidth > 0, frameHeight > 0, time.isFinite else { return false }
         let now = CACurrentMediaTime()
         os_unfair_lock_lock(lock)
@@ -244,7 +216,7 @@ private final class PoseWorker {
             let start = CACurrentMediaTime()
             let seen = self.run(buffer, time: time, camera: camera, continuous: continuous, orientation: o,
                      frameWidth: frameWidth, frameHeight: frameHeight, generation: generation, meter: meter,
-                     phaseFit: phaseFit, context: context)
+                     phaseFit: phaseFit, context: context, closeUp: closeUp)
             let end = CACurrentMediaTime()
             let took = end - start
             var idle = took.isFinite ? min(Self.maxIdle, max(0, took * Self.idleShare)) : 0
@@ -271,7 +243,7 @@ private final class PoseWorker {
     /// 返回这一帧有没有认到人（身体，或动作识别开着时的手 / 脸）；出错不算没人（返回 true，不触发省电放宽）
     private func run(_ buffer: CVPixelBuffer, time: Double, camera: CameraTransform, continuous: Bool,
                      orientation o: PoseOrientation, frameWidth: Int, frameHeight: Int, generation: Int,
-                     meter: VideoMotionMeter, phaseFit: Bool, context: Bool) -> Bool {
+                     meter: VideoMotionMeter, phaseFit: Bool, context: Bool, closeUp: Bool) -> Bool {
         if generation != trackedGeneration {
             tracker.reset()
             handTracker.reset()
@@ -317,15 +289,21 @@ private final class PoseWorker {
         os_unfair_lock_unlock(lock)
         candidates.removeAll(keepingCapacity: true)
         var rawJoints = 0
+        var rawLowJoints = 0
+        var rawConfidence = 0.0
         for observation in request.results ?? [] {
+            rawConfidence = max(rawConfidence, Double(observation.confidence))
             guard let points = try? observation.recognizedPoints(.all) else { continue }
             rawJoints = max(rawJoints, points.values.reduce(0) { $0 + ($1.confidence >= 0.3 ? 1 : 0) })
+            rawLowJoints = max(rawLowJoints, points.values.reduce(0) { $0 + ($1.confidence >= 0.1 ? 1 : 0) })
             var person = PoseCandidate()
-            person.confidence = Double(observation.confidence)
+            // 近景姿态放宽（默认关）：[0.1, 0.3) 的置信度抬到 0.3，其余原样
+            person.confidence = closeUp ? PoseCloseUp.lift(Double(observation.confidence)) : Double(observation.confidence)
             for (joint, name) in Self.joints {
                 guard let p = points[name], p.confidence > 0 else { continue }
                 let b = o.bufferPoint(visionX: Double(p.location.x), visionY: Double(p.location.y))
-                person.set(joint, x: b.x * w, y: b.y * h, confidence: Double(p.confidence))
+                let c = closeUp ? PoseCloseUp.lift(Double(p.confidence)) : Double(p.confidence)
+                person.set(joint, x: b.x * w, y: b.y * h, confidence: c)
             }
             candidates.append(person)
         }
@@ -334,6 +312,8 @@ private final class PoseWorker {
         // 调试列（只进表格）：Vision 原始认到几个人、关节最多的人有几个可信关节
         reading.rawPeople = request.results?.count ?? 0
         reading.rawJoints = rawJoints
+        reading.rawConfidence = rawConfidence
+        reading.rawLowJoints = rawLowJoints
         #if targetEnvironment(simulator)
         var bestConf = 0.0
         var best11 = 0
@@ -522,6 +502,8 @@ final class VideoMotionTap {
     /// rhythm-context P3：相位拟合 / 动作识别开关（主线程设，workQueue 读；默认都关 = P2 关着时的行为）
     private var phaseFitFlag = false
     private var contextFlag = false
+    /// 近景姿态放宽（实验，默认关）
+    private var closeUpFlag = false
     // 下面只在 workQueue 上用
     private var downscaler = LumaDownscaler()
     private var analyzer = MotionAnalyzer()
@@ -597,17 +579,18 @@ final class VideoMotionTap {
     }
 
     /// 主线程（rhythm-context P3）：相位拟合跟「相位脉动」开关走，动作识别跟「动作识别」开关走。下一帧起生效
-    func setRhythmFlags(phaseFit: Bool, context: Bool) {
+    func setRhythmFlags(phaseFit: Bool, context: Bool, closeUp: Bool = false) {
         os_unfair_lock_lock(flagLock)
         phaseFitFlag = phaseFit
         contextFlag = context
+        closeUpFlag = closeUp
         os_unfair_lock_unlock(flagLock)
     }
 
-    private var rhythmFlags: (phaseFit: Bool, context: Bool) {
+    private var rhythmFlags: (phaseFit: Bool, context: Bool, closeUp: Bool) {
         os_unfair_lock_lock(flagLock)
         defer { os_unfair_lock_unlock(flagLock) }
-        return (phaseFitFlag, contextFlag)
+        return (phaseFitFlag, contextFlag, closeUpFlag)
     }
 
     /// 主线程：不联动时定时器停在远期（不用 suspend，cancel 挂起的 source 会崩），联动时按当前频率跑
@@ -850,7 +833,7 @@ final class VideoMotionTap {
 
     /// workQueue：把这一帧的相机运动合进「上次提交姿态以来」那一段，到点就把这一帧交给姿态辅助（algo-opt-3）
     private func notePose(_ buffer: CVPixelBuffer, time: Double, generation: Int,
-                          flags: (phaseFit: Bool, context: Bool)) {
+                          flags: (phaseFit: Bool, context: Bool, closeUp: Bool)) {
         if analyzer.cameraContinuous {
             poseCamera = poseCamera.then(analyzer.lastCamera)
         } else {
@@ -861,7 +844,8 @@ final class VideoMotionTap {
         guard time.isFinite, time >= poseNext - 0.005 else { return }
         guard pose.submit(buffer, time: time, camera: poseCamera, continuous: poseContinuous,
                           frameWidth: frame.width, frameHeight: frame.height, generation: generation,
-                          meter: meter, phaseFit: flags.phaseFit, context: flags.context) else { return }
+                          meter: meter, phaseFit: flags.phaseFit, context: flags.context,
+                          closeUp: flags.closeUp) else { return }
         poseCamera = .identity
         poseContinuous = true
         poseNext = poseNext.isFinite ? max(poseNext + PoseWorker.interval, time + PoseWorker.interval * 0.5)
