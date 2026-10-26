@@ -3313,6 +3313,7 @@ final class MotionDebugLog {
         + "ref_low,ref_high,norm_conf,pose_weight,target,shaped_level,value,has_signal,action_kind,context,"
         + "rhythm_hz,rhythm_weight,rhythm_locked,activity,rate_level,out_ch0,out_ch1,"
         + AVDebugColumns.f0Header + "," + AVDebugColumns.f1Header + "," + AVDebugColumns.f2Header + "," + AVDebugColumns.f3Header + "," + AVDebugColumns.f4Header + "," + AVDebugColumns.f5Header
+        + ",pose_raw_people,pose_raw_joints,pose_raw_hands,pose_raw_faces"
     private var rows: [String] = []
     private var start = 0
 
@@ -3332,7 +3333,7 @@ final class MotionDebugLog {
         func f(_ x: Double) -> String { x.isFinite ? String(format: "%.4f", x) : "" }
         let r = w.roi.region
         let ctx = (context ?? "").replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
-        let fields: [String] = [
+        var fields: [String] = [
             f(t), f(CACurrentMediaTime()), String(w.frames), f(w.meanEnergy), f(w.peakEnergy), f(w.coverage),
             f(w.nearField), String(w.cutCount), f(w.subjectScore), f(w.subjectHz), String(w.poseFrames),
             String(w.posePresentFrames), f(w.poseScore), f(w.poseConfidence), f(w.poseTrust),
@@ -3342,7 +3343,10 @@ final class MotionDebugLog {
             hasSignal ? "1" : "0", String(kind), ctx,
             f(rhythmHz), f(rhythmWeight), rhythmLocked ? "1" : "0", f(activity), rateLevel.map(String.init) ?? "",
             String(out.count > 0 ? out[0] : 0), String(out.count > 1 ? out[1] : 0)
-        ] + av
+        ]
+        fields.append(contentsOf: av)
+        let raw: [String] = [String(w.poseRawPeople), String(w.poseRawJoints), String(w.poseRawHands), String(w.poseRawFaces)]
+        fields.append(contentsOf: raw)
         let line = fields.joined(separator: ",")
         if rows.count < Self.maxRows {
             rows.append(line)

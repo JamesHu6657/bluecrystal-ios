@@ -92,6 +92,11 @@ private final class PoseWorker {
     /// 不取 × 1：单次 0.2 秒时间隔就到 0.4 秒以上，超过 PoseMotionTracker.maxGap，姿态就一直连不上
     static let idleShare: Double = 0.5
     static let maxIdle: Double = 1
+    /// 省电（pose-idle-backoff）：连续 absentAfter 秒（host 时间）一个人都没认到（动作识别开着时手 / 脸也没认到），
+    /// 提交间隔放宽到 absentInterval；一认到人立刻回到约 9 Hz，换视频 / 跳转（generation 变）也立刻回到 9 Hz。
+    /// 代价：人刚入画时最多晚约 1 秒认出来。没人时姿态读数本来就是空的，放宽间隔对输出影响很小
+    static let absentAfter: Double = 3
+    static let absentInterval: Double = 1
 
     private let queue = DispatchQueue(label: "com.bluecrystal.motion.pose", qos: .utility)
     /// inFlight / thermalOK / orientation / failures / idleUntil 跨队列读写，锁保护
@@ -99,9 +104,13 @@ private final class PoseWorker {
     private var inFlight = false
     /// host 时间（CACurrentMediaTime）：上一次跑完 + 空闲时间，之前不提交
     private var idleUntil: CFTimeInterval = 0
+    /// 上一次提交的 generation（锁保护）：换视频 / 跳转后不等省电放宽的空闲期，马上提交
+    private var submittedGeneration = Int.min
     private var thermalOK = true
     private var failures = 0
     private var orientation = PoseOrientation.up
+    /// host 时间：最近一次认到人（或开始计没人）的时刻；-1 = 还没开始计。只在 queue 上读写
+    private var lastSeenHost: CFTimeInterval = -1
     // 下面只在 queue 上用
     private let request = VNDetectHumanBodyPoseRequest()
     private var tracker = PoseMotionTracker()
@@ -162,20 +171,29 @@ private final class PoseWorker {
         guard frameWidth > 0, frameHeight > 0, time.isFinite else { return false }
         let now = CACurrentMediaTime()
         os_unfair_lock_lock(lock)
-        let go = !inFlight && now >= idleUntil && thermalOK && failures < Self.maxFailures
-        if go { inFlight = true }
+        let go = !inFlight && (now >= idleUntil || generation != submittedGeneration)
+            && thermalOK && failures < Self.maxFailures
+        if go {
+            inFlight = true
+            submittedGeneration = generation
+        }
         let o = orientation
         os_unfair_lock_unlock(lock)
         guard go else { return false }
         queue.async { [weak self] in
             guard let self = self else { return }
             let start = CACurrentMediaTime()
-            self.run(buffer, time: time, camera: camera, continuous: continuous, orientation: o,
+            let seen = self.run(buffer, time: time, camera: camera, continuous: continuous, orientation: o,
                      frameWidth: frameWidth, frameHeight: frameHeight, generation: generation, meter: meter,
                      phaseFit: phaseFit, context: context)
             let end = CACurrentMediaTime()
             let took = end - start
-            let idle = took.isFinite ? min(Self.maxIdle, max(0, took * Self.idleShare)) : 0
+            var idle = took.isFinite ? min(Self.maxIdle, max(0, took * Self.idleShare)) : 0
+            if seen || self.lastSeenHost < 0 { self.lastSeenHost = end }
+            if !seen, end - self.lastSeenHost >= Self.absentAfter {
+                let took0 = took.isFinite ? max(0, took) : 0
+                idle = max(idle, Self.absentInterval - took0)
+            }
             os_unfair_lock_lock(self.lock)
             self.inFlight = false
             self.idleUntil = end + idle
@@ -184,15 +202,17 @@ private final class PoseWorker {
         return true
     }
 
-    /// queue：Vision → 分析帧像素坐标的候选人 → PoseMotionTracker → 电平计
+    /// queue：Vision → 分析帧像素坐标的候选人 → PoseMotionTracker → 电平计。
+    /// 返回这一帧有没有认到人（身体，或动作识别开着时的手 / 脸）；出错不算没人（返回 true，不触发省电放宽）
     private func run(_ buffer: CVPixelBuffer, time: Double, camera: CameraTransform, continuous: Bool,
                      orientation o: PoseOrientation, frameWidth: Int, frameHeight: Int, generation: Int,
-                     meter: VideoMotionMeter, phaseFit: Bool, context: Bool) {
+                     meter: VideoMotionMeter, phaseFit: Bool, context: Bool) -> Bool {
         if generation != trackedGeneration {
             tracker.reset()
             handTracker.reset()
             faceTracker.reset()
             trackedGeneration = generation
+            lastSeenHost = -1
         }
         tracker.phaseFitEnabled = phaseFit
         tracker.contextEnabled = context
@@ -222,14 +242,16 @@ private final class PoseWorker {
                 _ = handTracker.update(time: time, candidates: [], camera: .identity, continuous: false)
                 _ = faceTracker.update(time: time, candidates: [], camera: .identity, continuous: false)
             }
-            return
+            return true
         }
         os_unfair_lock_lock(lock)
         failures = 0
         os_unfair_lock_unlock(lock)
         candidates.removeAll(keepingCapacity: true)
+        var rawJoints = 0
         for observation in request.results ?? [] {
             guard let points = try? observation.recognizedPoints(.all) else { continue }
+            rawJoints = max(rawJoints, points.values.reduce(0) { $0 + ($1.confidence >= 0.3 ? 1 : 0) })
             var person = PoseCandidate()
             person.confidence = Double(observation.confidence)
             for (joint, name) in Self.joints {
@@ -239,20 +261,31 @@ private final class PoseWorker {
             }
             candidates.append(person)
         }
-        let reading = tracker.update(time: time, candidates: candidates, camera: camera, continuous: continuous,
+        var reading = tracker.update(time: time, candidates: candidates, camera: camera, continuous: continuous,
                                      frameHeight: h)
-        meter.addPose(reading, generation: generation)
-        guard context else { return }
+        // 调试列（只进表格）：Vision 原始认到几个人、关节最多的人有几个可信关节
+        reading.rawPeople = request.results?.count ?? 0
+        reading.rawJoints = rawJoints
+        guard context else {
+            meter.addPose(reading, generation: generation)
+            return !candidates.isEmpty
+        }
         // 自审 L3：手 / 脸检测让每帧姿态开销约翻倍，只在 .nominal 跑；.fair 起只留人体姿态（手 / 脸当没检测到）
         if ProcessInfo.processInfo.thermalState == .nominal {
             runContext(handler, time: time, camera: camera, continuous: continuous, orientation: o, width: w, height: h)
         } else {
             handTracker.reset()
             faceTracker.reset()
+            handCandidates.removeAll(keepingCapacity: true)
+            faceCandidates.removeAll(keepingCapacity: true)
         }
+        reading.rawHands = handCandidates.count
+        reading.rawFaces = faceCandidates.count
+        meter.addPose(reading, generation: generation)
         let c = PoseContext(valid: true, time: time, frameWidth: w, frameHeight: h, body: tracker.bodyContext,
                             hand: handTracker.reading, face: faceTracker.reading)
         meter.addContext(c, generation: generation)
+        return !candidates.isEmpty || !handCandidates.isEmpty || !faceCandidates.isEmpty
     }
 
     /// queue（rhythm-context P3）：同一个 handler 再跑手 / 脸检测。出错只当这一帧没检测到（不计入停用次数、不影响人体姿态）
