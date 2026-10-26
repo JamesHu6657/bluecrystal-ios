@@ -248,8 +248,10 @@ private final class PoseWorker {
         failures = 0
         os_unfair_lock_unlock(lock)
         candidates.removeAll(keepingCapacity: true)
+        var rawJoints = 0
         for observation in request.results ?? [] {
             guard let points = try? observation.recognizedPoints(.all) else { continue }
+            rawJoints = max(rawJoints, points.values.reduce(0) { $0 + ($1.confidence >= 0.3 ? 1 : 0) })
             var person = PoseCandidate()
             person.confidence = Double(observation.confidence)
             for (joint, name) in Self.joints {
@@ -259,10 +261,15 @@ private final class PoseWorker {
             }
             candidates.append(person)
         }
-        let reading = tracker.update(time: time, candidates: candidates, camera: camera, continuous: continuous,
+        var reading = tracker.update(time: time, candidates: candidates, camera: camera, continuous: continuous,
                                      frameHeight: h)
-        meter.addPose(reading, generation: generation)
-        guard context else { return !candidates.isEmpty }
+        // 调试列（只进表格）：Vision 原始认到几个人、关节最多的人有几个可信关节
+        reading.rawPeople = request.results?.count ?? 0
+        reading.rawJoints = rawJoints
+        guard context else {
+            meter.addPose(reading, generation: generation)
+            return !candidates.isEmpty
+        }
         // 自审 L3：手 / 脸检测让每帧姿态开销约翻倍，只在 .nominal 跑；.fair 起只留人体姿态（手 / 脸当没检测到）
         if ProcessInfo.processInfo.thermalState == .nominal {
             runContext(handler, time: time, camera: camera, continuous: continuous, orientation: o, width: w, height: h)
@@ -272,6 +279,9 @@ private final class PoseWorker {
             handCandidates.removeAll(keepingCapacity: true)
             faceCandidates.removeAll(keepingCapacity: true)
         }
+        reading.rawHands = handCandidates.count
+        reading.rawFaces = faceCandidates.count
+        meter.addPose(reading, generation: generation)
         let c = PoseContext(valid: true, time: time, frameWidth: w, frameHeight: h, body: tracker.bodyContext,
                             hand: handTracker.reading, face: faceTracker.reading)
         meter.addContext(c, generation: generation)

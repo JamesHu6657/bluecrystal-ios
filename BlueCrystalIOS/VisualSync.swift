@@ -2290,6 +2290,13 @@ struct PoseReading: Equatable {
     var rhythmRate: Double = 0
     /// rhythm-phase P2：挑出的那组按 rhythmHz 拟合的位移相位（已补上关节平滑的滞后），只给 RhythmPhaseLock
     var rhythmPhase = StrokeRhythm.PhaseFit()
+    /// 调试（pose-idle-backoff）：Vision 原始结果，只进调试表格，不参与任何计算。
+    /// rawPeople = 认到几个人；rawJoints = 其中关节最多的那个人有几个关节置信度 ≥ 0.3（Vision 全部 19 个关节都算）；
+    /// rawHands / rawFaces = 动作识别开着时手 / 脸检测到几个（关着时 0）
+    var rawPeople = 0
+    var rawJoints = 0
+    var rawHands = 0
+    var rawFaces = 0
 }
 
 /// 姿态 → 主体强度（algo-opt-3）：关节速度按躯干长度（或肩宽、关节包围框对角线）归一（远近 / 缩放无关），
@@ -3061,6 +3068,11 @@ struct MotionWindow: Equatable {
     var posePresentFrames: Int = 0
     var poseScore: Double = 0
     var poseConfidence: Double = 0
+    /// 调试：这一拍里 Vision 原始结果的最大值（PoseReading.raw*），只进调试表格
+    var poseRawPeople: Int = 0
+    var poseRawJoints: Int = 0
+    var poseRawHands: Int = 0
+    var poseRawFaces: Int = 0
     /// 最后一次有人时的关节可信度（PoseReading.trust；手搭的窗口不填 = 1）
     var poseTrust: Double = 1
     /// 往复频率跟随（rhythm-follow P1）：块运动主体最后一个读数的跟随频率 / 置信度 / 单程幅度（分析帧像素；
@@ -3107,6 +3119,10 @@ struct MotionWindowAccumulator {
     private var subjectHz: Double = 0
     private var poseFrames = 0
     private var posePresentFrames = 0
+    private var poseRawPeople = 0
+    private var poseRawJoints = 0
+    private var poseRawHands = 0
+    private var poseRawFaces = 0
     private var poseScore: Double = 0
     private var poseConfidence: Double = 0
     private var poseTrust: Double = 1
@@ -3173,6 +3189,10 @@ struct MotionWindowAccumulator {
     /// 一次姿态估计（algo-opt-3）：只记次数和最后一次有人时的分数（姿态本身已经按 1.2 秒平滑）
     mutating func addPose(_ r: PoseReading) {
         poseFrames += 1
+        poseRawPeople = max(poseRawPeople, r.rawPeople)
+        poseRawJoints = max(poseRawJoints, r.rawJoints)
+        poseRawHands = max(poseRawHands, r.rawHands)
+        poseRawFaces = max(poseRawFaces, r.rawFaces)
         guard r.present, r.score.isFinite, r.confidence.isFinite else { return }
         // 切镜前那些帧的读数（切镜样本之后才回来的）不算
         guard !(r.time < lastCutTime) else { return }
@@ -3213,6 +3233,10 @@ struct MotionWindowAccumulator {
         }
         window.poseFrames = poseFrames
         window.posePresentFrames = posePresentFrames
+        window.poseRawPeople = poseRawPeople
+        window.poseRawJoints = poseRawJoints
+        window.poseRawHands = poseRawHands
+        window.poseRawFaces = poseRawFaces
         window.poseScore = poseScore
         window.poseConfidence = poseConfidence
         window.poseTrust = poseTrust
