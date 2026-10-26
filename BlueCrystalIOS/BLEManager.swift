@@ -5,6 +5,24 @@ import UserNotifications
 import UIKit
 import os
 
+// 真机：下面这些名字就是 CoreBluetooth 原类型，编译出来和以前完全一样。
+// 模拟器没有蓝牙：换成文件末尾的模拟设备（只在模拟器构建里存在），BLEManager 的逻辑（停止帧对、回执、看门狗、额度）原样跑
+#if targetEnvironment(simulator)
+typealias LinkCentral = MockCentralManager
+typealias LinkPeripheral = MockPeripheral
+typealias LinkService = MockService
+typealias LinkCharacteristic = MockCharacteristic
+typealias LinkCentralDelegate = MockCentralManagerDelegate
+typealias LinkPeripheralDelegate = MockPeripheralDelegate
+#else
+typealias LinkCentral = CBCentralManager
+typealias LinkPeripheral = CBPeripheral
+typealias LinkService = CBService
+typealias LinkCharacteristic = CBCharacteristic
+typealias LinkCentralDelegate = CBCentralManagerDelegate
+typealias LinkPeripheralDelegate = CBPeripheralDelegate
+#endif
+
 /// mizzzee_0032 的 BLE 连接管理
 ///
 /// Service: 0000FFA0-0000-1000-8000-00805F9B34FB
@@ -129,10 +147,10 @@ final class BLEManager: NSObject, ObservableObject {
 
     private static let log = Logger(subsystem: "com.bluecrystal.ios", category: "ble")
 
-    private var central: CBCentralManager!
-    private var peripheral: CBPeripheral?
-    private var writeChar: CBCharacteristic?
-    private var pendingPeripheral: CBPeripheral?
+    private var central: LinkCentral!
+    private var peripheral: LinkPeripheral?
+    private var writeChar: LinkCharacteristic?
+    private var pendingPeripheral: LinkPeripheral?
 
     /// 只在 bleQueue 上读写的状态镜像，消除跨线程竞争
     private var queueState: State = .idle
@@ -297,7 +315,7 @@ final class BLEManager: NSObject, ObservableObject {
                 DispatchQueue.main.async { [weak self] in self?.lastError = Self.mayBeActiveMsg }
             }
         }
-        central = CBCentralManager(delegate: self, queue: bleQueue)
+        central = LinkCentral(delegate: self, queue: bleQueue)
         startWatchdog()
         // 修 CC M2：从多任务界面划掉 App 不一定收到 .background，退出前尽力发停止帧对
         NotificationCenter.default.addObserver(self, selector: #selector(appWillTerminate),
@@ -1145,7 +1163,7 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     /// 连接超时（修 Factory L6）：10 秒还没到 ready 就取消连接；调用方保证在 bleQueue 上
-    private func scheduleConnectTimeout(for p: CBPeripheral) {
+    private func scheduleConnectTimeout(for p: LinkPeripheral) {
         connectGen += 1
         let gen = connectGen
         bleQueue.asyncAfter(deadline: .now() + Self.connectTimeout) { [weak self] in
@@ -1283,9 +1301,9 @@ final class BLEManager: NSObject, ObservableObject {
     }
 }
 
-// MARK: - CBCentralManagerDelegate
-extension BLEManager: CBCentralManagerDelegate {
-    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+// MARK: - LinkCentralDelegate
+extension BLEManager: LinkCentralDelegate {
+    func centralManagerDidUpdateState(_ central: LinkCentral) {
         // N9：蓝牙关闭时系统不会回调 didDisconnect，必须在这里清理一切
         guard central.state == .poweredOn else {
             // 修 Factory H1：清理前先记下设备是否可能还在输出
@@ -1317,8 +1335,8 @@ extension BLEManager: CBCentralManagerDelegate {
         reconnectForStopIfNeeded()
     }
 
-    func centralManager(_ central: CBCentralManager,
-                        didDiscover peripheral: CBPeripheral,
+    func centralManager(_ central: LinkCentral,
+                        didDiscover peripheral: LinkPeripheral,
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
         // 修 Factory H2：只在扫描中处理；stopScan 前已排队的迟到回调直接忽略
@@ -1354,7 +1372,7 @@ extension BLEManager: CBCentralManagerDelegate {
         }
     }
 
-    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+    func centralManager(_ central: LinkCentral, didConnect peripheral: LinkPeripheral) {
         // 迟到的连接回调（已超时取消/已换外设）忽略
         guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
         central.stopScan() // 修 Factory H2
@@ -1364,8 +1382,8 @@ extension BLEManager: CBCentralManagerDelegate {
         peripheral.discoverServices([Self.serviceUUID])
     }
 
-    func centralManager(_ central: CBCentralManager,
-                        didFailToConnect peripheral: CBPeripheral,
+    func centralManager(_ central: LinkCentral,
+                        didFailToConnect peripheral: LinkPeripheral,
                         error: Error?) {
         // 修 G 小尾巴：只处理当前外设；失败后置空，避免残留引用
         guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
@@ -1374,8 +1392,8 @@ extension BLEManager: CBCentralManagerDelegate {
         setError("连接失败：\(error?.localizedDescription ?? "未知")")
     }
 
-    func centralManager(_ central: CBCentralManager,
-                        didDisconnectPeripheral peripheral: CBPeripheral,
+    func centralManager(_ central: LinkCentral,
+                        didDisconnectPeripheral peripheral: LinkPeripheral,
                         error: Error?) {
         // 修 G：只处理当前这台外设的回调；
         // finishDisconnect 里 cancelPeripheralConnection 的迟到回调会被忽略，
@@ -1400,9 +1418,9 @@ extension BLEManager: CBCentralManagerDelegate {
     }
 }
 
-// MARK: - CBPeripheralDelegate
-extension BLEManager: CBPeripheralDelegate {
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+// MARK: - LinkPeripheralDelegate
+extension BLEManager: LinkPeripheralDelegate {
+    func peripheral(_ peripheral: LinkPeripheral, didDiscoverServices error: Error?) {
         guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
         if let error = error { failConnection("发现服务失败：\(error.localizedDescription)"); return }
         guard let svc = peripheral.services?.first(where: { $0.uuid == Self.serviceUUID }) else {
@@ -1412,13 +1430,13 @@ extension BLEManager: CBPeripheralDelegate {
         peripheral.discoverCharacteristics([Self.writeUUID, Self.notifyUUID], for: svc)
     }
 
-    func peripheral(_ peripheral: CBPeripheral,
-                    didDiscoverCharacteristicsFor service: CBService,
+    func peripheral(_ peripheral: LinkPeripheral,
+                    didDiscoverCharacteristicsFor service: LinkService,
                     error: Error?) {
         guard let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
         if let error = error { failConnection("发现特征值失败：\(error.localizedDescription)"); return }
-        var write: CBCharacteristic?
-        var notify: CBCharacteristic?
+        var write: LinkCharacteristic?
+        var notify: LinkCharacteristic?
         for c in service.characteristics ?? [] {
             if c.uuid == Self.writeUUID {
                 write = c
@@ -1452,8 +1470,8 @@ extension BLEManager: CBPeripheralDelegate {
     }
 
     /// 修 L1：记录 FFA2 订阅结果
-    func peripheral(_ peripheral: CBPeripheral,
-                    didUpdateNotificationStateFor characteristic: CBCharacteristic,
+    func peripheral(_ peripheral: LinkPeripheral,
+                    didUpdateNotificationStateFor characteristic: LinkCharacteristic,
                     error: Error?) {
         guard characteristic.uuid == Self.notifyUUID,
               let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
@@ -1470,8 +1488,8 @@ extension BLEManager: CBPeripheralDelegate {
     /// 修 L1：记录 FFA2 每条通知的 HEX（目前协议含义未知，只记录不解析）。
     /// L6：日志带单调时间戳和距最近一次写入的间隔，便于之后对照真机判断它能不能当停止确认用；
     /// 用 notice 级别，Console / sysdiagnose 里能留下来
-    func peripheral(_ peripheral: CBPeripheral,
-                    didUpdateValueFor characteristic: CBCharacteristic,
+    func peripheral(_ peripheral: LinkPeripheral,
+                    didUpdateValueFor characteristic: LinkCharacteristic,
                     error: Error?) {
         guard characteristic.uuid == Self.notifyUUID,
               let cur = self.peripheral, cur.identifier == peripheral.identifier else { return }
@@ -1494,8 +1512,8 @@ extension BLEManager: CBPeripheralDelegate {
         DispatchQueue.main.async { [weak self] in self?.lastNotifyHex = hex }
     }
 
-    func peripheral(_ peripheral: CBPeripheral,
-                    didWriteValueFor characteristic: CBCharacteristic,
+    func peripheral(_ peripheral: LinkPeripheral,
+                    didWriteValueFor characteristic: LinkCharacteristic,
                     error: Error?) {
         guard characteristic.uuid == Self.writeUUID else { return }
         // 修 Factory L5：只认当前外设的回执
@@ -1535,3 +1553,193 @@ extension BLEManager: CBPeripheralDelegate {
         }
     }
 }
+
+// MARK: - 模拟器里的模拟设备（只在模拟器构建里编译，真机 IPA 里没有这段）
+#if targetEnvironment(simulator)
+/// 模拟一台 mizzzee_0032：广播名、FFA0 服务、FFA1（带回执写）/ FFA2（通知）特征值都照真机 GATT。
+/// 每笔写入约 20 ms 后回执成功，停止帧对、写入 FIFO、看门狗、额度都走 BLEManager 原有逻辑。
+/// 启动环境变量（Xcode scheme / Revyl launch env）可以做故障注入：
+///   BC_MOCK_BT=off            蓝牙关闭（验证"蓝牙已关闭"提示）
+///   BC_MOCK_BT=unauthorized   蓝牙未授权
+///   BC_MOCK_ACK=drop          写入永远不回执（验证写入超时 → 链路卡死 → 断开重连发停止）
+///   BC_MOCK_ACK=fail          写入回执都报错（验证写失败自动停止 / 停止重试与物理关机确认）
+///   BC_MOCK_ACK_MS=200        回执延迟（毫秒，默认 20）
+///   BC_MOCK_ABSENT=1          扫不到设备（验证"未找到 mizzzee_0032"）
+protocol MockCentralManagerDelegate: AnyObject {
+    func centralManagerDidUpdateState(_ central: MockCentralManager)
+    func centralManager(_ central: MockCentralManager, didDiscover peripheral: MockPeripheral,
+                        advertisementData: [String: Any], rssi RSSI: NSNumber)
+    func centralManager(_ central: MockCentralManager, didConnect peripheral: MockPeripheral)
+    func centralManager(_ central: MockCentralManager, didFailToConnect peripheral: MockPeripheral, error: Error?)
+    func centralManager(_ central: MockCentralManager, didDisconnectPeripheral peripheral: MockPeripheral, error: Error?)
+}
+
+protocol MockPeripheralDelegate: AnyObject {
+    func peripheral(_ peripheral: MockPeripheral, didDiscoverServices error: Error?)
+    func peripheral(_ peripheral: MockPeripheral, didDiscoverCharacteristicsFor service: MockService, error: Error?)
+    func peripheral(_ peripheral: MockPeripheral, didUpdateNotificationStateFor characteristic: MockCharacteristic, error: Error?)
+    func peripheral(_ peripheral: MockPeripheral, didUpdateValueFor characteristic: MockCharacteristic, error: Error?)
+    func peripheral(_ peripheral: MockPeripheral, didWriteValueFor characteristic: MockCharacteristic, error: Error?)
+}
+
+private enum MockConfig {
+    static let env = ProcessInfo.processInfo.environment
+    static var btState: CBManagerState {
+        switch env["BC_MOCK_BT"]?.lowercased() {
+        case "off": return .poweredOff
+        case "unauthorized": return .unauthorized
+        default: return .poweredOn
+        }
+    }
+    static var ack: String { env["BC_MOCK_ACK"]?.lowercased() ?? "ok" }
+    static var ackDelay: Double { (Double(env["BC_MOCK_ACK_MS"] ?? "") ?? 20) / 1000 }
+    static var absent: Bool { env["BC_MOCK_ABSENT"] == "1" }
+    static let log = Logger(subsystem: "com.bluecrystal.ios", category: "mock-ble")
+}
+
+final class MockCharacteristic {
+    let uuid: CBUUID
+    let properties: CBCharacteristicProperties
+    fileprivate(set) var isNotifying = false
+    fileprivate(set) var value: Data?
+    init(uuid: CBUUID, properties: CBCharacteristicProperties) {
+        self.uuid = uuid
+        self.properties = properties
+    }
+}
+
+final class MockService {
+    let uuid: CBUUID
+    fileprivate(set) var characteristics: [MockCharacteristic]?
+    init(uuid: CBUUID) { self.uuid = uuid }
+}
+
+struct MockError: LocalizedError {
+    let errorDescription: String?
+}
+
+final class MockPeripheral {
+    /// 固定 UUID：绑定（下次自动连）跨启动有效
+    let identifier = UUID(uuidString: "B1C0FFEE-0032-4D1E-9A00-000000000032")!
+    let name: String? = "mizzzee_0032"
+    weak var delegate: MockPeripheralDelegate?
+    private(set) var services: [MockService]?
+    fileprivate var queue: DispatchQueue = .main
+    fileprivate var connected = false
+    /// 最近收到的帧（HEX），只做调试日志
+    private(set) var receivedFrames: [String] = []
+
+    private let service: MockService = {
+        let s = MockService(uuid: BLEManager.serviceUUID)
+        s.characteristics = [
+            MockCharacteristic(uuid: BLEManager.writeUUID, properties: [.write]),
+            MockCharacteristic(uuid: BLEManager.notifyUUID, properties: [.notify])
+        ]
+        return s
+    }()
+
+    func discoverServices(_ uuids: [CBUUID]?) {
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self, self.connected else { return }
+            self.services = [self.service]
+            self.delegate?.peripheral(self, didDiscoverServices: nil)
+        }
+    }
+
+    func discoverCharacteristics(_ uuids: [CBUUID]?, for service: MockService) {
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self, self.connected else { return }
+            self.delegate?.peripheral(self, didDiscoverCharacteristicsFor: service, error: nil)
+        }
+    }
+
+    func setNotifyValue(_ enabled: Bool, for characteristic: MockCharacteristic) {
+        queue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self = self, self.connected else { return }
+            characteristic.isNotifying = enabled
+            self.delegate?.peripheral(self, didUpdateNotificationStateFor: characteristic, error: nil)
+        }
+    }
+
+    func writeValue(_ data: Data, for characteristic: MockCharacteristic, type: CBCharacteristicWriteType) {
+        guard connected else { return }
+        let hex = BCProtocol.hex(data)
+        receivedFrames.append(hex)
+        if receivedFrames.count > 200 { receivedFrames.removeFirst(receivedFrames.count - 200) }
+        MockConfig.log.notice("模拟设备收到 \(hex, privacy: .public)")
+        let mode = MockConfig.ack
+        guard mode != "drop" else { return }
+        queue.asyncAfter(deadline: .now() + MockConfig.ackDelay) { [weak self] in
+            guard let self = self, self.connected else { return }
+            let err: Error? = mode == "fail" ? MockError(errorDescription: "模拟写入失败") : nil
+            self.delegate?.peripheral(self, didWriteValueFor: characteristic, error: err)
+        }
+    }
+}
+
+final class MockCentralManager {
+    weak var delegate: MockCentralManagerDelegate?
+    private let queue: DispatchQueue
+    private(set) var state: CBManagerState = .unknown
+    private var scanGen = 0
+    private var connectGen = 0
+    /// 只有一台模拟设备，整个进程共用（retrievePeripherals 拿到的是同一个对象）
+    private static let device = MockPeripheral()
+
+    init(delegate: MockCentralManagerDelegate?, queue: DispatchQueue?) {
+        self.delegate = delegate
+        self.queue = queue ?? .main
+        Self.device.queue = self.queue
+        self.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self = self else { return }
+            self.state = MockConfig.btState
+            self.delegate?.centralManagerDidUpdateState(self)
+        }
+    }
+
+    func scanForPeripherals(withServices uuids: [CBUUID]?, options: [String: Any]?) {
+        guard state == .poweredOn else { return }
+        scanGen += 1
+        let gen = scanGen
+        guard !MockConfig.absent else { return }
+        queue.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self = self, self.scanGen == gen else { return }
+            let d = Self.device
+            self.delegate?.centralManager(self, didDiscover: d,
+                                          advertisementData: [CBAdvertisementDataLocalNameKey: d.name ?? ""],
+                                          rssi: -48)
+        }
+    }
+
+    func stopScan() {
+        scanGen += 1
+    }
+
+    func connect(_ peripheral: MockPeripheral, options: [String: Any]?) {
+        guard state == .poweredOn else { return }
+        connectGen += 1
+        let gen = connectGen
+        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self = self, self.connectGen == gen else { return }
+            peripheral.connected = true
+            self.delegate?.centralManager(self, didConnect: peripheral)
+        }
+    }
+
+    func cancelPeripheralConnection(_ peripheral: MockPeripheral) {
+        connectGen += 1
+        let wasConnected = peripheral.connected
+        peripheral.connected = false
+        for c in peripheral.services?.first?.characteristics ?? [] { c.isNotifying = false }
+        guard wasConnected else { return }
+        queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self else { return }
+            self.delegate?.centralManager(self, didDisconnectPeripheral: peripheral, error: nil)
+        }
+    }
+
+    func retrievePeripherals(withIdentifiers identifiers: [UUID]) -> [MockPeripheral] {
+        identifiers.contains(Self.device.identifier) ? [Self.device] : []
+    }
+}
+#endif
