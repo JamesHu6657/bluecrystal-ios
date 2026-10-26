@@ -71,8 +71,12 @@ final class VideoSyncPlayer: ObservableObject {
         if let tap = motionTap {
             let d = tap.diagSnapshot()
             lines.append("tap call=\(d.analyzeCalls) badT=\(d.badItemTime) noNew=\(d.noNewBuffer) fill=\(d.stillFills) copyNil=\(d.copyNil) badFmt=\(d.badFormat) fmt=\(String(d.lastFormat, radix: 16)) \(d.width)x\(d.height) ana=\(d.analyzed) smp=\(d.samples) item=\(String(format: "%.1f", d.lastItem))")
-            lines.append(String(format: "pose runs=%d seen=%d backoff=%d fail=%d ms=%.0f", d.pose.runs, d.pose.seenRuns,
-                                d.pose.backoff ? 1 : 0, d.pose.failures, d.pose.lastTookMs))
+            lines.append(String(format: "pose runs=%d seen=%d backoff=%d fail=%d ms=%.0f cpu=%d", d.pose.runs, d.pose.seenRuns,
+                                d.pose.backoff ? 1 : 0, d.pose.failures, d.pose.lastTookMs, d.pose.cpuForced ? 1 : 0))
+            lines.append(String(format: "vis ppl=%d cand=%d pres=%d last conf=%.2f j11=%d jlow=%d", d.pose.rawPeopleRuns,
+                                d.pose.candidateRuns, d.pose.presentRuns, d.pose.lastPersonConf, d.pose.lastJoints11,
+                                d.pose.lastJointsLow))
+            if !d.pose.lastError.isEmpty { lines.append("err " + d.pose.lastError) }
         } else {
             lines.append("tap=nil")
         }

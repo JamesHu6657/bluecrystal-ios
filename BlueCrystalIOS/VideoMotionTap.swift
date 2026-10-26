@@ -4,6 +4,9 @@ import CoreVideo
 import QuartzCore
 import ImageIO
 import Vision
+#if targetEnvironment(simulator)
+import CoreML
+#endif
 import UIKit
 import os
 
@@ -75,6 +78,16 @@ struct PoseDiag {
     var backoff = false
     var lastTookMs = 0.0
     var failures = 0
+    /// Vision 原始认到人的次数 / 有候选人过门槛（置信度 ≥ 0.3 且 11 个关节里 ≥ 4 个 ≥ 0.3）的次数 / 读数 present 的次数
+    var rawPeopleRuns = 0
+    var candidateRuns = 0
+    var presentRuns = 0
+    /// 最近一次：最高的人置信度、11 个关节里 ≥ 0.3 的个数（最多的那个人）、全部 19 个里 ≥ 0.1 的个数
+    var lastPersonConf = 0.0
+    var lastJoints11 = 0
+    var lastJointsLow = 0
+    var cpuForced = false
+    var lastError = ""
 }
 #endif
 
@@ -163,7 +176,31 @@ private final class PoseWorker {
         candidates.reserveCapacity(4)
         handCandidates.reserveCapacity(4)
         faceCandidates.reserveCapacity(4)
+        #if targetEnvironment(simulator)
+        // 模拟器没有神经引擎，Vision 默认设备会报错（3 次后姿态就停用）：模拟器构建里强制 CPU，好在模拟器上看到姿态的真实结果
+        diagState.cpuForced = Self.forceCPU(request)
+        _ = Self.forceCPU(handRequest)
+        _ = Self.forceCPU(faceRequest)
+        #endif
     }
+
+    #if targetEnvironment(simulator)
+    private static func forceCPU(_ r: VNRequest) -> Bool {
+        if #available(iOS 17.0, *) {
+            guard let devices = try? r.supportedComputeStageDevices, let main = devices[.main] else { return false }
+            for d in main {
+                if case .cpu(_) = d {
+                    r.setComputeDevice(d, for: .main)
+                    return true
+                }
+            }
+            return false
+        } else {
+            r.usesCPUOnly = true
+            return true
+        }
+    }
+    #endif
 
     deinit {
         lock.deinitialize(count: 1)
@@ -261,6 +298,9 @@ private final class PoseWorker {
         } catch {
             os_unfair_lock_lock(lock)
             failures += 1
+            #if targetEnvironment(simulator)
+            diagState.lastError = String(describing: error).prefix(80).description
+            #endif
             os_unfair_lock_unlock(lock)
             // 这一帧当作没人：下一次不和更早的帧算速度
             let reading = tracker.update(time: time, candidates: [], camera: .identity, continuous: false,
@@ -294,6 +334,31 @@ private final class PoseWorker {
         // 调试列（只进表格）：Vision 原始认到几个人、关节最多的人有几个可信关节
         reading.rawPeople = request.results?.count ?? 0
         reading.rawJoints = rawJoints
+        #if targetEnvironment(simulator)
+        var bestConf = 0.0
+        var best11 = 0
+        var bestLow = 0
+        var passes = false
+        for observation in request.results ?? [] {
+            bestConf = max(bestConf, Double(observation.confidence))
+            if let points = try? observation.recognizedPoints(.all) {
+                bestLow = max(bestLow, points.values.reduce(0) { $0 + ($1.confidence >= 0.1 ? 1 : 0) })
+            }
+        }
+        for person in candidates {
+            let n = person.c.reduce(0) { $0 + ($1 >= PoseMotionTracker.minJointConfidence ? 1 : 0) }
+            best11 = max(best11, n)
+            if person.confidence >= PoseMotionTracker.minPersonConfidence, n >= PoseMotionTracker.minJoints { passes = true }
+        }
+        os_unfair_lock_lock(lock)
+        if reading.rawPeople > 0 { diagState.rawPeopleRuns += 1 }
+        if passes { diagState.candidateRuns += 1 }
+        if reading.present { diagState.presentRuns += 1 }
+        diagState.lastPersonConf = bestConf
+        diagState.lastJoints11 = best11
+        diagState.lastJointsLow = bestLow
+        os_unfair_lock_unlock(lock)
+        #endif
         guard context else {
             meter.addPose(reading, generation: generation)
             return !candidates.isEmpty
